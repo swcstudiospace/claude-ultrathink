@@ -1,0 +1,17 @@
+{
+	"name": "ultrathink",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Prompt Uplift with Graph of Thought + Chain of Thought + HITL clarifications on a pluggable engine (Claude default, Grok optional), tracked in the Agent Task Graph Notion database and the Spectrum Web Co Linear team via ultrathink-kickoff/ultrathink-sync skills.",
+	"scripts": {
+		"test": "bun test",
+		"check": "bunx tsc --noEmit",
+		"hook:uplift": "bun hooks/uplift.ts",
+		"uplift": "bun hooks/uplift.ts --ctl",
+		"setup": "bun scripts/setup.ts"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.0"
+	}
+}

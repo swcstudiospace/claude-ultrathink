@@ -1,0 +1,7 @@
+{
+	"name": "ultrathink",
+	"version": "0.1.0",
+	"description": "Prompt Uplift with Graph of Thought + Chain of Thought + HITL clarifications on a pluggable engine (Claude default, Grok optional), tracked in the Agent Task Graph Notion database and the Spectrum Web Co Linear team.",
+	"author": { "name": "SWC Studio", "email": "noreply@swcstudio.space" },
+	"keywords": ["uplift", "prompt", "xml", "got", "cot", "hitl", "notion", "linear", "tracking"]
+}
