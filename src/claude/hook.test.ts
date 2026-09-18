@@ -84,6 +84,9 @@ describe("runPromptSubmit", () => {
 			const result = await runPromptSubmit(input, deps);
 			expect(result.output).toBeDefined();
 			expect(result.record?.result.source).toBe("fallback");
+			// Fallback output must not pollute the shared Notion/Linear tracker with
+			// generic FALLBACK_GRAPH boilerplate rows — the turn proceeds untracked.
+			expect(result.record?.plan).toBeUndefined();
 		} finally {
 			cleanup();
 		}

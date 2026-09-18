@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Clarification } from "../hitl/types.ts";
 import type { ThoughtGraph } from "../think/types.ts";
 import type { UpliftResult } from "../types.ts";
-import { buildTrackPlan, generateGraphId } from "./plan.ts";
+import { buildTrackPlan, generateGraphId, MAX_UPLIFTED_PROMPT_CHARS } from "./plan.ts";
 
 const uplift: UpliftResult = {
 	xml: "<BUILD_PROMPT><ORIGINAL>Add a widget list page</ORIGINAL></BUILD_PROMPT>",
@@ -130,5 +130,18 @@ describe("buildTrackPlan", () => {
 		expect(plan.task.item).toHaveLength(120);
 		expect(plan.task.item.endsWith("...")).toBe(true);
 		expect(plan.task.description).toBe(long);
+	});
+
+	test("short uplifted XML passes through unchanged", () => {
+		const plan = buildTrackPlan({ uplift, clarifications: [], graphId: "ut-fixed" });
+		expect(plan.task.upliftedPrompt).toBe(uplift.xml);
+	});
+
+	test("uplifted XML over the Notion rich-text cap is truncated with a marker, staying under the cap", () => {
+		const longXml = `<BUILD_PROMPT><ORIGINAL>${"x".repeat(5000)}</ORIGINAL></BUILD_PROMPT>`;
+		const plan = buildTrackPlan({ uplift: { ...uplift, xml: longXml }, clarifications: [], graphId: "ut-fixed" });
+		expect(plan.task.upliftedPrompt.length).toBeLessThanOrEqual(MAX_UPLIFTED_PROMPT_CHARS);
+		expect(plan.task.upliftedPrompt).toContain("truncated");
+		expect(plan.task.upliftedPrompt.startsWith(longXml.slice(0, 100))).toBe(true);
 	});
 });

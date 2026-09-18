@@ -3,7 +3,7 @@
  *
  * Calls headless `claude -p` so the plugin reuses whatever login the user already
  * has (OAuth or API key). Tools and settings sources are disabled so the child is a
- * plain completion, and AIO_UPLIFT_CHILD marks it so the UserPromptSubmit hook does
+ * plain completion, and ULTRATHINK_CHILD marks it so the UserPromptSubmit hook does
  * not recurse into itself.
  */
 

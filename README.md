@@ -47,7 +47,6 @@ Everything is fail-open: an engine failure, missing MCP connection, or tool erro
 
 ```json
 {
-  "engine": { "default": "claude" },
   "think": { "minNodes": 3, "maxNodes": 8, "engine": "claude" },
   "hitl": { "maxQuestions": 4 },
   "notion": { "dataSourceUrl": "collection://be3418f0-d2d8-411b-8677-fa8a95ee63be" },

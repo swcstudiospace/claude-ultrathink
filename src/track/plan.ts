@@ -6,6 +6,18 @@ import type { HitlPlan, IssueRow, LinearIssuePlan, LinearSubIssuePlan, SubIssueR
 
 const MAX_TITLE_CHARS = 120;
 
+/** Notion's single rich-text property limit is ~2000 chars; leave headroom under it. */
+export const MAX_UPLIFTED_PROMPT_CHARS = 1900;
+
+const TRUNCATION_MARKER = "\n<!-- truncated — full spec in the session's .xml file -->";
+
+/** Truncates the uplifted XML for the Notion `Uplifted Prompt` property; the full XML is always persisted to sessions/<id>.xml. */
+function truncateUpliftedPrompt(xml: string): string {
+	if (xml.length <= MAX_UPLIFTED_PROMPT_CHARS) return xml;
+	const cut = MAX_UPLIFTED_PROMPT_CHARS - TRUNCATION_MARKER.length;
+	return `${xml.slice(0, cut)}${TRUNCATION_MARKER}`;
+}
+
 export function generateGraphId(now: () => number = Date.now): string {
 	return `ut-${now().toString(36)}-${randomUUID().slice(0, 8)}`;
 }
@@ -65,7 +77,7 @@ export function buildTrackPlan(input: {
 		graphId,
 		item: taskTitle(input.uplift.original),
 		description: input.uplift.original.trim(),
-		upliftedPrompt: input.uplift.xml,
+		upliftedPrompt: truncateUpliftedPrompt(input.uplift.xml),
 		agent: "claude-code",
 		status: "Planning",
 		linearState: "Todo",

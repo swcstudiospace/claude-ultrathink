@@ -47,6 +47,32 @@ export function claudeMdPath(env: Record<string, string | undefined> = process.e
 	return join(home, "CLAUDE.md");
 }
 
+/** Records which MCP servers `apply` actually added, so `rollback` only undoes what it did. */
+export interface SetupState {
+	notionAdded: boolean;
+	linearAdded: boolean;
+}
+
+export function setupStatePath(env: Record<string, string | undefined> = process.env): string {
+	return join(dirname(claudeMdPath(env)), "ultrathink-setup-state.json");
+}
+
+/** Fail-open: a missing/unreadable state file means `apply` never ran (or predates this feature) — treat as "added nothing" so rollback removes nothing rather than guessing. */
+export function readSetupState(env: Record<string, string | undefined> = process.env): SetupState {
+	try {
+		const raw = JSON.parse(readFileSync(setupStatePath(env), "utf8")) as Partial<SetupState>;
+		return { notionAdded: raw.notionAdded === true, linearAdded: raw.linearAdded === true };
+	} catch {
+		return { notionAdded: false, linearAdded: false };
+	}
+}
+
+export function writeSetupState(state: SetupState, env: Record<string, string | undefined> = process.env): void {
+	const path = setupStatePath(env);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, JSON.stringify(state));
+}
+
 export function mergeClaudeMd(current: string): string {
 	if (BLOCK_RE.test(current)) return current.replace(BLOCK_RE, CLAUDE_MD_BLOCK);
 	const trimmed = current.trimEnd();
@@ -103,6 +129,8 @@ export function apply(
 		writeFileSync(path, after);
 	}
 
+	writeSetupState({ notionAdded: notion.added, linearAdded: linear.added }, env);
+
 	return { notion, linear, plugin, claudeMd: { path, changed: after !== before } };
 }
 
@@ -133,9 +161,14 @@ export function rollback(
 			claudeMdChanged = true;
 		}
 	}
-	const notion = run(["claude", "mcp", "remove", "notion"]);
-	const linear = run(["claude", "mcp", "remove", "linear"]);
-	return { claudeMd: { changed: claudeMdChanged }, notion: { removed: notion.code === 0 }, linear: { removed: linear.code === 0 } };
+	const state = readSetupState(env);
+	const notion = state.notionAdded ? run(["claude", "mcp", "remove", "notion"]) : undefined;
+	const linear = state.linearAdded ? run(["claude", "mcp", "remove", "linear"]) : undefined;
+	return {
+		claudeMd: { changed: claudeMdChanged },
+		notion: { removed: notion !== undefined && notion.code === 0 },
+		linear: { removed: linear !== undefined && linear.code === 0 },
+	};
 }
 
 async function main(): Promise<void> {

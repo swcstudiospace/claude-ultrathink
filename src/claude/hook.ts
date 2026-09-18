@@ -153,11 +153,16 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		}
 
 		let plan: TrackPlan | undefined;
-		try {
-			const git = deps.git?.(cwd) ?? { repo: resolveRepoSlug(cwd), branch: resolveBranch(cwd) };
-			plan = buildTrackPlan({ uplift: result, graph, clarifications, repo: git.repo, branch: git.branch });
-		} catch (error) {
-			log(`track plan failed: ${error instanceof Error ? error.message : String(error)}`);
+		// Fail-open per design: a totally failed engine (conservative XML fallback) proceeds
+		// untracked rather than creating generic FALLBACK_GRAPH boilerplate rows in the shared
+		// Notion/Linear tracker on every engine outage. Only build a plan for real LLM output.
+		if (result.source !== "fallback") {
+			try {
+				const git = deps.git?.(cwd) ?? { repo: resolveRepoSlug(cwd), branch: resolveBranch(cwd) };
+				plan = buildTrackPlan({ uplift: result, graph, clarifications, repo: git.repo, branch: git.branch });
+			} catch (error) {
+				log(`track plan failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 
 		const record: SessionRecord = {

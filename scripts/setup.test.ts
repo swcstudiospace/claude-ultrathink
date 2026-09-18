@@ -2,7 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { apply, claudeMdPath, ensureMcpServer, ensurePluginInstalled, mergeClaudeMd, rollback, status, type Run } from "./setup.ts";
+import {
+	apply,
+	claudeMdPath,
+	ensureMcpServer,
+	ensurePluginInstalled,
+	mergeClaudeMd,
+	readSetupState,
+	rollback,
+	status,
+	type Run,
+} from "./setup.ts";
 
 function tempClaudeDir(): { env: Record<string, string>; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-setup-"));
@@ -107,6 +117,65 @@ describe("apply / status / rollback", () => {
 			apply("/repo", run, env);
 			const text = readFileSync(claudeMdPath(env), "utf8");
 			expect(text.match(/<!-- ultrathink:start -->/g)).toHaveLength(1);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("apply records added:true for a server it actually adds; rollback then removes it", () => {
+		const { env, cleanup } = tempClaudeDir();
+		// "list" reports neither server configured, so ensureMcpServer adds both.
+		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "added", stderr: "", code: 0 }));
+		try {
+			apply("/repo", applyRun, env);
+			const state = readSetupState(env);
+			expect(state.notionAdded).toBe(true);
+			expect(state.linearAdded).toBe(true);
+
+			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const result = rollback(env, rollbackRun);
+			expect(result.notion.removed).toBe(true);
+			expect(result.linear.removed).toBe(true);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "notion"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "linear"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("apply records added:false for a server that was already configured; rollback does not remove it", () => {
+		const { env, cleanup } = tempClaudeDir();
+		// "list" reports both servers already configured, so ensureMcpServer skips both.
+		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "notion\nlinear\n", stderr: "", code: 0 } : { stdout: "", stderr: "", code: 0 }));
+		try {
+			apply("/repo", applyRun, env);
+			const state = readSetupState(env);
+			expect(state.notionAdded).toBe(false);
+			expect(state.linearAdded).toBe(false);
+
+			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const result = rollback(env, rollbackRun);
+			expect(result.notion.removed).toBe(false);
+			expect(result.linear.removed).toBe(false);
+			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "notion"]);
+			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "linear"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("rollback with no prior apply (missing state file) removes nothing", () => {
+		const { env, cleanup } = tempClaudeDir();
+		try {
+			const state = readSetupState(env);
+			expect(state.notionAdded).toBe(false);
+			expect(state.linearAdded).toBe(false);
+
+			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const result = rollback(env, rollbackRun);
+			expect(result.notion.removed).toBe(false);
+			expect(result.linear.removed).toBe(false);
+			expect(rollbackRun.calls).toEqual([]);
 		} finally {
 			cleanup();
 		}

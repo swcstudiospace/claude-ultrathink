@@ -56,6 +56,7 @@ Level = `Task`. Set these properties from `plan.task` (property names are the re
 | `Branch` | `plan.task.branch`, if set |
 | `Graph ID` | `plan.graphId` — the idempotency key for this whole run |
 | `Model` | your own model tier (`"Sonnet"`, `"Opus"`, or `"Haiku"`), if the property accepts it |
+| `Started` | now (ISO 8601), if this is a new Task row (do not overwrite it on a re-entrant kickoff for the same Graph ID) |
 
 Keep the created/updated Task page's ID/URL — every Issue row created below sets `Parent Item` to it.
 
