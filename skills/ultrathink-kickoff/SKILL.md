@@ -34,7 +34,7 @@ If `plan` is missing (tracking failed to build), skip straight to step 6 with `r
 
 ## 1. Find or create the Task row (idempotency)
 
-Target: the Notion data source at `collection://be3418f0-d2d8-411b-8677-fa8a95ee63be` (the "🧩 Agent Task Graph" database; confirm against your `notion` config if it has been overridden). Look for the Notion MCP tool that queries a data source by a property filter (commonly named something like `notion-query-data-sources` in rows/SQL mode, or `query_database` — inspect your available tools if unsure) and search for a row where `Graph ID` equals `plan.graphId`.
+Target: the Notion data source at `collection://be3418f0-d2d8-411b-8677-fa8a95ee63be` (the "🧩 Agent Task Graph" database; confirm against your `notion` config if it has been overridden). Look for the Notion MCP tool that queries a data source (commonly named something like `notion-query-data-sources`, or `query_database` — inspect your available tools if unsure) and search for a row where `Graph ID` equals `plan.graphId`. Prefer that tool's **SQL mode** for this lookup (`SELECT url, "Level", "Item" FROM "<data-source-url>" WHERE "Graph ID" = ?`) — verified live against the real schema; the same tool's structured-filter ("rows") mode rejected an equivalent filter object in testing, so don't rely on it here without checking its exact shape first.
 
 - If found: this is a re-entrant kickoff for the same prompt (a retried turn). Use its page as the Task page for step 2 (update, don't recreate) and skip straight to re-checking which Issues/Sub-Issues already exist (by `Graph ID` + `nodeId`, same pattern) before creating new ones.
 - If not found: proceed to create it.
