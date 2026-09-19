@@ -24,6 +24,16 @@
 				]
 			},
 			{
+				"matcher": "Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
+						"timeout": 30
+					}
+				]
+			},
+			{
 				"matcher": "mcp__aio__github_create_pull_request|github_create_pull_request|mcp__github__create_pull_request",
 				"hooks": [
 					{
