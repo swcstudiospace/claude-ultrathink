@@ -123,13 +123,13 @@ export async function runThink(opts: RunThinkOptions): Promise<ThinkResult> {
 	if (concurrency === 1) {
 		for (let index = 0; index < graph.nodes.length; index++) {
 			const node = graph.nodes[index]!;
-			opts.onProgress?.(`Chain of Thought n${index + 1}/${graph.nodes.length} · ${node.kind}…`);
+			opts.onProgress?.(`Node detail n${index + 1}/${graph.nodes.length} · ${node.kind}…`);
 			await fillNode(opts, graph, node);
 		}
 	} else {
 		let done = 0;
 		for (const group of dependencyLevels(graph.nodes)) {
-			opts.onProgress?.(`Chain of Thought ${done + 1}-${done + group.length}/${graph.nodes.length}…`);
+			opts.onProgress?.(`Node detail ${done + 1}-${done + group.length}/${graph.nodes.length}…`);
 			await fillLevel(opts, graph, group, concurrency);
 			done += group.length;
 		}

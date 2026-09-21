@@ -174,7 +174,8 @@ export function workflowWaves(graph: ThoughtGraph): WorkflowWave[] {
 
 export function parseNodeFill(xml: string): { thinking: string; conclusion: string } {
 	const body = extractTag(xml, "node") || xml;
-	const thinking = extractTag(body, "thinking") || extractTag(body, "chain_of_thought");
+	// "rationale" is current; "thinking"/"chain_of_thought" accepted for back-compat with older completions.
+	const thinking = extractTag(body, "rationale") || extractTag(body, "thinking") || extractTag(body, "chain_of_thought");
 	const conclusion = extractTag(body, "conclusion") || extractTag(body, "answer");
 	if (thinking || conclusion) {
 		return { thinking: thinking || conclusion, conclusion: conclusion || thinking };
@@ -192,7 +193,7 @@ function nodeXml(node: ThoughtNode): string {
 		`	<NODE id="${escapeXml(node.id)}" kind="${escapeXml(node.kind)}" title="${escapeXml(node.title)}">`,
 		`		<QUESTION>${escapeXml(node.question)}</QUESTION>`,
 		deps,
-		`		<THINKING>${escapeXml(node.thinking ?? "")}</THINKING>`,
+		`		<RATIONALE>${escapeXml(node.thinking ?? "")}</RATIONALE>`,
 		`		<CONCLUSION>${escapeXml(node.conclusion ?? "")}</CONCLUSION>`,
 		"	</NODE>",
 	].join("\n");

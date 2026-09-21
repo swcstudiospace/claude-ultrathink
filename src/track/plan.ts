@@ -41,17 +41,18 @@ function issueRow(graphId: string, node: ThoughtNode): IssueRow {
 	};
 }
 
-function cotThought(node: ThoughtNode): string {
-	const thinking = (node.thinking ?? "").trim();
+/** Renders a node's rationale + conclusion as a plan artifact — plain prose, not a labeled reasoning-trace dump. */
+function nodeDetail(node: ThoughtNode): string {
+	const rationale = (node.thinking ?? "").trim();
 	const conclusion = nodeConclusion(node);
-	const parts = [thinking && `THINKING: ${thinking}`, conclusion && `CONCLUSION: ${conclusion}`].filter(
+	const parts = [rationale && `Rationale: ${rationale}`, conclusion && `Conclusion: ${conclusion}`].filter(
 		(part): part is string => Boolean(part),
 	);
 	return parts.length > 0 ? parts.join("\n") : node.question;
 }
 
 function subIssueRow(graphId: string, node: ThoughtNode): SubIssueRow {
-	return { graphId, nodeId: node.id, item: `[${node.id}] Chain of Thought`, step: 1, thought: cotThought(node) };
+	return { graphId, nodeId: node.id, item: `[${node.id}] Node Detail`, step: 1, thought: nodeDetail(node) };
 }
 
 function linearIssue(node: ThoughtNode): LinearIssuePlan {
@@ -59,7 +60,7 @@ function linearIssue(node: ThoughtNode): LinearIssuePlan {
 }
 
 function linearSubIssue(node: ThoughtNode): LinearSubIssuePlan {
-	return { nodeId: node.id, title: `${node.title} — Chain of Thought`, description: cotThought(node) };
+	return { nodeId: node.id, title: `${node.title} — Node Detail`, description: nodeDetail(node) };
 }
 
 export function buildTrackPlan(input: {

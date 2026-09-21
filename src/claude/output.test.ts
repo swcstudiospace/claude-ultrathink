@@ -85,7 +85,7 @@ describe("formatPromptContext", () => {
 
 describe("truncateXml", () => {
 	const node = (id: string, thinking: number) =>
-		`\t<NODE id="${id}">\n\t\t<THINKING>${"t".repeat(thinking)}</THINKING>\n\t\t<CONCLUSION>done ${id}</CONCLUSION>\n\t</NODE>`;
+		`\t<NODE id="${id}">\n\t\t<RATIONALE>${"t".repeat(thinking)}</RATIONALE>\n\t\t<CONCLUSION>done ${id}</CONCLUSION>\n\t</NODE>`;
 	const tail = [
 		"\t<WORKFLOW>",
 		'\t\t<WAVE n="1" parallel="true">n1, n2</WAVE>',
@@ -105,11 +105,11 @@ describe("truncateXml", () => {
 		expect(truncateXml("short", 100)).toBe("short");
 	});
 
-	test("over budget, THINKING bodies are elided first and the WORKFLOW + CLARIFICATIONS tail survives", () => {
+	test("over budget, RATIONALE bodies are elided first and the WORKFLOW + CLARIFICATIONS tail survives", () => {
 		const out = truncateXml(spec(5_000), 4_000, "/s/x.xml");
 		expect(out.length).toBeLessThanOrEqual(4_000);
 		expect(out).not.toContain("ttttt");
-		expect(out.match(/<THINKING>\(omitted — full text in the specification file\)<\/THINKING>/g)).toHaveLength(3);
+		expect(out.match(/<RATIONALE>\(omitted — full text in the specification file\)<\/RATIONALE>/g)).toHaveLength(3);
 		expect(out).toContain("done n3");
 		expect(out).toContain('<WAVE n="1" parallel="true">n1, n2</WAVE>');
 		expect(out).toContain("<CLARIFICATIONS>");

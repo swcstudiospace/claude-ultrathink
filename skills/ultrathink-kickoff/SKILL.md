@@ -74,7 +74,7 @@ Keep each node's Notion Issue page ID/URL and Linear issue ID — the matching S
 For every entry in `plan.linearSubIssues` (same `nodeId`s as step 3):
 
 1. Create a Linear **sub-issue** under the Linear issue step 3 created for the same `nodeId` (set its parent to that issue), `title` = the entry's `title`, `description` = the entry's `description`.
-2. Create (or update) a Notion row: `Level` = `"Sub-Issue"`, `Item` = the matching `plan.subIssues[].item` (`"[nodeId] Chain of Thought"`), `Step` = the matching `plan.subIssues[].step` (currently always `1` — one Chain-of-Thought fill per node), `Thought` = the matching `plan.subIssues[].thought`, `Parent Item` = the **Issue** page from step 3 for this `nodeId` (not the Task page), `Graph ID` = `plan.graphId`, `Linear URL` = the new sub-issue's URL.
+2. Create (or update) a Notion row: `Level` = `"Sub-Issue"`, `Item` = the matching `plan.subIssues[].item` (`"[nodeId] Node Detail"`), `Step` = the matching `plan.subIssues[].step` (currently always `1` — one detail fill per node), `Thought` = the matching `plan.subIssues[].thought` (a short rationale + conclusion for that node — plan prose, not a raw model reasoning trace), `Parent Item` = the **Issue** page from step 3 for this `nodeId` (not the Task page), `Graph ID` = `plan.graphId`, `Linear URL` = the new sub-issue's URL.
 
 ## 5. Resolve HITL clarifications
 

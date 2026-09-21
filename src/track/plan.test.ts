@@ -68,9 +68,9 @@ describe("buildTrackPlan", () => {
 		expect(plan.subIssues[0]).toEqual({
 			graphId: "ut-fixed",
 			nodeId: "n1",
-			item: "[n1] Chain of Thought",
+			item: "[n1] Node Detail",
 			step: 1,
-			thought: "THINKING: Read the request\nCONCLUSION: Add a paginated list",
+			thought: "Rationale: Read the request\nConclusion: Add a paginated list",
 		});
 		expect(plan.subIssues[1]?.thought).toBe("What is the plan?");
 

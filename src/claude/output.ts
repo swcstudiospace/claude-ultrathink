@@ -13,11 +13,11 @@ import { THINK_ADDENDUM } from "../think/prompts.ts";
 import type { ThoughtGraph } from "../think/types.ts";
 import type { UpliftResult } from "../types.ts";
 
-/** Generous ceiling; the spec is normally far smaller. Over budget, THINKING bodies go first, then the tail. */
+/** Generous ceiling; the spec is normally far smaller. Over budget, RATIONALE bodies go first, then the tail. */
 export const DEFAULT_CONTEXT_CHARS = 90_000;
 
-const THINKING_RE = /(<THINKING>)[\s\S]*?(<\/THINKING>)/g;
-const THINKING_OMITTED = "(omitted — full text in the specification file)";
+const RATIONALE_RE = /(<RATIONALE>)[\s\S]*?(<\/RATIONALE>)/g;
+const RATIONALE_OMITTED = "(omitted — full text in the specification file)";
 
 export const UPLIFT_CONTEXT_HEADER = `## Prompt Uplift
 
@@ -35,12 +35,12 @@ export interface PromptContextInput {
 
 /**
  * Keeps the spec under `maxChars` with the least valuable content going first:
- * THINKING bodies are elided before anything is cut, so the graph's WORKFLOW and
+ * RATIONALE bodies are elided before anything is cut, so the graph's WORKFLOW and
  * the CLARIFICATIONS block at the end survive whenever they possibly can.
  */
 export function truncateXml(xml: string, maxChars: number, specPath?: string): string {
 	if (xml.length <= maxChars) return xml;
-	const elided = xml.replace(THINKING_RE, `$1${THINKING_OMITTED}$2`);
+	const elided = xml.replace(RATIONALE_RE, `$1${RATIONALE_OMITTED}$2`);
 	if (elided.length <= maxChars) return elided;
 	const cut = elided.lastIndexOf("\n", maxChars);
 	const head = elided.slice(0, cut > 0 ? cut : maxChars);
@@ -70,7 +70,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 			[
 				"## Ultrathink tracking",
 				"",
-				`Before starting work, invoke the ultrathink-kickoff skill with stateFile=${input.statePath}. It records this Task, its Graph-of-Thought Issues, and Chain-of-Thought Sub-Issues in Notion and Linear, resolves any blocking clarifications, and returns the final prompt to execute. Do not start coding before it returns.`,
+				`Before starting work, invoke the ultrathink-kickoff skill with stateFile=${input.statePath}. It records this Task, its Graph-of-Thought Issues, and per-node detail Sub-Issues in Notion and Linear, resolves any blocking clarifications, and returns the final prompt to execute. Do not start coding before it returns.`,
 			].join("\n"),
 		);
 	}

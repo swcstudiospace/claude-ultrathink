@@ -18,7 +18,7 @@ export interface ClaudeConfig {
 	callTimeoutMs: number;
 	/** Whole-hook budget in ms. 0 = run until the host hook timeout. */
 	budgetMs: number;
-	/** Parallel Chain-of-Thought fills per dependency level. */
+	/** Parallel node-detail fills per dependency level. */
 	concurrency: number;
 	/** Print a one-line summary to the user after each uplift. */
 	echo: boolean;

@@ -1,6 +1,6 @@
 /**
  * Orchestrates one UserPromptSubmit event: decide → uplift → Graph of Thought
- * with per-node Chain of Thought → HITL clarifications → build a Notion/Linear
+ * with per-node rationale/conclusion fills → HITL clarifications → build a Notion/Linear
  * TrackPlan → persist session state → return the spec plus an instruction to
  * invoke ultrathink-kickoff as hook context. Everything after "decide" is
  * fail-open: the user's prompt always goes through.
