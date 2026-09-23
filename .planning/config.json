@@ -21,7 +21,7 @@
     "research": true,
     "plan_check": true,
     "verifier": true,
-    "nyquist_validation": true,
+    "nyquist_validation": false,
     "auto_advance": false,
     "node_repair": true,
     "node_repair_budget": 2,
@@ -49,8 +49,7 @@
     "security_asvs_level": 1,
     "security_block_on": "high",
     "tdd_mode": false,
-    "ui_review": true,
-    "use_worktrees": true
+    "ui_review": true
   },
   "ship": {
     "pr_body_sections": []
@@ -61,16 +60,20 @@
   "project_code": null,
   "phase_naming": "sequential",
   "agent_skills": {},
-  "claude_md_path": "./.claude/CLAUDE.md",
+  "claude_md_path": "./.hermes/HERMES.md",
   "plan_review": {
     "source_grounding": true,
     "source_grounding_authority": "grep"
   },
   "resolve_model_ids": "omit",
+  "quick_branch_template": null,
   "intel": {
     "enabled": false
   },
   "graphify": {
-    "enabled": false
-  }
+    "enabled": false,
+    "auto_update": false
+  },
+  "mode": "yolo",
+  "granularity": "coarse"
 }
