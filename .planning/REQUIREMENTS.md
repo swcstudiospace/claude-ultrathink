@@ -76,29 +76,29 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| BRIDGE-01 | — | Pending |
-| BRIDGE-02 | — | Pending |
-| BRIDGE-03 | — | Pending |
-| BRIDGE-04 | — | Pending |
-| BRIDGE-05 | — | Pending |
-| KICK-01 | — | Pending |
-| KICK-02 | — | Pending |
-| KICK-03 | — | Pending |
-| KICK-04 | — | Pending |
-| KICK-05 | — | Pending |
-| SYNC-01 | — | Pending |
-| SYNC-02 | — | Pending |
-| SYNC-03 | — | Pending |
-| SYNC-04 | — | Pending |
-| CLEAN-01 | — | Pending |
-| CLEAN-02 | — | Pending |
-| CLEAN-03 | — | Pending |
+| BRIDGE-01 | Phase 1 | Pending |
+| BRIDGE-02 | Phase 2 | Pending |
+| BRIDGE-03 | Phase 1 | Pending |
+| BRIDGE-04 | Phase 1 | Pending |
+| BRIDGE-05 | Phase 1 | Pending |
+| KICK-01 | Phase 2 | Pending |
+| KICK-02 | Phase 2 | Pending |
+| KICK-03 | Phase 2 | Pending |
+| KICK-04 | Phase 2 | Pending |
+| KICK-05 | Phase 2 | Pending |
+| SYNC-01 | Phase 3 | Pending |
+| SYNC-02 | Phase 3 | Pending |
+| SYNC-03 | Phase 3 | Pending |
+| SYNC-04 | Phase 3 | Pending |
+| CLEAN-01 | Phase 1 | Pending |
+| CLEAN-02 | Phase 1 | Pending |
+| CLEAN-03 | Phase 1 | Pending |
 
 **Coverage:**
 - v1 requirements: 17 total
-- Mapped to phases: 0
-- Unmapped: 17 ⚠️
+- Mapped to phases: 17
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-09-24*
-*Last updated: 2026-09-24 after initial definition*
+*Last updated: 2026-09-24 after roadmap creation*
