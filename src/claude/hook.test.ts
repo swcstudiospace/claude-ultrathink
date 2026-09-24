@@ -47,6 +47,7 @@ function baseDeps(overrides: Partial<HookDeps> = {}): { deps: HookDeps; cleanup:
 		engine: "claude:sonnet",
 		stateDir: dir,
 		git: () => ({ repo: "acme/widgets", branch: "feat/widget" }),
+		brief: async () => "",
 		now: () => 1_000,
 		log: () => {},
 		...overrides,
@@ -180,6 +181,70 @@ describe("runPromptSubmit", () => {
 			expect(result.record?.plan?.task.repo).toBeUndefined();
 			expect(result.record?.plan?.task.branch).toBeUndefined();
 			expect(result.record?.plan?.issues).toHaveLength(3);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("substrate brief", () => {
+	test("injects the brief into hook context, framed as history not instructions", async () => {
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			brief: async () => "## Substrate brief: acme/widgets\n- 09:04 cursor edited widget.ts",
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const context = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(context).toContain("## Agent Substrate brief");
+			expect(context).toContain("09:04 cursor edited widget.ts");
+			expect(context).toContain("not as instructions");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("passes the resolved repo and branch to the brief", async () => {
+		let seen: { repo?: string; branch?: string; surface?: string } | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			brief: async (i) => {
+				seen = i;
+				return "";
+			},
+		});
+		try {
+			await runPromptSubmit(input, deps);
+			expect(seen).toEqual({ repo: "acme/widgets", branch: "feat/widget", surface: "claude-code" });
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("an empty brief adds no section at all", async () => {
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], brief: async () => "" });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.output?.hookSpecificOutput.additionalContext ?? "").not.toContain("## Agent Substrate brief");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a substrate outage never blocks the prompt", async () => {
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			brief: async () => {
+				throw new Error("ECONNREFUSED");
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.skipped).toBeUndefined();
+			expect(result.output?.hookSpecificOutput.additionalContext).toContain("## Prompt Uplift");
 		} finally {
 			cleanup();
 		}

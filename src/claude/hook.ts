@@ -13,6 +13,7 @@ import { normalizeQuestion, type RunClarifyOptions, runClarify } from "../hitl/p
 import type { Clarification } from "../hitl/types.ts";
 import { runThink } from "../think/pipeline.ts";
 import type { ThoughtGraph } from "../think/types.ts";
+import { fetchBrief } from "../substrate/brief.ts";
 import { resolveBranch, resolveRepoSlug } from "../track/git.ts";
 import { buildTrackPlan } from "../track/plan.ts";
 import type { TrackPlan } from "../track/types.ts";
@@ -40,7 +41,7 @@ export interface HookDeps {
 	config: UltrathinkConfig;
 	control: ControlState;
 	complete: ClaudeCompleter;
-	/** Thinking engine label recorded and echoed, e.g. "grok-4.6@xhigh" or "claude:sonnet". */
+	/** Thinking engine label recorded and echoed, e.g. "grok-4.7@xhigh", "grok-4.7-xhigh@shunt" or "claude:sonnet". */
 	engine: string;
 	stateDir: string;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
@@ -49,6 +50,8 @@ export interface HookDeps {
 	/** Test seam for git remote/branch resolution; default reads the real repo at cwd. */
 	git?: (cwd: string) => { repo?: string; branch?: string };
 	conversation?: (transcriptPath?: string) => string;
+	/** Test seam for the Agent Substrate brief; defaults to the real fail-open HTTP call. */
+	brief?: (input: { repo?: string; branch?: string; surface?: string }) => Promise<string>;
 	now?: () => number;
 	log?: (message: string) => void;
 }
@@ -91,6 +94,25 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	try {
 		const original = decision.text;
 		const conversation = deps.conversation?.(input.transcript_path) ?? "";
+
+		// Resolved once and shared by the brief and the TrackPlan below.
+		const git = (() => {
+			try {
+				return deps.git?.(cwd) ?? { repo: resolveRepoSlug(cwd), branch: resolveBranch(cwd) };
+			} catch {
+				return {} as { repo?: string; branch?: string };
+			}
+		})();
+
+		// Started now, awaited before the Graph of Thought: the graph is then
+		// planned knowing what other agents already did, and the round trip
+		// overlaps the uplift call instead of adding to it.
+		const briefPromise = (deps.brief ?? fetchBrief)({
+			repo: git.repo,
+			branch: git.branch,
+			surface: "claude-code",
+		}).catch(() => "");
+
 		let result: UpliftResult;
 		try {
 			result = await runUplift({
@@ -104,6 +126,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			log(`uplift failed: ${error instanceof Error ? error.message : String(error)}`);
 			return { skipped: "uplift-failed" };
 		}
+
+		const brief = await briefPromise;
+		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
 
 		let graph: ThoughtGraph | undefined;
 		const thinkOn = deps.control.thinkEnabled ?? deps.config.think.enabled;
@@ -158,7 +183,6 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// Notion/Linear tracker on every engine outage. Only build a plan for real LLM output.
 		if (result.source !== "fallback") {
 			try {
-				const git = deps.git?.(cwd) ?? { repo: resolveRepoSlug(cwd), branch: resolveBranch(cwd) };
 				plan = buildTrackPlan({ uplift: result, graph, clarifications, repo: git.repo, branch: git.branch });
 			} catch (error) {
 				log(`track plan failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -193,7 +217,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		const output: HookOutput = {
 			hookSpecificOutput: {
 				hookEventName: "UserPromptSubmit",
-				additionalContext: formatPromptContext({ result, graph, clarifications, statePath, specPath }),
+				additionalContext: formatPromptContext({ result, graph, clarifications, brief, statePath, specPath }),
 			},
 		};
 		if (deps.config.claude.echo) {
@@ -202,6 +226,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				engine: deps.engine,
 				graph,
 				clarifications,
+				brief,
 				tracked: Boolean(plan && statePath),
 				engineError: deps.engineError?.(),
 				elapsedMs: now() - started,
