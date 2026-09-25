@@ -185,6 +185,59 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.phase).toBe("ready");
 	});
 
+	test("a passing review that waits on CI or mergeability is not a failed round, even at maxRounds", async () => {
+		const old: ReviewResult = { source: "cli", status: "completed", score: 3, comments: [{ body: "fix" }], headSha: "old", at: 1 };
+		writeShip(statePath, { pr: PR, phase: "needs-fixes", rounds: [old] });
+		const pending = await ship("review", deps({ status: { checks: "pending" } }));
+		expect(pending.output).toMatchObject({ ready: false, round: 2, maxRounds: 2, score: 5 });
+		expect(String(pending.output.next)).toBe("review passed; CI checks pending: wait, then run merge again");
+		expect(readShip(statePath)).toMatchObject({ phase: "pr-open" });
+		expect(readShip(statePath)?.blockedReason).toBeUndefined();
+		expect(comments).toEqual([]);
+		const failing = await ship("review", deps({ status: { checks: "failing" } }));
+		expect(String(failing.output.next)).toStartWith("review passed; CI checks failing: fix CI");
+		expect(readShip(statePath)?.phase).toBe("pr-open");
+		expect((await ship("merge", deps())).output).toMatchObject({ ok: true, merged: true });
+	});
+
+	test("a waiting round does not count later: one failed review after it is still below maxRounds", async () => {
+		const waited: ReviewResult = { source: "cli", status: "completed", score: 5, comments: [], headSha: "abc", at: 1 };
+		writeShip(statePath, { pr: PR, phase: "pr-open", rounds: [waited] });
+		const out = await ship("review", deps({ status: { headSha: "def" }, head: "def", review: { score: 3, comments: [{ body: "fix" }] } }));
+		expect(out.output).toMatchObject({ round: 2, failedRounds: 1, maxRounds: 2 });
+		expect(readShip(statePath)?.phase).toBe("needs-fixes");
+		expect(comments).toEqual([]);
+	});
+
+	test("a passing review on a closed PR blocks without a comment; on a merged PR it points to merge", async () => {
+		writeShip(statePath, { pr: PR, phase: "pr-open" });
+		const closed = await ship("review", deps({ status: { state: "CLOSED" } }));
+		expect(String(closed.output.next)).toBe("stop: PR closed without merge");
+		expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: "PR closed without merge" });
+		expect(comments).toEqual([]);
+		writeShip(statePath, { rounds: [], phase: "pr-open", blockedReason: undefined });
+		const merged = await ship("review", deps({ status: { state: "MERGED" } }));
+		expect(String(merged.output.next)).toBe("PR already merged: run merge to finish the cleanup");
+		expect(readShip(statePath)?.phase).toBe("ready");
+	});
+
+	test("run finishes the cleanup when the PR was merged outside the flow", async () => {
+		const out = await ship("run", deps({ existingPr: PR, status: { state: "MERGED" } }));
+		expect(out.output).toMatchObject({ ok: true, review: { ready: true }, merge: { ok: true, merged: true, alreadyMerged: true } });
+		expect(calls).toContain("delete:feat");
+		expect(calls).toContain("sync:master");
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+	});
+
+	test("a PR merged outside the flow with a failing review is blocked, not ready, and run reports ok false", async () => {
+		const out = await ship("run", deps({ existingPr: PR, status: { state: "MERGED" }, review: { score: 3, comments: [{ body: "fix" }] } }));
+		expect(out.output).toMatchObject({ ok: false, review: { ready: false, blocked: true } });
+		expect(String(out.output.next)).toBe("stop: PR was merged outside the ship flow before its review passed");
+		expect(out.output.merge).toBeUndefined();
+		expect(calls.some((c) => c.startsWith("delete:") || c.startsWith("sync:"))).toBe(false);
+		expect(comments).toEqual([]);
+	});
+
 	test("merge refuses when autoMerge disabled", async () => {
 		writeShip(statePath, { pr: PR });
 		const out = await ship("merge", deps({ config: { autoMerge: false } }));

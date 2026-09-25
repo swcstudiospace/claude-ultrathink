@@ -19,7 +19,7 @@ import { createGithub } from "./github.ts";
 import type { Github } from "./github.ts";
 import { openThreadComments, runReview } from "./greptile.ts";
 import type { ToolCaller } from "./greptile.ts";
-import { mergeGate } from "./merge.ts";
+import { mergeGate, reviewPasses } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
 import { defaultRun } from "./run.ts";
 import { collectSignals, gatherDiff } from "./signals.ts";
@@ -47,6 +47,13 @@ const USAGE =
 	"usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.json> [--cwd <dir>] [--ignore-gsd]";
 const NEXT_FIX = "fix the listed findings, commit only the files you edited, push, then run review again";
 const NEXT_PENDING = "Greptile review still running; run review again (safe to repeat, it resumes the same review)";
+
+/** Next step when the review passed but the PR itself is not mergeable yet. */
+function prWaitNext(reason: string): string {
+	if (reason === "CI checks failing") return "review passed; CI checks failing: fix CI, commit, push, then run review again";
+	if (reason === "merge conflicts") return "review passed; merge conflicts: resolve them against the base, push, then run review again";
+	return `review passed; ${reason}: wait, then run merge again`;
+}
 
 function readRecord(statePath: string): ShipRecord | undefined {
 	try {
@@ -174,38 +181,59 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	const gate = mergeGate({ config: deps.config, status, latest: result });
 	const failedTwice =
 		result.status !== "completed" && prior !== undefined && prior.status !== "completed" && prior.headSha === result.headSha;
-	const blockedReason = gate.ok
-		? undefined
-		: failedTwice
-			? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
-			: rounds.length >= maxRounds
-				? `max rounds reached: ${gate.reason}`
-				: undefined;
-	const phase = gate.ok ? "ready" : blockedReason ? "blocked" : "needs-fixes";
+	// Rounds whose review passed (the PR merely waited on CI, mergeability or conflicts) never count toward maxRounds.
+	const failedRounds = rounds.filter((round) => !reviewPasses(deps.config, round)).length;
+	const passed = reviewPasses(deps.config, result);
+	// A PR merged outside the flow is ready only for cleanup, and only when its review passed.
+	const mergedPassing = status.state === "MERGED" && passed;
+	const waiting = !gate.ok && status.state === "OPEN" && result.headSha === status.headSha && passed;
+	const blockedReason =
+		gate.ok || waiting || mergedPassing
+			? undefined
+			: status.state === "MERGED"
+				? "PR was merged outside the ship flow before its review passed"
+				: status.state === "CLOSED"
+					? "PR closed without merge"
+					: failedTwice
+						? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
+						: failedRounds >= maxRounds
+							? `max rounds reached: ${gate.reason}`
+							: undefined;
+	const phase = gate.ok || mergedPassing ? "ready" : waiting ? "pr-open" : blockedReason ? "blocked" : "needs-fixes";
 	let commented: boolean | undefined;
-	if (blockedReason && !reusedRound && ship.phase !== "blocked") {
+	if (blockedReason && status.state === "OPEN" && !reusedRound && ship.phase !== "blocked") {
 		const findings = result.comments
 			.slice(0, 20)
 			.map((c) => `- ${c.path ?? "?"}${c.line ? `:${c.line}` : ""} ${c.severity ?? ""} ${c.body.split("\n")[0]}`.replace(/ +/g, " "));
 		const body = [
 			`**ultrathink-ship stopped:** ${blockedReason}`,
-			`Greptile score: ${result.score ?? "n/a"}/5 after ${rounds.length} round(s).`,
+			`Greptile score: ${result.score ?? "n/a"}/5 after ${failedRounds} failed round(s).`,
 			...(findings.length ? ["Remaining findings:", ...findings] : []),
 			"Left open for human follow-up.",
 		].join("\n");
 		commented = github.comment(pr.number, body).ok;
 	}
 	writeShip(statePath, { rounds, phase, blockedReason, pending: undefined }, deps.now());
-	const next = gate.ok ? "run merge" : blockedReason ? `stop: ${blockedReason}` : NEXT_FIX;
+	const next = gate.ok
+		? "run merge"
+		: mergedPassing
+			? "PR already merged: run merge to finish the cleanup"
+			: waiting
+				? prWaitNext(gate.reason)
+				: blockedReason
+					? `stop: ${blockedReason}`
+					: NEXT_FIX;
 	return {
 		ok: true,
-		ready: gate.ok,
+		ready: gate.ok || mergedPassing,
+		blocked: blockedReason !== undefined,
 		reused: reusedRound,
 		status: result.status,
 		score: result.score,
 		comments: result.comments,
 		gate,
 		round: rounds.length,
+		failedRounds,
 		maxRounds,
 		next,
 		...(commented === undefined ? {} : { commented }),
@@ -273,7 +301,7 @@ async function stepRun(ctx: Ctx): Promise<Output> {
 	const review = await stepReview(ctx);
 	if (!review.ready || !ctx.deps.config.autoMerge) {
 		const next = review.ready ? "autoMerge disabled: merge manually" : (review.next ?? `stop: ${String(review.reason)}`);
-		return { ok: review.ok !== false, assess, pr, review, next };
+		return { ok: review.ok !== false && review.blocked !== true, assess, pr, review, next };
 	}
 	const merge = await stepMerge(ctx);
 	return { ok: merge.ok, assess, pr, review, merge, next: merge.ok ? "run ultrathink-sync" : `stop: ${String(merge.reason)}` };
