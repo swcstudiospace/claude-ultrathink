@@ -443,16 +443,34 @@ def test_next_turn_delivers_a_nudge_no_tool_result_carried_once():
 		assert take_pr_nudges({"session_id": "pr-turn"}) == ""
 
 
-def test_a_pr_url_a_delegate_task_only_mentions_is_not_an_opened_pr():
+def test_a_pr_a_subagent_really_opened_nudges_the_parent_and_a_cited_one_does_not():
 	with tempfile.TemporaryDirectory() as home:
 		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
-		planned_session(home, "parent")
-		# A subagent's summary can cite an existing PR or a failed attempt; it is no proof a PR was opened.
-		summary = {"results": [{"task_index": 0, "status": "completed", "summary": f"Reviewed {PR_URL}; nothing to change."}]}
-		call = {"session_id": "parent", "tool_name": "delegate_task", "args": {"goal": "review the widget PR"}, "result": json.dumps(summary)}
-		assert pr_tool_result(call, env=env) is None
-		queue_pr_nudge(call, env=env)
+		state = planned_session(home, "parent")
+		bridge.note_subagent({"parent_session_id": "parent", "child_session_id": "child-1", "child_role": "coder"})
+		# A subagent's summary that only cites a PR (a review, a failed attempt) is no proof one was opened.
+		cite = {"session_id": "parent", "tool_name": "delegate_task", "args": {"goal": "review"}, "result": json.dumps({"results": [{"summary": f"Reviewed {PR_URL}; nothing to change."}]})}
+		assert pr_tool_result(cite, env=env) is None
+		queue_pr_nudge(cite, env=env)
 		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# The child's own `gh pr create` fires the tool hooks with the child's session id: that is the proof.
+		child_call = {**gh_pr_create("child-1"), "result": f"Creating pull request...\n{PR_URL}\n"}
+		assert pr_tool_result(child_call, env=env) is None  # the child's result stays untouched; the parent owns the task
+		queue_pr_nudge(child_call, env=env)
+		# The parent's delegate_task result naming that PR carries the nudge once, with the parent's graph.
+		opened = {**cite, "result": json.dumps({"results": [{"summary": f"Opened {PR_URL} for the widget."}]})}
+		result = pr_tool_result(opened, env=env)
+		assert result is not None and f"stateFile={state}, graphId=g1 and prUrl={PR_URL}" in result
+		assert pr_tool_result(opened, env=env) is None
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# A child PR the delegate result never names still reaches the parent on its next turn.
+		other = "https://github.com/acme/widgets/pull/99"
+		queue_pr_nudge({**child_call, "result": f"{other}\n"}, env=env)
+		assert other in take_pr_nudges({"session_id": "parent"})
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# Another session's delegate result citing that URL gets nothing: the proof belongs to this parent.
+		planned_session(home, "other")
+		assert pr_tool_result({**opened, "session_id": "other"}, env=env) is None
 
 
 def test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge():
@@ -572,7 +590,7 @@ def test_registers_every_ultrathink_command_next_to_the_hooks():
 	ctx = fake_ctx()
 	plugin.register(ctx)
 	assert sorted(ctx.commands) == [f"ultrathink-{verb}" for verb in ("off", "on", "quick", "skip", "status", "track")]
-	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify"]
+	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify", "subagent_start"]
 
 	# A Hermes that rejects the commands still plans every prompt.
 	def reject(*_args: object, **_kwargs: object) -> None:
@@ -698,7 +716,7 @@ if __name__ == "__main__":
 	test_extract_pr_url_reads_gh_output()
 	test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session()
 	test_next_turn_delivers_a_nudge_no_tool_result_carried_once()
-	test_a_pr_url_a_delegate_task_only_mentions_is_not_an_opened_pr()
+	test_a_pr_a_subagent_really_opened_nudges_the_parent_and_a_cited_one_does_not()
 	test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge()
 	test_no_sync_nudge_without_rows_after_sync_or_with_tracking_off()
 	test_sync_nudge_names_the_pr_the_session_opened()

@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .bridge import REPO_ROOT, control, plan, pr_tool_result, queue_pr_nudge, quick, sync_nudge, take_pr_nudges
+from .bridge import REPO_ROOT, control, plan, note_subagent, pr_tool_result, queue_pr_nudge, quick, sync_nudge, take_pr_nudges
 
 # Registered as ultrathink-<verb>, the name on every host: verb -> (args hint, description).
 COMMANDS: dict[str, tuple[str, str]] = {
@@ -69,6 +69,12 @@ def register(ctx: Any) -> None:
 		except Exception:
 			return None  # any other return lets the turn finish
 
+	def on_subagent_start(**kwargs: Any) -> None:
+		try:
+			note_subagent(kwargs)
+		except Exception:
+			pass
+
 	# Hermes joins pre_llm_call contexts in registration order but spills each
 	# one past its size cap to disk separately, so the fallback PR nudge follows
 	# the plan without pushing a long plan over the cap or hiding its tail.
@@ -77,6 +83,7 @@ def register(ctx: Any) -> None:
 	ctx.register_hook("transform_tool_result", on_transform_tool_result)
 	ctx.register_hook("post_tool_call", on_post_tool_call)
 	ctx.register_hook("pre_verify", on_pre_verify)
+	ctx.register_hook("subagent_start", on_subagent_start)
 
 	inject_message = getattr(ctx, "inject_message", None)
 

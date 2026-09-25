@@ -74,6 +74,11 @@ _pr_delivered: set[tuple[str, str]] = set()  # (session_id, PR URL) the model wa
 _pr_pending: dict[str, dict[str, str]] = {}  # session_id -> PR URL -> nudge for its next turn
 # Plan-scoped state is keyed by (session_id, graphId): a session's next planned prompt is a new graph with its own rows.
 _pr_latest: dict[tuple[str, str], str] = {}  # (session_id, graphId) -> the last PR URL opened for that plan
+# Subagents never plan, but their tool calls fire the same hooks: a PR URL a child's own `gh pr create`
+# printed is proof it was opened, and its delegate_task result can then nudge the parent.
+_child_parent: dict[str, str] = {}  # child session_id -> parent session_id (from subagent_start)
+_child_opened: dict[str, set[str]] = {}  # parent session_id -> PR URLs its children opened
+DELEGATE_TOOL = "delegate_task"  # Hermes runs subagents through this tool; its result is the child's text
 _sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify already continued with a sync nudge
 
 # /ultrathink-quick arms one skip per injected message. pre_llm_call consumes it only on
@@ -310,18 +315,50 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 	return record if isinstance(record, dict) else None
 
 
-def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
-	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
-	planned session. Subagents never plan (plan() skips them), so they have no state file."""
+def note_subagent(payload: dict[str, Any]) -> None:
+	"""subagent_start: remember which parent a child session works for."""
+	child = str(payload.get("child_session_id") or "").strip()
+	parent = str(payload.get("parent_session_id") or "").strip()
+	if child and parent:
+		with _pr_lock:
+			_child_parent[child] = parent
+
+
+def _opened_pr(payload: dict[str, Any]) -> tuple[str, str, bool] | None:
+	"""(owner session_id, PR URL, opened by a child) when this tool call proves a PR was
+	opened: the session's own `gh pr create`, a child's `gh pr create` (owned by its
+	parent), or a delegate_task result naming a PR one of this session's children opened."""
 	session_id = str(payload.get("session_id") or "").strip()
 	tool_name = str(payload.get("tool_name") or "")
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
-	if not session_id or not is_pr_creation_tool(tool_name, str(command)):
+	if not session_id:
 		return None
 	url = extract_pr_url(_result_text(payload.get("result")))
 	if not url:
 		return None
+	if is_pr_creation_tool(tool_name, str(command)):
+		with _pr_lock:
+			parent = _child_parent.get(session_id)
+			if parent is None:
+				return session_id, url, False
+			_child_opened.setdefault(parent, set()).add(url)
+		return parent, url, True
+	if tool_name == DELEGATE_TOOL:
+		# A delegate result that merely cites a PR (a review, a failed attempt) is not an opened PR.
+		with _pr_lock:
+			proven = url in _child_opened.get(session_id, set())
+		return (session_id, url, False) if proven else None
+	return None
+
+
+def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str, bool] | None:
+	"""(session_id, graphId, PR URL, nudge, opened by a child) for a planned session's
+	opened PR; subagents never plan, so a child's PR belongs to the parent's plan."""
+	opened = _opened_pr(payload)
+	if opened is None:
+		return None
+	session_id, url, by_child = opened
 	path = state_path(session_id, env)
 	record = _read_record(path)
 	if record is None or not isinstance(record.get("plan"), dict):
@@ -333,20 +370,32 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 		"so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. "
 		"ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues."
 	)
-	return session_id, graph_id, url, nudge
+	return session_id, graph_id, url, nudge, by_child
+
+
+def _queue(session_id: str, graph_id: str, url: str, nudge: str) -> None:
+	"""Hold the nudge for the session's next turn unless it was already delivered; caller holds no lock."""
+	with _pr_lock:
+		if (session_id, url) not in _pr_delivered:
+			_pr_pending.setdefault(session_id, {})[url] = nudge
+		_pr_latest[(session_id, graph_id)] = url
 
 
 def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -> str | None:
 	"""transform_tool_result: the tool result with the nudge appended below it,
 	the first time a planned session's tool call opens that PR. None keeps the
-	result unchanged."""
+	result unchanged. A child's own `gh pr create` result stays untouched: the
+	parent owns the tracked task, so its nudge is queued for the parent instead."""
 	result = payload.get("result")
 	if not isinstance(result, str):
 		return None  # only text can carry the nudge; post_tool_call queues it instead
 	event = _pr_event(payload, env)
 	if event is None:
 		return None
-	session_id, graph_id, url, nudge = event
+	session_id, graph_id, url, nudge, by_child = event
+	if by_child:
+		_queue(session_id, graph_id, url, nudge)
+		return None
 	with _pr_lock:
 		if (session_id, url) in _pr_delivered:
 			return None
@@ -363,11 +412,8 @@ def queue_pr_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return
-	session_id, graph_id, url, nudge = event
-	with _pr_lock:
-		if (session_id, url) not in _pr_delivered:
-			_pr_pending.setdefault(session_id, {})[url] = nudge
-		_pr_latest[(session_id, graph_id)] = url
+	session_id, graph_id, url, nudge, _by_child = event
+	_queue(session_id, graph_id, url, nudge)
 
 
 def take_pr_nudges(payload: dict[str, Any]) -> str:
