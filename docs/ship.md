@@ -115,7 +115,7 @@ If the review is still running when the wait ends, `review` returns `status: "pe
 
 A review of one head commit that stays pending longer than `ship.reviewTimeoutMs` (20 minutes) is recorded as a timed-out round.
 
-Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review re-reads the review threads, so a thread resolved since then no longer counts as open. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
+Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review, and `merge` itself, re-read the review threads, so a thread resolved since then no longer counts as open and a finding posted since then does. If the threads cannot be read, `review` reports not ready and `merge` refuses; neither falls back to the stored comments. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
 
 ## Fix loop and blocking
 

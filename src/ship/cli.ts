@@ -150,9 +150,13 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 				reviewThreads: () => github.reviewThreads(pr.number),
 			});
 	if (reusedRound && result.source === "pr") {
-		// Threads resolved since the round (non-actionable findings) close without a new commit; unknown keeps the old list.
+		// Threads resolved since the round (non-actionable findings) close without a new commit. A failed refresh must not
+		// fall back to the stored snapshot: a finding posted since then would be missed, so report not ready and persist nothing.
 		const threads = github.reviewThreads(pr.number);
-		if (threads.ok) result = { ...result, comments: openThreadComments(threads.threads) };
+		if (!threads.ok) {
+			return { ok: false, ready: false, reason: `could not read review threads: ${threads.error}`, next: "run review again" };
+		}
+		result = { ...result, comments: openThreadComments(threads.threads) };
 	}
 	const maxRounds = deps.config.maxRounds;
 	if (result.status === "pending") {
@@ -223,9 +227,15 @@ async function stepMerge(ctx: Ctx): Promise<Output & { ok: boolean }> {
 	}
 	let method = deps.config.mergeMethod;
 	if (status.state !== "MERGED") {
-		const latest = ship.rounds.at(-1);
+		let latest = ship.rounds.at(-1);
 		if (latest?.headSha && latest.headSha !== status.headSha) {
 			return { ok: false, merged: false, reason: "PR head changed since last review; run review again" };
+		}
+		if (latest?.source === "pr") {
+			// Merge on the PR's current threads, never on the stored snapshot; an unreadable thread list refuses the merge.
+			const threads = github.reviewThreads(pr.number);
+			if (!threads.ok) return { ok: false, merged: false, reason: `could not read review threads: ${threads.error}` };
+			latest = { ...latest, comments: openThreadComments(threads.threads) };
 		}
 		const gate = mergeGate({ config: deps.config, status, latest });
 		if (!gate.ok) return { ok: false, merged: false, reason: gate.reason };

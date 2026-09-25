@@ -249,17 +249,33 @@ describe("runShip", () => {
 		expect(calls).toEqual([]);
 	});
 
-	test("a reused PR round re-reads threads: a resolved finding clears, a failed lookup keeps it", async () => {
+	test("a reused PR round re-reads threads: a resolved finding clears; a failed lookup is not ready and persists nothing", async () => {
 		const open = { body: "intended behavior", path: "a.ts", threadId: "T1" };
 		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [open], headSha: "abc", at: 1 };
 		writeShip(statePath, { pr: PR, rounds: [round] });
-		const kept = await ship("review", deps());
-		expect(kept.output).toMatchObject({ reused: true, ready: false, comments: [open] });
+		const failed = await ship("review", deps());
+		expect(failed.output).toMatchObject({ ok: false, ready: false });
+		expect(String(failed.output.reason)).toContain("could not read review threads");
+		expect(readShip(statePath)?.rounds).toMatchObject([{ comments: [open] }]);
 		const resolved = { id: "T1", isResolved: true, isOutdated: false, author: "greptile-apps", body: "intended behavior" };
-		const cleared = await ship("review", deps({ threads: { ok: true, threads: [resolved] } }));
+		const threads: ReviewThreads = { ok: true, threads: [resolved] };
+		const cleared = await ship("review", deps({ threads }));
 		expect(cleared.output).toMatchObject({ reused: true, ready: true, round: 1, comments: [] });
 		expect(readShip(statePath)?.rounds).toMatchObject([{ comments: [] }]);
-		expect((await ship("merge", deps())).output).toMatchObject({ ok: true, merged: true });
+		expect((await ship("merge", deps())).output).toMatchObject({ ok: false, merged: false });
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+		expect((await ship("merge", deps({ threads }))).output).toMatchObject({ ok: true, merged: true });
+	});
+
+	test("a clean stored PR round does not pass review or merge when the threads cannot be read", async () => {
+		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [], headSha: "abc", at: 1 };
+		writeShip(statePath, { pr: PR, rounds: [round] });
+		expect((await ship("review", deps())).output).toMatchObject({ ok: false, ready: false });
+		expect((await ship("merge", deps())).output).toMatchObject({ ok: false, merged: false });
+		const posted = { id: "T9", isResolved: false, isOutdated: false, author: "greptile-apps", body: "**New finding**" };
+		const merge = await ship("merge", deps({ threads: { ok: true, threads: [posted] } }));
+		expect(merge.output).toMatchObject({ ok: false, merged: false, reason: "1 open review comment(s)" });
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
 	});
 
 	test("review refuses when local HEAD differs from the PR head", async () => {
