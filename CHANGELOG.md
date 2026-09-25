@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Hermes: plans are no longer dropped by Hermes' 30 s plugin hook cap. Install now sets `hermes config set plugins.hook_callback_timeout 600`, and the planner reads the cap Hermes enforces and stops at `min(540, cap − 15)` seconds. Under a 105 s cap (a deadline under 90 s) it doesn't start Bun and logs one warning naming that command. On the deadline it kills Bun's whole process group, so no engine call outlives the hook.
+- Hermes: the prompt hook no longer creates Notion or Linear rows. `ultrathink-kickoff` creates them with `ultrathink-mcp track complete --state <file>`, so a plan that Hermes abandons can't leave orphan rows.
+- A prompt that references an existing ultrathink graph (`graph ut-<id>-<8 hex>`, as dispatched workers and Linear issue footers do) is no longer planned again as a new graph on any host. Prefix it with `uplift:` to force a plan. On Hermes a bare skill preamble with no task is skipped too.
+- Hermes and Omp: stateless skips (`raw:`, commands, already uplifted XML, graph references, trivial acknowledgements) run before an engine is selected, and the Hermes plugin skips prompts that start with `/` and already uplifted XML before starting Bun.
+
 ## [0.3.0] - 2026-09-25
 
 First public release, licensed under AGPL-3.0-or-later.

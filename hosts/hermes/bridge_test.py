@@ -2,9 +2,13 @@
 # Copyright (C) 2026 SWC Studio
 import importlib.util
 import json
+import logging
+import os
+import signal
 import stat
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,13 +48,65 @@ PR_URL = "https://github.com/acme/widgets/pull/42"
 
 
 def fake_bun(path: Path) -> Path:
-	"""A bun stand-in that echoes the request prompt back as the engine's context."""
+	"""A bun stand-in that appends each request prompt to <path>.calls and echoes it back
+	as the engine's context."""
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(
-		f"#!{sys.executable}\nimport json, sys\nrequest = json.load(sys.stdin)\nprint(json.dumps({{'context': 'planned:' + request['prompt']}}))\n"
+		f"#!{sys.executable}\nimport json, sys\nrequest = json.load(sys.stdin)\n"
+		f"open({str(path) + '.calls'!r}, 'a').write(request['prompt'] + '\\n')\n"
+		"print(json.dumps({'context': 'planned:' + request['prompt']}))\n"
 	)
 	path.chmod(path.stat().st_mode | stat.S_IEXEC)
 	return path
+
+
+def bun_calls(path: Path) -> list[str]:
+	calls = Path(f"{path}.calls")
+	return calls.read_text().splitlines() if calls.exists() else []
+
+
+@contextmanager
+def hook_cap(cap: float | None) -> Iterator[None]:
+	"""Stand in for the plugins.hook_callback_timeout Hermes resolves; None is outside Hermes."""
+	saved = bridge.host_hook_cap
+	bridge.host_hook_cap = lambda: cap
+	try:
+		yield
+	finally:
+		bridge.host_hook_cap = saved
+
+
+@contextmanager
+def bridge_warnings() -> Iterator[list[str]]:
+	"""Collect the bridge's log warnings, with the once-per-process short-cap warning re-armed."""
+	messages: list[str] = []
+	handler = logging.Handler(logging.WARNING)
+	handler.emit = lambda record: messages.append(record.getMessage())  # type: ignore[method-assign]
+	bridge.logger.addHandler(handler)
+	bridge._cap_warned = False
+	try:
+		yield messages
+	finally:
+		bridge.logger.removeHandler(handler)
+		bridge._cap_warned = False
+
+
+def exited(pid: int) -> bool:
+	"""Whether pid is gone (or a zombie its new parent has yet to reap), polling up to 2s."""
+	give_up = time.monotonic() + 2
+	while True:
+		try:
+			os.kill(pid, 0)
+		except ProcessLookupError:
+			return True
+		try:
+			if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+				return True
+		except OSError:
+			pass
+		if time.monotonic() > give_up:
+			return False
+		time.sleep(0.05)
 
 
 def gh_stdout(url: str) -> str:
@@ -150,6 +206,87 @@ def test_engine_failure_returns_empty():
 		env={"BUN": "/bin/false"},
 	)
 	assert context == ""
+
+
+def test_slash_commands_and_uplifted_xml_never_start_bun():
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
+		fake = fake_bun(Path(tmp) / "bun")
+		engine = {"BUN": str(fake)}
+		for prompt in (
+			"/foo bar",
+			"  /ultrathink-status",
+			"<BUILD_PROMPT><task>add a widget</task></BUILD_PROMPT>",
+			"\n<fix_prompt>\n<goal>x</goal>\n</fix_prompt>",
+			'<ultrathink graph="ut-1-abcdef12"/>',
+			"<Uplifted_Prompt>",
+			"UPLIFTED",
+		):
+			assert plan({"user_message": prompt, "session_id": "s1"}, env=engine) == "", prompt
+		assert bun_calls(fake) == []
+		# Near misses are ordinary prompts: other tags, longer names, a slash mid-sentence.
+		for prompt in ("<BUILD_PROMPTS> add a widget", "<div>fix the layout</div>", "fix the /tmp cleanup"):
+			assert plan({"user_message": prompt, "session_id": "s1"}, env=engine) == f"planned:{prompt}", prompt
+		assert bun_calls(fake) == ["<BUILD_PROMPTS> add a widget", "<div>fix the layout</div>", "fix the /tmp cleanup"]
+
+
+def test_deadline_ends_fifteen_seconds_inside_the_hermes_cap():
+	saved = os.environ.pop("ULTRATHINK_HERMES_TIMEOUT", None)
+	try:
+		# 0 runs the hook inline with no cap; None is outside Hermes. Under 90s nothing runs.
+		for cap, deadline in ((600, 540), (300, 285), (105, 90), (104.9, None), (30, None), (0, 540), (None, 540)):
+			with hook_cap(cap):
+				assert bridge.plan_deadline() == deadline, cap
+		# ULTRATHINK_HERMES_TIMEOUT still shortens the deadline, but never past the cap.
+		os.environ["ULTRATHINK_HERMES_TIMEOUT"] = "120"
+		for cap, deadline in ((600, 120), (120, 105), (0, 120)):
+			with hook_cap(cap):
+				assert bridge.plan_deadline() == deadline, cap
+	finally:
+		os.environ.pop("ULTRATHINK_HERMES_TIMEOUT", None)
+		if saved is not None:
+			os.environ["ULTRATHINK_HERMES_TIMEOUT"] = saved
+
+
+def test_short_hook_cap_never_starts_bun_and_warns_once():
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(30), bridge_warnings() as warnings:
+		fake = fake_bun(Path(tmp) / "bun")
+		for _ in range(2):
+			assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == ""
+		assert bun_calls(fake) == []
+		assert len(warnings) == 1
+		assert "30" in warnings[0] and "hermes config set plugins.hook_callback_timeout 600" in warnings[0]
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(105), bridge_warnings() as warnings:
+		fake = fake_bun(Path(tmp) / "bun")
+		assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == "planned:add a widget"
+		assert warnings == []
+
+
+def test_deadline_kills_bun_and_everything_it_spawned():
+	with tempfile.TemporaryDirectory() as tmp:
+		pid_file = Path(tmp) / "grandchild.pid"
+		fake = Path(tmp) / "bun"
+		# The grandchild holds Bun's stdout open, so killing only Bun would still hang for 60s.
+		fake.write_text(
+			f"#!{sys.executable}\nimport pathlib, subprocess, time\n"
+			"child = subprocess.Popen(['sleep', '60'])\n"
+			f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+			"time.sleep(60)\n"
+		)
+		fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+		saved = bridge.plan_deadline
+		bridge.plan_deadline = lambda: 1.0
+		started = time.monotonic()
+		try:
+			assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == ""
+		finally:
+			bridge.plan_deadline = saved
+		assert time.monotonic() - started < 5
+		grandchild = int(pid_file.read_text())
+		try:
+			assert exited(grandchild)
+		finally:
+			if not exited(grandchild):
+				os.kill(grandchild, signal.SIGKILL)
 
 
 def test_pr_creation_tool_mirrors_pr_detect():
@@ -294,6 +431,10 @@ if __name__ == "__main__":
 	test_skill_scaffold_reaches_the_engine()
 	test_engine_is_found_off_path_when_bun_is_unset()
 	test_engine_failure_returns_empty()
+	test_slash_commands_and_uplifted_xml_never_start_bun()
+	test_deadline_ends_fifteen_seconds_inside_the_hermes_cap()
+	test_short_hook_cap_never_starts_bun_and_warns_once()
+	test_deadline_kills_bun_and_everything_it_spawned()
 	test_pr_creation_tool_mirrors_pr_detect()
 	test_extract_pr_url_reads_gh_output()
 	test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session()

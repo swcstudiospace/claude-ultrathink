@@ -205,7 +205,7 @@ To plan with Grok through a local gateway:
 | `ULTRATHINK_OAUTH_REDIRECT` | OAuth callback URL for `bin/ultrathink-mcp auth login`. Must be https, or http on `127.0.0.1`, `localhost` or `[::1]`. The `--redirect` flag wins over it. See [remote logins](tracking.md#logging-in-from-a-remote-machine). |
 | `ULTRATHINK_DEBUG=1` | The prompt hook (`hooks/uplift.ts`, used by Claude Code, Grok Build and Muse) writes `[ultrathink]` log lines to stderr. |
 | `ULTRATHINK_MCP_DEBUG=1` | `bin/ultrathink-mcp serve` writes relay log lines to stderr. |
-| `ULTRATHINK_HERMES_TIMEOUT` | Seconds the Hermes plugin waits for a plan. Default `540`, below Hermes' 600 second limit. Must be a positive integer. |
+| `ULTRATHINK_HERMES_TIMEOUT` | Seconds the Hermes plugin waits for a plan before Hermes' own hook cap applies. Default `540`; the plugin waits min(this, `plugins.hook_callback_timeout` − 15) seconds and skips planning below 90. Must be a positive integer. |
 
 ### Internal variables
 

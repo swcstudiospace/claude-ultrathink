@@ -2,7 +2,10 @@
 # Copyright (C) 2026 SWC Studio
 """Fail-open bridge from Hermes hooks into the TypeScript ultrathink engine.
 
-pre_llm_call plans the prompt through hooks/engine.ts. When a planned session's
+pre_llm_call plans the prompt through hooks/engine.ts, inside the hook cap Hermes
+enforces (plugins.hook_callback_timeout): Bun gets min(540, cap - 15) seconds in its
+own process group, and the whole group is killed at that deadline. Slash commands
+and already-uplifted ultrathink XML never start Bun. When a planned session's
 tool call opens a pull request, transform_tool_result appends an ultrathink-sync
 nudge to that tool result, so the model sees it in the same turn. If no tool
 result carried it, post_tool_call queues the nudge and the session's next
@@ -16,8 +19,10 @@ unplanned.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 from collections.abc import Callable
@@ -28,7 +33,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ENGINE = REPO_ROOT / "hooks" / "engine.ts"
 RUN_BUN = REPO_ROOT / "bin" / "run-bun"
 CLI = REPO_ROOT / "bin" / "ultrathink"
-DEFAULT_TIMEOUT_S = 540  # planning takes minutes; stay below Hermes' 600s backstop
+DEFAULT_TIMEOUT_S = 540  # planning takes minutes; stay below Hermes' 600s hook cap maximum
+HOOK_MARGIN_S = 15  # the bridge's deadline ends this long before Hermes abandons the hook
+MIN_PLAN_S = 90  # below this a plan cannot finish, so Bun is not started at all
 CONTROL_TIMEOUT_S = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
@@ -43,6 +50,18 @@ PR_TOOL_RE = re.compile(
 	r"create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest", re.ASCII | re.IGNORECASE
 )
 SHELL_TOOLS = frozenset({"Bash", "bash", "run_terminal_command", "shell", "exec", "terminal"})
+
+# Port of src/uplift/detect.ts isAlreadyUplifted: ROOT_TAGS (src/types.ts) plus "uplifted"
+# and "ultrathink", case-insensitive. JavaScript's \w is ASCII.
+UPLIFTED_ROOTS = frozenset(
+	tag.lower()
+	for tag in ("BUILD_PROMPT", "FIX_PROMPT", "RESEARCH_PROMPT", "CHANGE_PROMPT", "UPLIFTED_PROMPT", "uplifted", "ultrathink")
+)
+UPLIFTED_TAG_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_.-]*)")
+
+logger = logging.getLogger(__name__)
+_cap_lock = threading.Lock()
+_cap_warned = False  # the short-cap warning is logged once per process
 
 # Hooks fire from the agent thread and from parallel tool workers.
 _pr_lock = threading.Lock()
@@ -61,6 +80,50 @@ def timeout_seconds() -> int:
 	except ValueError:
 		return DEFAULT_TIMEOUT_S
 	return value if value > 0 else DEFAULT_TIMEOUT_S
+
+
+def host_hook_cap() -> float | None:
+	"""The pre_llm_call cap Hermes enforces right now, resolved the way Hermes does per
+	hook invocation; None outside Hermes."""
+	try:
+		from hermes_cli.plugins import _resolve_hook_callback_timeout  # type: ignore[import-not-found]
+
+		return float(_resolve_hook_callback_timeout())
+	except Exception:
+		return None
+
+
+def plan_deadline() -> float | None:
+	"""Seconds Bun may run: timeout_seconds(), cut to end HOOK_MARGIN_S before a positive
+	Hermes cap (a cap <= 0 runs the hook inline, without one). None when that leaves
+	less than MIN_PLAN_S."""
+	deadline = float(timeout_seconds())
+	cap = host_hook_cap()
+	if cap is not None and cap > 0:
+		deadline = min(deadline, cap - HOOK_MARGIN_S)
+	return deadline if deadline >= MIN_PLAN_S else None
+
+
+def is_already_uplifted(text: str) -> bool:
+	trimmed = text.strip()
+	if trimmed.startswith("<"):
+		match = UPLIFTED_TAG_RE.match(trimmed)
+		return match is not None and match.group(1).lower() in UPLIFTED_ROOTS
+	return trimmed.lower() in UPLIFTED_ROOTS
+
+
+def _warn_short_cap() -> None:
+	global _cap_warned
+	with _cap_lock:
+		if _cap_warned:
+			return
+		_cap_warned = True
+	logger.warning(
+		"ultrathink: Hermes hook cap %ss leaves under %ss to plan, so prompts go unplanned; "
+		"run `hermes config set plugins.hook_callback_timeout 600`",
+		host_hook_cap(),
+		MIN_PLAN_S,
+	)
 
 
 def message_text(message: Any) -> str:
@@ -84,6 +147,14 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	prompt = message_text(payload.get("user_message") or payload.get("prompt"))
 	if not prompt.strip() or _take_quick(prompt):
 		return ""
+	# Hermes expands /skill commands into an "[IMPORTANT: The user has invoked …]" scaffold
+	# before pre_llm_call, so a prompt still starting with "/" is never a skill with a task.
+	if prompt.strip().startswith("/") or is_already_uplifted(prompt):
+		return ""
+	deadline = plan_deadline()
+	if deadline is None:
+		_warn_short_cap()
+		return ""
 	request = {
 		"host": "hermes",
 		"session_id": payload.get("session_id") or payload.get("sessionId") or "",
@@ -100,20 +171,30 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	# PATH lacks it, and exits 0 with no output when bun is missing.
 	command = [bun, str(ENGINE)] if bun else [str(RUN_BUN), str(ENGINE)]
 	try:
-		completed = subprocess.run(
+		# Bun leads its own process group so the deadline can kill everything it spawned.
+		proc = subprocess.Popen(
 			command,
-			input=json.dumps(request),
+			stdin=subprocess.PIPE,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
 			text=True,
-			capture_output=True,
-			timeout=timeout_seconds(),
 			env=child_env,
 			cwd=str(REPO_ROOT),
-			check=False,
+			start_new_session=True,
 		)
-	except (OSError, subprocess.TimeoutExpired):
+	except OSError:
 		return ""
 	try:
-		parsed = json.loads(completed.stdout or "{}")
+		stdout, _ = proc.communicate(input=json.dumps(request), timeout=deadline)
+	except subprocess.TimeoutExpired:
+		try:
+			os.killpg(proc.pid, signal.SIGKILL)
+		except (ProcessLookupError, PermissionError):
+			pass
+		proc.communicate()
+		return ""
+	try:
+		parsed = json.loads(stdout or "{}")
 	except json.JSONDecodeError:
 		return ""
 	context = parsed.get("context") if isinstance(parsed, dict) else ""
