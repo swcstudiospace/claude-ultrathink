@@ -9,8 +9,9 @@ import type { SessionRecord } from "../claude/state.ts";
 import type { ShipDiff } from "./signals.ts";
 import type { Assessment, ShipSignals } from "./types.ts";
 
-export const JUDGE_SYSTEM_PROMPT = `You are a strict release reviewer. You are given the user's original request, the uplifted spec summary, the Graph-of-Thought goal and WORKFLOW, GSD roadmap/verification signals, the branch diff stat, commit log and the (possibly truncated) patch.
-Decide whether the requested work is complete enough to merge: check the patch against every stated requirement. Missing features, TODO/stub markers, failing verification or unaddressed clarifications mean NOT done.
+export const JUDGE_SYSTEM_PROMPT = `You are a strict release reviewer. You are given the user's original request, the uplifted spec summary, the Graph-of-Thought goal and WORKFLOW, the clarifications with any recorded answers, GSD roadmap/verification signals, the branch diff stat, commit log and the (possibly truncated) patch.
+Decide whether the requested work is complete enough to merge: check the patch against every stated requirement. Missing features, TODO/stub markers, failing verification or unanswered blocking clarifications mean NOT done.
+You run before the ship flow, which then pushes the branch, opens the PR into the default branch, gates it on CI and a Greptile review, merges it and deletes the branch. Never count as gaps: the branch not being pushed or merged yet, the PR not existing yet, or repository settings a person applies after the merge (such as visibility). Judge the delivered changes, not whether you can see logs of checks being run; CI and the review gate verify the code after you.
 List in gaps only concrete missing or broken work; leave gaps empty when done.
 Reply ONLY with JSON: {"done": boolean, "confidence": number between 0 and 1, "summary": string, "gaps": string[]}`;
 
