@@ -33,9 +33,11 @@ export function shipNudge(input: {
 	const ship = record.ship;
 	if (ship?.phase === "merged" || ship?.phase === "blocked" || ship?.nudgedAt !== undefined) return undefined;
 	if (!precheck.ok || !precheck.branch || !precheck.base) return undefined;
+	const autoMerge = input.config.autoMerge;
+	const merge = autoMerge ? "merges" : "leaves the PR for a manual merge (ship.autoMerge is off)";
 	return {
 		decision: "block",
-		reason: `Ultrathink: the ${skill} run looks finished on branch ${precheck.branch} (${precheck.ahead} ${precheck.ahead === 1 ? "commit" : "commits"} ahead of ${precheck.base}). Invoke the ultrathink-ship skill now with stateFile=${input.statePath} (CLI: ${SHIP_CLI}): it checks whether the task is done, opens a PR into ${precheck.base}, runs the Greptile review until 5/5 and merges.`,
-		systemMessage: `Ultrathink · ${skill} finished on ${precheck.branch}; running ultrathink-ship (PR into ${precheck.base}, Greptile review, merge).`,
+		reason: `Ultrathink: the ${skill} run looks finished on branch ${precheck.branch} (${precheck.ahead} ${precheck.ahead === 1 ? "commit" : "commits"} ahead of ${precheck.base}). Invoke the ultrathink-ship skill now with stateFile=${input.statePath} (CLI: ${SHIP_CLI}): it checks whether the task is done, opens a PR into ${precheck.base}, runs the Greptile review until 5/5 and ${merge}.`,
+		systemMessage: `Ultrathink · ${skill} finished on ${precheck.branch}; running ultrathink-ship (PR into ${precheck.base}, Greptile review, ${autoMerge ? "merge" : "manual merge"}).`,
 	};
 }

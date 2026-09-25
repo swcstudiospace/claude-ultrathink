@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 /**
- * Agent Substrate client.
+ * Agent Substrate client — an optional integration.
  *
  * Fetches the cross-agent briefing before the Graph of Thought is built, so the
  * graph is planned knowing what other agents already did in this repo.
  *
+ * Opt-in: nothing is contacted unless a server URL is set, either through the
+ * `SUBSTRATE_URL` environment variable or `substrate.url` in the ultrathink
+ * config (the environment wins). `SUBSTRATE_DISABLED=1` turns both off.
+ *
  * Every function here fails open. The substrate is an enhancement to a prompt,
- * never a precondition for one: if it is down, slow, or simply not installed,
- * the user's prompt proceeds exactly as it did before.
+ * never a precondition for one: if it is unset, down, slow, or simply not
+ * installed, the user's prompt proceeds exactly as it did before.
  */
 
-const DEFAULT_URL = "http://127.0.0.1:7410";
 const DEFAULT_TIMEOUT_MS = 1500;
 
 export interface BriefInput {
@@ -21,8 +24,25 @@ export interface BriefInput {
 	surface?: string;
 }
 
-function baseUrl(env: Record<string, string | undefined>): string {
-	return (env.SUBSTRATE_URL?.trim() || DEFAULT_URL).replace(/\/+$/, "");
+export interface SubstrateTarget {
+	url: string;
+	/** Where the URL came from; the environment wins over the config file. */
+	source: "SUBSTRATE_URL" | "config";
+}
+
+/**
+ * The server to talk to, or undefined when the integration is off: no URL in
+ * `SUBSTRATE_URL` or `substrate.url`, or `SUBSTRATE_DISABLED=1`.
+ */
+export function resolveSubstrate(
+	env: Record<string, string | undefined>,
+	configuredUrl: string,
+): SubstrateTarget | undefined {
+	if (env.SUBSTRATE_DISABLED === "1") return undefined;
+	const fromEnv = env.SUBSTRATE_URL?.trim().replace(/\/+$/, "");
+	if (fromEnv) return { url: fromEnv, source: "SUBSTRATE_URL" };
+	const fromConfig = configuredUrl.trim().replace(/\/+$/, "");
+	return fromConfig ? { url: fromConfig, source: "config" } : undefined;
 }
 
 function authHeaders(env: Record<string, string | undefined>): Record<string, string> {
@@ -36,16 +56,19 @@ function timeoutMs(env: Record<string, string | undefined>): number {
 }
 
 /**
- * The session brief as Markdown, or `""` when the substrate cannot answer in
- * time. An empty string is the caller's signal to carry on without it.
+ * The session brief as Markdown, or `""` when no substrate is configured or it
+ * cannot answer in time. An empty string is the caller's signal to carry on
+ * without it. `url` is the configured `substrate.url`; `SUBSTRATE_URL` wins.
  */
 export async function fetchBrief(
 	input: BriefInput,
 	env: Record<string, string | undefined> = process.env,
+	url = "",
 ): Promise<string> {
-	if (env.SUBSTRATE_DISABLED === "1") return "";
+	const target = resolveSubstrate(env, url);
+	if (!target) return "";
 	try {
-		const response = await fetch(`${baseUrl(env)}/brief`, {
+		const response = await fetch(`${target.url}/brief`, {
 			method: "POST",
 			headers: { "content-type": "application/json", ...authHeaders(env) },
 			body: JSON.stringify({
@@ -75,14 +98,19 @@ export interface EmitInput {
 	payload?: Record<string, unknown>;
 }
 
-/** Append an event. Returns whether it landed; callers are expected to ignore that. */
+/**
+ * Append an event. Returns whether it landed; callers are expected to ignore that.
+ * Same opt-in rule as {@link fetchBrief}: no URL, no request.
+ */
 export async function emitEvent(
 	input: EmitInput,
 	env: Record<string, string | undefined> = process.env,
+	url = "",
 ): Promise<boolean> {
-	if (env.SUBSTRATE_DISABLED === "1") return false;
+	const target = resolveSubstrate(env, url);
+	if (!target) return false;
 	try {
-		const response = await fetch(`${baseUrl(env)}/events`, {
+		const response = await fetch(`${target.url}/events`, {
 			method: "POST",
 			headers: { "content-type": "application/json", ...authHeaders(env) },
 			body: JSON.stringify({

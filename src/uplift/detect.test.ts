@@ -163,7 +163,7 @@ describe("decideUplift", () => {
 
 	test("skips a prompt that carries out an existing graph unless forced", () => {
 		const dispatched =
-			"You were dispatched by substrate-dispatcher for Linear issue SWC-467, graph ut-mughkkc0-1a2b3c4d. Implement the node and open a PR.";
+			"You were dispatched by a task dispatcher for Linear issue ENG-467, graph ut-mughkkc0-1a2b3c4d. Implement the node and open a PR.";
 		expect(decideUplift({ text: dispatched, source: "user" }, state())).toEqual({ action: "skip" });
 		expect(decideUplift({ text: `uplift: ${dispatched}`, source: "user" }, state())).toEqual({
 			action: "uplift",

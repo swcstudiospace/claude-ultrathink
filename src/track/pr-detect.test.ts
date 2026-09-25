@@ -32,7 +32,7 @@ describe("isPrCreationTool", () => {
 	});
 
 	test("PR-creation tool names match regardless of server prefix or casing", () => {
-		expect(isPrCreationTool("mcp__aio__github_create_pull_request", undefined)).toBe(true);
+		expect(isPrCreationTool("mcp__acme__github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("createPullRequest", undefined)).toBe(true);
 	});

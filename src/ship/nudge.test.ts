@@ -14,7 +14,7 @@ const record: SessionRecord = {
 	skill: { name: "gsd-execute-phase", source: "slash" },
 };
 const precheck = { ok: true, reason: "ok", branch: "feat/x", base: "master", ahead: 3 };
-const base = { record, config: DEFAULT_SHIP_CONFIG, precheck, statePath: "/s/s1.json", env: {} };
+const base = { record, config: { ...DEFAULT_SHIP_CONFIG, enabled: true }, precheck, statePath: "/s/s1.json", env: {} };
 
 describe("shipNudge", () => {
 	test("blocks with everything the agent needs to run the skill", () => {
@@ -27,7 +27,17 @@ describe("shipNudge", () => {
 		expect(nudge?.systemMessage).toContain("ultrathink-ship");
 	});
 
-	test("stays silent when already nudged, merged, blocked, re-entered, off-skill, disabled or precheck fails", () => {
+	test("promises a merge only when ship.autoMerge is on", () => {
+		const manual = shipNudge(base);
+		expect(manual?.reason).toContain("leaves the PR for a manual merge (ship.autoMerge is off)");
+		expect(manual?.reason).not.toContain("and merges");
+		expect(manual?.systemMessage).toContain("manual merge");
+		const auto = shipNudge({ ...base, config: { ...base.config, autoMerge: true } });
+		expect(auto?.reason).toEndWith("runs the Greptile review until 5/5 and merges.");
+		expect(auto?.systemMessage).toEndWith("Greptile review, merge).");
+	});
+
+	test("stays silent when already nudged, merged, blocked, re-entered, off-skill, disabled (the default) or precheck fails", () => {
 		const cases = [
 			{ ...base, record: { ...record, ship: { phase: "pr-open" as const, rounds: [], nudgedAt: 5, updatedAt: 5 } } },
 			{ ...base, record: { ...record, ship: { phase: "merged" as const, rounds: [], updatedAt: 5 } } },
@@ -37,7 +47,7 @@ describe("shipNudge", () => {
 			{ ...base, record: { ...record, skill: undefined } },
 			{ ...base, record: { ...record, plan: undefined } },
 			{ ...base, env: { ULTRATHINK_SHIP: "0" } },
-			{ ...base, config: { ...DEFAULT_SHIP_CONFIG, enabled: false } },
+			{ ...base, config: DEFAULT_SHIP_CONFIG },
 			{ ...base, precheck: { ok: false, reason: "on base", ahead: 0 } },
 		];
 		for (const input of cases) expect(shipNudge(input)).toBeUndefined();

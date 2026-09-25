@@ -22,7 +22,7 @@ import type { AuthDeps } from "./oauth.ts";
 import { isProviderId, PROVIDERS, USER_AGENT } from "./providers.ts";
 import type { ProviderId } from "./providers.ts";
 import { defaultRun, mountTailscale, planRedirect, readTailscaleDns, unmountTailscale } from "./redirect.ts";
-import type { RedirectPlan } from "./redirect.ts";
+import type { RedirectPlan, Run } from "./redirect.ts";
 import { createRelay, runStdioRelay } from "./relay.ts";
 import type { RelayAuth } from "./relay.ts";
 import { storePath } from "./store.ts";
@@ -31,7 +31,7 @@ const USAGE = `usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
-  ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--no-listen]
+  ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
   ultrathink-mcp track complete --state <sessions/<id>.json>
@@ -112,20 +112,48 @@ async function readLine(stream: ReadableStream<Uint8Array>, signal: AbortSignal)
 	}
 }
 
+/**
+ * Plans the OAuth callback route for `auth login`. Tailscale is used only when asked for with `--tailscale` or
+ * `ULTRATHINK_OAUTH_TAILSCALE=1`; then the `tailscale serve` handler is added, and `mount` is returned only if
+ * that worked (the caller removes it). If it fails, the login falls back to the loopback route.
+ */
+export function prepareRedirect(input: {
+	args: string[];
+	env: Record<string, string | undefined>;
+	port: number;
+	run: Run;
+}): { plan: RedirectPlan; mount?: NonNullable<RedirectPlan["mount"]> } {
+	const { env, port, run } = input;
+	const redirect = flag(input.args, "--redirect");
+	const tailscale = input.args.includes("--tailscale") || env.ULTRATHINK_OAUTH_TAILSCALE === "1";
+	let plan: RedirectPlan;
+	try {
+		plan = planRedirect({ env, port, redirect, tailscale, tailscaleDns: () => readTailscaleDns(run) });
+	} catch (error) {
+		throw new UsageError(error instanceof Error ? error.message : String(error));
+	}
+	const mount = plan.mount;
+	if (!mount) return { plan };
+	if (mountTailscale(mount, run)) return { plan, mount };
+	const fallback = planRedirect({ env, port, tailscale, tailscaleDns: () => undefined });
+	return {
+		plan: {
+			...fallback,
+			hint: [
+				`The Tailscale route (tailscale serve ${mount.path}) could not be set up; using ${fallback.redirectUri} instead.`,
+				...fallback.hint,
+			],
+		},
+	};
+}
+
 async function login(id: ProviderId, args: string[], deps: AuthDeps): Promise<void> {
 	const portText = flag(args, "--port") ?? "8765";
 	const port = Number(portText);
 	if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`invalid port: ${portText}`);
 	const listen = !args.includes("--no-listen");
-	const redirect = flag(args, "--redirect");
-	let plan: RedirectPlan;
-	try {
-		plan = planRedirect({ env: process.env, port, redirect, tailscaleDns: () => readTailscaleDns(defaultRun) });
-	} catch (error) {
-		throw new UsageError(error instanceof Error ? error.message : String(error));
-	}
-	const mount = plan.mount;
-	let mounted = false;
+	const { plan, mount } = prepareRedirect({ args, env: process.env, port, run: defaultRun });
+	let mounted = mount !== undefined;
 	const unmount = (): void => {
 		if (!mount || !mounted) return;
 		mounted = false;
@@ -135,21 +163,9 @@ async function login(id: ProviderId, args: string[], deps: AuthDeps): Promise<vo
 		unmount();
 		process.exit(signal === "SIGINT" ? 130 : 143);
 	};
-	if (mount) {
-		mounted = mountTailscale(mount, defaultRun);
-		if (mounted) {
-			process.on("SIGINT", onSignal);
-			process.on("SIGTERM", onSignal);
-		} else {
-			const fallback = planRedirect({ env: process.env, port, tailscaleDns: () => undefined });
-			plan = {
-				...fallback,
-				hint: [
-					`The Tailscale route (tailscale serve ${mount.path}) could not be set up; using ${fallback.redirectUri} instead.`,
-					...fallback.hint,
-				],
-			};
-		}
+	if (mounted) {
+		process.on("SIGINT", onSignal);
+		process.on("SIGTERM", onSignal);
 	}
 	const received = Promise.withResolvers<string>();
 	const abort = new AbortController();

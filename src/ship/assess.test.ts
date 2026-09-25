@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { assessDone } from "./assess.ts";
-import { collectSignals, gatherDiff } from "./signals.ts";
+import { collectSignals, gatherDiff, gsdToolsCandidates, resolveGsdTools } from "./signals.ts";
 import type { Run, ShipSignals } from "./types.ts";
 
 const dirs: string[] = [];
@@ -129,6 +129,86 @@ describe("collectSignals", () => {
 		const ignored = fakeRun({ ...GIT, "git check-ignore -q .planning": "" });
 		expect(collectSignals({ cwd, record: RECORD, run: ignored, gsdTools: "g.cjs" }).gsd?.trusted).toBe(true);
 	});
+
+	test("a roadmap with gsd-tools.cjs installed nowhere is flagged tools-missing without running node", () => {
+		const cwd = tempDir();
+		mkdirSync(join(cwd, ".planning"), { recursive: true });
+		writeFileSync(join(cwd, ".planning", "ROADMAP.md"), "# r");
+		const argvs: string[][] = [];
+		const base = fakeRun({ ...GIT, "git ls-files --error-unmatch .planning/ROADMAP.md": ".planning/ROADMAP.md" });
+		const run: Run = (argv, opts) => (argvs.push(argv), base(argv, opts));
+		const s = collectSignals({ cwd, record: RECORD, run, env: {}, home: tempDir() });
+		expect(s.gsd).toMatchObject({ phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true });
+		expect(argvs.some((argv) => argv[0] === "node")).toBe(false);
+	});
+
+	test("a gsd-tools.cjs installed under home is found and run", () => {
+		const cwd = tempDir();
+		const home = tempDir();
+		mkdirSync(join(cwd, ".planning"), { recursive: true });
+		writeFileSync(join(cwd, ".planning", "ROADMAP.md"), "# r");
+		const tool = join(home, ".agents", "gsd-core", "bin", "gsd-tools.cjs");
+		mkdirSync(join(home, ".agents", "gsd-core", "bin"), { recursive: true });
+		writeFileSync(tool, "");
+		const run = fakeRun({ ...GIT, [`node ${tool} query roadmap.analyze --cwd ${cwd}`]: JSON.stringify({ phase_count: 2, completed_phases: 2 }) });
+		const s = collectSignals({ cwd, record: RECORD, run, env: {}, home });
+		expect(s.gsd).toMatchObject({ phaseCount: 2, completedPhases: 2 });
+		expect(s.gsd?.toolsMissing).toBeUndefined();
+	});
+});
+
+describe("resolveGsdTools", () => {
+	const cwd = "/work/app";
+	const home = "/home/u";
+
+	test("GSD_TOOLS wins even over an installed copy", () => {
+		expect(resolveGsdTools({ cwd, home, env: { GSD_TOOLS: "/opt/gsd.cjs" }, exists: () => true })).toBe("/opt/gsd.cjs");
+	});
+
+	test("the first existing location wins: project-local before host config dirs", () => {
+		const installed = new Set([
+			"/work/app/.codex/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.claude/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.agents/gsd-core/bin/gsd-tools.cjs",
+		]);
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => installed.has(p) })).toBe(
+			"/work/app/.codex/gsd-core/bin/gsd-tools.cjs",
+		);
+		installed.delete("/work/app/.codex/gsd-core/bin/gsd-tools.cjs");
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => installed.has(p) })).toBe(
+			"/home/u/.claude/gsd-core/bin/gsd-tools.cjs",
+		);
+	});
+
+	test("host config dir overrides replace their home defaults", () => {
+		const env = {
+			CLAUDE_CONFIG_DIR: "/cfg/claude",
+			HERMES_HOME: "/cfg/hermes",
+			CODEX_HOME: "/cfg/codex",
+			GEMINI_CONFIG_DIR: "/cfg/gemini",
+			XDG_CONFIG_HOME: "/cfg/xdg",
+		};
+		expect(gsdToolsCandidates(cwd, env, home)).toEqual([
+			"/work/app/gsd-core/bin/gsd-tools.cjs",
+			"/work/app/.claude/gsd-core/bin/gsd-tools.cjs",
+			"/work/app/.codex/gsd-core/bin/gsd-tools.cjs",
+			"/cfg/claude/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.claude/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.agents/gsd-core/bin/gsd-tools.cjs",
+			"/cfg/hermes/gsd-core/bin/gsd-tools.cjs",
+			"/cfg/codex/gsd-core/bin/gsd-tools.cjs",
+			"/cfg/gemini/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.cursor/gsd-core/bin/gsd-tools.cjs",
+			"/cfg/xdg/opencode/gsd-core/bin/gsd-tools.cjs",
+			"/home/u/.claude/get-shit-done/bin/gsd-tools.cjs",
+		]);
+	});
+
+	test("the legacy get-shit-done install is the last resort; nothing installed is undefined", () => {
+		const legacy = "/home/u/.claude/get-shit-done/bin/gsd-tools.cjs";
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => p === legacy })).toBe(legacy);
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: () => false })).toBeUndefined();
+	});
 });
 
 test("gatherDiff caps output at 8000 chars", () => {
@@ -170,6 +250,11 @@ describe("assessDone rules", () => {
 			"gsd incomplete",
 			signals({}, { phaseCount: 3, completedPhases: 1, trusted: true }),
 			"GSD roadmap incomplete: 1/3 phases",
+		],
+		[
+			"gsd tools missing",
+			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true }),
+			"GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd",
 		],
 		[
 			"verification",

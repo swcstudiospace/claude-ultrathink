@@ -225,7 +225,7 @@ describe("runPromptSubmit", () => {
 
 describe("gateway tracking", () => {
 	const trackCmd = "/opt/ultrathink/bin/ultrathink-mcp track complete";
-	const url = "https://linear.app/spectrum/issue/SPE-12/understand";
+	const url = "https://linear.app/acme/issue/ENG-12/understand";
 
 	test("tracker refs land in the context, the spec file, and the session record", async () => {
 		let seenSignal: AbortSignal | undefined;
@@ -238,7 +238,7 @@ describe("gateway tracking", () => {
 					graphId: plan.graphId,
 					status: "partial",
 					linearTeam: "Team",
-					linear: { nodes: { n1: { id: "uuid-1", identifier: "SPE-12", url, title: "T1" } }, steps: {} },
+					linear: { nodes: { n1: { id: "uuid-1", identifier: "ENG-12", url, title: "T1" } }, steps: {} },
 					notion: { nodes: {}, steps: {} },
 					errors: ["notion: login required"],
 					updatedAt: 1_000,
@@ -251,14 +251,14 @@ describe("gateway tracking", () => {
 			expect(seenSignal).toBeInstanceOf(AbortSignal);
 			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
 			expect(ctx).toContain("## Linked issues");
-			expect(ctx).toContain("SPE-12");
+			expect(ctx).toContain("ENG-12");
 			expect(ctx).toContain(url);
 			const spec = readFileSync(join(deps.stateDir, "sessions", "s1.xml"), "utf8");
 			expect(spec).toContain("<ISSUES");
-			expect(spec).toContain('identifier="SPE-12"');
+			expect(spec).toContain('identifier="ENG-12"');
 			const persisted = readSession(deps.stateDir, "s1");
 			expect(persisted?.tracking?.status).toBe("partial");
-			expect(persisted?.tracking?.linear.nodes.n1?.identifier).toBe("SPE-12");
+			expect(persisted?.tracking?.linear.nodes.n1?.identifier).toBe("ENG-12");
 		} finally {
 			cleanup();
 		}
@@ -327,7 +327,7 @@ describe("gateway tracking", () => {
 				graphId: plan.graphId,
 				status: "partial",
 				linearTeam: "Team",
-				linear: { nodes: { n1: { id: "uuid-1", identifier: "SPE-12", url, title: "T1" } }, steps: {} },
+				linear: { nodes: { n1: { id: "uuid-1", identifier: "ENG-12", url, title: "T1" } }, steps: {} },
 				notion: { nodes: {}, steps: {} },
 				errors: [],
 				updatedAt: 1_000,
@@ -406,6 +406,41 @@ describe("substrate brief", () => {
 			expect(result.output?.hookSpecificOutput.additionalContext).toContain("## Prompt Uplift");
 		} finally {
 			cleanup();
+		}
+	});
+
+	test("without a brief seam, the substrate is contacted only at the configured substrate.url", async () => {
+		const realFetch = globalThis.fetch;
+		const saved = { url: process.env.SUBSTRATE_URL, disabled: process.env.SUBSTRATE_DISABLED };
+		delete process.env.SUBSTRATE_URL;
+		delete process.env.SUBSTRATE_DISABLED;
+		const urls: string[] = [];
+		globalThis.fetch = ((url: string) => {
+			urls.push(String(url));
+			return Promise.resolve(new Response("## Substrate brief: acme/widgets\n- earlier work"));
+		}) as unknown as typeof fetch;
+		const run = async (substrateUrl: string): Promise<string> => {
+			const config = trackedConfig();
+			config.substrate.url = substrateUrl;
+			const { deps, cleanup } = baseDeps({ config, complete: smartComplete(), clarify: async () => [], brief: undefined });
+			try {
+				const result = await runPromptSubmit(input, deps);
+				return result.output?.hookSpecificOutput.additionalContext ?? "";
+			} finally {
+				cleanup();
+			}
+		};
+		try {
+			expect(await run("")).not.toContain("## Agent Substrate brief");
+			expect(urls).toEqual([]);
+			expect(await run("https://substrate.test")).toContain("## Agent Substrate brief");
+			expect(urls).toEqual(["https://substrate.test/brief"]);
+		} finally {
+			globalThis.fetch = realFetch;
+			if (saved.url === undefined) delete process.env.SUBSTRATE_URL;
+			else process.env.SUBSTRATE_URL = saved.url;
+			if (saved.disabled === undefined) delete process.env.SUBSTRATE_DISABLED;
+			else process.env.SUBSTRATE_DISABLED = saved.disabled;
 		}
 	});
 });
@@ -538,8 +573,10 @@ describe("skill invocations", () => {
 		}
 	});
 
-	test("a gsd-* skill run asks for ultrathink-ship; other skills and plain prompts do not", async () => {
-		const { deps, cleanup } = baseDeps({ complete: smartComplete() });
+	test("with ship enabled a gsd-* skill run asks for ultrathink-ship; other skills and plain prompts do not", async () => {
+		const config = trackedConfig();
+		config.ship.enabled = true;
+		const { deps, cleanup } = baseDeps({ config, complete: smartComplete() });
 		try {
 			const gsd = await runPromptSubmit(skillInput, deps);
 			expect(gsd.output?.hookSpecificOutput.additionalContext).toMatch(
@@ -550,6 +587,16 @@ describe("skill invocations", () => {
 			expect(other.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
 			const plain = await runPromptSubmit(input, deps);
 			expect(plain.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("with the default config (ship off) a gsd-* skill run gets no Ship section", async () => {
+		const { deps, cleanup } = baseDeps({ complete: smartComplete() });
+		try {
+			const gsd = await runPromptSubmit(skillInput, deps);
+			expect(gsd.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
 		} finally {
 			cleanup();
 		}

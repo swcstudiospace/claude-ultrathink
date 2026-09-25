@@ -36,7 +36,7 @@ export function isGhPrCreateCommand(command: string): boolean {
 
 /**
  * True for a shell tool running `gh pr create`, or a tool whose name reads as
- * PR creation (e.g. `mcp__aio__github_create_pull_request`, `createPullRequest`).
+ * PR creation (e.g. `mcp__github__create_pull_request`, `createPullRequest`).
  */
 export function isPrCreationTool(toolName: string | undefined, command: string | undefined): boolean {
 	if (!toolName) return false;

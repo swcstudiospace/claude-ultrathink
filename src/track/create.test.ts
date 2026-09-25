@@ -50,7 +50,7 @@ function fakeLinear(
 			if (name === "list_issues") return { issues: opts.listed?.() ?? [] };
 			if (opts.throwOn?.(args)) throw new Error("HTTP 500");
 			counter++;
-			const identifier = `SPE-${counter}`;
+			const identifier = `ENG-${counter}`;
 			return { issue: { id: `uuid-${counter}`, identifier, url: `https://linear.app/org/issue/${identifier}/slug` } };
 		},
 	};
@@ -143,8 +143,8 @@ describe("createTracking", () => {
 
 	test("adoption emits issue events for adopted Linear rows", async () => {
 		const listed = () => [
-			{ identifier: "SPE-90", url: "https://linear.app/org/issue/SPE-90/x", title: "t", description: "d\n\nultrathink graph g-1 · node n1" },
-			{ identifier: "SPE-91", url: "https://linear.app/org/issue/SPE-91/x", title: "t", description: "d\n\nultrathink graph g-1 · node n1 · step 2" },
+			{ identifier: "ENG-90", url: "https://linear.app/org/issue/ENG-90/x", title: "t", description: "d\n\nultrathink graph g-1 · node n1" },
+			{ identifier: "ENG-91", url: "https://linear.app/org/issue/ENG-91/x", title: "t", description: "d\n\nultrathink graph g-1 · node n1 · step 2" },
 		];
 		const existing: TrackingRefs = {
 			graphId: "g-1",
@@ -159,8 +159,8 @@ describe("createTracking", () => {
 		await createTracking(makePlan(), GRAPH, existing, deps({ linear: fakeLinear({ listed }), notion: fakeNotion(), progress: (e) => events.push(e) }));
 		const issues = events.filter((e) => e.type === "issue" && e.provider === "linear");
 		expect(issues.slice(0, 2)).toEqual([
-			{ type: "issue", at: expect.any(Number), provider: "linear", nodeId: "n1", identifier: "SPE-90", url: "https://linear.app/org/issue/SPE-90/x" },
-			{ type: "issue", at: expect.any(Number), provider: "linear", nodeId: "n1", step: 2, identifier: "SPE-91", url: "https://linear.app/org/issue/SPE-91/x" },
+			{ type: "issue", at: expect.any(Number), provider: "linear", nodeId: "n1", identifier: "ENG-90", url: "https://linear.app/org/issue/ENG-90/x" },
+			{ type: "issue", at: expect.any(Number), provider: "linear", nodeId: "n1", step: 2, identifier: "ENG-91", url: "https://linear.app/org/issue/ENG-91/x" },
 		]);
 		expect(issues).toHaveLength(9);
 	});
@@ -254,7 +254,7 @@ describe("createTracking", () => {
 		const linear: ToolCaller = {
 			async call(_name, _args, signal) {
 				count++;
-				if (count === 1) return { identifier: "SPE-1", url: "https://linear.app/org/issue/SPE-1/x", id: "u1" };
+				if (count === 1) return { identifier: "ENG-1", url: "https://linear.app/org/issue/ENG-1/x", id: "u1" };
 				const { promise, reject } = Promise.withResolvers<unknown>();
 				signal?.addEventListener("abort", () => reject(new Error("aborted")));
 				return promise;
@@ -264,7 +264,7 @@ describe("createTracking", () => {
 		const refs = await createTracking(makePlan(), GRAPH, undefined, deps({ linear, notion: fakeNotion(), budgetMs: 20 }));
 		expect(performance.now() - started).toBeLessThan(1000);
 		expect(refs.status).toBe("partial");
-		expect(refs.linear.nodes.n1?.identifier).toBe("SPE-1");
+		expect(refs.linear.nodes.n1?.identifier).toBe("ENG-1");
 		expect(refs.errors.some((error) => error.includes("budget exhausted"))).toBe(true);
 	});
 
@@ -295,7 +295,7 @@ describe("createTracking", () => {
 		const lost = partial.linear.steps["n2.1"];
 		delete partial.linear.steps["n2.1"];
 		const listed = () => [
-			{ id: "other", identifier: "SPE-99", url: "https://linear.app/org/issue/SPE-99/x", title: "x", description: "ultrathink graph g-10 · node n2 · step 1" },
+			{ id: "other", identifier: "ENG-99", url: "https://linear.app/org/issue/ENG-99/x", title: "x", description: "ultrathink graph g-10 · node n2 · step 1" },
 			{ id: lost?.id, identifier: lost?.identifier, url: lost?.url, title: "Build — Step 1: s", description: "sd\n\nultrathink graph g-1 · node n2 · step 1" },
 		];
 		const linear = fakeLinear({ listed });

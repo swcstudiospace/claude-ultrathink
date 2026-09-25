@@ -67,22 +67,22 @@ describe("renderGraph", () => {
 		expect(plain(rows)).not.toContain("╭");
 	});
 	const stepModel: GraphModel = {
-		nodes: [node("n1", [], { steps: steps("SPE", 4) }), node("n2", ["n1"], { status: "running", steps: steps("RUN", 2) })],
+		nodes: [node("n1", [], { steps: steps("ENG", 4) }), node("n2", ["n1"], { status: "running", steps: steps("RUN", 2) })],
 	};
 	test("step modes", () => {
 		const all = plain(renderGraph(stepModel, theme, 120, { now: 0, steps: "all", animate: false }));
-		for (const id of ["SPE-1", "SPE-4", "RUN-2"]) expect(all).toContain(id);
+		for (const id of ["ENG-1", "ENG-4", "RUN-2"]) expect(all).toContain(id);
 		const none = plain(renderGraph(stepModel, theme, 120, { now: 0, steps: "none", animate: false }));
 		expect(none).toContain("▸ 4 sub-issues · 4 linked");
-		expect(none).not.toContain("SPE-1");
+		expect(none).not.toContain("ENG-1");
 		const active = plain(renderGraph(stepModel, theme, 120, { now: 0, steps: "active", animate: false }));
 		expect(active).toContain("RUN-1");
-		expect(active).not.toContain("SPE-1");
+		expect(active).not.toContain("ENG-1");
 		expect(active).toContain("▸ 4 sub-issues");
 	});
 	test("fold row counts linked sub-issues only when some are linked", () => {
 		const fold = (issues: number) => {
-			const model: GraphModel = { nodes: [node("n1", [], { steps: steps("SPE", 3).map((s, i) => (i < issues ? s : { ...s, issue: undefined })) })] };
+			const model: GraphModel = { nodes: [node("n1", [], { steps: steps("ENG", 3).map((s, i) => (i < issues ? s : { ...s, issue: undefined })) })] };
 			return plain(renderGraph(model, theme, 120, { now: 0, steps: "none", animate: false }));
 		};
 		expect(fold(0)).toContain("▸ 3 sub-issues");

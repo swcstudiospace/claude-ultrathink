@@ -34,7 +34,7 @@
 				]
 			},
 			{
-				"matcher": "mcp__aio__github_create_pull_request|github_create_pull_request|mcp__github__create_pull_request|github__create_pull_request",
+				"matcher": ".*(create_?pull_?request|pull_?request_?create|createPullRequest).*",
 				"hooks": [
 					{
 						"type": "command",

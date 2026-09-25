@@ -54,7 +54,7 @@ describe("conversationFromJsonl", () => {
 
 describe("recentConversationFromTranscript", () => {
 	test("reads a file and is fail-open on missing path", () => {
-		const dir = mkdtempSync(join(tmpdir(), "aio-transcript-"));
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-transcript-"));
 		dirs.push(dir);
 		const path = join(dir, "t.jsonl");
 		writeFileSync(path, `${line("user", "hello")}\n`);

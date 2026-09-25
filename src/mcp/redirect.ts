@@ -92,7 +92,12 @@ function overridePlan(raw: string, port: number, remote: boolean): RedirectPlan 
 	};
 }
 
-function loopbackPlan(env: Record<string, string | undefined>, port: number, remote: boolean): RedirectPlan {
+function loopbackPlan(
+	env: Record<string, string | undefined>,
+	port: number,
+	remote: boolean,
+	suggestTailscale: boolean,
+): RedirectPlan {
 	const redirectUri = `http://127.0.0.1:${port}/callback`;
 	const plan: RedirectPlan = { mode: "loopback", redirectUri, port, callbackPaths: ["/callback"], remote, hint: [] };
 	if (!remote) {
@@ -111,21 +116,32 @@ function loopbackPlan(env: Record<string, string | undefined>, port: number, rem
 		plan.hint.push(`  OpenSSH: ssh -L ${port}:127.0.0.1:${port} ${user}@${serverIp}`);
 	}
 	plan.hint.push("Without forwarding, pasting the redirected URL (the page may fail to load) still works.");
+	if (suggestTailscale) {
+		plan.hint.push(
+			"On a tailnet host you can pass --tailscale (or set ULTRATHINK_OAUTH_TAILSCALE=1) to receive the callback over `tailscale serve`.",
+		);
+	}
 	return plan;
 }
 
+/**
+ * Picks the OAuth callback route: an explicit override, then the Tailscale route (only when `tailscale` is
+ * requested, the session is remote and Tailscale serves HTTPS), then the loopback listener.
+ */
 export function planRedirect(input: {
 	env: Record<string, string | undefined>;
 	port: number;
 	redirect?: string;
+	/** Opt-in (`--tailscale` / `ULTRATHINK_OAUTH_TAILSCALE=1`); without it `tailscale` is never run. */
+	tailscale: boolean;
 	tailscaleDns: () => string | undefined;
 }): RedirectPlan {
 	const { env, port } = input;
 	const remote = isRemoteSession(env);
 	const override = input.redirect || env.ULTRATHINK_OAUTH_REDIRECT;
 	if (override) return overridePlan(override, port, remote);
-	const dns = remote ? input.tailscaleDns() : undefined;
-	if (!dns) return loopbackPlan(env, port, remote);
+	const dns = remote && input.tailscale ? input.tailscaleDns() : undefined;
+	if (!dns) return loopbackPlan(env, port, remote, !input.tailscale);
 	const redirectUri = `https://${dns}${TAILSCALE_PATH}/callback`;
 	return {
 		mode: "tailscale",

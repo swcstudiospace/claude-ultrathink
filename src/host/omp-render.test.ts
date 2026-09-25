@@ -78,8 +78,8 @@ const view: PlanView = {
 		wave: i,
 		dependsOn: i === 0 ? [] : [`n${i}`],
 		conclusion: "done\n\n".repeat(60),
-		issue: { identifier: `SPE-${i + 10}`, url: `https://linear.app/x/SPE-${i + 10}` },
-		steps: [{ step: 1, title: "Step one", identifier: `SPE-${i + 100}`, url: `https://linear.app/x/SPE-${i + 100}` }],
+		issue: { identifier: `ENG-${i + 10}`, url: `https://linear.app/x/ENG-${i + 10}` },
+		steps: [{ step: 1, title: "Step one", identifier: `ENG-${i + 100}`, url: `https://linear.app/x/ENG-${i + 100}` }],
 	})),
 	waves: [["n1"], ["n2", "n3"], ["n4", "n5", "n6", "n7", "n8", "n9", "n10"]],
 	clarifications: [
@@ -128,13 +128,13 @@ describe("plan card", () => {
 		expect(text).toContain("Wire the status bar");
 		expect(text).toMatch(/[╭┌]/);
 		expect(text).toContain("ctrl+o drops down sub-issues");
-		for (let i = 0; i < 3; i++) expect(text).not.toContain(`SPE-${i + 100}`);
+		for (let i = 0; i < 3; i++) expect(text).not.toContain(`ENG-${i + 100}`);
 		expect(text).not.toContain("waves");
 		const expanded = planCard(view, true, 160).plain.join("\n");
 		expect(expanded).not.toContain("ctrl+o");
 		for (let i = 0; i < 10; i++) {
-			expect(expanded).toContain(`SPE-${i + 10} https://linear.app/x/SPE-${i + 10}`);
-			expect(expanded).toContain(`SPE-${i + 100} https://linear.app/x/SPE-${i + 100}`);
+			expect(expanded).toContain(`ENG-${i + 10} https://linear.app/x/ENG-${i + 10}`);
+			expect(expanded).toContain(`ENG-${i + 100} https://linear.app/x/ENG-${i + 100}`);
 		}
 		expect(expanded).toContain("[blocking] Which DB? · recommended: Postgres");
 		expect(expanded).toContain("Keep the v1 API? → yes");

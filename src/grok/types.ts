@@ -34,9 +34,9 @@ export interface GrokConfig {
 	callTimeoutMs: number;
 	/** Never silently downgrade to Claude by default. */
 	fallbackToClaude: boolean;
-	/** Base URL of the shunt gateway; `/v1/messages` is appended. */
+	/** Base URL of your shunt gateway; `/v1/messages` is appended. "" = not configured (required for `transport: "shunt"`). */
 	shuntBaseUrl: string;
-	/** Wire model sent to shunt. The gateway route pins the effort, so the alias carries it. */
+	/** Wire model sent to shunt; the gateway route pins the effort, so the alias carries it. "" = not configured. */
 	shuntModel: string;
 	/** Anthropic Messages `max_tokens` for shunt calls. */
 	shuntMaxTokens: number;
@@ -52,8 +52,8 @@ export const DEFAULT_GROK_CONFIG: GrokConfig = {
 	home: "",
 	callTimeoutMs: 0,
 	fallbackToClaude: false,
-	shuntBaseUrl: "http://127.0.0.1:3001",
-	shuntModel: "grok-4.7-xhigh",
+	shuntBaseUrl: "",
+	shuntModel: "",
 	shuntMaxTokens: 8192,
 };
 

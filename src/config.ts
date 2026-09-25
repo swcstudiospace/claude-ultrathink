@@ -78,6 +78,15 @@ export const DEFAULT_TRACK_CONFIG: TrackConfig = {
 	concurrency: 6,
 };
 
+export interface SubstrateConfig {
+	/** Agent Substrate service base URL (`POST <url>/brief`); "" = never contacted. `SUBSTRATE_URL` overrides it. */
+	url: string;
+}
+
+export const DEFAULT_SUBSTRATE_CONFIG: SubstrateConfig = {
+	url: "",
+};
+
 export interface UltrathinkConfig {
 	uplift: { enabled: boolean; skipTrivial: boolean; maxChars: number; echo: boolean };
 	claude: ClaudeConfig;
@@ -88,6 +97,7 @@ export interface UltrathinkConfig {
 	linear: LinearConfig;
 	track: TrackConfig;
 	ship: ShipConfig;
+	substrate: SubstrateConfig;
 }
 
 export function defaultConfig(): UltrathinkConfig {
@@ -111,6 +121,7 @@ export function defaultConfig(): UltrathinkConfig {
 		linear: { ...DEFAULT_LINEAR_CONFIG },
 		track: { ...DEFAULT_TRACK_CONFIG },
 		ship: { ...DEFAULT_SHIP_CONFIG, skills: [...DEFAULT_SHIP_CONFIG.skills] },
+		substrate: { ...DEFAULT_SUBSTRATE_CONFIG },
 	};
 }
 
@@ -286,10 +297,17 @@ function mergeShip(ship: Record<string, unknown> | undefined, defaults: ShipConf
 			? (ship.mergeMethod as ShipConfig["mergeMethod"])
 			: defaults.mergeMethod,
 		deleteBranch: typeof ship.deleteBranch === "boolean" ? ship.deleteBranch : defaults.deleteBranch,
+		greptileOrganization:
+			typeof ship.greptileOrganization === "string" ? ship.greptileOrganization.trim() : defaults.greptileOrganization,
 		reviewTimeoutMs: positiveInt(ship.reviewTimeoutMs, defaults.reviewTimeoutMs),
 		pollMs: positiveInt(ship.pollMs, defaults.pollMs),
 		waitMs: positiveInt(ship.waitMs, defaults.waitMs),
 	};
+}
+
+function mergeSubstrate(substrate: Record<string, unknown> | undefined, defaults: SubstrateConfig): SubstrateConfig {
+	if (!substrate) return defaults;
+	return { url: httpUrl(substrate.url, defaults.url) };
 }
 
 export function mergeConfig(file: Record<string, unknown> | undefined, base: UltrathinkConfig): UltrathinkConfig {
@@ -304,6 +322,7 @@ export function mergeConfig(file: Record<string, unknown> | undefined, base: Ult
 		linear: mergeLinear(asRecord(file.linear), base.linear),
 		track: mergeTrack(asRecord(file.track), base.track),
 		ship: mergeShip(asRecord(file.ship), base.ship),
+		substrate: mergeSubstrate(asRecord(file.substrate), base.substrate),
 	};
 }
 

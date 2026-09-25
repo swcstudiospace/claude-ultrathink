@@ -23,6 +23,14 @@ describe("defaultConfig", () => {
 		expect(config.notion.dataSourceUrl).toBe("");
 		expect(config.linear.team).toBe("");
 	});
+
+	test("contacts no optional service and ships nothing until configured", () => {
+		const config = defaultConfig();
+		expect(config.substrate.url).toBe("");
+		expect(config.grok.shuntBaseUrl).toBe("");
+		expect(config.grok.shuntModel).toBe("");
+		expect(config.ship).toMatchObject({ enabled: false, autoMerge: false, deleteBranch: false, greptileOrganization: "" });
+	});
 });
 
 describe("mergeConfig", () => {
@@ -73,13 +81,13 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ grok: { reasoningEffort: "extreme" } }, base).grok.reasoningEffort).toBe(base.grok.reasoningEffort);
 	});
 
-	test("grok defaults are grok-4.7 @ xhigh over the http transport, with shunt defaults populated", () => {
+	test("grok defaults are grok-4.7 @ xhigh over the http transport, with no shunt gateway configured", () => {
 		const grok = defaultConfig().grok;
 		expect(grok.model).toBe("grok-4.7");
 		expect(grok.reasoningEffort).toBe("xhigh");
 		expect(grok.transport).toBe("http");
-		expect(grok.shuntBaseUrl).toBe("http://127.0.0.1:3001");
-		expect(grok.shuntModel).toBe("grok-4.7-xhigh");
+		expect(grok.shuntBaseUrl).toBe("");
+		expect(grok.shuntModel).toBe("");
 		expect(grok.shuntMaxTokens).toBe(8192);
 	});
 
@@ -200,8 +208,13 @@ describe("loadConfig", () => {
 
 describe("ship config", () => {
 	const base = defaultConfig();
-	test("defaults gate gsd- skills with strict review", () => {
-		expect(base.ship).toMatchObject({ enabled: true, skills: ["gsd-"], minScore: 5, mergeMethod: "squash", maxRounds: 5, waitMs: 100_000 });
+	test("defaults gate gsd- skills with strict review, but ship stays off until enabled", () => {
+		expect(base.ship).toMatchObject({ enabled: false, autoMerge: false, deleteBranch: false, skills: ["gsd-"], minScore: 5, mergeMethod: "squash", maxRounds: 5, waitMs: 100_000 });
+	});
+	test("opting in restores auto-merge and branch deletion; greptileOrganization is trimmed", () => {
+		const ship = mergeConfig({ ship: { enabled: true, autoMerge: true, deleteBranch: true, greptileOrganization: " acme " } }, base).ship;
+		expect(ship).toMatchObject({ enabled: true, autoMerge: true, deleteBranch: true, greptileOrganization: "acme" });
+		expect(mergeConfig({ ship: { greptileOrganization: 7 } }, base).ship.greptileOrganization).toBe("");
 	});
 	test("valid overrides apply", () => {
 		const ship = mergeConfig(
@@ -216,5 +229,17 @@ describe("ship config", () => {
 			base,
 		).ship;
 		expect(ship).toEqual(base.ship);
+	});
+});
+
+describe("substrate config", () => {
+	const base = defaultConfig();
+	test("accepts an http(s) URL with trailing slashes stripped", () => {
+		expect(mergeConfig({ substrate: { url: "http://127.0.0.1:7410/" } }, base).substrate.url).toBe("http://127.0.0.1:7410");
+	});
+	test("rejects non-http values and cannot be cleared by an empty string", () => {
+		expect(mergeConfig({ substrate: { url: "ftp://x" } }, base).substrate.url).toBe("");
+		const set = mergeConfig({ substrate: { url: "https://substrate.example" } }, base);
+		expect(mergeConfig({ substrate: { url: "" } }, set).substrate.url).toBe("https://substrate.example");
 	});
 });

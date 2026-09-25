@@ -5,6 +5,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
+import { prepareRedirect } from "./cli.ts";
+import type { Run } from "./redirect.ts";
 
 const CLI = join(import.meta.dir, "cli.ts");
 
@@ -174,5 +176,87 @@ describe("session mark", () => {
 			expect(stderr).toBe(`ultrathink-mcp: cannot read session record: ${path}\n`);
 			expect(readFileSync(path, "utf8")).toBe(garbage);
 		}
+	});
+});
+
+describe("auth login redirect", () => {
+	const DNS = "vps.example.ts.net";
+	const sshEnv = { SSH_CONNECTION: "198.51.100.4 51234 203.0.113.7 22", USER: "alice" };
+	const SERVE = ["tailscale", "serve", "--bg", "--https=443", "--set-path=/ultrathink-oauth", "http://127.0.0.1:8765"];
+
+	/** A host where Tailscale is running with HTTPS certificates; `serveExit` is what `tailscale serve` returns. */
+	function tailnetHost(serveExit = 0): { run: Run; calls: string[][] } {
+		const calls: string[][] = [];
+		const status = JSON.stringify({ BackendState: "Running", Self: { DNSName: `${DNS}.` }, CertDomains: [DNS] });
+		return {
+			calls,
+			run: (argv) => {
+				calls.push(argv);
+				return argv[1] === "status" ? { exitCode: 0, stdout: status } : { exitCode: serveExit, stdout: "" };
+			},
+		};
+	}
+
+	test("over SSH on a tailnet host without the opt-in, no tailscale command runs and the loopback route is used", () => {
+		const { run, calls } = tailnetHost();
+		const { plan, mount } = prepareRedirect({ args: [], env: sshEnv, port: 8765, run });
+		expect(calls).toEqual([]);
+		expect(mount).toBeUndefined();
+		expect(plan).toMatchObject({ mode: "loopback", redirectUri: "http://127.0.0.1:8765/callback", remote: true });
+		const hint = plan.hint.join("\n");
+		expect(hint).toContain("ssh -L 8765:127.0.0.1:8765 alice@203.0.113.7");
+		expect(hint).toContain("pasting the redirected URL");
+		expect(hint).toContain("--tailscale");
+	});
+
+	test("--tailscale or ULTRATHINK_OAUTH_TAILSCALE=1 mounts the tailscale serve route", () => {
+		const cases: [string[], Record<string, string>][] = [
+			[["--tailscale"], sshEnv],
+			[[], { ...sshEnv, ULTRATHINK_OAUTH_TAILSCALE: "1" }],
+		];
+		for (const [args, env] of cases) {
+			const { run, calls } = tailnetHost();
+			const { plan, mount } = prepareRedirect({ args, env, port: 8765, run });
+			expect(calls).toEqual([["tailscale", "status", "--json"], SERVE]);
+			expect(mount).toEqual({ https: 443, path: "/ultrathink-oauth", target: "http://127.0.0.1:8765" });
+			expect(plan).toMatchObject({ mode: "tailscale", redirectUri: `https://${DNS}/ultrathink-oauth/callback` });
+		}
+	});
+
+	test("ULTRATHINK_OAUTH_TAILSCALE other than 1 is not an opt-in", () => {
+		const { run, calls } = tailnetHost();
+		const { plan } = prepareRedirect({ args: [], env: { ...sshEnv, ULTRATHINK_OAUTH_TAILSCALE: "0" }, port: 8765, run });
+		expect(calls).toEqual([]);
+		expect(plan.mode).toBe("loopback");
+	});
+
+	test("an explicit redirect wins over --tailscale and runs no tailscale command", () => {
+		const { run, calls } = tailnetHost();
+		const { plan, mount } = prepareRedirect({
+			args: ["--tailscale", "--redirect", "https://auth.example.com/cb"],
+			env: sshEnv,
+			port: 8765,
+			run,
+		});
+		expect(calls).toEqual([]);
+		expect(mount).toBeUndefined();
+		expect(plan).toMatchObject({ mode: "override", redirectUri: "https://auth.example.com/cb" });
+	});
+
+	test("a failed tailscale serve falls back to the loopback route and reports why", () => {
+		const { run, calls } = tailnetHost(1);
+		const { plan, mount } = prepareRedirect({ args: ["--tailscale"], env: sshEnv, port: 8765, run });
+		expect(calls).toEqual([["tailscale", "status", "--json"], SERVE]);
+		expect(mount).toBeUndefined();
+		expect(plan).toMatchObject({ mode: "loopback", redirectUri: "http://127.0.0.1:8765/callback" });
+		expect(plan.mount).toBeUndefined();
+		expect(plan.hint[0]).toContain("could not be set up");
+		expect(plan.hint.join("\n")).toContain("ssh -L 8765:127.0.0.1:8765 alice@203.0.113.7");
+	});
+
+	test("the usage text lists --tailscale for auth login", () => {
+		const { code, stderr } = run("auth", "login");
+		expect(code).toBe(2);
+		expect(stderr).toContain("auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]");
 	});
 });

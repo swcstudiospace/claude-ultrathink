@@ -49,7 +49,7 @@ function record(): SessionRecord {
 		tracking: {
 			graphId: "g1",
 			status: "partial",
-			linear: { nodes: { n1: ref("SPE-1"), n2: ref("SPE-2") }, steps: { "n1.1": ref("SPE-9") } },
+			linear: { nodes: { n1: ref("ENG-1"), n2: ref("ENG-2") }, steps: { "n1.1": ref("ENG-9") } },
 			notion: { taskUrl: "https://notion.so/t", nodes: { n1: "https://notion.so/n1" }, steps: {} },
 			errors: ["notion: login required"],
 			updatedAt: 1,
@@ -68,13 +68,13 @@ describe("buildPlanView", () => {
 			["n4", 2],
 		]);
 		const [n1, n2, n3] = view.nodes;
-		expect(n1?.issue).toEqual({ identifier: "SPE-1", url: "https://linear.app/x/SPE-1" });
+		expect(n1?.issue).toEqual({ identifier: "ENG-1", url: "https://linear.app/x/ENG-1" });
 		expect(n1?.notionUrl).toBe("https://notion.so/n1");
 		expect(n1?.steps).toEqual([
-			{ step: 1, title: "Read the code", identifier: "SPE-9", url: "https://linear.app/x/SPE-9" },
+			{ step: 1, title: "Read the code", identifier: "ENG-9", url: "https://linear.app/x/ENG-9" },
 			{ step: 2, title: "Write the test" },
 		]);
-		expect(n2?.issue?.identifier).toBe("SPE-2");
+		expect(n2?.issue?.identifier).toBe("ENG-2");
 		expect(n3?.issue).toBeUndefined();
 		expect(view.clarifications).toEqual([{ id: "q1", question: "Which db?", blocking: true, recommended: "SQLite" }]);
 		expect(view.tracking).toEqual({

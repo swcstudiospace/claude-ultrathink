@@ -146,7 +146,7 @@ def tracked_session(home: str, session_id: str, **fields: object) -> Path:
 	rows = {
 		"graphId": f"graph-{session_id}",
 		"status": "complete",
-		"linear": {"nodes": {"n1": {"id": "i1", "identifier": "SPE-1", "url": "https://linear.app/o/issue/SPE-1", "title": "[n1] A"}}, "steps": {}},
+		"linear": {"nodes": {"n1": {"id": "i1", "identifier": "ENG-1", "url": "https://linear.app/o/issue/ENG-1", "title": "[n1] A"}}, "steps": {}},
 		"notion": {"taskUrl": "https://www.notion.so/task", "nodes": {}, "steps": {}},
 		"errors": [],
 	}
@@ -388,7 +388,7 @@ def test_pr_creation_tool_mirrors_pr_detect():
 	assert is_pr_creation_tool("terminal", "echo gh pr create")
 	for command in ("gh pr list", "gh pr view 5", "gh issue create", "xgh pr create", "gh pr created", ""):
 		assert not is_pr_creation_tool("terminal", command), command
-	assert is_pr_creation_tool("mcp__aio__github_create_pull_request", "")
+	assert is_pr_creation_tool("mcp__acme__github_create_pull_request", "")
 	assert is_pr_creation_tool("createPullRequest", "")
 	assert not is_pr_creation_tool("mcp__github__list_pull_requests", "")
 	# Any other tool is judged by its name, never by a command it happens to carry.

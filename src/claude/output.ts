@@ -188,7 +188,7 @@ function formatLinkedIssues(plan: TrackPlan, tracking: TrackingRefs, providers: 
 		"",
 		"- Copy each line into your TODO list, keeping the identifier and URL.",
 		"- Give every subagent the issue URL(s) for the node(s) it works on.",
-		"- Reference identifiers in commit messages (`Refs SPE-12`) and put `Fixes <identifier>` lines for completed node issues in PR bodies.",
+		"- Reference identifiers in commit messages (`Refs <identifier>`, for example `Refs ENG-12`) and put `Fixes <identifier>` lines for completed node issues in PR bodies.",
 		"- Move an issue's Linear state when its TODO completes; ultrathink-sync handles PR links.",
 	].join("\n");
 }
@@ -245,13 +245,15 @@ export function formatPromptContext(input: PromptContextInput): string {
 		tail.push(["## Ultrathink tracking", "", body].join("\n"));
 	}
 	if (input.ship && input.statePath) {
+		const flow =
+			"It decides whether the task is really done, opens a PR into the repository's default branch and runs the Greptile review until 5/5 with no open comments. It merges only when ship.autoMerge is on (otherwise the PR is left for a manual merge) and deletes the branch only when ship.deleteBranch is on. Do not merge any other way.";
 		tail.push(
 			[
 				"## Ship",
 				"",
 				hints
-					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${SHIP_CLI}). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`
-					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`,
+					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${SHIP_CLI}). ${flow}`
+					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). ${flow}`,
 			].join("\n"),
 		);
 	}

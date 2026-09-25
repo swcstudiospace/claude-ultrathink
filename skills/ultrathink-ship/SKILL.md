@@ -1,11 +1,13 @@
 ---
 name: ultrathink-ship
-description: Invoked with a stateFile after a GSD skill run finishes (or when the Ultrathink Stop hook or plan says so) to decide whether the task is really done and, if so, open a PR into the repository's default branch, run the Greptile review until 5/5 with no open comments, then merge and delete the branch. Do not invoke it for anything else.
+description: Invoked with a stateFile after a GSD skill run finishes (or when the Ultrathink Stop hook or plan says so) to decide whether the task is really done and, if so, open a PR into the repository's default branch, run the Greptile review until 5/5 with no open comments, then merge (only when `ship.autoMerge` is on) and delete the branch (only when `ship.deleteBranch` is on). Do not invoke it for anything else.
 ---
 
 # ultrathink-ship
 
 You have a `stateFile` (the session's `<state dir>/sessions/<id>.json`) from the nudge or the plan's `## Ship` section. Every step uses the plugin's CLI, `bin/ultrathink-ship <subcommand> --state <stateFile> [--cwd <repo dir>]`, which prints one JSON object. `bin/ultrathink-ship` below means the absolute path given as `CLI:` in the nudge or the Ship section (in Claude Code also `${CLAUDE_PLUGIN_ROOT}/bin/ultrathink-ship`); run it from the project's working tree, or pass `--cwd`. Run the steps in order and never skip the gates.
+
+Ship is opt-in: Ultrathink only asks for this skill when `ship.enabled` is true in the ultrathink config (`~/.config/ultrathink/config.json`). Merging additionally needs `ship.autoMerge`, and deleting the branch after the merge needs `ship.deleteBranch`; both are off by default.
 
 Every step is idempotent: it reuses an open PR, reuses a review of the same head commit and detects an already-merged PR. To resume after a partial failure, run `bin/ultrathink-ship status --state <stateFile>` and continue from the step its `phase` points to.
 
@@ -37,6 +39,7 @@ Always `git push` before `review`: it refuses when the local HEAD differs from t
 - `ready`: go to step 4.
 - `pr-open` (the review passed: 5/5, no open findings, but the PR is still waiting): follow `next`. For pending CI or mergeability not computed yet, wait about a minute and run `merge` (it re-checks everything); for failing CI or merge conflicts, fix them, commit, `git push`, then run `review` again. A waiting round never counts toward `maxRounds`.
 - Stop the loop and report when the phase is `blocked` (config `maxRounds` failed reviews reached, default 5, the review failed twice on one head, the PR was closed, or it was merged outside the flow before its review passed) or when two consecutive rounds return identical findings. On `blocked` the CLI has already posted a PR comment (for an open PR) and left it for a human; do not retry or merge.
+- `status: "blocked"` with no round recorded means Greptile is not usable as configured (not set up, or the account needs `ship.greptileOrganization`): report the `reason` to the user verbatim and stop; run `review` again only after they fixed it.
 - Never lower the bar: the only passing result is exactly 5/5 with zero open comments.
 - `needs-fixes`: fix the findings in greploop order — `securityIssue` first, then P0, P1, P2. Make the smallest correct fix; never suppress lint rules, weaken or delete tests, or skip checks to satisfy the reviewer. Stage only the files you edited, commit `address greptile review feedback`, `git push`, then run `review` again.
   - In PR mode the open findings are the PR's Greptile review threads that are neither resolved nor outdated. Changing a finding's line makes its thread outdated, so a real fix closes it.
@@ -54,7 +57,9 @@ Always `git push` before `review`: it refuses when the local HEAD differs from t
 
 `bin/ultrathink-ship merge --state <stateFile>`
 
-It refuses unless the latest review is 5/5 with zero open comments, the reviewed commit is still the PR head, the PR is mergeable and CI is not failing; on success it squash-merges and deletes the branch locally and remotely. Never merge any other way (no `gh pr merge`, no web UI).
+Only when `ship.autoMerge` is on. Otherwise `merge` refuses with `autoMerge disabled` (and `run` reports `autoMerge disabled: merge manually`): do not merge at all, tell the user the PR is ready for them to merge, and continue with steps 5 and 6.
+
+It refuses unless the latest review is 5/5 with zero open comments, the reviewed commit is still the PR head, the PR is mergeable and CI is not failing; on success it merges with config `mergeMethod` (squash by default) and, only when `ship.deleteBranch` is on, deletes the branch locally and remotely. Never merge any other way (no `gh pr merge`, no web UI).
 
 ## 5. Record it
 
@@ -62,4 +67,4 @@ Invoke the ultrathink-sync skill with the stateFile, `graphId=` (the `plan.graph
 
 ## 6. Report
 
-One short summary: PR URL, review rounds, final Greptile score, and merged — or exactly why not.
+One short summary: PR URL, review rounds, final Greptile score, and merged — or ready to merge manually (`ship.autoMerge` off) — or exactly why not.

@@ -15,6 +15,9 @@ export interface GreptileRepo {
 	remoteUrl?: string;
 }
 
+/** A repository as Greptile lists it; `reviewsEnabled` is absent when Greptile does not say. */
+export type ListedGreptileRepo = GreptileRepo & { reviewsEnabled?: boolean };
+
 type Obj = Record<string, unknown>;
 
 const asObj = (value: unknown): Obj | undefined =>
@@ -41,15 +44,49 @@ function repoArgs(repo: GreptileRepo): Obj {
 	return args;
 }
 
+/** `{ organization }` for every Greptile MCP call when ship.greptileOrganization is set; empty lets Greptile pick. */
+const orgArgs = (organization: string | undefined): Obj => (organization ? { organization } : {});
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Organization ids/handles a tenant_required error offers, from a JSON payload or a `candidates: a, b` list. */
+function tenantCandidates(message: string): string[] {
+	const start = message.indexOf("{");
+	const payload = start >= 0 ? parseJson(message.slice(start)) : undefined;
+	const listed = payload ? asArr(payload.candidates ?? asObj(payload.error)?.candidates) : [];
+	const names = listed
+		.map((entry) => asStr(entry) ?? asStr(asObj(entry)?.handle) ?? asStr(asObj(entry)?.id))
+		.filter((name): name is string => Boolean(name));
+	if (names.length > 0) return names;
+	// A truncated JSON payload lands here too: keep only bare ids/handles, never fragments of objects.
+	const inline = /candidates["']?\s*[:=]\s*\[?([^\]\n]+)/i.exec(message)?.[1] ?? "";
+	return inline
+		.split(",")
+		.map((name) => name.trim().replace(/^["']|["']$/g, ""))
+		.filter((name) => /^[\w.@-]+$/.test(name));
+}
+
+/** Actionable reason when Greptile refuses a call because the account spans several organizations and none was chosen. */
+export function tenantReason(message: string): string | undefined {
+	if (!/tenant_required/i.test(message)) return undefined;
+	const candidates = tenantCandidates(message);
+	const choose = candidates.length > 0 ? ` (one of: ${candidates.join(", ")})` : "";
+	return `Greptile account has several organizations; set ship.greptileOrganization in ~/.config/ultrathink/config.json${choose}`;
+}
+
+/** Lookup errors mean "not listed", except tenant_required, which throws the ship.greptileOrganization reason. */
 export async function findGreptileRepo(
 	client: ToolCaller,
 	repo: string,
-): Promise<(GreptileRepo & { reviewsEnabled?: boolean }) | undefined> {
+	organization?: string,
+): Promise<ListedGreptileRepo | undefined> {
 	const wanted = repo.toLowerCase();
 	const limit = 100;
 	try {
 		for (let page = 0; page < 50; page++) {
-			const result = asObj(await client.call("list_repositories", { limit, page, nameContains: repo.split("/").pop() }));
+			const result = asObj(
+				await client.call("list_repositories", { limit, page, nameContains: repo.split("/").pop(), ...orgArgs(organization) }),
+			);
 			const repos = asArr(result?.repositories);
 			for (const entry of repos) {
 				const item = asObj(entry);
@@ -58,7 +95,7 @@ export async function findGreptileRepo(
 				const defaultBranch = asStr(item?.defaultBranch);
 				if (!item || !name || name.toLowerCase() !== wanted || !defaultBranch) continue;
 				if (remote !== "github" && remote !== "gitlab") return undefined;
-				const found: GreptileRepo & { reviewsEnabled?: boolean } = { name, remote, defaultBranch };
+				const found: ListedGreptileRepo = { name, remote, defaultBranch };
 				const remoteUrl = asStr(item.remoteUrl);
 				if (remoteUrl) found.remoteUrl = remoteUrl;
 				if (typeof item.reviewsEnabled === "boolean") found.reviewsEnabled = item.reviewsEnabled;
@@ -67,7 +104,9 @@ export async function findGreptileRepo(
 			const total = asNum(result?.total) ?? 0;
 			if (repos.length === 0 || (page + 1) * limit >= total) return undefined;
 		}
-	} catch {
+	} catch (error) {
+		const reason = tenantReason(errorText(error));
+		if (reason) throw new Error(reason);
 		return undefined;
 	}
 	return undefined;
@@ -112,6 +151,8 @@ export async function reviewPr(input: {
 	headSha: string;
 	timeoutMs: number;
 	pollMs: number;
+	/** ship.greptileOrganization; "" or undefined omits `organization`. */
+	organization?: string;
 	/** The PR's review threads on GitHub; without them, or on failure, every unaddressed Greptile comment stays open. */
 	reviewThreads?: () => ReviewThreads;
 	now?: () => number;
@@ -130,7 +171,8 @@ export async function reviewPr(input: {
 	// The newest review id seen for headSha; a thrown error below still reports it so the next call resumes that run.
 	let pendingId: string | undefined;
 	try {
-		const tuple = repoArgs(input.repo);
+		const org = orgArgs(input.organization);
+		const tuple = { ...repoArgs(input.repo), ...org };
 		const deadline = now() + input.timeoutMs;
 		const stale = new Set<string>();
 		let triggered = false;
@@ -156,7 +198,9 @@ export async function reviewPr(input: {
 			} else if (failed && status) {
 				return done({ status: "failed", reviewId, error: `greptile review ${status.toLowerCase()}` });
 			} else if (status === "COMPLETED" && reviewId) {
-				const detail = asObj(asObj(await input.client.call("get_code_review", { codeReviewId: reviewId }))?.codeReview);
+				const detail = asObj(
+					asObj(await input.client.call("get_code_review", { codeReviewId: reviewId, ...org }))?.codeReview,
+				);
 				const score = parseScore(asStr(detail?.body) ?? "");
 				if (score === null) {
 					return done({ status: "failed", reviewId, error: "score not found in Greptile review body" });
@@ -189,10 +233,13 @@ export async function reviewPr(input: {
 		// The wait elapsed; the review keeps running server-side and the next call resumes it.
 		return done({ status: "pending", reviewId: pendingId });
 	} catch (error) {
+		const message = errorText(error);
+		// Without an organization Greptile refuses every call; retrying cannot help, the user must choose one.
+		const reason = tenantReason(message);
+		if (reason) return done({ status: "blocked", error: reason });
 		// A thrown tool or transport error says nothing about the review itself (Greptile's own FAILED/ERROR status is
 		// handled above), so it is pending: the next call retries, and ship.reviewTimeoutMs still bounds the wait.
-		const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);
-		return done({ status: "pending", error: message, ...(pendingId ? { reviewId: pendingId } : {}) });
+		return done({ status: "pending", error: message.slice(0, 300), ...(pendingId ? { reviewId: pendingId } : {}) });
 	}
 }
 
@@ -302,8 +349,18 @@ export async function reviewCli(input: {
 	return done({ status: "completed", score, comments: mapComments(parsed.comments), ...(runId ? { reviewId: runId } : {}) });
 }
 
+export const GREPTILE_SETUP =
+	"Greptile is not set up: run `bin/ultrathink-mcp auth set-key greptile --stdin` (or `auth login greptile`), or install and sign in to the greptile CLI (`greptile login`)";
+
+/** The greptile CLI is installed and signed in (`greptile whoami` exits 0 without "Not signed in"). */
+function cliSignedIn(run: Run, cwd: string): boolean {
+	const who = run(["greptile", "whoami"], { cwd, timeoutMs: CLI_QUERY_TIMEOUT_MS });
+	return who.exitCode === 0 && !/not signed in/i.test(`${who.stdout}\n${who.stderr}`);
+}
+
 export async function runReview(input: {
 	config: ShipConfig;
+	/** Greptile MCP client; undefined when no Greptile MCP credential is stored. */
 	client?: ToolCaller;
 	run?: Run;
 	cwd: string;
@@ -312,22 +369,44 @@ export async function runReview(input: {
 	prNumber: number;
 	headSha: string;
 	reviewThreads?: () => ReviewThreads;
+	now?: () => number;
 }): Promise<ReviewResult> {
-	const found = input.client ? await findGreptileRepo(input.client, input.repo) : undefined;
-	if (input.client && found && found.reviewsEnabled !== false) {
-		const { reviewsEnabled: _, ...repo } = found;
-		return reviewPr({
-			client: input.client,
-			repo,
-			prNumber: input.prNumber,
-			headSha: input.headSha,
-			timeoutMs: input.config.waitMs,
-			pollMs: input.config.pollMs,
-			...(input.reviewThreads ? { reviewThreads: input.reviewThreads } : {}),
-		});
+	const run = input.run ?? defaultRun;
+	const organization = input.config.greptileOrganization;
+	const blocked = (source: ReviewResult["source"], error: string): ReviewResult => ({
+		source,
+		status: "blocked",
+		score: null,
+		comments: [],
+		headSha: input.headSha,
+		error,
+		at: (input.now ?? Date.now)(),
+	});
+	if (!input.client) {
+		if (!cliSignedIn(run, input.cwd)) return blocked("cli", GREPTILE_SETUP);
+	} else {
+		let found: ListedGreptileRepo | undefined;
+		try {
+			found = await findGreptileRepo(input.client, input.repo, organization);
+		} catch (error) {
+			return blocked("pr", errorText(error));
+		}
+		if (found && found.reviewsEnabled !== false) {
+			const { reviewsEnabled: _, ...repo } = found;
+			return reviewPr({
+				client: input.client,
+				repo,
+				prNumber: input.prNumber,
+				headSha: input.headSha,
+				timeoutMs: input.config.waitMs,
+				pollMs: input.config.pollMs,
+				organization,
+				...(input.reviewThreads ? { reviewThreads: input.reviewThreads } : {}),
+			});
+		}
 	}
 	return reviewCli({
-		run: input.run ?? defaultRun,
+		run,
 		cwd: input.cwd,
 		base: input.base,
 		headSha: input.headSha,

@@ -6,11 +6,11 @@
  * Default transport talks directly to the Grok CLI chat proxy (`/responses`)
  * with the user's existing `grok login` session; the `cli` transport shells
  * out to the Grok Build CLI instead so the same login is reused either way.
- * The `shunt` transport posts Anthropic Messages to a local gateway
- * (`http://127.0.0.1:3001/v1/messages`) that owns its own upstream auth.
+ * The `shunt` transport posts Anthropic Messages to a shunt gateway you run
+ * (`grok.shuntBaseUrl` + `/v1/messages`) that owns its own upstream auth.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -42,9 +42,9 @@ export interface GrokCompleteOptions {
 	cwd?: string;
 	/** Test seam for the CLI-driven token refresh; default `ensureFreshGrokAuth`. */
 	refresh?: (opts: EnsureFreshOptions) => Promise<GrokAuth | undefined>;
-	/** `shunt` transport: gateway base URL (`/v1/messages` is appended). */
+	/** `shunt` transport: base URL of a shunt gateway you run (`/v1/messages` is appended). Required: there is no built-in default. */
 	shuntBaseUrl?: string;
-	/** `shunt` transport: wire model; overrides `model` because the gateway route pins the effort. */
+	/** `shunt` transport: wire model; overrides `model` because the gateway route pins the effort. Empty = `model`. */
 	shuntModel?: string;
 	/** `shunt` transport: Anthropic `max_tokens`. */
 	shuntMaxTokens?: number;
@@ -170,9 +170,13 @@ function callGuard(opts: GrokCompleteOptions): CallGuard {
 	};
 }
 
-async function completeShunt(system: string, user: string, opts: GrokCompleteOptions): Promise<string> {
-	const baseUrl = (opts.shuntBaseUrl?.trim() || DEFAULT_GROK_CONFIG.shuntBaseUrl).replace(/\/+$/, "");
-	const model = opts.shuntModel?.trim() || DEFAULT_GROK_CONFIG.shuntModel;
+const SHUNT_URL_MISSING =
+	"grok shunt transport: set grok.shuntBaseUrl (the base URL of your Anthropic-compatible gateway) in ~/.config/ultrathink/config.json, or switch grok.transport to \"http\"";
+
+async function completeShunt(system: string, user: string, opts: GrokCompleteOptions, fallbackModel: string): Promise<string> {
+	const baseUrl = (opts.shuntBaseUrl?.trim() ?? "").replace(/\/+$/, "");
+	if (!baseUrl) throw new Error(SHUNT_URL_MISSING);
+	const model = opts.shuntModel?.trim() || fallbackModel;
 	const maxTokens =
 		typeof opts.shuntMaxTokens === "number" && Number.isInteger(opts.shuntMaxTokens) && opts.shuntMaxTokens > 0
 			? opts.shuntMaxTokens
@@ -253,11 +257,12 @@ const CLI_DISALLOWED_TOOLS = "run_terminal_cmd,search_replace,write_file,read_fi
 
 let scratch: string | undefined;
 
-/** Working directory for headless CLI calls, created once per process. */
+/** Private working directory for headless CLI calls: created once per process with `mkdtemp`, removed on exit. */
 function scratchDir(): string {
 	if (!scratch) {
-		scratch = join(tmpdir(), "aio-grok-scratch");
-		mkdirSync(scratch, { recursive: true });
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-grok-"));
+		scratch = dir;
+		process.once("exit", () => rmSync(dir, { recursive: true, force: true }));
 	}
 	return scratch;
 }
@@ -285,7 +290,7 @@ function parseCliJson(stdout: string): string {
 }
 
 async function completeCli(system: string, user: string, opts: GrokCompleteOptions, model: string, effort: GrokEffort): Promise<string> {
-	const dir = mkdtempSync(join(tmpdir(), "aio-grok-"));
+	const dir = mkdtempSync(join(tmpdir(), "ultrathink-grok-"));
 	const promptPath = join(dir, "prompt.md");
 	writeFileSync(promptPath, user, "utf8");
 	const env: Record<string, string | undefined> = { ...process.env, GROK_SUBAGENTS: "0", GROK_MEMORY: "0", GROK_WEB_FETCH: "0" };
@@ -367,7 +372,7 @@ export async function grokComplete(system: string, user: string, opts: GrokCompl
 	const effort = opts.reasoningEffort ?? DEFAULT_GROK_CONFIG.reasoningEffort;
 	switch (opts.transport) {
 		case "shunt":
-			return completeShunt(system, user, opts);
+			return completeShunt(system, user, opts, model);
 		case "cli":
 			return completeCli(system, user, opts, model, effort);
 		default:

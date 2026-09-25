@@ -1,6 +1,6 @@
 ---
 name: ultrathink-kickoff
-description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner may already have created some or all of the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway (Claude Code, Grok, Muse, Omp) or left all of them to this skill (Hermes); this skill finishes or creates them with one command (manual MCP fallback only if that command cannot run), registers the graph in the Agent Substrate index, resolves blocking clarifications, sets the Task to Implementing, hands back the full spec plus linked TODO lines and marks the session kicked off. Do not invoke this for any other purpose.
+description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner may already have created some or all of the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway (Claude Code, Grok, Muse, Omp) or left all of them to this skill (Hermes); this skill finishes or creates them with one command (manual MCP fallback only if that command cannot run), resolves blocking clarifications, sets the Task to Implementing, hands back the full spec plus linked TODO lines and marks the session kicked off. Do not invoke this for any other purpose.
 ---
 
 # ultrathink-kickoff
@@ -78,9 +78,9 @@ Create only what `tracking` does not already contain.
 
 Keep every identifier/URL you created; steps 3 and 5 use them.
 
-## 3. Register the graph in the substrate index
+## 3. Optional: register the graph with an Agent Substrate server
 
-Only when an MCP server named `substrate` is connected in this session (you have its `graph_register` tool); otherwise skip this step without logging anything. Call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
+This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
 
 | Field | Value |
 |---|---|
