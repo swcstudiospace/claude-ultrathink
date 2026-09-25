@@ -232,7 +232,9 @@ describe("planPrompt", () => {
 			try {
 				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
 				expect(response.skipped).toBeUndefined();
-				expect(response.context).toContain("add a widget");
+				// Hermes gets a handoff that points at the spec file; the planned prompt lives there on every host.
+				expect(response.specPath && readFileSync(response.specPath, "utf8")).toContain("add a widget");
+				expect(response.context).toContain(response.specPath ?? "missing spec path");
 				expect(calls).toEqual({ engine: 1, createTracker: tracked, track: tracked });
 			} finally {
 				rmSync(root, { recursive: true, force: true });

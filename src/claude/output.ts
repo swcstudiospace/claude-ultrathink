@@ -50,6 +50,18 @@ export function SKILL_CONTEXT_HEADER(name: string): string {
 The user installed the Ultrathink plugin and invoked the "${name}" skill with this message; ultrathink planned the request before the skill runs. The skill's instructions stay authoritative for HOW to work: follow its workflow. Use the specification and Graph of Thought below as the plan for WHAT to do inside that workflow. Prefer repository evidence over inferred assumptions. The ORIGINAL element holds the user's verbatim words. Do not reprint the XML. Completing this rewrite is not the end of the turn.`;
 }
 
+/** Handoff header: the specification stays in its file and the model reads it there before working. */
+export const HANDOFF_CONTEXT_HEADER = `## Prompt Uplift
+
+The user installed the Ultrathink plugin. It expanded the user's message into a specification saved in the specification file named below: the ORIGINAL element holds the user's verbatim words, followed by the elaborated intent, the Graph of Thought and its WORKFLOW. Read that file in full before starting, treat it as the user's own elaborated intent and execute it. Do not reprint the XML. Prefer repository evidence over inferred assumptions. Completing this rewrite is not the end of the turn.`;
+
+/** Handoff header for a skill invocation: the plan in the specification file fills in WHAT, the skill still owns HOW. */
+export function SKILL_HANDOFF_CONTEXT_HEADER(name: string): string {
+	return `## Prompt Uplift
+
+The user installed the Ultrathink plugin and invoked the "${name}" skill with this message; ultrathink planned the request before the skill runs and saved the plan in the specification file named below (ORIGINAL holds the user's verbatim words, followed by the elaborated intent, the Graph of Thought and its WORKFLOW). Read that file in full before starting. The skill's instructions stay authoritative for HOW to work: follow its workflow, using the specification as the plan for WHAT to do inside it. Prefer repository evidence over inferred assumptions. Do not reprint the XML. Completing this rewrite is not the end of the turn.`;
+}
+
 /**
  * Framing for the Agent Substrate brief.
  *
@@ -97,6 +109,12 @@ export interface PromptContextInput {
 	providers?: TrackerProviders;
 	/** The host does not list plugin skills to the model (Hermes): every skill named here carries its load call and SKILL.md path. */
 	skillHints?: boolean;
+	/**
+	 * The host replays hook context in every later turn and spills pieces over 10,000 chars to a file (Hermes):
+	 * the context points at the specification file, state file and Graph ID instead of carrying the XML.
+	 * Implies `skillHints`.
+	 */
+	handoff?: boolean;
 }
 
 /**
@@ -167,8 +185,21 @@ function formatLinkedIssues(plan: TrackPlan, tracking: TrackingRefs, providers: 
 
 export function formatPromptContext(input: PromptContextInput): string {
 	const maxChars = input.maxChars ?? DEFAULT_CONTEXT_CHARS;
-	const parts: string[] = [input.skill ? SKILL_CONTEXT_HEADER(input.skill) : UPLIFT_CONTEXT_HEADER];
+	const hints = input.skillHints || input.handoff;
+	const header = input.handoff
+		? input.skill
+			? SKILL_HANDOFF_CONTEXT_HEADER(input.skill)
+			: HANDOFF_CONTEXT_HEADER
+		: input.skill
+			? SKILL_CONTEXT_HEADER(input.skill)
+			: UPLIFT_CONTEXT_HEADER;
+	const parts: string[] = [header];
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
+	if (input.handoff) {
+		const graphId = input.plan?.graphId ?? input.tracking?.graphId;
+		if (graphId) parts.push(`Graph ID: ${graphId}`);
+		if (input.statePath) parts.push(`State file: ${input.statePath}`);
+	}
 
 	const brief = input.brief?.trim();
 	if (brief) parts.push(SUBSTRATE_CONTEXT_HEADER, brief);
@@ -194,7 +225,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 			? `, which first runs \`${input.trackCommand} --state ${input.statePath}\` to finish the missing Notion/Linear rows`
 			: ", which first finishes the missing Notion/Linear rows";
 		const where = [...(providers.notion ? ["Notion"] : []), ...(providers.linear ? ["Linear"] : [])].join(" and ") || "the tracker";
-		const kickoff = skillReference("ultrathink-kickoff", input.skillHints);
+		const kickoff = skillReference("ultrathink-kickoff", hints);
 		const body = complete
 			? `The Task, its Graph-of-Thought Issues, and one Sub-Issue per Chain-of-Thought step already exist in ${where} (see Linked issues). Before starting work, invoke ${kickoff} with stateFile=${input.statePath} only to resolve any blocking clarifications and set the Task to Implementing; it must not create rows. Do not start coding before it returns.`
 			: `Tracker rows are incomplete. Before starting work, invoke ${kickoff} with stateFile=${input.statePath}${finish}, then resolves any blocking clarifications and returns the final prompt to execute. Do not start coding before it returns.`;
@@ -205,13 +236,14 @@ export function formatPromptContext(input: PromptContextInput): string {
 			[
 				"## Ship",
 				"",
-				input.skillHints
+				hints
 					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${SHIP_CLI}). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`
 					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`,
 			].join("\n"),
 		);
 	}
 
+	if (input.handoff) return [...parts, ...tail].join("\n\n");
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
 	const budget = Math.max(2_000, maxChars - fixed);
 	parts.push(truncateXml(input.result.xml, budget, input.specPath));

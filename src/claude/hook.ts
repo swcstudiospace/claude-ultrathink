@@ -323,6 +323,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					trackingOff: deps.trackingOff,
 					providers,
 					skillHints: deps.surface === "hermes",
+					handoff: deps.surface === "hermes",
 				}),
 			},
 		};

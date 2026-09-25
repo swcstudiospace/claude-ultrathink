@@ -317,3 +317,64 @@ describe("tracking", () => {
 		expect(formatSummary({ result, tracked: false, trackingOff: true })).toBe("Prompt Uplift · BUILD_PROMPT · llm · Tracking · off");
 	});
 });
+
+describe("handoff", () => {
+	const bigXml = `<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n<GRAPH_OF_THOUGHT>\n${"<N>node rationale</N>\n".repeat(3_000)}</GRAPH_OF_THOUGHT>\n</BUILD_PROMPT>`;
+	const spec = { result: { ...result, xml: bigXml }, specPath: "/s/spec.xml", statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", handoff: true };
+
+	test("points at the spec, state file and Graph ID instead of carrying the XML, and names each skill's load call and SKILL.md", () => {
+		const out = formatPromptContext({ ...spec, graph: FALLBACK_GRAPH, plan, ship: true });
+		expect(out).toContain("Specification file: /s/spec.xml");
+		expect(out).toContain("State file: /s/x.json");
+		expect(out).toContain("Graph ID: g1");
+		expect(out).toContain("Read that file in full before starting");
+		for (const tag of ["<UPLIFTED_PROMPT", "<BUILD_PROMPT", "<GRAPH_OF_THOUGHT", "<ORIGINAL>"]) expect(out).not.toContain(tag);
+		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {
+			expect(out).toContain(`skill_view name="ultrathink:${name}"`);
+			const path = new RegExp(`read (/\\S+/skills/${name}/SKILL\\.md)\\)`).exec(out)?.[1];
+			expect(path && existsSync(path)).toBe(true);
+		}
+		expect(out).not.toContain("if your host does not list that skill");
+		expect(out).toContain("Workflow waves:");
+		expect(out.indexOf("## Ultrathink tracking")).toBeLessThan(out.indexOf("## Ship"));
+	});
+
+	test("Graph ID falls back to the tracking refs and is omitted when neither is known", () => {
+		expect(formatPromptContext({ ...spec, tracking: { ...complete, graphId: "g9" } })).toContain("Graph ID: g9");
+		expect(formatPromptContext({ ...spec, plan, tracking: { ...complete, graphId: "g9" } })).toContain("Graph ID: g1");
+		expect(formatPromptContext({ ...spec })).not.toContain("Graph ID:");
+	});
+
+	test("a skill invocation keeps the skill framing and still sends the model to the spec file", () => {
+		const out = formatPromptContext({ ...spec, skill: "gsd-quick" });
+		expect(out).toContain('invoked the "gsd-quick" skill');
+		expect(out).toContain("authoritative for HOW");
+		expect(out).toContain("Read that file in full before starting");
+		expect(out).not.toContain("<BUILD_PROMPT");
+	});
+
+	test("an 8-node graph with 4 blocking clarifications stays under 6,000 characters", () => {
+		const graph = {
+			goal: "g",
+			nodes: Array.from({ length: 8 }, (_, i) => ({
+				id: `n${i + 1}`,
+				title: `Node ${i + 1}`,
+				kind: "decompose" as const,
+				question: "q".repeat(200),
+				dependsOn: i === 0 ? [] : [`n${Math.ceil(i / 2)}`],
+				thinking: "t".repeat(2_000),
+				conclusion: "c".repeat(1_200),
+			})),
+		};
+		const blocking: Clarification[] = Array.from({ length: 4 }, (_, i) => ({
+			...clarifications[0],
+			id: `q${i}`,
+			question: `Which database should the new service layer use, question ${i}?`,
+			why: "Schema, migrations and the deployment topology all depend on it",
+			options: [{ label: "Postgres" }, { label: "SQLite" }, { label: "MySQL" }, { label: "DynamoDB" }],
+		}));
+		const out = formatPromptContext({ ...spec, graph, clarifications: blocking, plan, skill: "gsd-quick", ship: true });
+		expect(out).toContain("## Clarifications (HITL)");
+		expect(out.length).toBeLessThan(6_000);
+	});
+});

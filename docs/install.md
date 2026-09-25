@@ -194,6 +194,8 @@ If another Hermes plugin already plans or rewrites prompts, disable it. Otherwis
 
 On Hermes the hook only plans. It never creates Notion or Linear rows. `ultrathink-kickoff` creates them at the start of the agent's turn by running `ultrathink-mcp track complete --state <file>`, so a plan that Hermes cuts off can't leave orphan rows. See [Tracking](tracking.md#when-rows-are-created).
 
+Hermes also gets a short handoff instead of the full specification: the spec path, the state file, the Graph ID and the kickoff instruction, plus the Linked issues TODO lines once rows exist. The full XML and the graph stay in the spec file. Hermes appends hook context to the user message, replays it in every later turn, and spills any piece over 10,000 characters (`hooks.output_spill.max_chars`) to a file, keeping only its first and last 500 characters, so a full specification would be cut.
+
 The plugin skips some prompts before Bun starts: cron runs, sessions with a parent session, empty prompts, prompts that start with `/`, and prompts that are already uplifted ultrathink XML. Hermes expands a skill command into its skill scaffold before `pre_llm_call` runs, so a prompt that still starts with `/` is never a skill with a task. The engine then skips a bare skill scaffold that carries no task, and, on every host, a prompt that references an existing ultrathink graph as `graph ut-<id>-<8 hex>` (as dispatched workers and the Linear issue footers do) unless you prefix it with `uplift:`. See [Commands](commands.md#prompt-prefixes-and-automatic-skips) for the other skips.
 
 In gateways such as Telegram, `/ultrathink-quick` needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, the command falls back to skipping the next message. See [Commands](commands.md).
@@ -203,7 +205,8 @@ In gateways such as Telegram, `/ultrathink-quick` needs `plugins.entries.ultrath
 1. `hermes config get plugins.hook_callback_timeout` prints `600`.
 2. `hermes plugins doctor ultrathink` reports no errors, and `hermes plugins list` shows `ultrathink` as enabled.
 3. Start a Hermes session and run `/ultrathink-status`. Hermes replies inline with the state.
-4. Send a non-trivial prompt. The plan reaches the model as context before its first call, and `~/.hermes/logs/agent.log` gets no new `Hook 'pre_llm_call' callback on_pre_llm_call timed out` line.
+4. In a Hermes session, ask the agent to call its `skills_list` tool. The result includes `ultrathink:ultrathink-kickoff` and the other three ultrathink skills.
+5. Send a non-trivial prompt. The short handoff reaches the model as context before its first call, the agent loads `ultrathink:ultrathink-kickoff`, and `~/.hermes/logs/agent.log` gets no new `Hook 'pre_llm_call' callback on_pre_llm_call timed out` line.
 
 Verified live on Hermes Agent v0.21.4 through its real CLI command dispatcher: `/ultrathink-status`, `/ultrathink-track off`, and `/ultrathink-quick`, which injected the message with no plan.
 

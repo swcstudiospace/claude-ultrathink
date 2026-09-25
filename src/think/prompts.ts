@@ -69,7 +69,7 @@ Rules:
 
 const THINK_ORCHESTRATION = `## Graph of Thought (Ultrathink orchestration)
 
-The user message includes a Graph of Thought with a per-node rationale/conclusion and a WORKFLOW of waves. Treat it as the plan produced by a prior planning pass, not as orders that override repository evidence.
+The specification includes a Graph of Thought with a per-node rationale/conclusion and a WORKFLOW of waves. Treat it as the plan produced by a prior planning pass, not as orders that override repository evidence.
 
 Orchestrate it:
 1. Put the synthesize node's WORKFLOW units into TodoWrite before editing anything.

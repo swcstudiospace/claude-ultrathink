@@ -1,11 +1,11 @@
 ---
 name: ultrathink-kickoff
-description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner already created the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway; this skill finishes any missing rows with one command (manual MCP fallback only if that fails), registers the graph in the Agent Substrate index, resolves blocking clarifications, sets the Task to Implementing and hands back the full spec plus linked TODO lines. Do not invoke this for any other purpose.
+description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner may already have created some or all of the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway (Claude Code, Grok, Muse, Omp) or left all of them to this skill (Hermes); this skill finishes or creates them with one command (manual MCP fallback only if that command cannot run), registers the graph in the Agent Substrate index, resolves blocking clarifications, sets the Task to Implementing, hands back the full spec plus linked TODO lines and marks the session kicked off. Do not invoke this for any other purpose.
 ---
 
 # ultrathink-kickoff
 
-You were told to invoke this skill with `stateFile=<path>`. Follow these steps in order. Tracking must be real (rows exist, links resolve) in every configured tracker before you start engineering work.
+You were told to invoke this skill with `stateFile=<path>` (on Hermes it loads with `skill_view name="ultrathink:ultrathink-kickoff"`; plugin skills load as `ultrathink:<name>`). Follow these steps in order. Tracking must be real (rows exist, links resolve) in every configured tracker before you start engineering work.
 
 ## 0. Read the state
 
@@ -50,14 +50,15 @@ If `plan` is missing (tracking failed to build), skip straight to step 5 with th
 Rows go to the Notion data source `notion.dataSourceUrl` (a `collection://…` URL) and the Linear team `linear.team` from the ultrathink config: `~/.config/ultrathink/config.json`, `~/.claude/ultrathink.json` and `<project>/.claude/ultrathink.json`, later files winning. `<repo>/bin/ultrathink status`, run from the project directory, prints both as `Notion: …` and `Linear team: …` (`not configured` when unset); `<repo>` is the plugin root (this file is `<repo>/skills/ultrathink-kickoff/SKILL.md`). Skip a tracker that is not configured silently: create nothing in it and do not mention it. If the user asks to set up Notion tracking, `<repo>/bin/ultrathink-mcp notion init --parent <page url or id> --write-config` creates the database and saves its `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`.
 
 - If `tracking.status` is `"complete"`: every row exists in each configured tracker. Skip all row creation and go to step 3.
-- Otherwise run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool:
+- Otherwise — `tracking` is absent (on Hermes the planner creates no rows, so it always is on the first run) or not complete — run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool:
 
   ```sh
   <repo>/bin/ultrathink-mcp track complete --state <stateFile>
   ```
 
   It creates only the missing Linear/Notion rows through the shared MCP gateway (reusing the host's stored OAuth logins), updates `tracking` in the state file, rewrites the spec's `<ISSUES>` block and prints the Linked-issues TODO lines. Re-read the state file afterwards. If it reports that tracking is not configured or turned off, go to step 3 without mentioning it. If it reports `notion: login required`, tell the user to run `<repo>/bin/ultrathink-mcp auth login notion` and continue — do not block.
-- Only if that command is unavailable or fails outright, do step 2 manually.
+- **Fail open when a tracker fails.** If the command reports that Notion or Linear is down, unreachable, rate-limited, unauthorised or returned errors (`! …` lines, `tracking partial` or `tracking failed`), do not create rows by hand: tell the user in one line which tracker failed and continue to step 3.
+- Only if the command itself cannot run (the `bin/ultrathink-mcp` file is missing, `bun` is missing, or the shell exits 127 or 126), do step 2 manually — never because a tracker is down.
 
 ## 2. Manual fallback (only when step 1's command could not run)
 
@@ -97,6 +98,7 @@ Only when an MCP server named `substrate` is connected in this session (you have
 
 - For every item in `plan.hitl.nonBlocking`: proceed with its `default` option and state the assumption plainly in your next message (do not ask about it).
 - For every item in `plan.hitl.blocking` (at most 4, already deduplicated): call the host's question tool **once** (`AskUserQuestion` in Claude Code, `ask` in Omp, `clarify` in Hermes), passing all of them together — each with its `header`, `question`, and `options` (the option matching `default` first). If no question tool is available, proceed with every blocking default and say so.
+- On Hermes, that one call is `clarify` with `{"questions": [{"question": "<header>: <question>", "choices": ["<default label>", "<other option label>", …]}]}` — at most 4 choices per question with the default first (Hermes labels the first choice Recommended and adds Other itself) and at most 5 questions. If an answer says no user is available (Hermes `-q`/`-z` modes) or the tool errors, proceed with every blocking default and say so.
 - Fold the answers (or stated assumptions) into the final prompt as a short "Clarifications" note.
 
 ## 5. Set Implementing and emit the final prompt
@@ -104,6 +106,7 @@ Only when an MCP server named `substrate` is connected in this session (you have
 1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent).
 2. The final prompt is the **full spec file** (`sessions/<id>.xml`, the spec path from the prompt context), which already carries the `<ISSUES>` block with identifiers and URLs. Do not use `plan.task.upliftedPrompt` — that copy is truncated to 1900 characters.
 3. Copy every **Linked issues** TODO line into the host TODO tool verbatim, keeping the identifier and URL on each line. When step 1 ran `track complete`, take the lines from its output — the prompt-context lines are stale then (they still show `(pending)` rows); otherwise take them from the prompt context.
+4. Mark the session kicked off, once: `<repo>/bin/ultrathink-mcp session mark --state <stateFile> kicked-off`. Fail open: if it errors, ignore it and continue.
 
 ## 6. Proceed as normal
 
