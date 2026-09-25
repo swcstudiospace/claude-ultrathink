@@ -48,6 +48,13 @@ const USAGE =
 const NEXT_FIX = "fix the listed findings, commit only the files you edited, push, then run review again";
 const NEXT_PENDING = "Greptile review still running; run review again (safe to repeat, it resumes the same review)";
 
+/** Next step when the review passed but the PR itself is not mergeable yet. */
+function prWaitNext(reason: string): string {
+	if (reason === "CI checks failing") return "review passed; CI checks failing: fix CI, commit, push, then run review again";
+	if (reason === "merge conflicts") return "review passed; merge conflicts: resolve them against the base, push, then run review again";
+	return `review passed; ${reason}: wait, then run merge again`;
+}
+
 function readRecord(statePath: string): ShipRecord | undefined {
 	try {
 		return JSON.parse(readFileSync(statePath, "utf8")) as ShipRecord;
@@ -174,14 +181,23 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	const gate = mergeGate({ config: deps.config, status, latest: result });
 	const failedTwice =
 		result.status !== "completed" && prior !== undefined && prior.status !== "completed" && prior.headSha === result.headSha;
-	const blockedReason = gate.ok
-		? undefined
-		: failedTwice
-			? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
-			: rounds.length >= maxRounds
-				? `max rounds reached: ${gate.reason}`
-				: undefined;
-	const phase = gate.ok ? "ready" : blockedReason ? "blocked" : "needs-fixes";
+	// A passing review whose PR is still waiting on CI, mergeability or conflicts is not a failed round: it never counts
+	// toward maxRounds and never blocks the ship.
+	const reviewPassed = mergeGate({
+		config: deps.config,
+		status: { ...status, state: "OPEN", mergeable: "MERGEABLE", checks: "passing" },
+		latest: result,
+	}).ok;
+	const waiting = !gate.ok && reviewPassed;
+	const blockedReason =
+		gate.ok || waiting
+			? undefined
+			: failedTwice
+				? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
+				: rounds.length >= maxRounds
+					? `max rounds reached: ${gate.reason}`
+					: undefined;
+	const phase = gate.ok ? "ready" : waiting ? "pr-open" : blockedReason ? "blocked" : "needs-fixes";
 	let commented: boolean | undefined;
 	if (blockedReason && !reusedRound && ship.phase !== "blocked") {
 		const findings = result.comments
@@ -196,7 +212,13 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 		commented = github.comment(pr.number, body).ok;
 	}
 	writeShip(statePath, { rounds, phase, blockedReason, pending: undefined }, deps.now());
-	const next = gate.ok ? "run merge" : blockedReason ? `stop: ${blockedReason}` : NEXT_FIX;
+	const next = gate.ok
+		? "run merge"
+		: waiting
+			? prWaitNext(gate.reason)
+			: blockedReason
+				? `stop: ${blockedReason}`
+				: NEXT_FIX;
 	return {
 		ok: true,
 		ready: gate.ok,

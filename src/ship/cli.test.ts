@@ -185,6 +185,21 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.phase).toBe("ready");
 	});
 
+	test("a passing review that waits on CI or mergeability is not a failed round, even at maxRounds", async () => {
+		const old: ReviewResult = { source: "cli", status: "completed", score: 3, comments: [{ body: "fix" }], headSha: "old", at: 1 };
+		writeShip(statePath, { pr: PR, phase: "needs-fixes", rounds: [old] });
+		const pending = await ship("review", deps({ status: { checks: "pending" } }));
+		expect(pending.output).toMatchObject({ ready: false, round: 2, maxRounds: 2, score: 5 });
+		expect(String(pending.output.next)).toBe("review passed; CI checks pending: wait, then run merge again");
+		expect(readShip(statePath)).toMatchObject({ phase: "pr-open" });
+		expect(readShip(statePath)?.blockedReason).toBeUndefined();
+		expect(comments).toEqual([]);
+		const failing = await ship("review", deps({ status: { checks: "failing" } }));
+		expect(String(failing.output.next)).toStartWith("review passed; CI checks failing: fix CI");
+		expect(readShip(statePath)?.phase).toBe("pr-open");
+		expect((await ship("merge", deps())).output).toMatchObject({ ok: true, merged: true });
+	});
+
 	test("merge refuses when autoMerge disabled", async () => {
 		writeShip(statePath, { pr: PR });
 		const out = await ship("merge", deps({ config: { autoMerge: false } }));

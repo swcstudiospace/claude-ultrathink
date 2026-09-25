@@ -125,6 +125,7 @@ After each round the phase is one of:
 |---|---|---|
 | `ready` | The merge gate passes | run `merge` |
 | `needs-fixes` | The gate fails and rounds remain | The agent fixes the findings (security issues first, then P0, P1, P2), commits only the files it edited, pushes and runs `review` again. It never suppresses lint rules, weakens tests or skips checks to satisfy the reviewer. |
+| `pr-open` | The review passed (5/5, no open comments) but the PR is still waiting: CI pending or failing, mergeability not computed, or merge conflicts | Not a failed round: it never counts toward `maxRounds` or blocks the ship. Wait and run `merge` again; fix failing CI or conflicts, push, and run `review` again. |
 | `blocked` | `ship.maxRounds` rounds reached, or two failed or timed-out rounds on the same head commit | The CLI posts a PR comment with the reason, the score and up to 20 remaining findings, and leaves the PR open for a human. |
 
 The skill also stops and reports when two rounds in a row return the same findings.

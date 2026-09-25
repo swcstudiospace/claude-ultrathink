@@ -24,6 +24,10 @@ First public release, licensed under AGPL-3.0-or-later.
 - Notion and Linear targets no longer default to the author's workspace. Set `notion.dataSourceUrl` and/or `linear.team` (or run `ultrathink-mcp notion init`); with neither set, tracking is off.
 - The MCP gateway reports an upstream rate limit as a rate limit, with the retry delay when it is known, instead of as an authentication error.
 
+### Fixed
+
+- Ship: a passing review whose pull request is only waiting on CI, mergeability or conflicts is no longer counted as a failed round, so it cannot block the ship at `maxRounds`, and `review` now says what to wait for instead of "fix the listed findings".
+
 ### Security
 
 - Nothing notable in this release.
