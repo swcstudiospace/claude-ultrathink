@@ -10,6 +10,8 @@ const TRIVIAL_RE =
 	/^(?:yes|y|no|n|ok|okay|k|continue|go|go ahead|do it|please|thanks|thank you|sure|yep|nope|lgtm)[.!?!,;:]*$/i;
 
 const COMMAND_TAG_RE = /^<(?:command-name|command-message|local-command)\b/i;
+/** An existing ultrathink graph id introduced by "graph", e.g. `graph ut-mugl6r87-70da50da`. */
+const PLANNED_GRAPH_RE = /\bgraph\s+ut-[a-z0-9]+-[0-9a-f]{8}\b/i;
 
 /** User-typed `/cmd` and Claude Code expansions (`<command-name>…`) must not be rewritten. */
 export function isCommandPrompt(text: string): boolean {
@@ -43,6 +45,11 @@ export function isAlreadyUplifted(text: string): boolean {
 	return ALREADY_ROOTS[trimmed.toLowerCase()] === true;
 }
 
+/** The prompt carries out an already-planned graph (a dispatcher or kickoff hand-off); planning it again would fork the graph. */
+export function referencesPlannedGraph(text: string): boolean {
+	return PLANNED_GRAPH_RE.test(text);
+}
+
 export function decideUplift(
 	event: { text: string; source: string; streamingBehavior?: string; idle?: boolean },
 	state: UpliftState,
@@ -56,6 +63,7 @@ export function decideUplift(
 
 	if (isCommandPrompt(text)) return { action: "skip" };
 	if (isAlreadyUplifted(text)) return { action: "skip" };
+	if (!force && referencesPlannedGraph(text)) return { action: "skip" };
 
 	if (state.skipOnce) {
 		state.skipOnce = false;

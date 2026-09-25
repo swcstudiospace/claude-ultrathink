@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import { existsSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import type { Clarification } from "../hitl/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
@@ -247,6 +248,20 @@ describe("tracking", () => {
 		expect(without).toContain("stateFile=/s/x.json, which first finishes the missing");
 		expect(without).not.toContain("--state");
 		expect(without).not.toContain("## Linked issues");
+	});
+
+	test("skill hints: a host that does not list plugin skills gets each skill's load call and an existing SKILL.md path", () => {
+		const out = formatPromptContext({ result, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", ship: true, skillHints: true });
+		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {
+			expect(out).toContain(`skill_view name="ultrathink:${name}"`);
+			const path = new RegExp(`read (/\\S+/skills/${name}/SKILL\\.md)\\)`).exec(out)?.[1];
+			expect(path && existsSync(path)).toBe(true);
+		}
+		expect(out).toContain("stateFile=/s/x.json, which first runs `/r/bin/ultrathink-mcp track complete --state /s/x.json`");
+		expect(out).not.toContain("if your host does not list that skill");
+		const plain = formatPromptContext({ result, statePath: "/s/x.json", ship: true });
+		expect(plain).not.toContain("skill_view");
+		expect(plain).toContain("invoke the ultrathink-kickoff skill with stateFile=/s/x.json");
 	});
 
 	test("truncation keeps the ISSUES block and re-appends it before the root close", () => {

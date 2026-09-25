@@ -26,8 +26,18 @@ export const DEFAULT_CONTEXT_CHARS = 90_000;
 const RATIONALE_RE = /(<RATIONALE>)[\s\S]*?(<\/RATIONALE>)/g;
 const RATIONALE_OMITTED = "(omitted — full text in the specification file)";
 const ISSUES_RE = /\n?[ \t]*<ISSUES graphId="[^"]*"[\s\S]*?<\/ISSUES>/;
-/** Absolute path of the ship skill, for hosts that do not list plugin skills (Hermes). */
-const SHIP_SKILL_FILE = join(import.meta.dir, "..", "..", "skills", "ultrathink-ship", "SKILL.md");
+const SKILLS_DIR = join(import.meta.dir, "..", "..", "skills");
+/** Absolute path of the ship skill, for hosts that do not list plugin skills. */
+const SHIP_SKILL_FILE = join(SKILLS_DIR, "ultrathink-ship", "SKILL.md");
+
+/**
+ * How the context names one of this plugin's skills. With `hints` (a host that does not list
+ * plugin skills to the model, i.e. Hermes) it adds Hermes' load call and the absolute SKILL.md path.
+ */
+export function skillReference(name: string, hints = false): string {
+	if (!hints) return `the ${name} skill`;
+	return `the ${name} skill (load it with skill_view name="ultrathink:${name}", or read ${join(SKILLS_DIR, name, "SKILL.md")})`;
+}
 
 export const UPLIFT_CONTEXT_HEADER = `## Prompt Uplift
 
@@ -85,6 +95,8 @@ export interface PromptContextInput {
 	/** Tracking is off: no kickoff instruction, no Linked issues, a one-line note instead. */
 	trackingOff?: boolean;
 	providers?: TrackerProviders;
+	/** The host does not list plugin skills to the model (Hermes): every skill named here carries its load call and SKILL.md path. */
+	skillHints?: boolean;
 }
 
 /**
@@ -182,9 +194,10 @@ export function formatPromptContext(input: PromptContextInput): string {
 			? `, which first runs \`${input.trackCommand} --state ${input.statePath}\` to finish the missing Notion/Linear rows`
 			: ", which first finishes the missing Notion/Linear rows";
 		const where = [...(providers.notion ? ["Notion"] : []), ...(providers.linear ? ["Linear"] : [])].join(" and ") || "the tracker";
+		const kickoff = skillReference("ultrathink-kickoff", input.skillHints);
 		const body = complete
-			? `The Task, its Graph-of-Thought Issues, and one Sub-Issue per Chain-of-Thought step already exist in ${where} (see Linked issues). Before starting work, invoke the ultrathink-kickoff skill with stateFile=${input.statePath} only to resolve any blocking clarifications and set the Task to Implementing; it must not create rows. Do not start coding before it returns.`
-			: `Tracker rows are incomplete. Before starting work, invoke the ultrathink-kickoff skill with stateFile=${input.statePath}${finish}, then resolves any blocking clarifications and returns the final prompt to execute. Do not start coding before it returns.`;
+			? `The Task, its Graph-of-Thought Issues, and one Sub-Issue per Chain-of-Thought step already exist in ${where} (see Linked issues). Before starting work, invoke ${kickoff} with stateFile=${input.statePath} only to resolve any blocking clarifications and set the Task to Implementing; it must not create rows. Do not start coding before it returns.`
+			: `Tracker rows are incomplete. Before starting work, invoke ${kickoff} with stateFile=${input.statePath}${finish}, then resolves any blocking clarifications and returns the final prompt to execute. Do not start coding before it returns.`;
 		tail.push(["## Ultrathink tracking", "", body].join("\n"));
 	}
 	if (input.ship && input.statePath) {
@@ -192,7 +205,9 @@ export function formatPromptContext(input: PromptContextInput): string {
 			[
 				"## Ship",
 				"",
-				`When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`,
+				input.skillHints
+					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${SHIP_CLI}). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`
+					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). It decides whether the task is really done, opens a PR into the repository's default branch, runs the Greptile review until 5/5 with no open comments, then merges and deletes the branch. Do not merge any other way.`,
 			].join("\n"),
 		);
 	}

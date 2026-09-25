@@ -172,7 +172,7 @@ rm ~/.grok/plugins/ultrathink
 
 ## Hermes Agent
 
-Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. It waits up to 540 s, below Hermes' 600 s backstop; `ULTRATHINK_HERMES_TIMEOUT` (seconds) overrides this. The plugin also registers the `/ultrathink-<verb>` commands and a pull-request nudge for `ultrathink-sync`.
+Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. The plugin also registers the `/ultrathink-<verb>` commands, a pull-request nudge for `ultrathink-sync`, and the four ultrathink skills. Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
 
 ### Install
 
@@ -181,19 +181,29 @@ mkdir -p ~/.hermes/plugins
 ln -sfn <clone>/hosts/hermes ~/.hermes/plugins/ultrathink
 hermes plugins enable ultrathink
 hermes plugins doctor ultrathink
+hermes config set plugins.hook_callback_timeout 600
 ```
 
-ultrathink only registers hooks and commands. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`). The plugin resolves the symlink to find the engine, so keep the rest of `<clone>` in place.
+The last command is required. Hermes stops waiting for a plugin hook after `plugins.hook_callback_timeout` seconds: 30 by default, 600 at most. A plan takes minutes, so under the default Hermes drops it after 30 s and the prompt goes through unplanned. Don't set it to 0: that turns off Hermes' hook deadline, and the turn waits on the hook.
+
+The planner reads the cap Hermes enforces and stops the engine after `min(540, cap − 15)` seconds, which leaves 15 s for Hermes to take the plan. At a 600 s cap that is 540 s. `ULTRATHINK_HERMES_TIMEOUT` (seconds) replaces the 540. When the deadline is reached, the planner kills Bun's whole process group, including the engine calls Bun started, and the prompt goes through unplanned. Under a 105 s cap the deadline would be under 90 s, too short for a plan, so the planner doesn't start Bun at all. Every prompt then goes through unplanned, and the Hermes log gets one warning per process naming the fix, `hermes config set plugins.hook_callback_timeout 600`.
+
+ultrathink only registers hooks, commands and skills. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`). The plugin resolves the symlink to find the engine, so keep the rest of `<clone>` in place.
 
 If another Hermes plugin already plans or rewrites prompts, disable it. Otherwise both will plan the same turn.
+
+On Hermes the hook only plans. It never creates Notion or Linear rows. `ultrathink-kickoff` creates them at the start of the agent's turn by running `ultrathink-mcp track complete --state <file>`, so a plan that Hermes cuts off can't leave orphan rows. See [Tracking](tracking.md#when-rows-are-created).
+
+The plugin skips some prompts before Bun starts: cron runs, sessions with a parent session, empty prompts, prompts that start with `/`, and prompts that are already uplifted ultrathink XML. Hermes expands a skill command into its skill scaffold before `pre_llm_call` runs, so a prompt that still starts with `/` is never a skill with a task. The engine then skips a bare skill scaffold that carries no task, and, on every host, a prompt that references an existing ultrathink graph as `graph ut-<id>-<8 hex>` (as dispatched workers and the Linear issue footers do) unless you prefix it with `uplift:`. See [Commands](commands.md#prompt-prefixes-and-automatic-skips) for the other skips.
 
 In gateways such as Telegram, `/ultrathink-quick` needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, the command falls back to skipping the next message. See [Commands](commands.md).
 
 ### Verify
 
-1. `hermes plugins doctor ultrathink` reports no errors, and `hermes plugins list` shows `ultrathink` as enabled.
-2. Start a Hermes session and run `/ultrathink-status`. Hermes replies inline with the state.
-3. Send a non-trivial prompt. The plan reaches the model as context before its first call.
+1. `hermes config get plugins.hook_callback_timeout` prints `600`.
+2. `hermes plugins doctor ultrathink` reports no errors, and `hermes plugins list` shows `ultrathink` as enabled.
+3. Start a Hermes session and run `/ultrathink-status`. Hermes replies inline with the state.
+4. Send a non-trivial prompt. The plan reaches the model as context before its first call, and `~/.hermes/logs/agent.log` gets no new `Hook 'pre_llm_call' callback on_pre_llm_call timed out` line.
 
 Verified live on Hermes Agent v0.21.4 through its real CLI command dispatcher: `/ultrathink-status`, `/ultrathink-track off`, and `/ultrathink-quick`, which injected the message with no plan.
 

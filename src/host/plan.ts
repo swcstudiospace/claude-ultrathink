@@ -7,15 +7,17 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { claudeConfigPaths, loadConfig } from "../config.ts";
+import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
 import { runPromptSubmit } from "../claude/hook.ts";
 import { readControl, sessionPath } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
+import { decideUplift, isTrivial } from "../uplift/detect.ts";
 import { planningTarget, type SkillInvocation } from "../uplift/skill.ts";
+import { fetchBrief } from "../substrate/brief.ts";
 import { writePlanCarrier } from "./carrier.ts";
-import { createGatewayTracker, trackCommand } from "../track/gateway.ts";
+import { createGatewayTracker, trackCommand, type Tracker } from "../track/gateway.ts";
 import { detectHost } from "./detect.ts";
 import { selectEngine } from "./engine.ts";
 import { isOmpSubagentSessionId } from "./omp-session.ts";
@@ -48,6 +50,10 @@ export interface PlanResponse {
 
 export interface PlanOptions {
 	progress?: ProgressSink;
+	/** Test seam for completer selection; defaults to `selectEngine`. */
+	selectEngine?: typeof selectEngine;
+	/** Test seam for the hook-side tracker; defaults to `createGatewayTracker`. */
+	createTracker?: (config: UltrathinkConfig) => Tracker | undefined;
 }
 
 function skipReason(request: PlanRequest, env: Record<string, string | undefined>): string | undefined {
@@ -94,14 +100,22 @@ export async function planPrompt(
 		if ("skip" in target) return skip(target.skip);
 		text = target.text;
 		skill = target.skill;
+		// A Hermes skill loaded with no task (or only an ack) is a preamble, not a request to plan.
+		if (host === "hermes" && skill && (!skill.instruction || isTrivial(skill.instruction))) return skip("skill-preamble");
 	} catch {
 		// fail-open: a throwing skill parser plans the prompt as written
 	}
 	const stateDir = resolveStateDir({ ...env, ULTRATHINK_HOST: host });
 	try {
-		const config = loadConfig(claudeConfigPaths(cwd));
+		const config = loadConfig(claudeConfigPaths(cwd, env));
 		const control = readControl(stateDir);
-		const engine = await selectEngine(config, control, cwd);
+		// Stateless skips (raw:, commands, uplifted XML, graph hand-offs, acks) never pay for engine selection; runPromptSubmit still applies enabled/skipOnce.
+		const precheck = decideUplift(
+			{ text, source: "user", idle: true },
+			{ enabled: true, skipOnce: false, skipTrivial: config.uplift.skipTrivial },
+		);
+		if (precheck.action !== "uplift") return skip(`precheck-${precheck.action}`);
+		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd);
 		if ("skipped" in engine) return skip(engine.skipped);
 		const sessionId = request.session_id?.trim() || "unknown";
 		const result = await runPromptSubmit(
@@ -121,7 +135,12 @@ export async function planPrompt(
 				stateDir,
 				surface: host,
 				conversation: recentConversationFromTranscript,
-				track: trackingEnabled(config, control, env) ? createGatewayTracker(config) : undefined,
+				brief: (input) => fetchBrief(input, env),
+				// On Hermes the kickoff skill creates rows through `track complete`, so an abandoned or killed hook never leaves orphan rows.
+				track:
+					host !== "hermes" && trackingEnabled(config, control, env)
+						? (options.createTracker ?? createGatewayTracker)(config)
+						: undefined,
 				trackingOff: trackingOff(config, control),
 				trackCommand: trackCommand(),
 				progress: options.progress,

@@ -311,7 +311,7 @@ async function main(): Promise<void> {
 		}
 		console.log(`Grok rule: ${grok.rule.changed ? "installed" : "already up to date"} (${grok.rule.path})`);
 		console.log(`Grok hooks: ${grok.hooks.changed ? "installed" : "already up to date"} (${grok.hooks.path})`);
-		console.log(`Hermes: symlink ${join(repoRoot, "hosts/hermes")} to ~/.hermes/plugins/ultrathink, then disable prompt-uplift so both do not plan the same turn.`);
+		console.log(`Hermes: symlink ${join(repoRoot, "hosts/hermes")} to ~/.hermes/plugins/ultrathink, run hermes config set plugins.hook_callback_timeout 600 (Hermes drops hooks after 30s by default), then disable prompt-uplift so both do not plan the same turn.`);
 		console.log(`Muse: muse plugins install ${repoRoot} --scope user && muse plugins approve ultrathink`);
 		console.log(`Omp: omp plugin link ${repoRoot}`);
 		return;

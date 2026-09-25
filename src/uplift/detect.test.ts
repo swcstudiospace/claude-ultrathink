@@ -161,6 +161,27 @@ describe("decideUplift", () => {
 		}
 	});
 
+	test("skips a prompt that carries out an existing graph unless forced", () => {
+		const dispatched =
+			"You were dispatched by substrate-dispatcher for Linear issue SWC-467, graph ut-mughkkc0-1a2b3c4d. Implement the node and open a PR.";
+		expect(decideUplift({ text: dispatched, source: "user" }, state())).toEqual({ action: "skip" });
+		expect(decideUplift({ text: `uplift: ${dispatched}`, source: "user" }, state())).toEqual({
+			action: "uplift",
+			text: dispatched,
+		});
+	});
+
+	test("mentions of graphs or ut- names without a graph id still uplift", () => {
+		for (const text of [
+			"explain graph theory for the onboarding doc",
+			"rename ut-foo to ut-bar in the config",
+			"graph ut-mughkkc0-1a2b3c4 is one hex short",
+			"see ut-mughkkc0-1a2b3c4d without the graph keyword",
+		]) {
+			expect(decideUplift({ text, source: "user" }, state())).toEqual({ action: "uplift", text });
+		}
+	});
+
 	test("skipOnce skips then clears", () => {
 		const current = state({ skipOnce: true });
 		expect(decideUplift({ text: "build a form", source: "user" }, current)).toEqual({ action: "skip" });

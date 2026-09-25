@@ -7,9 +7,10 @@ ultrathink-sync once a planned session opens a pull request, and adds the
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from .bridge import control, plan, pr_tool_result, queue_pr_nudge, quick, take_pr_nudges
+from .bridge import REPO_ROOT, control, plan, pr_tool_result, queue_pr_nudge, quick, take_pr_nudges
 
 # Registered as ultrathink-<verb>, the name on every host: verb -> (args hint, description).
 COMMANDS: dict[str, tuple[str, str]] = {
@@ -20,6 +21,22 @@ COMMANDS: dict[str, tuple[str, str]] = {
 	"track": ("<on|off>", "Keep planning but stop or start creating Linear/Notion rows"),
 	"status": ("", "Show the current ultrathink state"),
 }
+
+# Plugin skills stay invisible to the model unless registered; it loads them as ultrathink:<name>.
+SKILLS = ("ultrathink-kickoff", "ultrathink-sync", "ultrathink-plan", "ultrathink-ship")
+
+
+def skill_description(path: Path) -> str:
+	"""The `description:` value from the SKILL.md frontmatter, or "" when there is none."""
+	lines = path.read_text(encoding="utf-8").splitlines()
+	if not lines or lines[0].strip() != "---":
+		return ""
+	for line in lines[1:]:
+		if line.strip() == "---":
+			break
+		if line.startswith("description:"):
+			return line[len("description:") :].strip()
+	return ""
 
 
 def register(ctx: Any) -> None:
@@ -85,3 +102,12 @@ def register(ctx: Any) -> None:
 			ctx.register_command(f"ultrathink-{verb}", command(verb), description=description, args_hint=args_hint)
 		except Exception:
 			pass  # a Hermes without slash commands still plans every prompt
+
+	register_skill = getattr(ctx, "register_skill", None)
+	if callable(register_skill):
+		for name in SKILLS:
+			try:
+				path = REPO_ROOT / "skills" / name / "SKILL.md"
+				register_skill(name, path, description=skill_description(path))
+			except Exception:
+				pass  # every instruction naming a skill also carries its SKILL.md path

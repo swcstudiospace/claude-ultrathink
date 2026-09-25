@@ -3,7 +3,7 @@
 ultrathink fails open. When something is wrong, your prompt still goes through, with less planning or none. So most problems look like "the plan didn't appear" or "the rows didn't appear". Start with the [first checks](#first-checks), then look up the symptom or the host.
 
 - [First checks](#first-checks)
-- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [bun not found](#bun-not-found) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked)
+- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [bun not found](#bun-not-found) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked)
 - By host: [Claude Code](#claude-code) · [Grok Build](#grok-build) · [Muse Code](#muse-code) · [Hermes Agent](#hermes-agent) · [Omp](#omp)
 - [Uninstalling](#uninstalling)
 
@@ -86,10 +86,31 @@ A full plan makes several model calls (uplift, graph, one fill per node, clarifi
 | Claude Code | Hook timeout 86 400 s (`hooks/hooks.json`) | Not reached in practice. |
 | Grok Build | 600 s `UserPromptSubmit` timeout in `~/.grok/hooks/ultrathink.json` | Grok stops the hook and the prompt goes through unplanned. |
 | Muse Code | 600 s (`timeoutMs: 600000` in `.muse-plugin/plugin.json`) | Same. |
-| Hermes Agent | `ULTRATHINK_HERMES_TIMEOUT`, default 540 s | The planner subprocess is stopped and no context is added. |
+| Hermes Agent | `min(540, cap − 15)` s, where the cap is Hermes' `plugins.hook_callback_timeout` (30 s by default, set it to 600); `ULTRATHINK_HERMES_TIMEOUT` replaces the 540 | The planner kills Bun's process group and no context is added. See [Hermes: the plan never arrives](#hermes-the-plan-never-arrives). |
 | Omp | 25 s inline, then the plan arrives as an aside, with the engine run capped at 10 minutes | See [Omp](#omp). |
 
 To make plans faster, lower `think.maxNodes`, raise `claude.concurrency`, set `claude.budgetMs` to cap the whole run, or turn Graph of Thought (`bin/ultrathink think off`) or HITL (`bin/ultrathink hitl off`) off for a host. See [Configuration](configuration.md).
+
+## Hermes: the plan never arrives
+
+Hermes stops waiting for a plugin hook after `plugins.hook_callback_timeout` seconds, 30 by default. A plan takes minutes, so at the default every plan is dropped and `~/.hermes/logs/agent.log` shows, once per prompt:
+
+```text
+Hook 'pre_llm_call' callback on_pre_llm_call timed out after 30s — skipping
+```
+
+Fix it and restart Hermes, including any running gateway:
+
+```sh
+hermes config set plugins.hook_callback_timeout 600
+hermes config get plugins.hook_callback_timeout   # prints 600
+```
+
+600 is Hermes' maximum. Don't use 0, which turns off Hermes' hook deadline and makes the turn wait on the hook.
+
+The planner gives the engine `min(540, cap − 15)` seconds. Under a 105 s cap that is under 90 s, too short for a plan, so the planner doesn't start Bun at all and logs one warning per process naming `hermes config set plugins.hook_callback_timeout 600`. In that case Hermes logs no timeout line, yet no prompt is planned.
+
+If the cap is 600 and plans still don't arrive, the engine ran past 540 s and its process group was killed. See [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) to make plans faster.
 
 ## Tracking rows don't appear
 
@@ -101,6 +122,8 @@ Check the tracking line of `bin/ultrathink status` first:
 | `Tracking: off (Linear/Notion rows)` | `/ultrathink-track off` is set for this host. | `/ultrathink-track on`. |
 | `Tracking: kickoff (planner-side row creation off; …)` | `ULTRATHINK_TRACK=0` or `track.enabled: false`. The planner creates nothing, and `ultrathink-kickoff` creates the rows during the agent's turn. | Expected. Unset it for planner-side rows. |
 | `Tracking: on (Linear/Notion rows)` | Tracking should run. | Continue below. |
+
+On Hermes the planner never creates rows, whatever the status line says. `ultrathink-kickoff` creates them at the start of the agent's turn with `ultrathink-mcp track complete --state <file>`, so check that the agent ran kickoff before anything else.
 
 If tracking is on and configured:
 
@@ -201,8 +224,9 @@ Resume at any time with `bin/ultrathink-ship status --state <stateFile>`. Every 
 - **One planner.** If another plugin also plans prompts before the model call, disable it, or both will plan the same turn.
 - **Gateway injection.** `/ultrathink-quick <message>` sends the message through `inject_message`. In gateways this needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, the command falls back to skipping your next message and replies `Ultrathink will not plan your next message. Send it now (or prefix any message with raw:).`
 - **Command names in chat apps.** The commands are registered with hyphens (`ultrathink-status`) because chat menus accept only a restricted character set, and one colon name stops Discord from listing the commands after it. Telegram menus show them with underscores: `ultrathink_status`, `ultrathink_quick` and so on.
-- **Timeout.** The planner subprocess runs for at most `ULTRATHINK_HERMES_TIMEOUT` seconds (default 540), below Hermes' 600 s backstop. Control commands time out after 20 s.
-- Cron runs and sessions with a parent session are never planned.
+- **Timeout.** The planner subprocess runs for at most `min(540, cap − 15)` seconds, where the cap is `plugins.hook_callback_timeout`. `ULTRATHINK_HERMES_TIMEOUT` replaces the 540. On the deadline the whole Bun process group is killed. Under a 105 s cap the planner doesn't run at all. See [Hermes: the plan never arrives](#hermes-the-plan-never-arrives). Control commands time out after 20 s.
+- **Skipped before Bun.** Cron runs, sessions with a parent session, empty prompts, prompts that start with `/`, and already uplifted ultrathink XML are never sent to the engine. The engine then skips a bare skill scaffold with no task, and a prompt that references an existing graph as `graph ut-<id>-<8 hex>` unless it starts with `uplift:`.
+- **No rows from the hook.** On Hermes the planner creates no Notion or Linear rows. `ultrathink-kickoff` creates them at the start of the agent's turn with `ultrathink-mcp track complete --state <file>`, so rows appear only once the agent has run kickoff.
 
 ## Omp
 

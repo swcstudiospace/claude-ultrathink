@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Tracker } from "../track/gateway.ts";
 import { writePlanCarrier } from "./carrier.ts";
 import { detectHost } from "./detect.ts";
+import type { SelectedEngine } from "./engine.ts";
 import { isSubagentEnvelope, normalizeEnvelope, parseEnvelope } from "./envelope.ts";
 import { isPlanningPath, resolveStateDir } from "./paths.ts";
+import { planPrompt, type PlanOptions } from "./plan.ts";
 
 describe("detectHost", () => {
 	test("Grok markers win over Claude aliases, and an explicit host wins over both", () => {
@@ -151,6 +154,137 @@ describe("writePlanCarrier", () => {
 			expect(body.instruction).toContain("ultrathink-kickoff");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+/** Dispatches by payload so one fake answers the uplift, graph, node, and clarify calls. */
+async function stubComplete(_system: string, user: string): Promise<string> {
+	if (user.includes("<user_request>")) return "<BUILD_PROMPT><ORIGINAL>add a widget</ORIGINAL></BUILD_PROMPT>";
+	if (user.startsWith("<spec>")) return JSON.stringify({ questions: [] });
+	if (user.includes("current_node")) {
+		const id = user.match(/current_node id="([^"]+)"/)?.[1] ?? "n?";
+		const steps = Array.from({ length: 5 }, (_, i) => `${i + 1}. ${id} step ${i + 1}`).join(" ");
+		return `<node><rationale>${steps}</rationale><conclusion>c ${id}</conclusion></node>`;
+	}
+	return JSON.stringify({
+		goal: "Ship it",
+		nodes: Array.from({ length: 5 }, (_, i) => ({
+			id: `n${i + 1}`,
+			title: `T${i + 1}`,
+			kind: i === 0 ? "understand" : i === 4 ? "synthesize" : "generate",
+			question: `Q${i + 1}`,
+			depends_on: i === 0 ? [] : [`n${i}`],
+		})),
+	});
+}
+
+/** An isolated home with Linear and Notion configured, and seams that count engine and tracker use. */
+function planHarness(): {
+	root: string;
+	env: Record<string, string>;
+	options: PlanOptions;
+	calls: { engine: number; createTracker: number; track: number };
+} {
+	const root = mkdtempSync(join(tmpdir(), "ultrathink-plan-"));
+	mkdirSync(join(root, "xdg", "ultrathink"), { recursive: true });
+	writeFileSync(
+		join(root, "xdg", "ultrathink", "config.json"),
+		JSON.stringify({ linear: { team: "Team" }, notion: { dataSourceUrl: "collection://ds" } }),
+	);
+	const calls = { engine: 0, createTracker: 0, track: 0 };
+	const track: Tracker = async () => {
+		calls.track++;
+		return undefined;
+	};
+	return {
+		root,
+		env: {
+			XDG_CONFIG_HOME: join(root, "xdg"),
+			CLAUDE_CONFIG_DIR: join(root, "claude"),
+			ULTRATHINK_STATE_DIR: join(root, "state"),
+			SUBSTRATE_DISABLED: "1",
+		},
+		options: {
+			selectEngine: async (): Promise<SelectedEngine> => {
+				calls.engine++;
+				return { label: "stub", complete: stubComplete, error: () => undefined };
+			},
+			createTracker: () => {
+				calls.createTracker++;
+				return track;
+			},
+		},
+		calls,
+	};
+}
+
+const HERMES_SKILL =
+	'[IMPORTANT: The user has invoked the "gsd-quick" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\n\n---\nname: gsd-quick\ndescription: Quick task\n---\nDo the quick task.';
+
+describe("planPrompt", () => {
+	test("Hermes plans without a hook-side tracker; other hosts still track", async () => {
+		for (const [host, tracked] of [
+			["hermes", 0],
+			["claude-code", 1],
+		] as const) {
+			const { root, env, options, calls } = planHarness();
+			try {
+				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
+				expect(response.skipped).toBeUndefined();
+				expect(response.context).toContain("add a widget");
+				expect(calls).toEqual({ engine: 1, createTracker: tracked, track: tracked });
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("stateless skips return before an engine is selected", async () => {
+		const { root, env, options, calls } = planHarness();
+		try {
+			for (const [prompt, reason] of [
+				["ok", "precheck-skip"],
+				["raw: add a widget", "precheck-passthrough"],
+				["<BUILD_PROMPT>add a widget</BUILD_PROMPT>", "precheck-skip"],
+				["Implement node n2 of graph ut-mughkkc0-1a2b3c4d.", "precheck-skip"],
+			] as const) {
+				expect(await planPrompt({ host: "hermes", prompt, cwd: root }, env, options)).toEqual({ context: "", skipped: reason });
+			}
+			expect(calls.engine).toBe(0);
+			const forced = await planPrompt(
+				{ host: "hermes", prompt: "uplift: Implement node n2 of graph ut-mughkkc0-1a2b3c4d.", cwd: root },
+				env,
+				options,
+			);
+			expect(forced.skipped).toBeUndefined();
+			expect(calls.engine).toBe(1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a Hermes skill preamble plans only when it carries a task", async () => {
+		const { root, env, options, calls } = planHarness();
+		try {
+			const instructed = (instruction: string) =>
+				`${HERMES_SKILL}\n\nThe user has provided the following instruction alongside the skill invocation: ${instruction}`;
+			for (const prompt of [HERMES_SKILL, instructed("ok")]) {
+				expect(await planPrompt({ host: "hermes", prompt, cwd: root }, env, options)).toEqual({
+					context: "",
+					skipped: "skill-preamble",
+				});
+			}
+			expect(calls.engine).toBe(0);
+			const planned = await planPrompt({ host: "hermes", prompt: instructed("add a widget"), cwd: root }, env, options);
+			expect(planned.skipped).toBeUndefined();
+			expect(calls.engine).toBe(1);
+			// Other hosts keep planning a bare skill from its objective.
+			const claude = await planPrompt({ host: "claude-code", prompt: HERMES_SKILL, cwd: root }, env, options);
+			expect(claude.skipped).toBeUndefined();
+			expect(calls.engine).toBe(2);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
