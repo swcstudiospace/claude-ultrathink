@@ -262,25 +262,23 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 /**
  * Joins a handoff under `limit` so no section can fall into the part Hermes drops. The fixed sections (header, paths,
- * orchestration, clarifications, kickoff, ship) always stay; the substrate brief is cut first, then the Linked issues
- * list becomes a pointer to the spec's ISSUES block, which holds the same lines.
+ * orchestration, clarifications, kickoff, ship) always stay. The Linked issues list gives way first, to a pointer at
+ * the spec's ISSUES block that holds the same lines; the substrate brief is saved nowhere else, so it is cut last.
  */
 function fitHandoff(parts: string[], briefParts: string[], tail: string[], linked: string | undefined, limit: number): string {
 	const join = (sections: string[]): string => sections.join("\n\n");
-	let body = tail;
-	const full = join([...parts, ...briefParts, ...body]);
+	const full = join([...parts, ...briefParts, ...tail]);
 	if (full.length <= limit) return full;
-	for (;;) {
-		const bare = join([...parts, ...body]);
-		const [header, brief] = briefParts;
-		if (header && brief) {
-			const room = limit - bare.length - header.length - BRIEF_CUT.length - 4;
-			if (room >= brief.length) return join([...parts, header, brief, ...body]);
-			if (room > 200) return join([...parts, header, `${brief.slice(0, room)}${BRIEF_CUT}`, ...body]);
-		}
-		if (bare.length <= limit || !linked || body !== tail) return bare;
-		body = tail.map((section) => (section === linked ? LINKED_POINTER : section));
+	const body = linked ? tail.map((section) => (section === linked ? LINKED_POINTER : section)) : tail;
+	const pointed = join([...parts, ...briefParts, ...body]);
+	if (pointed.length <= limit) return pointed;
+	const bare = join([...parts, ...body]);
+	const [header, brief] = briefParts;
+	if (header && brief) {
+		const room = limit - bare.length - header.length - BRIEF_CUT.length - 4;
+		if (room > 200) return join([...parts, header, `${brief.slice(0, room)}${BRIEF_CUT}`, ...body]);
 	}
+	return bare;
 }
 
 export function formatSummary(input: {

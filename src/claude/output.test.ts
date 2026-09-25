@@ -411,5 +411,11 @@ describe("handoff", () => {
 		const small = formatPromptContext({ ...spec, brief: "one short brief line" });
 		expect(small).toContain("one short brief line");
 		expect(small).not.toContain("(brief truncated)");
+		// The list is also in the spec's ISSUES block; the brief is saved nowhere, so the list gives way and the brief stays whole.
+		const mediumBrief = "cross-agent warning line\n".repeat(80).trim();
+		const both = formatPromptContext({ ...spec, brief: mediumBrief, plan: bigPlan, tracking: bigTracking } as Parameters<typeof formatPromptContext>[0]);
+		expect(both.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+		expect(both).toContain(mediumBrief);
+		expect(both).toContain("copy them from the ISSUES block of the specification file");
 	});
 });
