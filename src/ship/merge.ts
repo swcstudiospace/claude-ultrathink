@@ -2,6 +2,12 @@
 // Copyright (C) 2026 SWC Studio
 import type { PrStatus, ReviewResult, ShipConfig } from "./types.ts";
 
+/** The review side of the gate: a completed review at or above minScore with no open comments (when required). */
+export function reviewPasses(config: ShipConfig, review: ReviewResult): boolean {
+	if (review.status !== "completed" || review.score === null || review.score < config.minScore) return false;
+	return !config.requireNoComments || review.comments.length === 0;
+}
+
 export function mergeGate(input: { config: ShipConfig; status: PrStatus; latest?: ReviewResult }): {
 	ok: boolean;
 	reason: string;
