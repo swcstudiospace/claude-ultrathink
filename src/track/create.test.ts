@@ -374,7 +374,7 @@ describe("createTracking", () => {
 		expect(pages.every((page) => !("metadata" in page.properties))).toBe(true);
 	});
 
-	test("a schema read that finds none of the core names still sends them, so rows are never created empty", async () => {
+	test("a schema read that finds none of the core names sends every property unfiltered, never a partial row", async () => {
 		const calls: Call[] = [];
 		const notion: ToolCaller = {
 			async call(name, args) {
@@ -385,7 +385,9 @@ describe("createTracking", () => {
 		};
 		await createTracking(makePlan(), GRAPH, undefined, deps({ linear: fakeLinear(), notion, concurrency: 1 }));
 		const task = (calls.find((call) => call.name === "notion-create-pages")?.args.pages as Array<{ properties: Record<string, unknown> }>)[0];
-		expect(task?.properties).toMatchObject({ Item: expect.any(String), Level: "Task", "Graph ID": "g-1" });
+		expect(task?.properties).toMatchObject({ Item: expect.any(String), Level: "Task", "Graph ID": "g-1", Status: expect.any(String), Agent: expect.any(String) });
+		const node = (calls.filter((call) => call.name === "notion-create-pages")[1]?.args.pages as Array<{ properties: Record<string, unknown> }>)[0];
+		expect(node?.properties).toMatchObject({ Level: "Issue", Thought: expect.any(String), "Parent Item": expect.any(String) });
 	});
 
 	test("structured page urls win over urls mentioned elsewhere in the result", async () => {

@@ -137,7 +137,14 @@ def tracked_session(home: str, session_id: str, **fields: object) -> Path:
 	"""A planned session whose kickoff created the tracker rows; `fields` override the record."""
 	path = planned_session(home, session_id)
 	record = json.loads(path.read_text())
-	record.update({"plan": {"graphId": f"graph-{session_id}"}, "tracking": {"notionTaskPageId": "page-1"}, "kickedOff": True}, **fields)
+	rows = {
+		"graphId": f"graph-{session_id}",
+		"status": "complete",
+		"linear": {"nodes": {"n1": {"id": "i1", "identifier": "SPE-1", "url": "https://linear.app/o/issue/SPE-1", "title": "[n1] A"}}, "steps": {}},
+		"notion": {"taskUrl": "https://www.notion.so/task", "nodes": {}, "steps": {}},
+		"errors": [],
+	}
+	record.update({"plan": {"graphId": f"graph-{session_id}"}, "tracking": rows, "kickedOff": True}, **fields)
 	path.write_text(json.dumps(record))
 	return path
 
@@ -443,6 +450,31 @@ def test_sync_nudge_names_the_pr_the_session_opened():
 		assert nudge is not None and f"prUrl={PR_URL}." in nudge["message"]
 
 
+def test_a_new_plan_in_the_session_gets_its_own_nudge_and_never_the_old_pr():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		tracked_session(home, "replanned")
+		assert pr_tool_result(gh_pr_create("replanned"), env=env) is not None
+		assert sync_nudge(verify("replanned"), env=env) is not None
+		# The session's next planned prompt writes a new graph (new Graph ID, new rows, synced false).
+		tracked_session(home, "replanned", plan={"graphId": "graph-second"})
+		nudge = sync_nudge(verify("replanned"), env=env)
+		assert nudge is not None and "graph graph-second" in nudge["message"]
+		assert "prUrl=" not in nudge["message"]
+		assert sync_nudge(verify("replanned"), env=env) is None
+
+
+def test_tracking_refs_with_no_created_rows_do_not_use_up_the_nudge():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		empty = {"graphId": "graph-empty", "status": "failed", "linear": {"nodes": {}, "steps": {}}, "notion": {"nodes": {}, "steps": {}}, "errors": ["notion: login required"]}
+		tracked_session(home, "empty", tracking=empty)
+		assert sync_nudge(verify("empty"), env=env) is None
+		# Once a retried kickoff creates rows, the same plan still gets its nudge.
+		tracked_session(home, "empty")
+		assert sync_nudge(verify("empty"), env=env) is not None
+
+
 def test_pre_verify_hook_fails_open():
 	ctx = fake_ctx()
 	plugin.register(ctx)
@@ -602,6 +634,8 @@ if __name__ == "__main__":
 	test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge()
 	test_no_sync_nudge_without_rows_after_sync_or_with_tracking_off()
 	test_sync_nudge_names_the_pr_the_session_opened()
+	test_a_new_plan_in_the_session_gets_its_own_nudge_and_never_the_old_pr()
+	test_tracking_refs_with_no_created_rows_do_not_use_up_the_nudge()
 	test_pre_verify_hook_fails_open()
 	test_registers_every_ultrathink_command_next_to_the_hooks()
 	test_registers_the_four_ultrathink_skills_with_their_descriptions()

@@ -512,13 +512,14 @@ async function createNotion(
 		fail(`notion schema: ${shortError(error)}`);
 		return;
 	}
-	// A schema read that misses the core names was not understood; sending only recognised names would then create empty rows.
-	// Send the core names anyway, so a truly different data source fails loudly instead.
-	if (!CORE_PROPERTIES.every((name) => names.has(name))) for (const name of CORE_PROPERTIES) names.add(name);
+	// A schema read that misses the core names was not understood. Filtering by it would create rows with fields silently
+	// dropped, and later runs skip rows whose URLs are recorded, so send every property instead: a data source that really
+	// lacks one fails the create loudly and nothing is recorded.
+	const understood = CORE_PROPERTIES.every((name) => names.has(name));
 	const props = (values: Record<string, string | number | undefined>): Record<string, unknown> => {
 		const out: Record<string, unknown> = {};
 		for (const [name, value] of Object.entries(values)) {
-			if (value === undefined || value === "" || !names.has(name)) continue;
+			if (value === undefined || value === "" || (understood && !names.has(name))) continue;
 			out[name] = value;
 		}
 		return out;

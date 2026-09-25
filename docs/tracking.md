@@ -52,9 +52,9 @@ On Hermes the hook only plans and skips step 1. Hermes cuts plugin hooks off at 
 
 Kickoff fails open. When `track complete` reports that Notion or Linear is down, unreachable, rate-limited or unauthorised, or returns errors, kickoff creates no rows by hand. It tells you in one line which tracker failed and carries on with your task. Run `track complete` again later to fill in the missing rows.
 
-Sync looks rows up by Graph ID only: the Notion Task by its `Graph ID`, the Linear issues by the session record's `tracking` refs or the `ultrathink graph <id>` footer. It never matches by branch, PR title or repo, never creates a row, and never clears or overwrites `PR URL` or `PR #` in a turn that has no pull request. It fails open like kickoff: when Notion or Linear is down, unreachable, rate-limited or unauthorised, it doesn't retry, says in one line which tracker it couldn't update, and the turn carries on, including the turn that opened the PR.
+Sync looks rows up by Graph ID only: the Notion Task by the session record's `tracking.notion.taskUrl` or its `Graph ID`, the Linear issues by the session record's `tracking` refs or the `ultrathink graph <id>` footer. It never matches by branch, PR title or repo, never creates a row, and never clears or overwrites `PR URL` or `PR #` in a turn that has no pull request. It fails open like kickoff: when Notion or Linear is down, unreachable, rate-limited or unauthorised, it doesn't retry, says in one line which tracker it couldn't update, and the turn carries on, including the turn that opened the PR.
 
-On Hermes the plugin nudges sync when a tool call opens a pull request and, through Hermes' `pre_verify` hook, once per session when a coding turn is about to finish with rows created but `synced` not yet set. Recording `synced` stops that end-of-turn nudge.
+On Hermes the plugin nudges sync when a tool call opens a pull request and, through Hermes' `pre_verify` hook, once per plan (per session and Graph ID) when a coding turn is about to finish with rows created but `synced` not yet set. Recording `synced` stops that end-of-turn nudge.
 
 No rows are created when:
 

@@ -69,8 +69,9 @@ _cap_warned = False  # the short-cap warning is logged once per process
 _pr_lock = threading.Lock()
 _pr_delivered: set[tuple[str, str]] = set()  # (session_id, PR URL) the model was nudged about
 _pr_pending: dict[str, dict[str, str]] = {}  # session_id -> PR URL -> nudge for its next turn
-_pr_latest: dict[str, str] = {}  # session_id -> the last PR URL it opened
-_sync_nudged: set[str] = set()  # session_ids pre_verify already continued with a sync nudge
+# Plan-scoped state is keyed by (session_id, graphId): a session's next planned prompt is a new graph with its own rows.
+_pr_latest: dict[tuple[str, str], str] = {}  # (session_id, graphId) -> the last PR URL opened for that plan
+_sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify already continued with a sync nudge
 
 # /ultrathink-quick arms one skip per injected message. pre_llm_call consumes it only on
 # that exact message, so a message queued behind a running turn still goes out unplanned.
@@ -273,9 +274,9 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 	return record if isinstance(record, dict) else None
 
 
-def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str] | None:
-	"""(session_id, PR URL, nudge) when this tool call opened a PR for a planned
-	session. Subagents never plan (plan() skips them), so they have no state file."""
+def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
+	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
+	planned session. Subagents never plan (plan() skips them), so they have no state file."""
 	session_id = str(payload.get("session_id") or "").strip()
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
@@ -288,13 +289,14 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	record = _read_record(path)
 	if record is None or not isinstance(record.get("plan"), dict):
 		return None
+	graph_id = str(record["plan"].get("graphId") or "")
 	nudge = (
-		f"Ultrathink: a pull request was opened for the tracked task (graph {record['plan'].get('graphId')}, {url}). "
+		f"Ultrathink: a pull request was opened for the tracked task (graph {graph_id}, {url}). "
 		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path} and prUrl={url}, "
 		"so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. "
 		"ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues."
 	)
-	return session_id, url, nudge
+	return session_id, graph_id, url, nudge
 
 
 def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -> str | None:
@@ -307,12 +309,12 @@ def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return None
-	session_id, url, nudge = event
+	session_id, graph_id, url, nudge = event
 	with _pr_lock:
 		if (session_id, url) in _pr_delivered:
 			return None
 		_pr_delivered.add((session_id, url))
-		_pr_latest[session_id] = url
+		_pr_latest[(session_id, graph_id)] = url
 	return f"{result}\n\n{nudge}"
 
 
@@ -324,11 +326,11 @@ def queue_pr_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return
-	session_id, url, nudge = event
+	session_id, graph_id, url, nudge = event
 	with _pr_lock:
 		if (session_id, url) not in _pr_delivered:
 			_pr_pending.setdefault(session_id, {})[url] = nudge
-		_pr_latest[session_id] = url
+		_pr_latest[(session_id, graph_id)] = url
 
 
 def take_pr_nudges(payload: dict[str, Any]) -> str:
@@ -347,34 +349,40 @@ def _tracking_enabled(env: dict[str, str] | None) -> bool:
 	return record is None or record.get("trackEnabled") is not False
 
 
+def _has_rows(tracking: Any) -> bool:
+	"""True when kickoff's tracking refs name at least one created Notion or Linear row."""
+	if not isinstance(tracking, dict):
+		return False
+	sections = ((tracking.get("linear"), ("nodes", "steps")), (tracking.get("notion"), ("taskUrl", "nodes", "steps")))
+	return any(isinstance(section, dict) and any(section.get(key) for key in keys) for section, keys in sections)
+
+
 def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> dict[str, str] | None:
-	"""pre_verify: continue the turn once per session with an ultrathink-sync nudge
+	"""pre_verify: continue the turn once per plan with an ultrathink-sync nudge
 	when its plan has tracker rows that were never synced. Hermes re-fires the hook
 	after each nudge (attempt 1, 2, ...), so only attempt 0 can nudge."""
 	session_id = str(payload.get("session_id") or "").strip()
 	if not session_id or payload.get("attempt"):
 		return None
-	with _pr_lock:
-		if session_id in _sync_nudged:
-			return None
 	path = state_path(session_id, env)
 	record = _read_record(path)
 	if record is None or record.get("synced") is True:
 		return None
 	plan_record = record.get("plan")
-	# Kickoff creates the rows; without them sync has nothing to update.
-	if not isinstance(plan_record, dict) or not isinstance(record.get("tracking"), dict):
+	# Kickoff creates the rows; without any, sync has nothing to update.
+	if not isinstance(plan_record, dict) or not _has_rows(record.get("tracking")):
 		return None
 	if not _tracking_enabled(env):
 		return None
+	key = (session_id, str(plan_record.get("graphId") or ""))
 	with _pr_lock:
-		if session_id in _sync_nudged:
+		if key in _sync_nudged:
 			return None
-		_sync_nudged.add(session_id)
-		url = _pr_latest.get(session_id, "")
+		_sync_nudged.add(key)
+		url = _pr_latest.get(key, "")
 	pr = f" and prUrl={url}" if url else ""
 	message = (
-		f"Ultrathink: this session's plan (graph {plan_record.get('graphId')}) is tracked but not synced. "
+		f"Ultrathink: this session's plan (graph {key[1]}) is tracked but not synced. "
 		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}{pr}. "
 		"It only updates the existing Notion Task row and Linear issues found by Graph ID and never creates rows; "
 		"if Notion or Linear is down, report that in one line and finish without blocking."
