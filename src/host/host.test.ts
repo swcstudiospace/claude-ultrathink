@@ -291,22 +291,24 @@ describe("planPrompt", () => {
 		}
 	});
 
-	test("an armed /ultrathink-skip is consumed by a trivial or bare-preamble prompt on Hermes and Omp, as on Claude", async () => {
+	test("an armed /ultrathink-skip is consumed before engine selection by a trivial or bare-preamble prompt on Hermes and Omp", async () => {
 		for (const host of ["hermes", "omp"] as const) {
-			const { root, env, options } = planHarness();
+			const { root, env, options, calls } = planHarness();
 			const stateDir = env.ULTRATHINK_STATE_DIR!;
 			const hostEnv = { ...env, PI_CODING_AGENT_DIR: join(root, "omp") };
 			try {
 				for (const prompt of ["ok", HERMES_SKILL]) {
 					writeControl(stateDir, { skipOnce: true });
-					expect(await planPrompt({ host, prompt, cwd: root }, hostEnv, options)).toEqual({ context: "", skipped: "skip" });
+					expect(await planPrompt({ host, prompt, cwd: root }, hostEnv, options)).toEqual({ context: "", skipped: "precheck-skip" });
 					expect(readControl(stateDir).skipOnce).toBe(false);
 				}
+				// Consumed before engine selection, so an engine that is unavailable (e.g. a Grok login) cannot leave it armed.
+				expect(calls.engine).toBe(0);
 				// Stateless skips that never consume the skip on Claude leave it armed here too.
 				writeControl(stateDir, { skipOnce: true });
 				expect(await planPrompt({ host, prompt: "<BUILD_PROMPT>x</BUILD_PROMPT>", cwd: root }, hostEnv, options)).toEqual({
 					context: "",
-					skipped: "skip",
+					skipped: "precheck-skip",
 				});
 				expect(readControl(stateDir).skipOnce).toBe(true);
 			} finally {

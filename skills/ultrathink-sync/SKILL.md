@@ -33,7 +33,7 @@ Apply only the columns of configured trackers. When both are configured, set `Li
 
 ### Locating the Linear issues
 
-Read `tracking` from the same state file when its `plan.graphId` is this graph: `tracking.linear.nodes[<nodeId>]` and `tracking.linear.steps["<nodeId>.<step>"]` hold `{ id, identifier, url }` for every node issue and step sub-issue. Fallback when `tracking` is absent: Linear `list_issues` with `query` = `ultrathink graph <graphId>` (every planner-created issue ends its description with that footer).
+Read `tracking` from the same state file when its `plan.graphId` is this graph: `tracking.linear.nodes[<nodeId>]` and `tracking.linear.steps["<nodeId>.<step>"]` hold `{ id, identifier, url }` for every node issue and step sub-issue. Fallback when `tracking` is absent, or when the state file's `plan.graphId` is not this graph (a newer plan replaced it): Linear `list_issues` with `query` = `ultrathink graph <graphId>` (every planner-created issue ends its description with that footer).
 
 - Attach the PR with `save_issue` (`id` = the identifier, `links` = `[{ url: <PR URL>, title: "PR #<n>" }]`) on each node issue it covers.
 - Move the state of node issues whose TODO lines (and step sub-issues) are done; leave the rest.

@@ -42,10 +42,9 @@ MIN_PLAN_S = 90  # below this a plan cannot finish, so Bun is not started at all
 CONTROL_TIMEOUT_S = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
-SENDER_TAG_RE = re.compile(r"\[[^\]\n]*\]\s+")
+SENDER_TAG_RE = re.compile(r"\[([^\]\n]*)\]\s+")
 # Hermes' skill scaffold also opens with a bracket; it is the prompt, not a sender tag.
 SKILL_SCAFFOLD_PREFIX = "[IMPORTANT: The user has invoked the "
-DELEGATE_TOOL = "delegate_task"  # Hermes runs subagents through this tool; its result is the child's text
 
 # Ports of src/track/pr-detect.ts. JavaScript's \s, \b, and \d are spelled out
 # because Python's are Unicode-aware and disagree with them at the edges.
@@ -146,14 +145,31 @@ def message_text(message: Any) -> str:
 	return ""
 
 
-def strip_sender_tag(prompt: str) -> str:
+def strip_sender_tag(prompt: str, sender: str | None = None) -> str:
 	"""The message without a shared session's leading "[Name] " sender tag; unchanged
-	when it has none. Hermes' "[IMPORTANT: …]" skill scaffold is not a tag."""
+	when it has none. Hermes' "[IMPORTANT: …]" skill scaffold is not a tag. With `sender`,
+	only a tag naming that sender is removed, so a user's own "[backend] …" label stays."""
 	text = prompt.lstrip()
 	if text.startswith(SKILL_SCAFFOLD_PREFIX):
 		return prompt
 	tag = SENDER_TAG_RE.match(text)
-	return text[tag.end() :] if tag else prompt
+	if tag is None:
+		return prompt
+	# Slack tags read "[Name | Slack user <@U…>]" (gateway/run_inbound.py _prefix_inbound_sender_context).
+	if sender is not None and tag.group(1).split(" | ", 1)[0].strip() != sender.strip():
+		return prompt
+	return text[tag.end() :]
+
+
+def session_sender() -> str:
+	"""The current gateway sender's display name (HERMES_SESSION_USER_NAME, which Hermes
+	binds for the turn and copies into hook threads); "" outside a gateway turn."""
+	try:
+		from gateway.session_context import get_session_env  # type: ignore[import-not-found]
+
+		return get_session_env("HERMES_SESSION_USER_NAME") or ""
+	except Exception:
+		return ""
 
 
 def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
@@ -166,7 +182,10 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	prompt = message_text(payload.get("user_message") or payload.get("prompt"))
 	if not prompt.strip() or _take_quick(prompt):
 		return ""
-	prompt = strip_sender_tag(prompt)
+	# Only the sender's own tag goes: a leading "[label] " the user typed is part of the request.
+	sender = session_sender()
+	if sender:
+		prompt = strip_sender_tag(prompt, sender)
 	# Hermes expands /skill commands into an "[IMPORTANT: The user has invoked …]" scaffold
 	# before pre_llm_call, so a prompt still starting with "/" is never a skill with a task.
 	if not prompt.strip() or prompt.strip().startswith("/") or is_already_uplifted(prompt):
@@ -293,13 +312,12 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 
 def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
 	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
-	planned session. Subagents never plan (plan() skips them), so they have no state
-	file: a PR URL in a delegate_task result is a PR event for the parent session."""
+	planned session. Subagents never plan (plan() skips them), so they have no state file."""
 	session_id = str(payload.get("session_id") or "").strip()
 	tool_name = str(payload.get("tool_name") or "")
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
-	if not session_id or not (tool_name == DELEGATE_TOOL or is_pr_creation_tool(tool_name, str(command))):
+	if not session_id or not is_pr_creation_tool(tool_name, str(command)):
 		return None
 	url = extract_pr_url(_result_text(payload.get("result")))
 	if not url:

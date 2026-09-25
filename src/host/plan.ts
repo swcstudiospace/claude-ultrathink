@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
 import { runPromptSubmit } from "../claude/hook.ts";
-import { type ControlState, readControl, sessionPath } from "../claude/state.ts";
+import { type ControlState, readControl, sessionPath, writeControl } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
 import { decideUplift, isTrivial } from "../uplift/detect.ts";
@@ -24,6 +24,7 @@ import { isOmpSubagentSessionId } from "./omp-session.ts";
 import { resolveStateDir } from "./paths.ts";
 import type { ProgressSink } from "./progress.ts";
 import type { HostId } from "./types.ts";
+import type { UpliftState } from "../types.ts";
 import { buildPlanView, type PlanView } from "./view.ts";
 
 export interface PlanRequest {
@@ -112,15 +113,24 @@ export async function planPrompt(
 	}
 	try {
 		const config = loadConfig(claudeConfigPaths(cwd, env));
-		// Stateless skips (raw:, commands, uplifted XML, graph hand-offs, acks) never pay for engine selection; runPromptSubmit
-		// still applies enabled/skipOnce. With a skip armed they are left to runPromptSubmit, which consumes it as Claude does.
-		if (control.skipOnce !== true) {
-			const precheck = decideUplift(
-				{ text, source: "user", idle: true },
-				{ enabled: true, skipOnce: false, skipTrivial: config.uplift.skipTrivial },
-			);
-			if (precheck.action !== "uplift") return skip(`precheck-${precheck.action}`);
+		// Every uplift skip is decided here, before an engine is selected: the stateless ones (raw:, commands, uplifted XML,
+		// graph hand-offs, acks), planning turned off, and an armed /ultrathink-skip, which is consumed and saved now, as the
+		// Claude hook does, so a failed engine selection can never leave it armed for a later task.
+		const state: UpliftState = {
+			enabled: control.enabled ?? config.uplift.enabled,
+			skipOnce: control.skipOnce === true,
+			skipTrivial: config.uplift.skipTrivial,
+		};
+		const decision = decideUplift({ text, source: "user", idle: true }, state);
+		if (control.skipOnce === true && !state.skipOnce) {
+			control = { ...control, skipOnce: false };
+			try {
+				writeControl(stateDir, { skipOnce: false });
+			} catch {
+				// fail-open: the skip still applies to this prompt
+			}
 		}
+		if (decision.action !== "uplift") return skip(`precheck-${decision.action}`);
 		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd);
 		if ("skipped" in engine) return skip(engine.skipped);
 		const sessionId = request.session_id?.trim() || "unknown";
