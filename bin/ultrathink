@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Planner controls: ultrathink status|off|on|skip|track on|off|last|think|hitl|grok ...
+# State dir: ULTRATHINK_HOST (claude-code, grok-build, muse, omp, hermes), else the detected host (src/host/detect.ts).
+set -eu
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink -- "$self")
+	case $link in
+	/*) self=$link ;;
+	*) self=$(dirname -- "$self")/$link ;;
+	esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd)
+exec "$root/bin/run-bun" "$root/src/uplift/commands.ts" "$@"

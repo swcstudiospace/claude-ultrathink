@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
  * Claude Code PostToolUse hook (matcher: AskUserQuestion): fold the user's
  * answers back into this session's clarifications and the saved spec XML.
@@ -7,6 +9,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { isChildInvocation } from "../src/claude/complete.ts";
 import { defaultStateDir, readSession, type SessionRecord, sessionPath, writeSession } from "../src/claude/state.ts";
+import { parseEnvelope } from "../src/host/envelope.ts";
 import { applyAnswers, type AskUserQuestionInput, type AskUserQuestionResponse } from "../src/hitl/answers.ts";
 import { injectClarificationsXml } from "../src/hitl/format.ts";
 import type { Clarification } from "../src/hitl/types.ts";
@@ -23,7 +26,7 @@ async function main(): Promise<void> {
 	if (isChildInvocation()) return;
 	let input: HookInput = {};
 	try {
-		input = JSON.parse(await new Response(Bun.stdin.stream()).text()) as HookInput;
+		input = parseEnvelope(await new Response(Bun.stdin.stream()).text()) as HookInput;
 	} catch {
 		return;
 	}

@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Muse speaks the Claude hook protocol (Claude-shaped stdin, reads
+# hookSpecificOutput.additionalContext), so this runs the Claude hook entry.
+# Muse hook argv cannot set env: the launcher forces the Muse host (state dir).
+# Missing bun exits 0 so the turn still proceeds.
+trap 'exit 0' EXIT
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export ULTRATHINK_HOST=muse
+exec "$root/bin/run-bun" "$root/hooks/uplift.ts"

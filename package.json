@@ -1,15 +1,34 @@
 {
 	"name": "ultrathink",
-	"version": "0.1.0",
+	"version": "0.3.0",
 	"private": true,
 	"type": "module",
-	"description": "Prompt Uplift with Graph of Thought + Chain of Thought + HITL clarifications on a pluggable engine (Claude default, Grok optional), tracked in the Agent Task Graph Notion database and the Spectrum Web Co Linear team via ultrathink-kickoff/ultrathink-sync skills.",
+	"description": "Plans every prompt into a spec + Graph of Thought, tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR, across Claude Code, Grok Build, Hermes Agent, Muse and Omp.",
+	"license": "AGPL-3.0-or-later",
+	"author": "SWC Studio",
+	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/swcstudiospace/claude-ultrathink.git"
+	},
+	"bugs": {
+		"url": "https://github.com/swcstudiospace/claude-ultrathink/issues"
+	},
+	"keywords": ["claude-code", "grok", "hermes", "muse", "omp", "agent", "planning", "graph-of-thought", "linear", "notion", "greptile"],
 	"scripts": {
 		"test": "bun test",
-		"check": "bunx tsc --noEmit",
+		"check": "bunx --package typescript@5.9.3 tsc --noEmit",
 		"hook:uplift": "bun hooks/uplift.ts",
 		"uplift": "bun hooks/uplift.ts --ctl",
-		"setup": "bun scripts/setup.ts"
+		"setup": "bun scripts/setup.ts",
+		"mcp": "bun src/mcp/cli.ts",
+		"ship": "bun src/ship/cli.ts"
+	},
+	"omp": {
+		"extensions": ["./src/host/omp.ts"]
+	},
+	"pi": {
+		"extensions": ["./src/host/omp.ts"]
 	},
 	"devDependencies": {
 		"@types/bun": "^1.4.0"

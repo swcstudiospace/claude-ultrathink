@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import {
 	dependencyLevels,
@@ -144,7 +146,14 @@ describe("graphToXml", () => {
 });
 
 describe("parseNodeFill", () => {
-	test("reads thinking and conclusion", () => {
+	test("reads rationale and conclusion", () => {
+		expect(parseNodeFill("<node><rationale>step 1</rationale><conclusion>do x</conclusion></node>")).toEqual({
+			thinking: "step 1",
+			conclusion: "do x",
+		});
+	});
+
+	test("still reads the older <thinking> tag for back-compat", () => {
 		expect(parseNodeFill("<node><thinking>step 1</thinking><conclusion>do x</conclusion></node>")).toEqual({
 			thinking: "step 1",
 			conclusion: "do x",

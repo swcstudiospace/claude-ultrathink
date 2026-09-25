@@ -5,11 +5,13 @@ description: Invoked after opening a pull request for a task ultrathink-kickoff 
 
 # ultrathink-sync
 
-You were nudged (or asked) to sync a tracked task. You'll have a `graphId` from the nudge message, or from context if invoked manually — if you don't have one, look at the current session's ultrathink state file (`~/.claude/ultrathink/sessions/<sessionId>.json`) for `plan.graphId`.
+You were nudged (or asked) to sync a tracked task. You'll have a `graphId` from the nudge message, or from context if invoked manually — if you don't have one, look at the current session's ultrathink state file (`<host state dir>/sessions/<sessionId>.json` — e.g. `~/.claude/ultrathink/` in Claude Code; the planner reports the exact `statePath` on other hosts) for `plan.graphId`.
 
 ## 1. Find the tracked Task row
 
-Query the Notion "🧩 Agent Task Graph" data source (`collection://be3418f0-d2d8-411b-8677-fa8a95ee63be` — confirm against your `notion` config if it has been overridden) for the row where `Level = "Task"` and `Graph ID` equals the `graphId`. If none is found, stop — there is nothing to sync (do not create one; that is `ultrathink-kickoff`'s job, not this one's).
+The trackers are the Notion data source `notion.dataSourceUrl` (a `collection://…` URL) and the Linear team `linear.team` from the ultrathink config: `~/.config/ultrathink/config.json`, `~/.claude/ultrathink.json` and `<project>/.claude/ultrathink.json`, later files winning. `<repo>/bin/ultrathink status`, run from the project directory, prints both as `Notion: …` and `Linear team: …` (`not configured` when unset); `<repo>` is the plugin root (this file is `<repo>/skills/ultrathink-sync/SKILL.md`). Skip a tracker that is not configured silently. With neither configured there is nothing to sync: stop here without a report and carry on. If the user asks to set up Notion tracking, `<repo>/bin/ultrathink-mcp notion init --parent <page url or id> --write-config` creates the database and saves its `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`.
+
+Query the configured Notion data source for the row where `Level = "Task"` and `Graph ID` equals the `graphId`. If none is found, stop — there is nothing to sync (do not create one; that is `ultrathink-kickoff`'s job, not this one's). Without Notion configured, skip this lookup and update only the Linear issues.
 
 ## 2. Update whatever changed
 
@@ -23,9 +25,17 @@ Update only the properties that actually have new information right now — don'
 | The PR was approved | `PR State = "Approved"` | — |
 | The PR was merged | `PR State = "Merged"`, `Status = "Merged"`, `Completed` = now | move the Linear issue(s) to "Done" |
 | Work stopped without a PR (research/investigation task) | `Status = "Done"` (or `"Failed"`/`"Blocked"` if it didn't finish), `Completed` = now if terminal | move the Linear issue(s) to match |
-| Still in progress, just checking in | `Status = "Implementing"` (leave as-is if already there) | — |
+| Still in progress, just checking in | `Status = "Implementing"` (leave as-is if already there) | move node issues whose TODOs are done to "Done" |
 
-Set `Linear State` on the Notion row to mirror whatever you just set on the actual Linear issue(s), so the two stay consistent.
+Apply only the columns of configured trackers. When both are configured, set `Linear State` on the Notion row to mirror whatever you just set on the actual Linear issue(s), so the two stay consistent.
+
+### Locating the Linear issues
+
+Read `tracking` from the same state file: `tracking.linear.nodes[<nodeId>]` and `tracking.linear.steps["<nodeId>.<step>"]` hold `{ id, identifier, url }` for every node issue and step sub-issue. Fallback when `tracking` is absent: Linear `list_issues` with `query` = `ultrathink graph <graphId>` (every planner-created issue ends its description with that footer).
+
+- Attach the PR with `save_issue` (`id` = the identifier, `links` = `[{ url: <PR URL>, title: "PR #<n>" }]`) on each node issue it covers.
+- Move the state of node issues whose TODO lines (and step sub-issues) are done; leave the rest.
+- Never create issues or rows here, even if some are missing — that is `ultrathink-kickoff`'s job.
 
 ## 3. Report
 

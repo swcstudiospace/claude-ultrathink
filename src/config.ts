@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, type GrokConfig, type GrokEffort } from "./grok/types.ts";
+import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
+import { DEFAULT_SHIP_CONFIG, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
 import { MAX_NODES, MIN_NODES, type ThinkConfig } from "./think/types.ts";
 
 export interface ClaudeConfig {
@@ -18,7 +21,7 @@ export interface ClaudeConfig {
 	callTimeoutMs: number;
 	/** Whole-hook budget in ms. 0 = run until the host hook timeout. */
 	budgetMs: number;
-	/** Parallel Chain-of-Thought fills per dependency level. */
+	/** Parallel node-detail fills per dependency level. */
 	concurrency: number;
 	/** Print a one-line summary to the user after each uplift. */
 	echo: boolean;
@@ -43,21 +46,36 @@ export const DEFAULT_CLAUDE_CONFIG: ClaudeConfig = {
 };
 
 export interface NotionConfig {
-	/** Data source URL for the "Agent Task Graph" database (`collection://<id>`). */
+	/** Data source URL for the "Agent Task Graph" database (`collection://<id>`); "" = Notion tracking not configured. */
 	dataSourceUrl: string;
 }
 
 export const DEFAULT_NOTION_CONFIG: NotionConfig = {
-	dataSourceUrl: "collection://be3418f0-d2d8-411b-8677-fa8a95ee63be",
+	dataSourceUrl: "",
 };
 
 export interface LinearConfig {
-	/** Linear team name that Issues/Sub-Issues are created under. */
+	/** Linear team name that Issues/Sub-Issues are created under; "" = Linear tracking not configured. */
 	team: string;
 }
 
 export const DEFAULT_LINEAR_CONFIG: LinearConfig = {
-	team: "Spectrum Web Co",
+	team: "",
+};
+
+export interface TrackConfig {
+	/** Create Linear/Notion rows from the hook before the agent sees the prompt. */
+	enabled: boolean;
+	/** Whole tracker-creation budget in ms. */
+	budgetMs: number;
+	/** Parallel tracker calls. */
+	concurrency: number;
+}
+
+export const DEFAULT_TRACK_CONFIG: TrackConfig = {
+	enabled: true,
+	budgetMs: 60_000,
+	concurrency: 6,
 };
 
 export interface UltrathinkConfig {
@@ -68,6 +86,8 @@ export interface UltrathinkConfig {
 	think: ThinkConfig;
 	notion: NotionConfig;
 	linear: LinearConfig;
+	track: TrackConfig;
+	ship: ShipConfig;
 }
 
 export function defaultConfig(): UltrathinkConfig {
@@ -89,6 +109,8 @@ export function defaultConfig(): UltrathinkConfig {
 		hitl: { ...DEFAULT_HITL_CONFIG },
 		notion: { ...DEFAULT_NOTION_CONFIG },
 		linear: { ...DEFAULT_LINEAR_CONFIG },
+		track: { ...DEFAULT_TRACK_CONFIG },
+		ship: { ...DEFAULT_SHIP_CONFIG, skills: [...DEFAULT_SHIP_CONFIG.skills] },
 	};
 }
 
@@ -173,12 +195,31 @@ function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConf
 		reasoningEffort: GROK_EFFORTS.includes(grok.reasoningEffort as GrokEffort)
 			? (grok.reasoningEffort as GrokEffort)
 			: defaults.reasoningEffort,
-		transport: grok.transport === "http" || grok.transport === "cli" ? grok.transport : defaults.transport,
+		transport: GROK_TRANSPORTS.includes(grok.transport as GrokTransport) ? (grok.transport as GrokTransport) : defaults.transport,
 		bin: nonEmpty(grok.bin, defaults.bin),
 		home: typeof grok.home === "string" ? grok.home.trim() : defaults.home,
 		callTimeoutMs: nonNegativeMs(grok.callTimeoutMs, defaults.callTimeoutMs),
 		fallbackToClaude: typeof grok.fallbackToClaude === "boolean" ? grok.fallbackToClaude : defaults.fallbackToClaude,
+		shuntBaseUrl: httpUrl(grok.shuntBaseUrl, defaults.shuntBaseUrl),
+		shuntModel: nonEmpty(grok.shuntModel, defaults.shuntModel),
+		shuntMaxTokens:
+			typeof grok.shuntMaxTokens === "number" && Number.isInteger(grok.shuntMaxTokens) && grok.shuntMaxTokens > 0
+				? grok.shuntMaxTokens
+				: defaults.shuntMaxTokens,
 	};
+}
+
+/** A non-empty http(s) URL with trailing slashes stripped; anything else falls back. */
+function httpUrl(value: unknown, fallback: string): string {
+	if (typeof value !== "string") return fallback;
+	const trimmed = value.trim().replace(/\/+$/, "");
+	if (!trimmed) return fallback;
+	try {
+		const url = new URL(trimmed);
+		return url.protocol === "http:" || url.protocol === "https:" ? trimmed : fallback;
+	} catch {
+		return fallback;
+	}
 }
 
 function mergeHitl(hitl: Record<string, unknown> | undefined, defaults: HitlConfig): HitlConfig {
@@ -205,6 +246,52 @@ function mergeLinear(linear: Record<string, unknown> | undefined, defaults: Line
 	return { team: nonEmpty(linear.team, defaults.team) };
 }
 
+function mergeTrack(track: Record<string, unknown> | undefined, defaults: TrackConfig): TrackConfig {
+	if (!track) return defaults;
+	return {
+		enabled: typeof track.enabled === "boolean" ? track.enabled : defaults.enabled,
+		budgetMs:
+			typeof track.budgetMs === "number" && Number.isFinite(track.budgetMs) && track.budgetMs > 0
+				? track.budgetMs
+				: defaults.budgetMs,
+		concurrency:
+			typeof track.concurrency === "number" && Number.isFinite(track.concurrency) && track.concurrency >= 1
+				? Math.floor(track.concurrency)
+				: defaults.concurrency,
+	};
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+function mergeShip(ship: Record<string, unknown> | undefined, defaults: ShipConfig): ShipConfig {
+	if (!ship) return defaults;
+	const skills =
+		Array.isArray(ship.skills) && ship.skills.every((s) => typeof s === "string" && s.trim())
+			? (ship.skills as string[]).map((s) => s.trim())
+			: defaults.skills;
+	return {
+		enabled: typeof ship.enabled === "boolean" ? ship.enabled : defaults.enabled,
+		autoMerge: typeof ship.autoMerge === "boolean" ? ship.autoMerge : defaults.autoMerge,
+		skills,
+		minScore:
+			typeof ship.minScore === "number" && Number.isFinite(ship.minScore) && ship.minScore >= 1 && ship.minScore <= 5
+				? ship.minScore
+				: defaults.minScore,
+		requireNoComments:
+			typeof ship.requireNoComments === "boolean" ? ship.requireNoComments : defaults.requireNoComments,
+		maxRounds: positiveInt(ship.maxRounds, defaults.maxRounds),
+		mergeMethod: MERGE_METHODS.includes(ship.mergeMethod as ShipConfig["mergeMethod"])
+			? (ship.mergeMethod as ShipConfig["mergeMethod"])
+			: defaults.mergeMethod,
+		deleteBranch: typeof ship.deleteBranch === "boolean" ? ship.deleteBranch : defaults.deleteBranch,
+		reviewTimeoutMs: positiveInt(ship.reviewTimeoutMs, defaults.reviewTimeoutMs),
+		pollMs: positiveInt(ship.pollMs, defaults.pollMs),
+		waitMs: positiveInt(ship.waitMs, defaults.waitMs),
+	};
+}
+
 export function mergeConfig(file: Record<string, unknown> | undefined, base: UltrathinkConfig): UltrathinkConfig {
 	if (!file) return base;
 	return {
@@ -215,13 +302,20 @@ export function mergeConfig(file: Record<string, unknown> | undefined, base: Ult
 		think: mergeThink(asRecord(file.think), base.think),
 		notion: mergeNotion(asRecord(file.notion), base.notion),
 		linear: mergeLinear(asRecord(file.linear), base.linear),
+		track: mergeTrack(asRecord(file.track), base.track),
+		ship: mergeShip(asRecord(file.ship), base.ship),
 	};
 }
 
-/** Config files for ultrathink, lowest precedence first — later files win. */
+/** Host-neutral user config: `${XDG_CONFIG_HOME || ~/.config}/ultrathink/config.json`. */
+export function userConfigPath(env: Record<string, string | undefined> = process.env): string {
+	return join(env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"), "ultrathink", "config.json");
+}
+
+/** Config files for ultrathink, lowest precedence first — later files win: user, then Claude user, then project. */
 export function claudeConfigPaths(cwd: string, env: Record<string, string | undefined> = process.env): string[] {
 	const home = env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
-	return [join(home, "ultrathink.json"), join(cwd, ".claude", "ultrathink.json")];
+	return [userConfigPath(env), join(home, "ultrathink.json"), join(cwd, ".claude", "ultrathink.json")];
 }
 
 /** Loads config from `files` in order (later files win); defaults when none override. */

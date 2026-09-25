@@ -1,0 +1,75 @@
+name: Bug report
+description: ultrathink did something wrong, or failed to do something it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a security vulnerability, do not use this form: [report it privately](https://github.com/swcstudiospace/claude-ultrathink/security/advisories/new) instead.
+
+        **Remove tokens, API keys and other secrets from everything you paste below.** This issue is public.
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      description: Where did it happen? Pick every host where you can reproduce it.
+      multiple: true
+      options:
+        - Claude Code
+        - Grok Build
+        - Hermes Agent
+        - Muse
+        - Omp
+    validations:
+      required: true
+  - type: input
+    id: ultrathink-version
+    attributes:
+      label: ultrathink version
+      description: The release you installed, or the commit of your checkout (`git rev-parse --short HEAD`).
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: input
+    id: host-version
+    attributes:
+      label: Host version
+      description: The output of `claude --version`, `grok --version`, `hermes --version`, `muse --version` or `omp --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The prompt or command you ran, and anything configured that matters (engine, tracking, `/ultrathink-status` output).
+      placeholder: |
+        1. Configure ...
+        2. Send the prompt ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Reproduce with `ULTRATHINK_DEBUG=1` set in the host's environment. On Claude Code, Grok Build and Muse, the prompt hook then logs `[ultrathink] …` lines to stderr. Paste those and any error output from the host.
+      render: text
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Secrets
+      options:
+        - label: I removed tokens, API keys and other secrets from this report.
+          required: true

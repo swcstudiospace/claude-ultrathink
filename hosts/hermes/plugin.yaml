@@ -1,0 +1,9 @@
+name: ultrathink
+version: 0.3.0
+description: "Plans each prompt with the shared ultrathink engine. /ultrathink-quick <message> sends one message without planning."
+author: "SWC Studio"
+license: AGPL-3.0-or-later
+hooks:
+  - pre_llm_call
+  - transform_tool_result
+  - post_tool_call

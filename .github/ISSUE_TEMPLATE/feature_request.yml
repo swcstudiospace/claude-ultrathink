@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a change to how ultrathink plans, tracks or ships work.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should ultrathink do instead? Include any commands, config keys or output you have in mind.
+    validations:
+      required: true
+  - type: dropdown
+    id: hosts
+    attributes:
+      label: Hosts
+      description: Which hosts does this concern? Leave it empty if it applies to all of them.
+      multiple: true
+      options:
+        - Claude Code
+        - Grok Build
+        - Hermes Agent
+        - Muse
+        - Omp
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other approaches you ruled out.

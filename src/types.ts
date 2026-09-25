@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 export const ROOT_TAGS = [
 	"BUILD_PROMPT",
 	"FIX_PROMPT",

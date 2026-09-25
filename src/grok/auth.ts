@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
  * Reads the Grok Build CLI OAuth session (`~/.grok/auth.json`) so the plugin can
  * call the CLI chat proxy with the user's existing SuperGrok login.

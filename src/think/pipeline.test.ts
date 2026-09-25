@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { UpliftResult } from "../types.ts";
 import { dependencyLevels } from "./graph.ts";
+import { nodeStepTitles } from "../track/plan.ts";
 import { runThink } from "./pipeline.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "./prompts.ts";
 import { FALLBACK_GRAPH } from "./types.ts";
@@ -32,21 +35,21 @@ describe("runThink", () => {
 			uplift,
 			complete: async (system, user) => {
 				calls.push({ system, user });
-				if (calls.length === 1) return graphJson(3);
+				if (calls.length === 1) return graphJson(5);
 				const id = user.match(/current_node id="([^"]+)"/)?.[1] ?? `n${calls.length - 1}`;
 				return `<node><thinking>think ${id}</thinking><conclusion>done ${id}</conclusion></node>`;
 			},
 		});
 
-		expect(calls).toHaveLength(1 + 3);
+		expect(calls).toHaveLength(1 + 5);
 		expect(calls[0]?.system).toBe(GRAPH_SYSTEM_PROMPT);
 		expect(calls[0]?.user).toContain("add list");
 		expect(calls[0]?.user).toContain("<BUILD_PROMPT>");
 		expect(calls.slice(1).every((call) => call.system === COT_SYSTEM_PROMPT)).toBe(true);
 		expect(calls[2]?.user).toContain("done n1");
-		expect(result.graph.nodes.map((node) => node.id)).toEqual(["n1", "n2", "n3"]);
+		expect(result.graph.nodes.map((node) => node.id)).toEqual(["n1", "n2", "n3", "n4", "n5"]);
 		expect(result.graph.nodes[0]?.conclusion).toBe("done n1");
-		expect(result.graph.nodes[2]?.kind).toBe("synthesize");
+		expect(result.graph.nodes[4]?.kind).toBe("synthesize");
 		expect(result.source).toBe("llm");
 		expect(result.xml).toContain("<BUILD_PROMPT>");
 		expect(result.xml).toContain("<ORIGINAL>add list</ORIGINAL>");
@@ -100,7 +103,7 @@ describe("runThink", () => {
 			uplift,
 			complete: async (_system, user) => {
 				if (user.includes("current_node id=\"n2\"")) throw new Error("node boom");
-				if (!user.includes("current_node")) return graphJson(3);
+				if (!user.includes("current_node")) return graphJson(5);
 				const id = user.match(/current_node id="([^"]+)"/)?.[1] ?? "n?";
 				return `<node><thinking>t ${id}</thinking><conclusion>c ${id}</conclusion></node>`;
 			},
@@ -128,6 +131,7 @@ describe("runThink concurrency", () => {
 		const result = await runThink({
 			uplift,
 			concurrency: 4,
+			minNodes: 4,
 			complete: async (_system, user) => {
 				if (order.length === 0 && !user.includes("current_node")) return JSON.stringify(graph);
 				const id = user.match(/current_node id="([^"]+)"/)?.[1] ?? "?";
@@ -148,5 +152,59 @@ describe("runThink concurrency", () => {
 			["n2", "n3"],
 			["n4"],
 		]);
+	});
+});
+
+describe("runThink onEvent", () => {
+	const fillFor = async (_system: string, user: string): Promise<string> => {
+		if (!user.includes("current_node")) return graphJson(5);
+		if (user.includes("current_node id=\"n3\"")) throw new Error("node boom");
+		return "<node><thinking>t</thinking><conclusion>c</conclusion></node>";
+	};
+	for (const concurrency of [1, 3]) {
+		test(`graph once then start/done per node (concurrency ${concurrency})`, async () => {
+			const events: Array<Record<string, unknown>> = [];
+			await runThink({ uplift, concurrency, complete: fillFor, onEvent: (event) => events.push(event) });
+			expect(events[0]).toMatchObject({ type: "graph", total: 5 });
+			expect(events[0]?.nodes).toHaveLength(5);
+			expect(events.filter((event) => event.type === "graph")).toHaveLength(1);
+			const nodes = events.slice(1);
+			expect(nodes).toHaveLength(10);
+			for (let index = 0; index < 5; index++) {
+				const id = `n${index + 1}`;
+				const start = nodes.findIndex((event) => event.id === id && event.phase === "start");
+				const done = nodes.findIndex((event) => event.id === id && event.phase === "done");
+				expect(start).toBeGreaterThanOrEqual(0);
+				expect(done).toBeGreaterThan(start);
+				expect(nodes[start]).toMatchObject({ type: "node", index, total: 5 });
+				expect(nodes[done]?.fallback).toBe(id === "n3" ? true : undefined);
+			}
+		});
+	}
+
+	test("graph nodes carry dependsOn; every done event carries the node's step titles, fallback included", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const complete = async (_system: string, user: string): Promise<string> => {
+			if (!user.includes("current_node")) return graphJson(5);
+			if (user.includes('current_node id="n2"')) throw new Error("node boom");
+			return "<node><thinking>1. read it 2. write it</thinking><conclusion>c</conclusion></node>";
+		};
+		const result = await runThink({ uplift, complete, onEvent: (event) => events.push(event) });
+		expect(events[0]?.nodes).toEqual([
+			{ id: "n1", title: "T1", kind: "understand", dependsOn: [] },
+			{ id: "n2", title: "T2", kind: "generate", dependsOn: ["n1"] },
+			{ id: "n3", title: "T3", kind: "generate", dependsOn: ["n2"] },
+			{ id: "n4", title: "T4", kind: "generate", dependsOn: ["n3"] },
+			{ id: "n5", title: "T5", kind: "synthesize", dependsOn: ["n4"] },
+		]);
+		const done = events.filter((event) => event.phase === "done");
+		expect(done).toHaveLength(5);
+		for (const event of done) {
+			const node = result.graph.nodes.find((candidate) => candidate.id === event.id)!;
+			expect(event.steps).toEqual(nodeStepTitles(node));
+		}
+		expect(done.find((event) => event.id === "n1")?.steps).toEqual(["Step 1: read it", "Step 2: write it"]);
+		expect(done.find((event) => event.id === "n2")).toMatchObject({ fallback: true, steps: ["Step 1: Q2"] });
+		expect(events.filter((event) => event.phase === "start").every((event) => event.steps === undefined)).toBe(true);
 	});
 });

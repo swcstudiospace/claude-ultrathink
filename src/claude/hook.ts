@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
  * Orchestrates one UserPromptSubmit event: decide → uplift → Graph of Thought
- * with per-node Chain of Thought → HITL clarifications → build a Notion/Linear
+ * with per-node rationale/conclusion fills → HITL clarifications → build a Notion/Linear
  * TrackPlan → persist session state → return the spec plus an instruction to
  * invoke ultrathink-kickoff as hook context. Everything after "decide" is
  * fail-open: the user's prompt always goes through.
@@ -16,12 +18,17 @@ import type { ThoughtGraph } from "../think/types.ts";
 import { fetchBrief } from "../substrate/brief.ts";
 import { resolveBranch, resolveRepoSlug } from "../track/git.ts";
 import { buildTrackPlan } from "../track/plan.ts";
-import type { TrackPlan } from "../track/types.ts";
+import type { Tracker } from "../track/gateway.ts";
+import { injectTrackingXml } from "../track/render.ts";
+import type { TrackingRefs, TrackPlan } from "../track/types.ts";
+import type { ProgressEvent, ProgressSink, StageName } from "../host/progress.ts";
 import type { UpliftResult, UpliftState } from "../types.ts";
 import { decideUplift } from "../uplift/detect.ts";
+import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
 import type { ClaudeCompleter } from "./complete.ts";
 import { formatPromptContext, formatSummary } from "./output.ts";
+import { shipApplies } from "../ship/policy.ts";
 import { type ControlState, readSession, type SessionRecord, sessionPath, writeControl, writeSession } from "./state.ts";
 
 export interface PromptSubmitInput {
@@ -30,6 +37,8 @@ export interface PromptSubmitInput {
 	cwd?: string;
 	prompt?: string;
 	hook_event_name?: string;
+	/** Set when `prompt` is the instruction (or objective) of a skill invocation; the skill stays authoritative. */
+	skill?: SkillInvocation;
 }
 
 export interface HookOutput {
@@ -52,8 +61,18 @@ export interface HookDeps {
 	conversation?: (transcriptPath?: string) => string;
 	/** Test seam for the Agent Substrate brief; defaults to the real fail-open HTTP call. */
 	brief?: (input: { repo?: string; branch?: string; surface?: string }) => Promise<string>;
+	/** Host that asked for the brief. Defaults to Claude so existing callers stay stable. */
+	surface?: string;
 	now?: () => number;
 	log?: (message: string) => void;
+	/** Creates tracker rows through the MCP gateway before the prompt goes out; fail-open. */
+	track?: Tracker;
+	/** Deterministic command the kickoff skill runs to finish missing rows. */
+	trackCommand?: string;
+	/** Tracking is off for this prompt: no tracker call, no kickoff instruction or Linked issues; the plan is still recorded. */
+	trackingOff?: boolean;
+	/** Structured live progress (Omp status bar); a throwing sink never breaks planning. */
+	progress?: ProgressSink;
 }
 
 export interface PromptSubmitResult {
@@ -68,6 +87,15 @@ function specFile(stateDir: string, sessionId: string): string {
 
 export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps): Promise<PromptSubmitResult> {
 	const now = deps.now ?? Date.now;
+	const emit = (event: ProgressEvent): void => {
+		try {
+			deps.progress?.(event);
+		} catch {
+			// fail-open: progress is display only
+		}
+	};
+	const stage = (name: StageName, phase: "start" | "end", ok?: boolean, detail?: string): void =>
+		emit({ type: "stage", at: now(), stage: name, phase, ...(ok === undefined ? {} : { ok }), ...(detail ? { detail } : {}) });
 	const started = now();
 	const log = deps.log ?? (() => {});
 	const cwd = input.cwd?.trim() || process.cwd();
@@ -87,13 +115,28 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		}
 	}
 	if (decision.action !== "uplift") return { skipped: decision.action };
+	const skill = input.skill;
+	emit({
+		type: "begin",
+		at: now(),
+		sessionId,
+		engine: deps.engine,
+		track: deps.track !== undefined && !deps.trackingOff,
+		...(skill ? { skill: skill.name } : {}),
+	});
+	let outcome: "planned" | "skipped" | "failed" = "failed";
+	let outcomeDetail: string | undefined;
 
 	const controller = new AbortController();
 	const budget =
 		deps.config.claude.budgetMs > 0 ? setTimeout(() => controller.abort(), deps.config.claude.budgetMs) : undefined;
 	try {
 		const original = decision.text;
-		const conversation = deps.conversation?.(input.transcript_path) ?? "";
+		const history = deps.conversation?.(input.transcript_path) ?? "";
+		const skillLine = skill
+			? `The user invoked the "${skill.name}" skill with this message.${skill.summary ? ` Skill summary: ${skill.summary}` : ""}`
+			: "";
+		const conversation = [skillLine, history].filter(Boolean).join("\n");
 
 		// Resolved once and shared by the brief and the TrackPlan below.
 		const git = (() => {
@@ -107,13 +150,15 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// Started now, awaited before the Graph of Thought: the graph is then
 		// planned knowing what other agents already did, and the round trip
 		// overlaps the uplift call instead of adding to it.
+		stage("brief", "start");
 		const briefPromise = (deps.brief ?? fetchBrief)({
 			repo: git.repo,
 			branch: git.branch,
-			surface: "claude-code",
+			surface: deps.surface ?? "claude-code",
 		}).catch(() => "");
 
 		let result: UpliftResult;
+		stage("uplift", "start");
 		try {
 			result = await runUplift({
 				original,
@@ -124,15 +169,21 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			});
 		} catch (error) {
 			log(`uplift failed: ${error instanceof Error ? error.message : String(error)}`);
+			stage("uplift", "end", false);
+			outcome = "skipped";
+			outcomeDetail = "uplift-failed";
 			return { skipped: "uplift-failed" };
 		}
+		stage("uplift", "end", true, `${result.root} · ${result.source}`);
 
 		const brief = await briefPromise;
 		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
+		stage("brief", "end", true, brief ? `${brief.split("\n").length} lines` : "none");
 
 		let graph: ThoughtGraph | undefined;
 		const thinkOn = deps.control.thinkEnabled ?? deps.config.think.enabled;
 		if (thinkOn && !controller.signal.aborted) {
+			stage("think", "start");
 			try {
 				const thought = await runThink({
 					uplift: result,
@@ -142,11 +193,14 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					maxNodes: deps.config.think.maxNodes,
 					concurrency: deps.config.claude.concurrency,
 					onProgress: log,
+					onEvent: (event) => emit({ ...event, at: now() }),
 				});
 				result = thought;
 				graph = thought.graph;
+				stage("think", "end", true, `${graph.nodes.length} nodes`);
 			} catch (error) {
 				log(`think failed: ${error instanceof Error ? error.message : String(error)}`);
+				stage("think", "end", false);
 			}
 		}
 
@@ -156,6 +210,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		);
 		const hitlOn = deps.control.hitlEnabled ?? deps.config.hitl.enabled;
 		if (hitlOn && !controller.signal.aborted) {
+			stage("clarify", "start");
 			try {
 				const fresh = await (deps.clarify ?? runClarify)({
 					uplift: result,
@@ -169,8 +224,10 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				});
 				const seen = new Set(clarifications.map((c) => normalizeQuestion(c.question)));
 				clarifications = [...clarifications, ...fresh.filter((c) => !seen.has(normalizeQuestion(c.question)))];
+				stage("clarify", "end", true, `${clarifications.length} question${clarifications.length === 1 ? "" : "s"}`);
 			} catch (error) {
 				log(`clarify failed: ${error instanceof Error ? error.message : String(error)}`);
+				stage("clarify", "end", false);
 			}
 		}
 		if (clarifications.length > 0) {
@@ -182,10 +239,37 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// untracked rather than creating generic FALLBACK_GRAPH boilerplate rows in the shared
 		// Notion/Linear tracker on every engine outage. Only build a plan for real LLM output.
 		if (result.source !== "fallback") {
+			stage("plan", "start");
 			try {
-				plan = buildTrackPlan({ uplift: result, graph, clarifications, repo: git.repo, branch: git.branch });
+				plan = buildTrackPlan({
+					uplift: result,
+					graph,
+					clarifications,
+					repo: git.repo,
+					branch: git.branch,
+					agent: deps.surface ?? "claude-code",
+				});
+				stage("plan", "end", true, `${plan.linearIssues.length} issues · ${plan.linearSubIssues.length} steps`);
 			} catch (error) {
 				log(`track plan failed: ${error instanceof Error ? error.message : String(error)}`);
+				stage("plan", "end", false);
+			}
+		}
+
+		let tracking: TrackingRefs | undefined;
+		if (plan && deps.track && !deps.trackingOff) {
+			stage("track", "start");
+			tracking = await deps.track({ plan, graph, signal: controller.signal, progress: deps.progress }).catch((error: unknown) => {
+				log(`tracking failed: ${error instanceof Error ? error.message : String(error)}`);
+				return undefined;
+			});
+			if (tracking) {
+				result = { ...result, xml: injectTrackingXml(result.xml, plan, tracking) };
+				log(`tracking ${tracking.status}${tracking.errors.length > 0 ? `: ${tracking.errors.join("; ")}` : ""}`);
+				const issues = Object.keys(tracking.linear.nodes).length;
+				stage("track", "end", tracking.status !== "failed", `${tracking.status} · ${issues}/${plan.linearIssues.length} issues`);
+			} else {
+				stage("track", "end", false);
 			}
 		}
 
@@ -193,31 +277,52 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			sessionId,
 			at: now(),
 			engine: deps.engine,
+			host: deps.surface ?? "claude-code",
 			result,
 			graph,
 			clarifications,
 			plan,
+			tracking,
+			...(skill ? { skill: { name: skill.name, ...(skill.summary ? { summary: skill.summary } : {}), source: skill.source } } : {}),
 			kickedOff: false,
 			synced: false,
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
+		stage("state", "start");
 		try {
 			specPath = specFile(deps.stateDir, sessionId);
 			mkdirSync(dirname(specPath), { recursive: true });
 			writeFileSync(specPath, `${result.xml}\n`);
 			writeSession(deps.stateDir, record);
 			statePath = sessionPath(deps.stateDir, sessionId);
+			stage("state", "end", true);
 		} catch (error) {
 			log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
 			specPath = undefined;
 			statePath = undefined;
+			stage("state", "end", false);
 		}
 
+		const providers = { linear: deps.config.linear.team.trim() !== "", notion: deps.config.notion.dataSourceUrl.trim() !== "" };
 		const output: HookOutput = {
 			hookSpecificOutput: {
 				hookEventName: "UserPromptSubmit",
-				additionalContext: formatPromptContext({ result, graph, clarifications, brief, statePath, specPath }),
+				additionalContext: formatPromptContext({
+					result,
+					graph,
+					clarifications,
+					brief,
+					statePath,
+					specPath,
+					plan,
+					tracking,
+					trackCommand: deps.trackCommand,
+					...(skill ? { skill: skill.name } : {}),
+					ship: shipApplies(deps.config.ship, skill?.name),
+					trackingOff: deps.trackingOff,
+					providers,
+				}),
 			},
 		};
 		if (deps.config.claude.echo) {
@@ -227,13 +332,23 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				graph,
 				clarifications,
 				brief,
-				tracked: Boolean(plan && statePath),
+				tracked: Boolean(plan && statePath) && !deps.trackingOff,
+				tracking,
+				plan,
+				...(skill ? { skill: skill.name } : {}),
+				trackingOff: deps.trackingOff,
+				providers,
 				engineError: deps.engineError?.(),
 				elapsedMs: now() - started,
 			});
 		}
+		outcome = "planned";
 		return { output, record };
+	} catch (error) {
+		outcomeDetail = error instanceof Error ? error.name : "error";
+		throw error;
 	} finally {
-		if (budget !== undefined) clearTimeout(budget);
+		clearTimeout(budget);
+		emit({ type: "end", at: now(), outcome, ...(outcomeDetail ? { detail: outcomeDetail } : {}) });
 	}
 }

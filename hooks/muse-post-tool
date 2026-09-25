@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Muse PostToolUse speaks the Claude hook protocol but has no matcher, so every
+# tool call lands here; hooks/pr-sync.ts filters to PR creation itself. The
+# launcher forces the Muse host (state dir). Missing bun exits 0.
+trap 'exit 0' EXIT
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export ULTRATHINK_HOST=muse
+exec "$root/bin/run-bun" "$root/hooks/pr-sync.ts"

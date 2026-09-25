@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Muse Stop stdin is Claude-shaped, so this runs the shared Claude stop hook.
+# Muse hook argv cannot set env: the launcher forces the Muse host (state dir).
+# Missing bun exits 0.
+trap 'exit 0' EXIT
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export ULTRATHINK_HOST=muse
+exec "$root/bin/run-bun" "$root/hooks/stop.ts"

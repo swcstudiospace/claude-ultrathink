@@ -1,7 +1,10 @@
 {
 	"name": "ultrathink",
-	"version": "0.1.0",
-	"description": "Prompt Uplift with Graph of Thought + Chain of Thought + HITL clarifications on a pluggable engine (Claude default, Grok optional), tracked in the Agent Task Graph Notion database and the Spectrum Web Co Linear team.",
+	"version": "0.3.0",
+	"description": "Plans every prompt into a spec + Graph of Thought with HITL clarifications on a pluggable engine (Claude default, Grok optional), tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR.",
 	"author": { "name": "SWC Studio", "email": "noreply@swcstudio.space" },
-	"keywords": ["uplift", "prompt", "xml", "got", "cot", "hitl", "notion", "linear", "tracking"]
+	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+	"repository": "https://github.com/swcstudiospace/claude-ultrathink",
+	"license": "AGPL-3.0-or-later",
+	"keywords": ["planning", "prompt", "graph-of-thought", "hitl", "agent", "linear", "notion", "greptile"]
 }

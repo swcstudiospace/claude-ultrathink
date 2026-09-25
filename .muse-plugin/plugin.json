@@ -1,0 +1,82 @@
+{
+	"schemaVersion": 1,
+	"name": "ultrathink",
+	"displayName": "Ultrathink",
+	"version": "0.3.0",
+	"description": "Plans each prompt with the shared ultrathink engine and writes the spec for the agent to read.",
+	"compat": {
+		"source": "native",
+		"manifestDir": ".muse-plugin"
+	},
+	"capabilities": {
+		"skills": [
+			{
+				"id": "ultrathink-plan",
+				"path": "skills/ultrathink-plan/SKILL.md"
+			},
+			{
+				"id": "ultrathink-kickoff",
+				"path": "skills/ultrathink-kickoff/SKILL.md"
+			},
+			{
+				"id": "ultrathink-sync",
+				"path": "skills/ultrathink-sync/SKILL.md"
+			},
+			{
+				"id": "ultrathink-ship",
+				"path": "skills/ultrathink-ship/SKILL.md"
+			}
+		],
+		"commands": [
+			{
+				"id": "ultrathink-quick",
+				"path": "commands/ultrathink-quick.md"
+			},
+			{
+				"id": "ultrathink-skip",
+				"path": "commands/ultrathink-skip.md"
+			},
+			{
+				"id": "ultrathink-off",
+				"path": "commands/ultrathink-off.md"
+			},
+			{
+				"id": "ultrathink-on",
+				"path": "commands/ultrathink-on.md"
+			},
+			{
+				"id": "ultrathink-track",
+				"path": "commands/ultrathink-track.md"
+			},
+			{
+				"id": "ultrathink-status",
+				"path": "commands/ultrathink-status.md"
+			}
+		],
+		"hooks": [
+			{
+				"id": "user-prompt-submit",
+				"event": "UserPromptSubmit",
+				"command": ["sh", "hooks/muse-prompt"],
+				"timeoutMs": 600000,
+				"statusMessage": "Ultrathink · Graph of Thought"
+			},
+			{
+				"id": "post-tool-use",
+				"event": "PostToolUse",
+				"command": ["sh", "hooks/muse-post-tool"],
+				"timeoutMs": 10000,
+				"statusMessage": "Ultrathink · PR sync check"
+			},
+			{
+				"id": "stop",
+				"event": "Stop",
+				"command": ["sh", "hooks/muse-stop"],
+				"timeoutMs": 5000,
+				"statusMessage": "Ultrathink · sync nudge"
+			}
+		],
+		"mcpServers": [],
+		"reminders": []
+	}
+}

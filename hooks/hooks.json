@@ -5,7 +5,7 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/uplift.ts\"",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/uplift.ts\"",
 						"timeout": 86400,
 						"statusMessage": "Ultrathink · Graph of Thought"
 					}
@@ -18,7 +18,7 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/answers.ts\"",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/answers.ts\"",
 						"timeout": 30
 					}
 				]
@@ -28,17 +28,17 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
 						"timeout": 30
 					}
 				]
 			},
 			{
-				"matcher": "mcp__aio__github_create_pull_request|github_create_pull_request|mcp__github__create_pull_request",
+				"matcher": "mcp__aio__github_create_pull_request|github_create_pull_request|mcp__github__create_pull_request|github__create_pull_request",
 				"hooks": [
 					{
 						"type": "command",
-						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
 						"timeout": 30
 					}
 				]
@@ -49,7 +49,7 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.ts\"",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.ts\"",
 						"timeout": 60
 					}
 				]
