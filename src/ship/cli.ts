@@ -176,7 +176,8 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 			const error = result.error ? { error: result.error } : {};
 			return { ok: true, ready: false, status: "pending", pending, round: ship.rounds.length, maxRounds, next: NEXT_PENDING, ...error };
 		}
-		result = { ...result, status: "timeout", error: `review still pending after ${deps.config.reviewTimeoutMs}ms` };
+		const cause = result.error ? ` (last error: ${result.error})` : "";
+		result = { ...result, status: "timeout", error: `review still pending after ${deps.config.reviewTimeoutMs}ms${cause}` };
 	}
 	const rounds: ReviewResult[] = reusedRound ? [...ship.rounds.slice(0, -1), result] : [...ship.rounds, result];
 	const gate = mergeGate({ config: deps.config, status, latest: result });
