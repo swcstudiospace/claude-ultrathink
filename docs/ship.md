@@ -126,7 +126,7 @@ After each round the phase is one of:
 | `ready` | The merge gate passes | run `merge` |
 | `needs-fixes` | The gate fails and rounds remain | The agent fixes the findings (security issues first, then P0, P1, P2), commits only the files it edited, pushes and runs `review` again. It never suppresses lint rules, weakens tests or skips checks to satisfy the reviewer. |
 | `pr-open` | The review passed (5/5, no open comments) but the PR is still waiting: CI pending or failing, mergeability not computed, or merge conflicts | Not a failed round: it never counts toward `maxRounds` or blocks the ship. Wait and run `merge` again; fix failing CI or conflicts, push, and run `review` again. |
-| `blocked` | `ship.maxRounds` failed reviews reached (rounds whose review passed and only waited do not count), two failed or timed-out reviews on the same head commit, or the PR was closed without merging | For an open PR the CLI posts a comment with the reason, the score and up to 20 remaining findings, and leaves the PR for a human. |
+| `blocked` | `ship.maxRounds` failed reviews reached (rounds whose review passed and only waited do not count), two failed or timed-out reviews on the same head commit, the PR was closed without merging, or it was merged outside the ship flow before its review passed | For an open PR the CLI posts a comment with the reason, the score and up to 20 remaining findings, and leaves the PR for a human. `run` reports `ok: false`. A PR merged outside the flow after a passing review is `ready`: `merge` skips the merge and finishes the branch cleanup. |
 
 The skill also stops and reports when two rounds in a row return the same findings.
 

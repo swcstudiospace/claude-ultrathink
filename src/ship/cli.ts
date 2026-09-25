@@ -183,19 +183,23 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 		result.status !== "completed" && prior !== undefined && prior.status !== "completed" && prior.headSha === result.headSha;
 	// Rounds whose review passed (the PR merely waited on CI, mergeability or conflicts) never count toward maxRounds.
 	const failedRounds = rounds.filter((round) => !reviewPasses(deps.config, round)).length;
-	const merged = status.state === "MERGED";
-	const waiting = !gate.ok && status.state === "OPEN" && result.headSha === status.headSha && reviewPasses(deps.config, result);
+	const passed = reviewPasses(deps.config, result);
+	// A PR merged outside the flow is ready only for cleanup, and only when its review passed.
+	const mergedPassing = status.state === "MERGED" && passed;
+	const waiting = !gate.ok && status.state === "OPEN" && result.headSha === status.headSha && passed;
 	const blockedReason =
-		gate.ok || waiting || merged
+		gate.ok || waiting || mergedPassing
 			? undefined
-			: status.state === "CLOSED"
-				? "PR closed without merge"
-				: failedTwice
-					? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
-					: failedRounds >= maxRounds
-						? `max rounds reached: ${gate.reason}`
-						: undefined;
-	const phase = gate.ok || merged ? "ready" : waiting ? "pr-open" : blockedReason ? "blocked" : "needs-fixes";
+			: status.state === "MERGED"
+				? "PR was merged outside the ship flow before its review passed"
+				: status.state === "CLOSED"
+					? "PR closed without merge"
+					: failedTwice
+						? `review ${result.status} twice for ${status.headSha}: ${result.error ?? gate.reason}`
+						: failedRounds >= maxRounds
+							? `max rounds reached: ${gate.reason}`
+							: undefined;
+	const phase = gate.ok || mergedPassing ? "ready" : waiting ? "pr-open" : blockedReason ? "blocked" : "needs-fixes";
 	let commented: boolean | undefined;
 	if (blockedReason && status.state === "OPEN" && !reusedRound && ship.phase !== "blocked") {
 		const findings = result.comments
@@ -212,7 +216,7 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	writeShip(statePath, { rounds, phase, blockedReason, pending: undefined }, deps.now());
 	const next = gate.ok
 		? "run merge"
-		: merged
+		: mergedPassing
 			? "PR already merged: run merge to finish the cleanup"
 			: waiting
 				? prWaitNext(gate.reason)
@@ -221,8 +225,8 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 					: NEXT_FIX;
 	return {
 		ok: true,
-		// An already-merged PR is ready for `merge`, which skips the merge and finishes the cleanup.
-		ready: gate.ok || merged,
+		ready: gate.ok || mergedPassing,
+		blocked: blockedReason !== undefined,
 		reused: reusedRound,
 		status: result.status,
 		score: result.score,
@@ -297,7 +301,7 @@ async function stepRun(ctx: Ctx): Promise<Output> {
 	const review = await stepReview(ctx);
 	if (!review.ready || !ctx.deps.config.autoMerge) {
 		const next = review.ready ? "autoMerge disabled: merge manually" : (review.next ?? `stop: ${String(review.reason)}`);
-		return { ok: review.ok !== false, assess, pr, review, next };
+		return { ok: review.ok !== false && review.blocked !== true, assess, pr, review, next };
 	}
 	const merge = await stepMerge(ctx);
 	return { ok: merge.ok, assess, pr, review, merge, next: merge.ok ? "run ultrathink-sync" : `stop: ${String(merge.reason)}` };

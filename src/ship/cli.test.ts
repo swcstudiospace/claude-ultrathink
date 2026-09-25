@@ -229,6 +229,15 @@ describe("runShip", () => {
 		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
 	});
 
+	test("a PR merged outside the flow with a failing review is blocked, not ready, and run reports ok false", async () => {
+		const out = await ship("run", deps({ existingPr: PR, status: { state: "MERGED" }, review: { score: 3, comments: [{ body: "fix" }] } }));
+		expect(out.output).toMatchObject({ ok: false, review: { ready: false, blocked: true } });
+		expect(String(out.output.next)).toBe("stop: PR was merged outside the ship flow before its review passed");
+		expect(out.output.merge).toBeUndefined();
+		expect(calls.some((c) => c.startsWith("delete:") || c.startsWith("sync:"))).toBe(false);
+		expect(comments).toEqual([]);
+	});
+
 	test("merge refuses when autoMerge disabled", async () => {
 		writeShip(statePath, { pr: PR });
 		const out = await ship("merge", deps({ config: { autoMerge: false } }));
