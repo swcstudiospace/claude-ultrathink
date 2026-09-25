@@ -91,6 +91,17 @@ describe("formatHitlAddendum", () => {
 		expect(out).not.toContain("### Answered");
 		expect(out).toContain("### Open (non-blocking)");
 	});
+
+	test("Hermes' clarify tool replaces AskUserQuestion in the ask and the no-user fallback, keeping the item lists", () => {
+		const claude = formatHitlAddendum([open, soft, answered]);
+		const out = formatHitlAddendum([open, soft, answered], { questionTool: "clarify" });
+		expect(out).not.toContain("AskUserQuestion");
+		expect(out).toContain('call Hermes\' `clarify` tool ONCE with `{"questions": [{"question": "...", "choices": ["..."]}]}`');
+		expect(out).toContain("at most 5 questions, at most 4 choices each, with the recommended default as the first choice");
+		expect(out).toContain("If `clarify` is unavailable or answers that no user is available");
+		// Only steps 2 and 5 differ; the open/answered lists are the same.
+		expect(out.slice(out.indexOf("### Open (blocking)"))).toBe(claude.slice(claude.indexOf("### Open (blocking)")));
+	});
 });
 
 describe("formatHitlEcho", () => {

@@ -50,12 +50,13 @@ PR_URL = "https://github.com/acme/widgets/pull/42"
 
 
 def fake_bun(path: Path) -> Path:
-	"""A bun stand-in that appends each request prompt to <path>.calls and echoes it back
-	as the engine's context."""
+	"""A bun stand-in that appends each request prompt to <path>.calls (and the whole
+	request to <path>.requests) and echoes the prompt back as the engine's context."""
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(
 		f"#!{sys.executable}\nimport json, sys\nrequest = json.load(sys.stdin)\n"
 		f"open({str(path) + '.calls'!r}, 'a').write(request['prompt'] + '\\n')\n"
+		f"open({str(path) + '.requests'!r}, 'a').write(json.dumps(request) + '\\n')\n"
 		"print(json.dumps({'context': 'planned:' + request['prompt']}))\n"
 	)
 	path.chmod(path.stat().st_mode | stat.S_IEXEC)
@@ -65,6 +66,11 @@ def fake_bun(path: Path) -> Path:
 def bun_calls(path: Path) -> list[str]:
 	calls = Path(f"{path}.calls")
 	return calls.read_text().splitlines() if calls.exists() else []
+
+
+def bun_requests(path: Path) -> list[dict]:
+	requests = Path(f"{path}.requests")
+	return [json.loads(line) for line in requests.read_text().splitlines()] if requests.exists() else []
 
 
 @contextmanager
@@ -269,6 +275,52 @@ def test_slash_commands_and_uplifted_xml_never_start_bun():
 		assert bun_calls(fake) == ["<BUILD_PROMPTS> add a widget", "<div>fix the layout</div>", "fix the /tmp cleanup"]
 
 
+def test_only_the_senders_own_tag_is_stripped_and_it_never_defeats_the_skips():
+	saved = bridge.session_sender
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
+		fake = fake_bun(Path(tmp) / "bun")
+		engine = {"BUN": str(fake)}
+		try:
+			# A shared multi-user gateway session prefixes each message with its sender's name.
+			bridge.session_sender = lambda: "Alice"
+			for prompt in (
+				"[Alice] /model x",
+				"[Alice] <BUILD_PROMPT><task>add a widget</task></BUILD_PROMPT>",
+				'[Alice] <ultrathink graph="ut-1-abcdef12"/>',
+				"[Alice] ",
+			):
+				assert plan({"user_message": prompt, "session_id": "s1"}, env=engine) == "", prompt
+			bridge.session_sender = lambda: "Bob"
+			assert plan({"user_message": "[Bob | Slack user <@U1>]   /ultrathink-status", "session_id": "s1"}, env=engine) == ""
+			assert bun_calls(fake) == []
+			# The engine sees the text without the sender's tag, so its own skips (acks, raw:) apply.
+			bridge.session_sender = lambda: "Alice"
+			assert plan({"user_message": "[Alice] ok", "session_id": "s1"}, env=engine) == "planned:ok"
+			assert plan({"user_message": "[Alice] add a widget", "session_id": "s1"}, env=engine) == "planned:add a widget"
+			# A label the user typed is part of the request, with or without a gateway sender.
+			assert plan({"user_message": "[backend] update the guide", "session_id": "s1"}, env=engine) == "planned:[backend] update the guide"
+			bridge.session_sender = lambda: ""
+			assert plan({"user_message": "[Alice] add a widget", "session_id": "s1"}, env=engine) == "planned:[Alice] add a widget"
+			# Hermes' skill scaffold opens with a bracket too, and reaches the engine whole.
+			scaffold = '[IMPORTANT: The user has invoked the "gsd-quick" skill, indicating they want you to follow its instructions.] fix it'
+			assert plan({"user_message": scaffold, "session_id": "s1"}, env=engine) == f"planned:{scaffold}"
+			assert bun_calls(fake) == ["ok", "add a widget", "[backend] update the guide", "[Alice] add a widget", scaffold]
+		finally:
+			bridge.session_sender = saved
+
+
+def test_the_planner_runs_in_the_terminal_cwd_hermes_tools_use():
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
+		fake = fake_bun(Path(tmp) / "bun")
+		repo = str(Path(tmp) / "repo")
+		payload = {"user_message": "add a widget", "session_id": "s1"}
+		plan(payload, env={"BUN": str(fake), "TERMINAL_CWD": repo})
+		plan({**payload, "cwd": "/from/payload"}, env={"BUN": str(fake), "TERMINAL_CWD": repo})
+		plan(payload, env={"BUN": str(fake), "TERMINAL_CWD": "  "})
+		assert [request["cwd"] for request in bun_requests(fake)] == [repo, "/from/payload", os.getcwd()]
+
+
+
 def test_deadline_ends_fifteen_seconds_inside_the_hermes_cap():
 	saved = os.environ.pop("ULTRATHINK_HERMES_TIMEOUT", None)
 	try:
@@ -363,7 +415,7 @@ def test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session():
 		assert pr_tool_result({**call, "args": {"command": "gh pr view 42"}}, env=env) is None
 		result = pr_tool_result(call, env=env)
 		assert result is not None and result.startswith(call["result"] + "\n\n")
-		assert f'Invoke the ultrathink-sync skill (load it with skill_view name="ultrathink:ultrathink-sync", or read {SYNC_SKILL}) now with stateFile={state} and prUrl={PR_URL}' in result
+		assert f'Invoke the ultrathink-sync skill (load it with skill_view name="ultrathink:ultrathink-sync", or read {SYNC_SKILL}) now with stateFile={state}, graphId=g1 and prUrl={PR_URL}' in result
 		assert f"(graph g1, {PR_URL})" in result
 		assert "do not create new Notion rows or Linear issues" in result
 		assert pr_tool_result(call, env=env) is None
@@ -391,6 +443,45 @@ def test_next_turn_delivers_a_nudge_no_tool_result_carried_once():
 		assert take_pr_nudges({"session_id": "pr-turn"}) == ""
 
 
+def test_a_pr_a_subagent_really_opened_nudges_the_parent_and_a_cited_one_does_not():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		state = planned_session(home, "parent")
+		bridge.note_subagent({"parent_session_id": "parent", "child_session_id": "child-1", "child_role": "coder"})
+		# A subagent's summary that only cites a PR (a review, a failed attempt) is no proof one was opened.
+		cite = {"session_id": "parent", "tool_name": "delegate_task", "args": {"goal": "review"}, "result": json.dumps({"results": [{"summary": f"Reviewed {PR_URL}; nothing to change."}]})}
+		assert pr_tool_result(cite, env=env) is None
+		queue_pr_nudge(cite, env=env)
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# The child's own `gh pr create` fires the tool hooks with the child's session id: that is the proof.
+		child_call = {**gh_pr_create("child-1"), "result": f"Creating pull request...\n{PR_URL}\n"}
+		assert pr_tool_result(child_call, env=env) is None  # the child's result stays untouched; the parent owns the task
+		queue_pr_nudge(child_call, env=env)
+		# The parent's delegate_task result naming that PR carries the nudge once, with the parent's graph.
+		opened = {**cite, "result": json.dumps({"results": [{"summary": f"Opened {PR_URL} for the widget."}]})}
+		result = pr_tool_result(opened, env=env)
+		assert result is not None and f"stateFile={state}, graphId=g1 and prUrl={PR_URL}" in result
+		assert pr_tool_result(opened, env=env) is None
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# A child PR the delegate result never names still reaches the parent on its next turn.
+		other = "https://github.com/acme/widgets/pull/99"
+		queue_pr_nudge({**child_call, "result": f"{other}\n"}, env=env)
+		assert other in take_pr_nudges({"session_id": "parent"})
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		# Another session's delegate result citing that URL gets nothing: the proof belongs to this parent.
+		planned_session(home, "other")
+		assert pr_tool_result({**opened, "session_id": "other"}, env=env) is None
+		# After a new plan replaces the graph, a delegate result citing the old plan's PR proves nothing for the new one,
+		# and the old PR does not become the new plan's latest PR for the end-of-turn nudge.
+		record = json.loads(state.read_text())
+		record["plan"] = {"graphId": "g2"}
+		state.write_text(json.dumps(record))
+		assert pr_tool_result(opened, env=env) is None
+		queue_pr_nudge(opened, env=env)
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		assert ("parent", "g2") not in bridge._pr_latest
+
+
 def test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge():
 	with tempfile.TemporaryDirectory() as home:
 		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
@@ -402,7 +493,7 @@ def test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge():
 		assert nudge is not None and nudge["action"] == "continue"
 		message = nudge["message"]
 		assert SYNC_SKILL.is_absolute() and SYNC_SKILL.is_file()
-		assert "graph graph-sync-once" in message and f"stateFile={state}" in message and "prUrl=" not in message
+		assert "graph graph-sync-once" in message and f"stateFile={state}, graphId=graph-sync-once." in message and "prUrl=" not in message
 		assert f'skill_view name="ultrathink:ultrathink-sync", or read {SYNC_SKILL}' in message
 		assert "never creates rows" in message and "one line" in message
 		assert sync_nudge(verify("sync-once"), env=env) is None
@@ -508,7 +599,7 @@ def test_registers_every_ultrathink_command_next_to_the_hooks():
 	ctx = fake_ctx()
 	plugin.register(ctx)
 	assert sorted(ctx.commands) == [f"ultrathink-{verb}" for verb in ("off", "on", "quick", "skip", "status", "track")]
-	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify"]
+	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify", "subagent_start"]
 
 	# A Hermes that rejects the commands still plans every prompt.
 	def reject(*_args: object, **_kwargs: object) -> None:
@@ -597,6 +688,7 @@ def test_quick_sends_the_message_once_without_a_plan():
 		# A shared gateway session hands the turn over as "[Alice] fix the typo".
 		assert ctx.commands["ultrathink-quick"]("fix the typo") is None
 		assert plan({"user_message": "[Alice] fix the typo", "session_id": "q1"}, env=engine) == ""
+		# Outside a gateway turn there is no sender to match, so the tagged text is planned as written.
 		assert plan({"user_message": "[Alice] fix the typo", "session_id": "q1"}, env=engine) == "planned:[Alice] fix the typo"
 
 
@@ -624,6 +716,8 @@ if __name__ == "__main__":
 	test_engine_is_found_off_path_when_bun_is_unset()
 	test_engine_failure_returns_empty()
 	test_slash_commands_and_uplifted_xml_never_start_bun()
+	test_only_the_senders_own_tag_is_stripped_and_it_never_defeats_the_skips()
+	test_the_planner_runs_in_the_terminal_cwd_hermes_tools_use()
 	test_deadline_ends_fifteen_seconds_inside_the_hermes_cap()
 	test_short_hook_cap_never_starts_bun_and_warns_once()
 	test_deadline_kills_bun_and_everything_it_spawned()
@@ -631,6 +725,7 @@ if __name__ == "__main__":
 	test_extract_pr_url_reads_gh_output()
 	test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session()
 	test_next_turn_delivers_a_nudge_no_tool_result_carried_once()
+	test_a_pr_a_subagent_really_opened_nudges_the_parent_and_a_cited_one_does_not()
 	test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge()
 	test_no_sync_nudge_without_rows_after_sync_or_with_tracking_off()
 	test_sync_nudge_names_the_pr_the_session_opened()

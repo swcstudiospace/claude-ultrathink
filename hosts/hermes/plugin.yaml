@@ -8,3 +8,4 @@ hooks:
   - transform_tool_result
   - post_tool_call
   - pre_verify
+  - subagent_start

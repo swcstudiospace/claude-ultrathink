@@ -5,9 +5,10 @@
 pre_llm_call plans the prompt through hooks/engine.ts, inside the hook cap Hermes
 enforces (plugins.hook_callback_timeout): Bun gets min(540, cap - 15) seconds in its
 own process group, and the whole group is killed at that deadline. Slash commands
-and already-uplifted ultrathink XML never start Bun. When a planned session's
-tool call opens a pull request, transform_tool_result appends an ultrathink-sync
-nudge to that tool result, so the model sees it in the same turn. If no tool
+and already-uplifted ultrathink XML never start Bun, even behind a shared session's
+"[Name] " sender tag. When a planned session's tool call opens a pull request (or a
+delegate_task subagent's result names one), transform_tool_result appends an
+ultrathink-sync nudge to that tool result, so the model sees it in the same turn. If no tool
 result carried it, post_tool_call queues the nudge and the session's next
 pre_llm_call delivers it. Each PR URL is nudged once per session. When a coding
 turn is about to finish (pre_verify) and the session's tracked plan has not been
@@ -41,7 +42,9 @@ MIN_PLAN_S = 90  # below this a plan cannot finish, so Bun is not started at all
 CONTROL_TIMEOUT_S = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
-SENDER_TAG_RE = re.compile(r"\[[^\]\n]*\]\s+")
+SENDER_TAG_RE = re.compile(r"\[([^\]\n]*)\]\s+")
+# Hermes' skill scaffold also opens with a bracket; it is the prompt, not a sender tag.
+SKILL_SCAFFOLD_PREFIX = "[IMPORTANT: The user has invoked the "
 
 # Ports of src/track/pr-detect.ts. JavaScript's \s, \b, and \d are spelled out
 # because Python's are Unicode-aware and disagree with them at the edges.
@@ -71,6 +74,11 @@ _pr_delivered: set[tuple[str, str]] = set()  # (session_id, PR URL) the model wa
 _pr_pending: dict[str, dict[str, str]] = {}  # session_id -> PR URL -> nudge for its next turn
 # Plan-scoped state is keyed by (session_id, graphId): a session's next planned prompt is a new graph with its own rows.
 _pr_latest: dict[tuple[str, str], str] = {}  # (session_id, graphId) -> the last PR URL opened for that plan
+# Subagents never plan, but their tool calls fire the same hooks: a PR URL a child's own `gh pr create`
+# printed is proof it was opened, and its delegate_task result can then nudge the parent.
+_child_parent: dict[str, str] = {}  # child session_id -> parent session_id (from subagent_start)
+_child_opened: dict[tuple[str, str], set[str]] = {}  # (parent session_id, graphId) -> PR URLs its children opened for that plan
+DELEGATE_TOOL = "delegate_task"  # Hermes runs subagents through this tool; its result is the child's text
 _sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify already continued with a sync nudge
 
 # /ultrathink-quick arms one skip per injected message. pre_llm_call consumes it only on
@@ -142,6 +150,33 @@ def message_text(message: Any) -> str:
 	return ""
 
 
+def strip_sender_tag(prompt: str, sender: str | None = None) -> str:
+	"""The message without a shared session's leading "[Name] " sender tag; unchanged
+	when it has none. Hermes' "[IMPORTANT: …]" skill scaffold is not a tag. With `sender`,
+	only a tag naming that sender is removed, so a user's own "[backend] …" label stays."""
+	text = prompt.lstrip()
+	if text.startswith(SKILL_SCAFFOLD_PREFIX):
+		return prompt
+	tag = SENDER_TAG_RE.match(text)
+	if tag is None:
+		return prompt
+	# Slack tags read "[Name | Slack user <@U…>]" (gateway/run_inbound.py _prefix_inbound_sender_context).
+	if sender is not None and tag.group(1).split(" | ", 1)[0].strip() != sender.strip():
+		return prompt
+	return text[tag.end() :]
+
+
+def session_sender() -> str:
+	"""The current gateway sender's display name (HERMES_SESSION_USER_NAME, which Hermes
+	binds for the turn and copies into hook threads); "" outside a gateway turn."""
+	try:
+		from gateway.session_context import get_session_env  # type: ignore[import-not-found]
+
+		return get_session_env("HERMES_SESSION_USER_NAME") or ""
+	except Exception:
+		return ""
+
+
 def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	"""Return context to inject, or "" when the engine should not run."""
 	parent = payload.get("parent_session_id") or payload.get("parentSessionId")
@@ -152,24 +187,30 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	prompt = message_text(payload.get("user_message") or payload.get("prompt"))
 	if not prompt.strip() or _take_quick(prompt):
 		return ""
+	# Only the sender's own tag goes: a leading "[label] " the user typed is part of the request.
+	sender = session_sender()
+	if sender:
+		prompt = strip_sender_tag(prompt, sender)
 	# Hermes expands /skill commands into an "[IMPORTANT: The user has invoked …]" scaffold
 	# before pre_llm_call, so a prompt still starting with "/" is never a skill with a task.
-	if prompt.strip().startswith("/") or is_already_uplifted(prompt):
+	if not prompt.strip() or prompt.strip().startswith("/") or is_already_uplifted(prompt):
 		return ""
 	deadline = plan_deadline()
 	if deadline is None:
 		_warn_short_cap()
 		return ""
+	child_env = os.environ.copy()
+	child_env.update(env or {})
+	# Hermes passes no cwd to pre_llm_call; its tools run in TERMINAL_CWD.
+	cwd = payload.get("cwd") or child_env.get("TERMINAL_CWD", "").strip() or os.getcwd()
 	request = {
 		"host": "hermes",
 		"session_id": payload.get("session_id") or payload.get("sessionId") or "",
 		"prompt": prompt,
-		"cwd": payload.get("cwd") or os.getcwd(),
+		"cwd": cwd,
 		"platform": payload.get("platform") or "",
 		"parent_session_id": parent or "",
 	}
-	child_env = os.environ.copy()
-	child_env.update(env or {})
 	child_env["ULTRATHINK_HOST"] = "hermes"
 	bun = child_env.get("BUN")
 	# BUN is an explicit override; otherwise bin/run-bun finds bun even when
@@ -274,42 +315,91 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 	return record if isinstance(record, dict) else None
 
 
-def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
-	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
-	planned session. Subagents never plan (plan() skips them), so they have no state file."""
+def note_subagent(payload: dict[str, Any]) -> None:
+	"""subagent_start: remember which parent a child session works for."""
+	child = str(payload.get("child_session_id") or "").strip()
+	parent = str(payload.get("parent_session_id") or "").strip()
+	if child and parent:
+		with _pr_lock:
+			_child_parent[child] = parent
+
+
+def _opened_pr(payload: dict[str, Any]) -> tuple[str, str, bool] | None:
+	"""(owner session_id, PR URL, opened by a child) when this tool call may prove a PR was
+	opened: the session's own `gh pr create`, a child's `gh pr create` (owned by its parent),
+	or a delegate_task result naming a PR; _pr_event checks the last against the plan's proof."""
 	session_id = str(payload.get("session_id") or "").strip()
+	tool_name = str(payload.get("tool_name") or "")
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
-	if not session_id or not is_pr_creation_tool(str(payload.get("tool_name") or ""), str(command)):
+	if not session_id:
 		return None
 	url = extract_pr_url(_result_text(payload.get("result")))
 	if not url:
 		return None
+	if is_pr_creation_tool(tool_name, str(command)):
+		with _pr_lock:
+			parent = _child_parent.get(session_id)
+		return (session_id, url, False) if parent is None else (parent, url, True)
+	if tool_name == DELEGATE_TOOL:
+		return session_id, url, False
+	return None
+
+
+def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str, bool] | None:
+	"""(session_id, graphId, PR URL, nudge, opened by a child) for a planned session's
+	opened PR; subagents never plan, so a child's PR belongs to the parent's current plan."""
+	opened = _opened_pr(payload)
+	if opened is None:
+		return None
+	session_id, url, by_child = opened
 	path = state_path(session_id, env)
 	record = _read_record(path)
 	if record is None or not isinstance(record.get("plan"), dict):
 		return None
 	graph_id = str(record["plan"].get("graphId") or "")
+	# Proof is plan-scoped: a child's PR counts for the plan the parent had when it was opened, so a later
+	# delegate result that cites it after a new plan replaced that graph proves nothing for the new one.
+	if by_child:
+		with _pr_lock:
+			_child_opened.setdefault((session_id, graph_id), set()).add(url)
+	elif str(payload.get("tool_name") or "") == DELEGATE_TOOL:
+		with _pr_lock:
+			proven = url in _child_opened.get((session_id, graph_id), set())
+		if not proven:
+			return None  # a delegate result that merely cites a PR (a review, a failed attempt) is not an opened PR
 	nudge = (
 		f"Ultrathink: a pull request was opened for the tracked task (graph {graph_id}, {url}). "
-		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path} and prUrl={url}, "
+		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path}, graphId={graph_id} and prUrl={url}, "
 		"so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. "
 		"ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues."
 	)
-	return session_id, graph_id, url, nudge
+	return session_id, graph_id, url, nudge, by_child
+
+
+def _queue(session_id: str, graph_id: str, url: str, nudge: str) -> None:
+	"""Hold the nudge for the session's next turn unless it was already delivered; caller holds no lock."""
+	with _pr_lock:
+		if (session_id, url) not in _pr_delivered:
+			_pr_pending.setdefault(session_id, {})[url] = nudge
+		_pr_latest[(session_id, graph_id)] = url
 
 
 def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -> str | None:
 	"""transform_tool_result: the tool result with the nudge appended below it,
 	the first time a planned session's tool call opens that PR. None keeps the
-	result unchanged."""
+	result unchanged. A child's own `gh pr create` result stays untouched: the
+	parent owns the tracked task, so its nudge is queued for the parent instead."""
 	result = payload.get("result")
 	if not isinstance(result, str):
 		return None  # only text can carry the nudge; post_tool_call queues it instead
 	event = _pr_event(payload, env)
 	if event is None:
 		return None
-	session_id, graph_id, url, nudge = event
+	session_id, graph_id, url, nudge, by_child = event
+	if by_child:
+		_queue(session_id, graph_id, url, nudge)
+		return None
 	with _pr_lock:
 		if (session_id, url) in _pr_delivered:
 			return None
@@ -326,11 +416,8 @@ def queue_pr_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return
-	session_id, graph_id, url, nudge = event
-	with _pr_lock:
-		if (session_id, url) not in _pr_delivered:
-			_pr_pending.setdefault(session_id, {})[url] = nudge
-		_pr_latest[(session_id, graph_id)] = url
+	session_id, graph_id, url, nudge, _by_child = event
+	_queue(session_id, graph_id, url, nudge)
 
 
 def take_pr_nudges(payload: dict[str, Any]) -> str:
@@ -383,7 +470,7 @@ def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> di
 	pr = f" and prUrl={url}" if url else ""
 	message = (
 		f"Ultrathink: this session's plan (graph {key[1]}) is tracked but not synced. "
-		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}{pr}. "
+		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}, graphId={key[1]}{pr}. "
 		"It only updates the existing Notion Task row and Linear issues found by Graph ID and never creates rows; "
 		"if Notion or Linear is down, report that in one line and finish without blocking."
 	)
@@ -421,9 +508,9 @@ def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, s
 def _take_quick(prompt: str) -> bool:
 	"""Consume one /ultrathink-quick marker for exactly this message, sender tag aside."""
 	text = prompt.strip()
-	tag = SENDER_TAG_RE.match(text)
+	untagged = strip_sender_tag(text)
 	with _quick_lock:
-		for key in (text, text[tag.end() :]) if tag else (text,):
+		for key in (text, untagged) if untagged != text else (text,):
 			count = _quick_pending.pop(key, 0)
 			if count > 1:
 				_quick_pending[key] = count - 1

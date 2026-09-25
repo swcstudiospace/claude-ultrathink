@@ -30,6 +30,8 @@ export const HANDOFF_MAX_CHARS = 9_000;
 const BRIEF_CUT = "\n(brief truncated)";
 const LINKED_POINTER =
 	"## Linked issues\n\nThe tracker rows' TODO lines are too long to repeat here: copy them from the ISSUES block of the specification file (or from kickoff's `track complete` output), keeping each identifier and URL.";
+/** Hermes names for the Claude tools the THINK addendum mentions (skill-hint hosts only). */
+const HERMES_TOOL_NAMES = "On Hermes, TodoWrite is the `todo` tool and Task subagents are `delegate_task`.";
 
 const RATIONALE_RE = /(<RATIONALE>)[\s\S]*?(<\/RATIONALE>)/g;
 const RATIONALE_OMITTED = "(omitted — full text in the specification file)";
@@ -215,7 +217,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 	const tail: string[] = [];
 	if (input.graph) {
-		tail.push((input.trackingOff ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim());
+		const think = (input.trackingOff ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim();
+		tail.push(hints ? `${think}\n${HERMES_TOOL_NAMES}` : think);
 		const waves = workflowWaves(input.graph)
 			.map((w) => `${w.wave}: ${w.ids.join(", ")}${w.parallel ? " (parallel)" : ""}`)
 			.join(" · ");
@@ -225,7 +228,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 	const linked = input.plan && input.tracking && !input.trackingOff ? formatLinkedIssues(input.plan, input.tracking, providers) : undefined;
 	if (linked) tail.push(linked);
 	if (input.clarifications?.length) {
-		const hitl = formatHitlAddendum(input.clarifications).trim();
+		const hitl = formatHitlAddendum(input.clarifications, hints ? { questionTool: "clarify" } : {}).trim();
 		if (hitl) tail.push(hitl);
 	}
 	if (input.trackingOff) tail.push(TRACKING_OFF_NOTE);
