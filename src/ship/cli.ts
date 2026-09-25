@@ -272,7 +272,8 @@ async function stepRun(ctx: Ctx): Promise<Output> {
 	if (!pr.ok) return { ok: false, assess, pr, next: `stop: ${String(pr.reason)}` };
 	const review = await stepReview(ctx);
 	if (!review.ready || !ctx.deps.config.autoMerge) {
-		return { ok: true, assess, pr, review, next: review.ready ? "autoMerge disabled: merge manually" : review.next };
+		const next = review.ready ? "autoMerge disabled: merge manually" : (review.next ?? `stop: ${String(review.reason)}`);
+		return { ok: review.ok !== false, assess, pr, review, next };
 	}
 	const merge = await stepMerge(ctx);
 	return { ok: merge.ok, assess, pr, review, merge, next: merge.ok ? "run ultrathink-sync" : `stop: ${String(merge.reason)}` };

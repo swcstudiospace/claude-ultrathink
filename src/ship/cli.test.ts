@@ -228,6 +228,16 @@ describe("runShip", () => {
 		expect(calls).not.toContain("merge:squash:abc");
 	});
 
+	test("run reports ok false when its review step fails", async () => {
+		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [], headSha: "abc", at: 1 };
+		writeShip(statePath, { pr: PR, rounds: [round] });
+		const out = await ship("run", deps({ existingPr: PR }));
+		expect(out.output).toMatchObject({ ok: false, review: { ok: false, ready: false } });
+		expect(String(out.output.next)).toBe("run review again");
+		expect(out.output.merge).toBeUndefined();
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+	});
+
 	test("unexpected throw is reported with exit 0", async () => {
 		const d = deps();
 		d.signals = () => {
