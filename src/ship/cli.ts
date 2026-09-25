@@ -173,7 +173,8 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 			const runId = result.reviewId ?? same?.runId;
 			const pending = { headSha: status.headSha, source: result.source, since, ...(runId ? { runId } : {}) };
 			writeShip(statePath, { pending }, deps.now());
-			return { ok: true, ready: false, status: "pending", pending, round: ship.rounds.length, maxRounds, next: NEXT_PENDING };
+			const error = result.error ? { error: result.error } : {};
+			return { ok: true, ready: false, status: "pending", pending, round: ship.rounds.length, maxRounds, next: NEXT_PENDING, ...error };
 		}
 		result = { ...result, status: "timeout", error: `review still pending after ${deps.config.reviewTimeoutMs}ms` };
 	}

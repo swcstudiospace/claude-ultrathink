@@ -115,6 +115,8 @@ If the review is still running when the wait ends, `review` returns `status: "pe
 
 A review of one head commit that stays pending longer than `ship.reviewTimeoutMs` (20 minutes) is recorded as a timed-out round.
 
+In PR mode, a Greptile tool or network error while polling (for example a transient `Repository not found`) is also reported as `pending`, with the message in `error`, rather than as a failed review: the next `review` call retries and resumes the same run, and `ship.reviewTimeoutMs` still bounds the wait. Only Greptile's own `FAILED`/`ERROR` review status counts as a failed round.
+
 Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review, and `merge` itself, re-read the review threads, so a thread resolved since then no longer counts as open and a finding posted since then does. If the threads cannot be read, `review` reports not ready and `merge` refuses; neither falls back to the stored comments. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
 
 ## Fix loop and blocking

@@ -127,13 +127,14 @@ export async function reviewPr(input: {
 		...fields,
 		at: now(),
 	});
+	// The newest review id seen for headSha; a thrown error below still reports it so the next call resumes that run.
+	let pendingId: string | undefined;
 	try {
 		const tuple = repoArgs(input.repo);
 		const deadline = now() + input.timeoutMs;
 		const stale = new Set<string>();
 		let triggered = false;
 		let delay = input.pollMs;
-		let pendingId: string | undefined;
 		while (true) {
 			const listed = asObj(await input.client.call("list_code_reviews", { ...tuple, prNumber: input.prNumber, limit: 20 }));
 			const latest = asArr(listed?.codeReviews)
@@ -188,7 +189,10 @@ export async function reviewPr(input: {
 		// The wait elapsed; the review keeps running server-side and the next call resumes it.
 		return done({ status: "pending", reviewId: pendingId });
 	} catch (error) {
-		return done({ status: "failed", error: (error instanceof Error ? error.message : String(error)).slice(0, 300) });
+		// A thrown tool or transport error says nothing about the review itself (Greptile's own FAILED/ERROR status is
+		// handled above), so it is pending: the next call retries, and ship.reviewTimeoutMs still bounds the wait.
+		const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+		return done({ status: "pending", error: message, ...(pendingId ? { reviewId: pendingId } : {}) });
 	}
 }
 

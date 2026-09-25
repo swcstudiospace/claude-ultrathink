@@ -27,6 +27,7 @@ First public release, licensed under AGPL-3.0-or-later.
 ### Fixed
 
 - Ship: a passing review whose pull request is only waiting on CI, mergeability or conflicts is no longer counted as a failed round, so it cannot block the ship at `maxRounds`, and `review` now says what to wait for instead of "fix the listed findings".
+- Ship: a transient Greptile tool or network error during a PR-mode review is reported as `pending` and retried on the next call, instead of being recorded as a failed round that counts toward `maxRounds`.
 
 ### Security
 
