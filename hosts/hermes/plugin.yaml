@@ -7,3 +7,4 @@ hooks:
   - pre_llm_call
   - transform_tool_result
   - post_tool_call
+  - pre_verify

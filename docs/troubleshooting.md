@@ -220,7 +220,7 @@ Resume at any time with `bin/ultrathink-ship status --state <stateFile>`. Every 
 
 ## Hermes Agent
 
-- **Check that the plugin loads.** `hermes plugins doctor <clone>/hosts/hermes` should print `OK: runtime discovery, manifest parsing, import, and registration passed`, with 4 hooks registered.
+- **Check that the plugin loads.** `hermes plugins doctor <clone>/hosts/hermes` should print `OK: runtime discovery, manifest parsing, import, and registration passed`, with 5 hooks registered.
 - **One planner.** If another plugin also plans prompts before the model call, disable it, or both will plan the same turn.
 - **Gateway injection.** `/ultrathink-quick <message>` sends the message through `inject_message`. In gateways this needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, the command falls back to skipping your next message and replies `Ultrathink will not plan your next message. Send it now (or prefix any message with raw:).`
 - **Command names in chat apps.** The commands are registered with hyphens (`ultrathink-status`) because chat menus accept only a restricted character set, and one colon name stops Discord from listing the commands after it. Telegram menus show them with underscores: `ultrathink_status`, `ultrathink_quick` and so on.

@@ -9,7 +9,9 @@ and already-uplifted ultrathink XML never start Bun. When a planned session's
 tool call opens a pull request, transform_tool_result appends an ultrathink-sync
 nudge to that tool result, so the model sees it in the same turn. If no tool
 result carried it, post_tool_call queues the nudge and the session's next
-pre_llm_call delivers it. Each PR URL is nudged once per session.
+pre_llm_call delivers it. Each PR URL is nudged once per session. When a coding
+turn is about to finish (pre_verify) and the session's tracked plan has not been
+synced, the turn continues once with a nudge to run ultrathink-sync.
 
 The /ultrathink-<verb> slash commands run bin/ultrathink against the engine's
 state directory; /ultrathink-quick sends one message that pre_llm_call leaves
@@ -67,6 +69,9 @@ _cap_warned = False  # the short-cap warning is logged once per process
 _pr_lock = threading.Lock()
 _pr_delivered: set[tuple[str, str]] = set()  # (session_id, PR URL) the model was nudged about
 _pr_pending: dict[str, dict[str, str]] = {}  # session_id -> PR URL -> nudge for its next turn
+# Plan-scoped state is keyed by (session_id, graphId): a session's next planned prompt is a new graph with its own rows.
+_pr_latest: dict[tuple[str, str], str] = {}  # (session_id, graphId) -> the last PR URL opened for that plan
+_sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify already continued with a sync nudge
 
 # /ultrathink-quick arms one skip per injected message. pre_llm_call consumes it only on
 # that exact message, so a message queued behind a running turn still goes out unplanned.
@@ -254,9 +259,24 @@ def _result_text(result: Any) -> str:
 		return ""
 
 
-def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str] | None:
-	"""(session_id, PR URL, nudge) when this tool call opened a PR for a planned
-	session. Subagents never plan (plan() skips them), so they have no state file."""
+def skill_reference(name: str) -> str:
+	"""How a Hermes nudge names a plugin skill: its load call, with the SKILL.md
+	path for a Hermes that did not register it (src/claude/output.ts skillReference)."""
+	path = REPO_ROOT / "skills" / name / "SKILL.md"
+	return f'the {name} skill (load it with skill_view name="ultrathink:{name}", or read {path})'
+
+
+def _read_record(path: Path) -> dict[str, Any] | None:
+	try:
+		record = json.loads(path.read_text(encoding="utf-8"))
+	except (OSError, ValueError):
+		return None
+	return record if isinstance(record, dict) else None
+
+
+def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
+	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
+	planned session. Subagents never plan (plan() skips them), so they have no state file."""
 	session_id = str(payload.get("session_id") or "").strip()
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
@@ -266,19 +286,17 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	if not url:
 		return None
 	path = state_path(session_id, env)
-	try:
-		record = json.loads(path.read_text(encoding="utf-8"))
-	except (OSError, ValueError):
+	record = _read_record(path)
+	if record is None or not isinstance(record.get("plan"), dict):
 		return None
-	if not isinstance(record, dict) or not isinstance(record.get("plan"), dict):
-		return None
+	graph_id = str(record["plan"].get("graphId") or "")
 	nudge = (
-		f"Ultrathink: a pull request was opened for the tracked task ({url}). "
-		f"Invoke the ultrathink-sync skill now with stateFile={path} and prUrl={url}, "
+		f"Ultrathink: a pull request was opened for the tracked task (graph {graph_id}, {url}). "
+		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path} and prUrl={url}, "
 		"so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. "
 		"ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues."
 	)
-	return session_id, url, nudge
+	return session_id, graph_id, url, nudge
 
 
 def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -> str | None:
@@ -291,11 +309,12 @@ def pr_tool_result(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return None
-	session_id, url, nudge = event
+	session_id, graph_id, url, nudge = event
 	with _pr_lock:
 		if (session_id, url) in _pr_delivered:
 			return None
 		_pr_delivered.add((session_id, url))
+		_pr_latest[(session_id, graph_id)] = url
 	return f"{result}\n\n{nudge}"
 
 
@@ -307,10 +326,11 @@ def queue_pr_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -
 	event = _pr_event(payload, env)
 	if event is None:
 		return
-	session_id, url, nudge = event
+	session_id, graph_id, url, nudge = event
 	with _pr_lock:
 		if (session_id, url) not in _pr_delivered:
 			_pr_pending.setdefault(session_id, {})[url] = nudge
+		_pr_latest[(session_id, graph_id)] = url
 
 
 def take_pr_nudges(payload: dict[str, Any]) -> str:
@@ -321,6 +341,53 @@ def take_pr_nudges(payload: dict[str, Any]) -> str:
 		nudges = [nudge for url, nudge in queued.items() if (session_id, url) not in _pr_delivered]
 		_pr_delivered.update((session_id, url) for url in queued)
 	return "\n\n".join(nudges)
+
+
+def _tracking_enabled(env: dict[str, str] | None) -> bool:
+	"""control.json's trackEnabled (src/claude/state.ts readControl); a missing or unreadable file means on."""
+	record = _read_record(state_dir(env) / "control.json")
+	return record is None or record.get("trackEnabled") is not False
+
+
+def _has_rows(tracking: Any) -> bool:
+	"""True when kickoff's tracking refs name at least one created Notion or Linear row."""
+	if not isinstance(tracking, dict):
+		return False
+	sections = ((tracking.get("linear"), ("nodes", "steps")), (tracking.get("notion"), ("taskUrl", "nodes", "steps")))
+	return any(isinstance(section, dict) and any(section.get(key) for key in keys) for section, keys in sections)
+
+
+def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> dict[str, str] | None:
+	"""pre_verify: continue the turn once per plan with an ultrathink-sync nudge
+	when its plan has tracker rows that were never synced. Hermes re-fires the hook
+	after each nudge (attempt 1, 2, ...), so only attempt 0 can nudge."""
+	session_id = str(payload.get("session_id") or "").strip()
+	if not session_id or payload.get("attempt"):
+		return None
+	path = state_path(session_id, env)
+	record = _read_record(path)
+	if record is None or record.get("synced") is True:
+		return None
+	plan_record = record.get("plan")
+	# Kickoff creates the rows; without any, sync has nothing to update.
+	if not isinstance(plan_record, dict) or not _has_rows(record.get("tracking")):
+		return None
+	if not _tracking_enabled(env):
+		return None
+	key = (session_id, str(plan_record.get("graphId") or ""))
+	with _pr_lock:
+		if key in _sync_nudged:
+			return None
+		_sync_nudged.add(key)
+		url = _pr_latest.get(key, "")
+	pr = f" and prUrl={url}" if url else ""
+	message = (
+		f"Ultrathink: this session's plan (graph {key[1]}) is tracked but not synced. "
+		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}{pr}. "
+		"It only updates the existing Notion Task row and Linear issues found by Graph ID and never creates rows; "
+		"if Notion or Linear is down, report that in one line and finish without blocking."
+	)
+	return {"action": "continue", "message": message}
 
 
 def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, str]:
