@@ -47,6 +47,7 @@ def load_plugin() -> ModuleType:
 plugin = load_plugin()
 
 PR_URL = "https://github.com/acme/widgets/pull/42"
+CAP_FIX = "hermes config set plugins.hook_callback_timeout 600"
 
 
 def fake_bun(path: Path) -> Path:
@@ -86,17 +87,52 @@ def hook_cap(cap: float | None) -> Iterator[None]:
 
 @contextmanager
 def bridge_warnings() -> Iterator[list[str]]:
-	"""Collect the bridge's log warnings, with the once-per-process short-cap warning re-armed."""
+	"""Collect the bridge's log warnings, with its once-per-process warnings re-armed."""
 	messages: list[str] = []
 	handler = logging.Handler(logging.WARNING)
 	handler.emit = lambda record: messages.append(record.getMessage())  # type: ignore[method-assign]
 	bridge.logger.addHandler(handler)
-	bridge._cap_warned = False
+	bridge._warned.clear()
 	try:
 		yield messages
 	finally:
 		bridge.logger.removeHandler(handler)
-		bridge._cap_warned = False
+		bridge._warned.clear()
+
+
+@contextmanager
+def hermes(resolver: Callable[[], float] | None = None, config: str | None = None, importable: bool = True) -> Iterator[Path]:
+	"""Run the bridge as if inside Hermes: a stand-in hermes_cli.plugins whose private
+	_resolve_hook_callback_timeout is `resolver` (a Hermes without one when None), and a
+	HERMES_HOME whose config.yaml holds `config` (none when None). importable=False is
+	outside Hermes, where hermes_cli cannot be imported. Yields the HERMES_HOME."""
+	names = ("hermes_cli", "hermes_cli.plugins")
+	saved_modules = {name: sys.modules[name] for name in names if name in sys.modules}
+	saved_home = os.environ.get("HERMES_HOME")
+	with tempfile.TemporaryDirectory() as home:
+		if config is not None:
+			(Path(home) / "config.yaml").write_text(config)
+		os.environ["HERMES_HOME"] = home
+		if importable:
+			plugins = ModuleType("hermes_cli.plugins")
+			if resolver is not None:
+				vars(plugins)["_resolve_hook_callback_timeout"] = resolver
+			package = ModuleType("hermes_cli")
+			vars(package)["plugins"] = plugins
+			sys.modules.update({"hermes_cli": package, "hermes_cli.plugins": plugins})
+		else:
+			for name in names:
+				sys.modules[name] = None  # type: ignore[assignment]  # None makes the import fail
+		try:
+			yield Path(home)
+		finally:
+			for name in names:
+				sys.modules.pop(name, None)
+			sys.modules.update(saved_modules)
+			if saved_home is None:
+				os.environ.pop("HERMES_HOME", None)
+			else:
+				os.environ["HERMES_HOME"] = saved_home
 
 
 def exited(pid: int) -> bool:
@@ -353,6 +389,81 @@ def test_short_hook_cap_never_starts_bun_and_warns_once():
 		assert warnings == []
 
 
+def test_inside_hermes_its_own_cap_resolver_wins_and_outside_there_is_no_cap():
+	# config.yaml is only the fallback: neither Hermes' own resolver nor a process outside Hermes reads it.
+	config = "plugins:\n  hook_callback_timeout: 30\n"
+	with hermes(lambda: 300, config), bridge_warnings() as inside:
+		assert bridge.host_hook_cap() == 300
+	with hermes(config=config, importable=False), bridge_warnings() as outside:
+		assert bridge.host_hook_cap() is None
+	assert inside == outside == []
+
+
+def test_a_hermes_without_its_cap_resolver_uses_the_config_yaml_cap_and_warns_once():
+	# Only the plugins: block's own key counts: not a comment, another section's key, or a plugin's setting.
+	config = (
+		"# hook_callback_timeout: 5\n"
+		"agent:\n  hook_callback_timeout: 5\n"
+		"plugins:\n"
+		"  enabled:\n  - ultrathink\n"
+		"  entries:\n    other:\n      hook_callback_timeout: 5\n"
+		"  # hook_callback_timeout: 5\n"
+		"  hook_callback_timeout: 600  # ten minutes\n"
+		"hooks:\n  hook_callback_timeout: 5\n"
+	)
+
+	def failing() -> float:
+		raise RuntimeError("config cache busy")
+
+	for resolver in (None, failing):  # a Hermes version without the private resolver, or one where it fails
+		with tempfile.TemporaryDirectory() as tmp, hermes(resolver, config) as home, bridge_warnings() as warnings:
+			fake = fake_bun(Path(tmp) / "bun")
+			assert bridge.host_hook_cap() == 600, resolver
+			assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == "planned:add a widget"
+			assert len(warnings) == 1, warnings
+			assert str(home / "config.yaml") in warnings[0] and CAP_FIX in warnings[0]
+
+
+def test_the_config_yaml_cap_counts_the_way_hermes_counts_it():
+	# A quoted number counts and 0 is no cap; over 600 is clamped; negative, non-numeric or empty is the 30s default.
+	for value, cap in (("120", 120), ("'300'", 300), ("0", 0), ("1000", 600), ("-5", 30), ("soon", 30), ("", 30)):
+		with hermes(config=f"plugins:\n  hook_callback_timeout: {value}\n"), bridge_warnings():
+			assert bridge.host_hook_cap() == cap, value
+
+
+def test_a_hermes_without_its_cap_resolver_or_a_configured_cap_assumes_30s_and_never_starts_bun():
+	with tempfile.TemporaryDirectory() as tmp, hermes() as home, bridge_warnings() as warnings:
+		fake = fake_bun(Path(tmp) / "bun")
+		assert bridge.host_hook_cap() == 30
+		for _ in range(2):
+			assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == ""
+		assert bun_calls(fake) == []
+		assert len(warnings) == 1, warnings
+		assert str(home / "config.yaml") in warnings[0] and CAP_FIX in warnings[0]
+
+
+def test_a_plugin_directory_without_its_engine_warns_once_and_never_starts_bun():
+	# Hermes loaded a copy of hosts/hermes instead of a symlink into a clone: nothing to run is beside it.
+	saved = bridge.ENGINE, bridge.RUN_BUN
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
+		fake = fake_bun(Path(tmp) / "bun")
+		try:
+			bridge.ENGINE = Path(tmp) / "hooks" / "engine.ts"
+			with bridge_warnings() as warnings:
+				for _ in range(2):
+					assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)}) == ""
+			assert bun_calls(fake) == []
+			assert len(warnings) == 1 and str(bridge.ENGINE) in warnings[0], warnings
+			assert "docs/install.md#hermes-agent" in warnings[0]
+			# Without a BUN override the engine starts through bin/run-bun, which must be there too.
+			bridge.ENGINE, bridge.RUN_BUN = saved[0], Path(tmp) / "bin" / "run-bun"
+			with bridge_warnings() as warnings:
+				assert plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": ""}) == ""
+			assert len(warnings) == 1 and str(bridge.RUN_BUN) in warnings[0], warnings
+		finally:
+			bridge.ENGINE, bridge.RUN_BUN = saved
+
+
 def test_deadline_kills_bun_and_everything_it_spawned():
 	with tempfile.TemporaryDirectory() as tmp:
 		pid_file = Path(tmp) / "grandchild.pid"
@@ -391,6 +502,9 @@ def test_pr_creation_tool_mirrors_pr_detect():
 	assert is_pr_creation_tool("mcp__acme__github_create_pull_request", "")
 	assert is_pr_creation_tool("createPullRequest", "")
 	assert not is_pr_creation_tool("mcp__github__list_pull_requests", "")
+	# The name must end in the verb, as in pr-detect.ts: reviewing a PR or handing one to Copilot opens none.
+	for tool in ("mcp__github__create_pull_request_review", "mcp__github__create_pull_request_with_copilot"):
+		assert not is_pr_creation_tool(tool, ""), tool
 	# Any other tool is judged by its name, never by a command it happens to carry.
 	assert not is_pr_creation_tool("write_file", "gh pr create")
 	assert not is_pr_creation_tool("", "gh pr create")
@@ -667,9 +781,10 @@ def test_control_failures_come_back_as_one_line():
 		with cli(Path(tmp) / "missing"):
 			reply = off("")
 			assert reply.startswith("Ultrathink off: ") and "\n" not in reply, reply
-		# bin/run-bun exits 0 without output when bun is missing.
-		with cli(fake_cli(Path(tmp), "sys.stderr.write('ultrathink: bun not found\\n'); sys.exit(0)")):
-			assert off("") == "Ultrathink off failed: ultrathink: bun not found"
+		# Without bun, bin/ultrathink exits 127 with an install hint on stderr.
+		hint = "ultrathink: bun not found. Install Bun 1.2 or later (https://bun.sh) or set BUN=/path/to/bun"
+		with cli(fake_cli(Path(tmp), f"sys.stderr.write({hint!r} + '\\n'); sys.exit(127)")):
+			assert off("") == f"Ultrathink off failed: {hint}"
 		with cli(fake_cli(Path(tmp), "import time; time.sleep(10)"), timeout=1):
 			assert off("") == "Ultrathink off: no answer after 1s"
 
@@ -720,6 +835,11 @@ if __name__ == "__main__":
 	test_the_planner_runs_in_the_terminal_cwd_hermes_tools_use()
 	test_deadline_ends_fifteen_seconds_inside_the_hermes_cap()
 	test_short_hook_cap_never_starts_bun_and_warns_once()
+	test_inside_hermes_its_own_cap_resolver_wins_and_outside_there_is_no_cap()
+	test_a_hermes_without_its_cap_resolver_uses_the_config_yaml_cap_and_warns_once()
+	test_the_config_yaml_cap_counts_the_way_hermes_counts_it()
+	test_a_hermes_without_its_cap_resolver_or_a_configured_cap_assumes_30s_and_never_starts_bun()
+	test_a_plugin_directory_without_its_engine_warns_once_and_never_starts_bun()
 	test_deadline_kills_bun_and_everything_it_spawned()
 	test_pr_creation_tool_mirrors_pr_detect()
 	test_extract_pr_url_reads_gh_output()

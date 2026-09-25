@@ -51,6 +51,7 @@ describe("notion init", () => {
 		const { code, stderr } = run("notion", "init", "--parent", "0123456789abcdef0123456789abcdef", "--write-config");
 		expect(code).toBe(1);
 		expect(stderr).toContain("notion is not logged in: run: ultrathink-mcp auth login notion");
+		expect(stderr).not.toContain("set-key");
 		expect(existsSync(join(root, "xdg", "ultrathink", "config.json"))).toBe(false);
 	});
 });

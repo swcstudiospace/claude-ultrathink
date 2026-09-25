@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMcpClient } from "./client.ts";
+import { createMcpClient, loginHint } from "./client.ts";
 import { writeStore } from "./store.ts";
 
 interface Rpc {
@@ -91,6 +91,33 @@ describe("createMcpClient", () => {
 		expect((error as Error).message.startsWith("save_issue: rate limited")).toBe(true);
 		expect((error as Error).message.length).toBeLessThanOrEqual(200);
 		client.close();
+	});
+
+	test.each([
+		["linear", "Linear"],
+		["greptile", "Greptile"],
+	] as const)("a %s call without credentials names OAuth login and the settings API key", async (provider, label) => {
+		const dir = mkdtempSync(join(tmpdir(), "mcp-client-"));
+		dirs.push(dir);
+		const storePath = join(dir, "creds.json");
+		writeStore(storePath, { version: 1, providers: {} });
+		const unauthorized = (async () => new Response(null, { status: 401 })) as unknown as typeof fetch;
+		const client = createMcpClient(provider, { storePath, fetch: unauthorized });
+		const error = await client.call("list_issues", {}).catch((e: unknown) => e as Error);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("authentication required");
+		expect(message).toContain(`ultrathink-mcp auth login ${provider}`);
+		expect(message).toContain(`ultrathink-mcp auth set-key ${provider} --stdin`);
+		expect(message).toContain(`${label} account settings`);
+		client.close();
+	});
+
+	test("the notion hint offers OAuth login only", () => {
+		const hint = loginHint("notion");
+		expect(hint).toContain("ultrathink-mcp auth login notion");
+		expect(hint).not.toContain("set-key");
+		expect(hint).not.toContain("API key");
 	});
 
 	// Real 20ms timer: the timeout lives inside the client and is the behaviour under test.

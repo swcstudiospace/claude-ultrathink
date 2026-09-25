@@ -7,7 +7,7 @@ import { readControl } from "../claude/state.ts";
 import type { SessionRecord } from "../claude/state.ts";
 import { createGatewayTracker } from "../track/gateway.ts";
 import { formatTrackingTodos, injectTrackingXml } from "../track/render.ts";
-import { createMcpClient } from "./client.ts";
+import { createMcpClient, loginHint } from "./client.ts";
 import { DEFAULT_TASK_GRAPH_TITLE, initTaskGraphDatabase, notionPageId, writeNotionConfig } from "./notion-db.ts";
 import {
 	beginLogin,
@@ -59,12 +59,6 @@ function flag(args: string[], name: string): string | undefined {
 	const value = args[index + 1];
 	if (!value || value.startsWith("--")) throw new UsageError(`${name} needs a value`);
 	return value;
-}
-
-function loginHint(id: ProviderId): string {
-	return PROVIDERS[id].apiKey
-		? `run: ultrathink-mcp auth set-key ${id} --stdin`
-		: `run: ultrathink-mcp auth login ${id}`;
 }
 
 function relayAuth(id: ProviderId, deps: AuthDeps): RelayAuth {

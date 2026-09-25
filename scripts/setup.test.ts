@@ -4,17 +4,23 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
 	apply,
+	applyReport,
 	claudeMdPath,
 	ensureMcpServer,
 	ensurePluginInstalled,
 	grokHooksConfig,
+	hermesHint,
 	installGrokHooks,
 	installGrokRule,
 	mergeBlock,
 	readSetupState,
+	repoRootFromModule,
 	rollback,
+	rollbackReport,
+	setupStatePath,
 	status,
 	type Run,
 } from "./setup.ts";
@@ -70,6 +76,24 @@ function fakeRun(script: (cmd: string[]) => { stdout: string; stderr: string; co
 	return Object.assign(run, { calls });
 }
 
+/** `claude mcp get` finds nothing (exit 1), `claude mcp list` prints `list`, every other claude call succeeds. */
+function mcpRun(list: string): Run & { calls: string[][] } {
+	return fakeRun((cmd) => {
+		if (cmd[1] === "mcp" && cmd[2] === "get") return { stdout: "", stderr: `No MCP server named "${cmd[3]}".`, code: 1 };
+		if (cmd[1] === "mcp" && cmd[2] === "list") return { stdout: list, stderr: "", code: 0 };
+		return { stdout: "", stderr: "", code: 0 };
+	});
+}
+
+const LOOKALIKES = [
+	"Checking MCP server health…",
+	"",
+	"notion-foo: https://example.com/mcp (HTTP) - ✔ Connected",
+	"claude.ai Notion: https://mcp.notion.com/mcp - ✔ Connected",
+	"docs: https://mcp.notion.com/mcp (HTTP) - ✔ Connected",
+	"my-linear: npx linear-mcp - ✔ Connected",
+].join("\n");
+
 describe("claudeMdPath", () => {
 	test("uses CLAUDE_CONFIG_DIR when set, else ~/.claude", () => {
 		expect(claudeMdPath({ CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join("/cfg", "CLAUDE.md"));
@@ -94,22 +118,35 @@ describe("mergeBlock", () => {
 });
 
 describe("ensureMcpServer", () => {
-	test("skips when already configured", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "notion\nlinear\n", stderr: "", code: 0 } : { stdout: "", stderr: "", code: 0 }));
+	test("skips when `claude mcp get` finds the server by name", () => {
+		const run = fakeRun(() => ({ stdout: "notion:\n  Type: http", stderr: "", code: 0 }));
 		const result = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
 		expect(result.added).toBe(false);
-		expect(run.calls).toEqual([["claude", "mcp", "list"]]);
+		expect(run.calls).toEqual([["claude", "mcp", "get", "notion"]]);
+	});
+
+	test("falls back to an exact first-field match in `claude mcp list` when `claude mcp get` fails", () => {
+		const run = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\n");
+		expect(ensureMcpServer("notion", "https://mcp.notion.com/mcp", run).added).toBe(false);
+		expect(run.calls.some((cmd) => cmd[2] === "add")).toBe(false);
+	});
+
+	test("a lookalike name or a URL that mentions the server does not count as configured", () => {
+		const run = mcpRun(LOOKALIKES);
+		expect(ensureMcpServer("notion", "https://mcp.notion.com/mcp", run).added).toBe(true);
+		expect(ensureMcpServer("linear", "https://mcp.linear.app/mcp", run).added).toBe(true);
+		expect(run.calls).toContainEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "notion", "https://mcp.notion.com/mcp"]);
 	});
 
 	test("adds when missing", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "added", stderr: "", code: 0 }));
+		const run = mcpRun("");
 		const result = ensureMcpServer("linear", "https://mcp.linear.app/mcp", run);
 		expect(result.added).toBe(true);
-		expect(run.calls[1]).toEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "linear", "https://mcp.linear.app/mcp"]);
+		expect(run.calls.at(-1)).toEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "linear", "https://mcp.linear.app/mcp"]);
 	});
 
 	test("reports failure without throwing", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "", stderr: "network down", code: 1 }));
+		const run = fakeRun((cmd) => (cmd[2] === "add" ? { stdout: "", stderr: "network down", code: 1 } : { stdout: "", stderr: "", code: 1 }));
 		const result = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
 		expect(result.added).toBe(false);
 		expect(result.message).toContain("network down");
@@ -149,10 +186,18 @@ describe("apply / status / rollback", () => {
 			const rolledBack = rollback(env, run);
 			expect(rolledBack.claudeMd.changed).toBe(true);
 			expect(rolledBack.grok).toEqual({ rule: { path: rulePath, removed: true }, hooks: { path: hooksPath, removed: true } });
+			expect(rolledBack.state).toEqual({ path: setupStatePath(env), removed: true });
 			expect(readFileSync(claudeMdPath(env), "utf8")).not.toContain("<!-- ultrathink:start -->");
 			expect(existsSync(rulePath)).toBe(false);
 			expect(existsSync(hooksPath)).toBe(false);
+			expect(existsSync(setupStatePath(env))).toBe(false);
 			expect(status(env, statusRun)).toContain(`Grok rule: missing — run: bun scripts/setup.ts apply (${rulePath})`);
+
+			// The plugin itself is only named for the user to remove; rollback never runs the uninstall.
+			const report = rollbackReport(rolledBack).join("\n");
+			expect(report).toContain("claude plugin uninstall ultrathink@ultrathink");
+			expect(report).toContain("claude plugin marketplace remove ultrathink");
+			expect(run.calls.some((cmd) => cmd[1] === "plugin" && (cmd[2] === "uninstall" || cmd[3] === "remove"))).toBe(false);
 		} finally {
 			cleanup();
 		}
@@ -173,15 +218,30 @@ describe("apply / status / rollback", () => {
 		}
 	});
 
-	test("the CLAUDE.md block defers to the configured Notion database and Linear team instead of naming a workspace", () => {
+	test("the CLAUDE.md block defers to the configured Notion database and Linear team and tells the agent how to check", () => {
 		const { env, repo, cleanup } = tempSetup();
 		try {
 			apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
 			const text = readFileSync(claudeMdPath(env), "utf8");
 			expect(text).toContain("notion.dataSourceUrl");
 			expect(text).toContain("linear.team");
+			expect(text).toContain("bin/ultrathink status");
+			expect(text).toContain("When tracking is configured");
+			// Unconditional claims would be false on a machine without tracking configured.
+			expect(text).not.toMatch(/All Claude Code work in this project is tracked/i);
 			expect(text).not.toContain("collection://");
 			expect(text).not.toContain("Spectrum Web Co");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("status decides MCP presence by exact server name", () => {
+		const { env, cleanup } = tempSetup();
+		try {
+			const text = status(env, mcpRun(`${LOOKALIKES}\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n`));
+			expect(text).toContain("Notion MCP: missing — run: claude mcp add");
+			expect(text).toContain("Linear MCP: configured");
 		} finally {
 			cleanup();
 		}
@@ -243,8 +303,8 @@ describe("apply / status / rollback", () => {
 
 	test("apply records added:true for a server it actually adds; rollback then removes it", () => {
 		const { env, repo, cleanup } = tempSetup();
-		// "list" reports neither server configured, so ensureMcpServer adds both.
-		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "added", stderr: "", code: 0 }));
+		// Neither server is configured, so ensureMcpServer adds both.
+		const applyRun = mcpRun("");
 		try {
 			apply(repo, applyRun, env);
 			const state = readSetupState(env);
@@ -264,8 +324,8 @@ describe("apply / status / rollback", () => {
 
 	test("apply records added:false for a server that was already configured; rollback does not remove it", () => {
 		const { env, repo, cleanup } = tempSetup();
-		// "list" reports both servers already configured, so ensureMcpServer skips both.
-		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "notion\nlinear\n", stderr: "", code: 0 } : { stdout: "", stderr: "", code: 0 }));
+		// `claude mcp list` shows both servers already configured, so ensureMcpServer skips both.
+		const applyRun = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n");
 		try {
 			apply(repo, applyRun, env);
 			const state = readSetupState(env);
@@ -299,6 +359,60 @@ describe("apply / status / rollback", () => {
 			cleanup();
 		}
 	});
+
+	test("rollback deletes the setup state, so a later rollback cannot remove servers the user added since", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			expect(existsSync(setupStatePath(env))).toBe(true);
+			expect(rollback(env, fakeRun(() => ({ stdout: "", stderr: "", code: 0 }))).state.removed).toBe(true);
+			expect(existsSync(setupStatePath(env))).toBe(false);
+
+			const again = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			expect(rollback(env, again).state.removed).toBe(false);
+			expect(again.calls).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("any checkout path", () => {
+	test("the repo root is decoded from the module URL, so spaces and non-ASCII are kept verbatim", () => {
+		const root = join(tmpdir(), "my clones", "ultrathink-é");
+		expect(repoRootFromModule(pathToFileURL(join(root, "scripts", "setup.ts")).href)).toBe(root);
+	});
+
+	test("apply from a clone whose path has a space writes that path verbatim and prints pasteable commands", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink setup "));
+		try {
+			const repo = join(dir, "my clone");
+			writeRepo(repo);
+			const env = { CLAUDE_CONFIG_DIR: join(dir, "claude"), GROK_HOME: join(dir, "grok"), HERMES_HOME: join(dir, "hermes home") };
+			const result = apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
+			const hooks = readFileSync(result.grok.hooks.path, "utf8");
+			expect(hooks).toContain(`${repo}/hooks/uplift.ts`);
+			expect(hooks).not.toContain("%20");
+			const report = applyReport(repo, result, env).join("\n");
+			expect(report).toContain(`omp plugin link '${repo}'`);
+			expect(report).toContain(`muse plugins install '${repo}' --scope user`);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("hermesHint", () => {
+	test("links into HERMES_HOME when set, else ~/.hermes, and states the global hook cap", () => {
+		const hint = hermesHint("/src/ultrathink", { HERMES_HOME: "/opt/hermes home" });
+		expect(hint).toContain(`ln -s '/src/ultrathink/hosts/hermes' '/opt/hermes home/plugins/ultrathink'`);
+		expect(hint).toContain("hermes config set plugins.hook_callback_timeout 600");
+		expect(hint).toContain("at least 105 s");
+		expect(hint).toContain("global Hermes setting");
+		expect(hint).toContain("disable any other prompt-planning plugin");
+		expect(hint).not.toContain("prompt-uplift");
+		expect(hermesHint("/src/ultrathink", {})).toContain(`${join(".hermes", "plugins", "ultrathink")}'`);
+	});
 });
 
 describe("grok global hooks", () => {
@@ -311,7 +425,7 @@ describe("grok global hooks", () => {
 	test("grokHooksConfig resolves the plugin root, forces the grok host, and raises only the prompt timeout", () => {
 		const { root, cleanup } = tempRepo();
 		try {
-			// A trailing slash (main() passes a URL pathname) must not produce `//` paths.
+			// A root given with a trailing slash must not produce `//` paths.
 			const config = grokHooksConfig(`${root}/`) as {
 				hooks: Record<string, { matcher?: string; hooks: { command: string; timeout: number; env: Record<string, string> }[] }[]>;
 			};

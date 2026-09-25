@@ -403,6 +403,24 @@ describe("createTracking", () => {
 		expect(refs.notion.nodes.n2).toBe("https://www.notion.so/p1");
 	});
 
+	test("a text create reply with app.notion.com page urls counts every row as created", async () => {
+		let counter = 0;
+		const notion: ToolCaller = {
+			async call(name, args) {
+				if (name === "notion-fetch") return { schema: { Item: { type: "title" }, Level: { type: "select" } } };
+				const pages = args.pages as unknown[];
+				return `Created ${pages.length} pages:\n${pages.map(() => `<page url="https://app.notion.com/p/row-${++counter}">`).join("\n")}`;
+			},
+		};
+		const refs = await createTracking(makePlan(), GRAPH, undefined, deps({ linear: fakeLinear(), notion, concurrency: 1 }));
+		expect(refs.errors).toEqual([]);
+		expect(refs.status).toBe("complete");
+		expect(refs.notion.taskUrl).toBe("https://app.notion.com/p/row-1");
+		expect(Object.keys(refs.notion.nodes)).toHaveLength(3);
+		expect(Object.keys(refs.notion.steps)).toHaveLength(6);
+		expect(refs.notion.nodes.n1).toBe("https://app.notion.com/p/row-2");
+	});
+
 	test("a node whose dependency failed is skipped, then created with full blockedBy on re-run", async () => {
 		const plan = makePlan();
 		const failing = fakeLinear({ throwOn: (args) => args.title === "[n2] Build" });

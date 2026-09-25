@@ -1,9 +1,14 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 SWC Studio
-# Locate bun when a host hook PATH does not include it.
-# A missing runtime must not block the prompt: exit 0, never 127.
-trap 'exit 0' EXIT
+# Run bun even when the caller's PATH lacks it. find_bun tries, in order: $BUN,
+# PATH, $BUN_INSTALL/bin/bun, ~/.bun/bin/bun, /usr/local/bin/bun,
+# /opt/homebrew/bin/bun, ~/.local/share/*/bun/bin/bun.
+# Hooks must not block the prompt: without bun, or when bun cannot start, exit 0.
+# The CLIs (bin/ultrathink, bin/ultrathink-mcp, bin/ultrathink-ship) set
+# ULTRATHINK_BUN_REQUIRED=1: without bun they exit 127 with an install hint,
+# and any other failure keeps its exit status.
+[ "${ULTRATHINK_BUN_REQUIRED:-}" = 1 ] || trap 'exit 0' EXIT
 
 find_bun() {
 	if [ -n "${BUN:-}" ] && [ -x "$BUN" ]; then
@@ -26,10 +31,15 @@ find_bun() {
 			return 0
 		fi
 	done
-	printf '%s\n' "ultrathink: bun not found" >&2
 	return 1
 }
 
-BUN_BIN=$(find_bun) || exit 0
+if ! BUN_BIN=$(find_bun); then
+	printf '%s\n' "ultrathink: bun not found. Install Bun 1.2 or later (https://bun.sh) or set BUN=/path/to/bun" >&2
+	[ "${ULTRATHINK_BUN_REQUIRED:-}" = 1 ] && exit 127
+	exit 0
+fi
+# bun and everything it starts must not inherit the CLI flag.
+unset ULTRATHINK_BUN_REQUIRED
 export PATH="$(dirname "$BUN_BIN"):${PATH:-/usr/bin:/bin}"
 exec "$BUN_BIN" "$@"

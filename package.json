@@ -15,6 +15,9 @@
 		"url": "https://github.com/swcstudiospace/claude-ultrathink/issues"
 	},
 	"keywords": ["claude-code", "grok", "hermes", "muse", "omp", "agent", "planning", "graph-of-thought", "linear", "notion", "greptile"],
+	"engines": {
+		"bun": ">=1.2"
+	},
 	"scripts": {
 		"test": "bun test",
 		"check": "bunx --package typescript@5.9.3 tsc --noEmit",
