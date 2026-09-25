@@ -34,7 +34,7 @@
 				]
 			},
 			{
-				"matcher": ".*(create_?pull_?request|pull_?request_?create|createPullRequest).*",
+				"matcher": ".*(create_?pull_?request|pull_?request_?create|createPullRequest)$",
 				"hooks": [
 					{
 						"type": "command",

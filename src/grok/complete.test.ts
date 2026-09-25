@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { type EnsureFreshOptions, type GrokAuth, GrokAuthError, GrokHttpError, readGrokAuth } from "./auth.ts";
@@ -446,7 +446,7 @@ describe("grokComplete (cli)", () => {
 		};
 		expect(seen.prompt).toBe("USER TEXT");
 		expect(seen.env).toEqual({ GROK_HOME: home, GROK_SUBAGENTS: "0", GROK_MEMORY: "0", GROK_WEB_FETCH: "0" });
-		expect(dirname(seen.cwd)).toBe(tmpdir());
+		expect(realpathSync(dirname(seen.cwd))).toBe(realpathSync(tmpdir()));
 		expect(basename(seen.cwd)).toMatch(/^ultrathink-grok-.+$/);
 		expect(statSync(seen.cwd).mode & 0o777).toBe(0o700);
 		expect(seen.args.slice(0, 4)).toEqual(["-m", "grok-4.6", "--reasoning-effort", "high"]);

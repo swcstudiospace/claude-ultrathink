@@ -35,6 +35,12 @@ describe("isPrCreationTool", () => {
 		expect(isPrCreationTool("mcp__acme__github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("createPullRequest", undefined)).toBe(true);
+		expect(isPrCreationTool("mcp__github__pull_request_create", undefined)).toBe(true);
+	});
+
+	test("PR review and Copilot tools are not PR creation", () => {
+		expect(isPrCreationTool("mcp__github__create_pull_request_review", undefined)).toBe(false);
+		expect(isPrCreationTool("mcp__github__create_pull_request_with_copilot", undefined)).toBe(false);
 	});
 
 	test("other tools never match, even with a gh pr create command", () => {

@@ -9,7 +9,7 @@
 
 const GH_PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
 const PR_URL_RE = /https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/(\d+)/;
-const PR_TOOL_RE = /create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest/i;
+const PR_TOOL_RE = /(?:create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest)$/i;
 const SHELL_TOOLS: Record<string, true> = {
 	Bash: true,
 	bash: true,

@@ -352,10 +352,14 @@ export async function reviewCli(input: {
 export const GREPTILE_SETUP =
 	"Greptile is not set up: run `bin/ultrathink-mcp auth set-key greptile --stdin` (or `auth login greptile`), or install and sign in to the greptile CLI (`greptile login`)";
 
-/** The greptile CLI is installed and signed in (`greptile whoami` exits 0 without "Not signed in"). */
-function cliSignedIn(run: Run, cwd: string): boolean {
-	const who = run(["greptile", "whoami"], { cwd, timeoutMs: CLI_QUERY_TIMEOUT_MS });
-	return who.exitCode === 0 && !/not signed in/i.test(`${who.stdout}\n${who.stderr}`);
+/**
+ * True only on a definite "not set up" answer: the greptile CLI cannot be spawned, or `greptile whoami` says it is
+ * signed out (that exits 0). A timeout or API error is not proof, so the CLI review runs and reports it itself.
+ */
+function cliNotSetUp(run: Run, cwd: string): boolean {
+	const who = run(["greptile", "whoami"], { cwd, timeoutMs: 10_000 });
+	const text = `${who.stdout}\n${who.stderr}`;
+	return who.exitCode === 127 || /ENOENT/.test(text) || /not signed in|saved sign-in could not be read/i.test(text);
 }
 
 export async function runReview(input: {
@@ -383,7 +387,7 @@ export async function runReview(input: {
 		at: (input.now ?? Date.now)(),
 	});
 	if (!input.client) {
-		if (!cliSignedIn(run, input.cwd)) return blocked("cli", GREPTILE_SETUP);
+		if (cliNotSetUp(run, input.cwd)) return blocked("cli", GREPTILE_SETUP);
 	} else {
 		let found: ListedGreptileRepo | undefined;
 		try {

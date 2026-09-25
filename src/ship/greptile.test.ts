@@ -504,12 +504,15 @@ describe("runReview", () => {
 		}
 	});
 
-	test("without a Greptile MCP credential a signed-in CLI reviews", async () => {
-		const { run, argvs } = fakeRun((argv) =>
-			argv[1] === "whoami" ? { exitCode: 0, stdout: "Signed in as dev@example.com" } : argv[2] === "status" ? { exitCode: 1 } : cliOut,
-		);
-		expect(await runReview({ ...input, run })).toMatchObject({ source: "cli", status: "completed", score: 2 });
-		expect(argvs.at(-1)).toEqual(["greptile", "review", "--json", "-b", "master"]);
+	test("without a Greptile MCP credential a signed-in CLI, or a whoami that merely failed (network), still reviews", async () => {
+		for (const whoami of [
+			{ exitCode: 0, stdout: "Signed in as dev@example.com" },
+			{ exitCode: 1, stderr: "request to https://api.greptile.com failed: ETIMEDOUT" },
+		]) {
+			const { run, argvs } = fakeRun((argv) => (argv[1] === "whoami" ? whoami : argv[2] === "status" ? { exitCode: 1 } : cliOut));
+			expect(await runReview({ ...input, run })).toMatchObject({ source: "cli", status: "completed", score: 2 });
+			expect(argvs.at(-1)).toEqual(["greptile", "review", "--json", "-b", "master"]);
+		}
 	});
 });
 
