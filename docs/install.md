@@ -172,7 +172,7 @@ rm ~/.grok/plugins/ultrathink
 
 ## Hermes Agent
 
-Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. The plugin also registers the `/ultrathink-<verb>` commands, a pull-request nudge for `ultrathink-sync`, and the four ultrathink skills. Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
+Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. The plugin also registers the `/ultrathink-<verb>` commands, the `ultrathink-sync` nudges, and the four ultrathink skills. Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
 
 ### Install
 
@@ -193,6 +193,8 @@ ultrathink only registers hooks, commands and skills. It does not replace built-
 If another Hermes plugin already plans or rewrites prompts, disable it. Otherwise both will plan the same turn.
 
 On Hermes the hook only plans. It never creates Notion or Linear rows. `ultrathink-kickoff` creates them at the start of the agent's turn by running `ultrathink-mcp track complete --state <file>`, so a plan that Hermes cuts off can't leave orphan rows. See [Tracking](tracking.md#when-rows-are-created).
+
+The plugin nudges the agent to run `ultrathink-sync` in two cases: when a tool call opens a pull request (`transform_tool_result`, `post_tool_call` and `pre_llm_call`), and, through Hermes' `pre_verify` hook, once per session when a coding turn (one that edited files with `write_file` or `patch`) is about to finish with a tracked plan that has not been synced. The nudge passes the state file, the Graph ID and, when the session opened one, the PR URL. Sync updates only the rows kickoff created, found by Graph ID, and records `synced` in the session record, which stops the end-of-turn nudge. See [Tracking](tracking.md#when-rows-are-created).
 
 Hermes also gets a short handoff instead of the full specification: the spec path, the state file, the Graph ID and the kickoff instruction, plus the Linked issues TODO lines once rows exist. The full XML and the graph stay in the spec file. Hermes appends hook context to the user message, replays it in every later turn, and spills any piece over 10,000 characters (`hooks.output_spill.max_chars`) to a file, keeping only its first and last 500 characters, so a full specification would be cut.
 

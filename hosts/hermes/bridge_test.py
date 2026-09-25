@@ -9,7 +9,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -26,6 +26,8 @@ from bridge import (  # noqa: E402
 	plan,
 	pr_tool_result,
 	queue_pr_nudge,
+	state_path,
+	sync_nudge,
 	take_pr_nudges,
 )
 
@@ -131,11 +133,41 @@ def planned_session(home: str, session_id: str) -> Path:
 	return path
 
 
+def tracked_session(home: str, session_id: str, **fields: object) -> Path:
+	"""A planned session whose kickoff created the tracker rows; `fields` override the record."""
+	path = planned_session(home, session_id)
+	record = json.loads(path.read_text())
+	record.update({"plan": {"graphId": f"graph-{session_id}"}, "tracking": {"notionTaskPageId": "page-1"}, "kickedOff": True}, **fields)
+	path.write_text(json.dumps(record))
+	return path
+
+
+def verify(session_id: str, attempt: int = 0) -> dict:
+	"""Hermes' pre_verify kwargs for a coding turn about to finish."""
+	return {
+		"session_id": session_id,
+		"platform": "cli",
+		"model": "m",
+		"coding": True,
+		"attempt": attempt,
+		"final_response": "Done.",
+		"changed_paths": ["src/app.ts"],
+	}
+
+
+SYNC_SKILL = HERE.parents[1] / "skills" / "ultrathink-sync" / "SKILL.md"
+
+
 def fake_ctx(accepts: bool | None = True) -> SimpleNamespace:
 	"""A Hermes PluginContext stand-in. accepts=False refuses to inject (the TUI, or a gateway
 	without allow_gateway_injection); accepts=None is a Hermes without inject_message."""
-	ctx = SimpleNamespace(hooks=[], commands={}, injected=[], skills={})
-	ctx.register_hook = lambda name, callback: ctx.hooks.append(name)
+	ctx = SimpleNamespace(hooks=[], callbacks={}, commands={}, injected=[], skills={})
+
+	def register_hook(name: str, callback: Callable[..., object]) -> None:
+		ctx.hooks.append(name)
+		ctx.callbacks[name] = callback
+
+	ctx.register_hook = register_hook
 	ctx.register_command = lambda name, handler, description="", args_hint="": ctx.commands.__setitem__(name, handler)
 	ctx.register_skill = lambda name, path, description="", frontmatter=None: ctx.skills.__setitem__(name, (path, description))
 	if accepts is not None:
@@ -324,7 +356,8 @@ def test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session():
 		assert pr_tool_result({**call, "args": {"command": "gh pr view 42"}}, env=env) is None
 		result = pr_tool_result(call, env=env)
 		assert result is not None and result.startswith(call["result"] + "\n\n")
-		assert f"Invoke the ultrathink-sync skill now with stateFile={state} and prUrl={PR_URL}" in result
+		assert f'Invoke the ultrathink-sync skill (load it with skill_view name="ultrathink:ultrathink-sync", or read {SYNC_SKILL}) now with stateFile={state} and prUrl={PR_URL}' in result
+		assert f"(graph g1, {PR_URL})" in result
 		assert "do not create new Notion rows or Linear issues" in result
 		assert pr_tool_result(call, env=env) is None
 		# The sequential executor fires post_tool_call after the transform, with the delivered result.
@@ -351,11 +384,99 @@ def test_next_turn_delivers_a_nudge_no_tool_result_carried_once():
 		assert take_pr_nudges({"session_id": "pr-turn"}) == ""
 
 
+def test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		state = tracked_session(home, "sync-once")
+		assert state == state_path("sync-once", env)
+		# Hermes re-fires pre_verify after each nudge; a later attempt never nudges.
+		assert sync_nudge(verify("sync-once", attempt=1), env=env) is None
+		nudge = sync_nudge(verify("sync-once"), env=env)
+		assert nudge is not None and nudge["action"] == "continue"
+		message = nudge["message"]
+		assert SYNC_SKILL.is_absolute() and SYNC_SKILL.is_file()
+		assert "graph graph-sync-once" in message and f"stateFile={state}" in message and "prUrl=" not in message
+		assert f'skill_view name="ultrathink:ultrathink-sync", or read {SYNC_SKILL}' in message
+		assert "never creates rows" in message and "one line" in message
+		assert sync_nudge(verify("sync-once"), env=env) is None
+
+
+def test_no_sync_nudge_without_rows_after_sync_or_with_tracking_off():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		assert sync_nudge(verify("no-state"), env=env) is None
+		assert sync_nudge({**verify("no-state"), "session_id": ""}, env=env) is None
+		planned_session(home, "no-rows")
+		assert sync_nudge(verify("no-rows"), env=env) is None
+		tracked_session(home, "synced", synced=True)
+		assert sync_nudge(verify("synced"), env=env) is None
+		tracked_session(home, "no-plan", plan=None)
+		assert sync_nudge(verify("no-plan"), env=env) is None
+		broken = state_path("broken", env)
+		broken.write_text("{not json")
+		assert sync_nudge(verify("broken"), env=env) is None
+
+		tracked_session(home, "track-off")
+		control = Path(home) / "ultrathink" / "control.json"
+		control.write_text(json.dumps({"trackEnabled": False}))
+		assert sync_nudge(verify("track-off"), env=env) is None
+		# Turning tracking back on still nudges: the refusal above did not use up the session's nudge.
+		control.write_text(json.dumps({"trackEnabled": True}))
+		assert sync_nudge(verify("track-off"), env=env) is not None
+
+
+def test_sync_nudge_names_the_pr_the_session_opened():
+	with tempfile.TemporaryDirectory() as home:
+		env = {"HERMES_HOME": home, "ULTRATHINK_STATE_DIR": ""}
+		tracked_session(home, "sync-pr")
+		second = "https://github.com/acme/widgets/pull/43"
+		assert pr_tool_result(gh_pr_create("sync-pr"), env=env) is not None
+		assert pr_tool_result(gh_pr_create("sync-pr", second), env=env) is not None
+		assert pr_tool_result(gh_pr_create("another-session"), env=env) is None
+		nudge = sync_nudge(verify("sync-pr"), env=env)
+		assert nudge is not None and nudge["message"].count("prUrl=") == 1 and f"prUrl={second}." in nudge["message"]
+
+		# A PR only queued for the next turn (no tool result carried it) counts too.
+		tracked_session(home, "sync-queued")
+		queue_pr_nudge(gh_pr_create("sync-queued"), env=env)
+		nudge = sync_nudge(verify("sync-queued"), env=env)
+		assert nudge is not None and f"prUrl={PR_URL}." in nudge["message"]
+
+
+def test_pre_verify_hook_fails_open():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+	hook = ctx.callbacks["pre_verify"]
+	saved = plugin.sync_nudge
+
+	def explode(_payload: dict) -> None:
+		raise RuntimeError("state directory vanished")
+
+	setattr(plugin, "sync_nudge", explode)  # noqa: B010 - the hook looks the name up in the plugin module
+	try:
+		assert hook(**verify("fails-open")) is None
+	finally:
+		setattr(plugin, "sync_nudge", saved)  # noqa: B010
+	saved_env = {key: os.environ.get(key) for key in ("HERMES_HOME", "ULTRATHINK_STATE_DIR")}
+	with tempfile.TemporaryDirectory() as home:
+		os.environ["HERMES_HOME"] = home
+		os.environ.pop("ULTRATHINK_STATE_DIR", None)
+		try:
+			tracked_session(home, "hooked")
+			assert hook(**verify("hooked"))["action"] == "continue"
+		finally:
+			for key, value in saved_env.items():
+				if value is None:
+					os.environ.pop(key, None)
+				else:
+					os.environ[key] = value
+
+
 def test_registers_every_ultrathink_command_next_to_the_hooks():
 	ctx = fake_ctx()
 	plugin.register(ctx)
 	assert sorted(ctx.commands) == [f"ultrathink-{verb}" for verb in ("off", "on", "quick", "skip", "status", "track")]
-	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call"]
+	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify"]
 
 	# A Hermes that rejects the commands still plans every prompt.
 	def reject(*_args: object, **_kwargs: object) -> None:
@@ -478,6 +599,10 @@ if __name__ == "__main__":
 	test_extract_pr_url_reads_gh_output()
 	test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session()
 	test_next_turn_delivers_a_nudge_no_tool_result_carried_once()
+	test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge()
+	test_no_sync_nudge_without_rows_after_sync_or_with_tracking_off()
+	test_sync_nudge_names_the_pr_the_session_opened()
+	test_pre_verify_hook_fails_open()
 	test_registers_every_ultrathink_command_next_to_the_hooks()
 	test_registers_the_four_ultrathink_skills_with_their_descriptions()
 	test_skill_registration_failures_leave_hooks_and_commands_registered()
