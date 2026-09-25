@@ -133,10 +133,18 @@ function nodeLevels(nodeIds: string[], graph: ThoughtGraph | undefined): string[
 	return levels.filter((entry) => entry.length > 0);
 }
 
+/** Property names every ultrathink Agent Task Graph data source has; a parsed schema without them was not understood. */
+const CORE_PROPERTIES = ["Item", "Level", "Graph ID"] as const;
+
 function collectSchemaNames(result: unknown): Set<string> {
 	const names = new Set<string>();
+	const texts: string[] = [];
 	const walk = (value: unknown, depth: number): void => {
 		if (depth > 8) return;
+		if (typeof value === "string") {
+			texts.push(value);
+			return;
+		}
 		if (Array.isArray(value)) {
 			for (const entry of value) walk(entry, depth + 1);
 			return;
@@ -158,14 +166,17 @@ function collectSchemaNames(result: unknown): Set<string> {
 		}
 	};
 	walk(result, 0);
-	const text = toText(result);
-	for (const match of text.matchAll(/"([^"\\\n]{1,80})"\s*:\s*\{[^{}]*?"type"\s*:/g)) names.add(match[1] as string);
-	// Embedded JSON in a text payload (e.g. `<data-source-state>{…}</data-source-state>`).
-	for (const match of text.matchAll(/\{[\s\S]*\}/g)) {
-		try {
-			walk(JSON.parse(match[0]), 0);
-		} catch {
-			// not JSON
+	// A text payload carries the schema as JSON inside markup, e.g. `{ text: "…<data-source-state>{…}</data-source-state>…" }`.
+	// Scan each string leaf itself: stringifying the whole result would escape the quotes the patterns rely on.
+	for (const text of [...texts]) {
+		for (const match of text.matchAll(/"([^"\\\n]{1,80})"\s*:\s*\{[^{}]*?"type"\s*:/g)) names.add(match[1] as string);
+		const blocks = [...text.matchAll(/<([\w-]+)>\s*(\{[\s\S]*?\})\s*<\/\1>/g)].map((match) => match[2] as string);
+		for (const block of [...blocks, ...(text.match(/\{[\s\S]*\}/g) ?? [])]) {
+			try {
+				walk(JSON.parse(block), 0);
+			} catch {
+				// not JSON
+			}
 		}
 	}
 	names.delete("type");
@@ -501,7 +512,9 @@ async function createNotion(
 		fail(`notion schema: ${shortError(error)}`);
 		return;
 	}
-	if (names.size === 0) names = new Set(["Item", "Level", "Graph ID"]);
+	// A schema read that misses the core names was not understood; sending only recognised names would then create empty rows.
+	// Send the core names anyway, so a truly different data source fails loudly instead.
+	if (!CORE_PROPERTIES.every((name) => names.has(name))) for (const name of CORE_PROPERTIES) names.add(name);
 	const props = (values: Record<string, string | number | undefined>): Record<string, unknown> => {
 		const out: Record<string, unknown> = {};
 		for (const [name, value] of Object.entries(values)) {

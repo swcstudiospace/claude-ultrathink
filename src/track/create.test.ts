@@ -348,6 +348,46 @@ describe("createTracking", () => {
 		expect(refs.notion.nodes.n3).toBe("https://www.notion.so/page-4");
 	});
 
+	test("the hosted Notion fetch shape (schema JSON inside a text field) keeps every property on created rows", async () => {
+		const schema = Object.fromEntries(["Item", "Level", "Graph ID", "Agent", "Status", "Thought", "Parent Item", "Step"].map((name) => [name, { name, type: "text" }]));
+		const text = [
+			'<data-source url="{{collection://ds-uuid}}">',
+			"Here is the database's configurable state:",
+			`<data-source-state>${JSON.stringify({ name: "Agent Task Graph", schema })}</data-source-state>`,
+			'<sqlite-table>CREATE TABLE "collection://ds-uuid" ("Item" TEXT, "Level" TEXT)</sqlite-table>',
+			"</data-source>",
+		].join("\n");
+		const calls: Call[] = [];
+		let counter = 0;
+		const notion: ToolCaller = {
+			async call(name, args) {
+				calls.push({ name, args });
+				if (name === "notion-fetch") return { metadata: { type: "data_source" }, title: "Agent Task Graph", url: "collection://ds-uuid", text };
+				return { pages: (args.pages as unknown[]).map(() => ({ url: `https://www.notion.so/page-${++counter}` })) };
+			},
+		};
+		await createTracking(makePlan(), GRAPH, undefined, deps({ linear: fakeLinear(), notion, concurrency: 1 }));
+		const pages = calls.filter((call) => call.name === "notion-create-pages").flatMap((call) => call.args.pages as Array<{ properties: Record<string, unknown> }>);
+		expect(pages.length).toBeGreaterThan(0);
+		for (const page of pages) expect(page.properties).toMatchObject({ "Graph ID": "g-1", Level: expect.any(String), Item: expect.any(String) });
+		expect(pages[0]?.properties).toMatchObject({ Level: "Task", Status: expect.any(String) });
+		expect(pages.every((page) => !("metadata" in page.properties))).toBe(true);
+	});
+
+	test("a schema read that finds none of the core names still sends them, so rows are never created empty", async () => {
+		const calls: Call[] = [];
+		const notion: ToolCaller = {
+			async call(name, args) {
+				calls.push({ name, args });
+				if (name === "notion-fetch") return { metadata: { type: "data_source" }, text: "unparseable schema" };
+				return { pages: (args.pages as unknown[]).map((_, index) => ({ url: `https://www.notion.so/q${index}` })) };
+			},
+		};
+		await createTracking(makePlan(), GRAPH, undefined, deps({ linear: fakeLinear(), notion, concurrency: 1 }));
+		const task = (calls.find((call) => call.name === "notion-create-pages")?.args.pages as Array<{ properties: Record<string, unknown> }>)[0];
+		expect(task?.properties).toMatchObject({ Item: expect.any(String), Level: "Task", "Graph ID": "g-1" });
+	});
+
 	test("structured page urls win over urls mentioned elsewhere in the result", async () => {
 		const notion: ToolCaller = {
 			async call(name, args) {
