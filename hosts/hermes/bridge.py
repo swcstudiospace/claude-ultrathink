@@ -77,7 +77,7 @@ _pr_latest: dict[tuple[str, str], str] = {}  # (session_id, graphId) -> the last
 # Subagents never plan, but their tool calls fire the same hooks: a PR URL a child's own `gh pr create`
 # printed is proof it was opened, and its delegate_task result can then nudge the parent.
 _child_parent: dict[str, str] = {}  # child session_id -> parent session_id (from subagent_start)
-_child_opened: dict[str, set[str]] = {}  # parent session_id -> PR URLs its children opened
+_child_opened: dict[tuple[str, str], set[str]] = {}  # (parent session_id, graphId) -> PR URLs its children opened for that plan
 DELEGATE_TOOL = "delegate_task"  # Hermes runs subagents through this tool; its result is the child's text
 _sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify already continued with a sync nudge
 
@@ -325,9 +325,9 @@ def note_subagent(payload: dict[str, Any]) -> None:
 
 
 def _opened_pr(payload: dict[str, Any]) -> tuple[str, str, bool] | None:
-	"""(owner session_id, PR URL, opened by a child) when this tool call proves a PR was
-	opened: the session's own `gh pr create`, a child's `gh pr create` (owned by its
-	parent), or a delegate_task result naming a PR one of this session's children opened."""
+	"""(owner session_id, PR URL, opened by a child) when this tool call may prove a PR was
+	opened: the session's own `gh pr create`, a child's `gh pr create` (owned by its parent),
+	or a delegate_task result naming a PR; _pr_event checks the last against the plan's proof."""
 	session_id = str(payload.get("session_id") or "").strip()
 	tool_name = str(payload.get("tool_name") or "")
 	args = payload.get("args")
@@ -340,21 +340,15 @@ def _opened_pr(payload: dict[str, Any]) -> tuple[str, str, bool] | None:
 	if is_pr_creation_tool(tool_name, str(command)):
 		with _pr_lock:
 			parent = _child_parent.get(session_id)
-			if parent is None:
-				return session_id, url, False
-			_child_opened.setdefault(parent, set()).add(url)
-		return parent, url, True
+		return (session_id, url, False) if parent is None else (parent, url, True)
 	if tool_name == DELEGATE_TOOL:
-		# A delegate result that merely cites a PR (a review, a failed attempt) is not an opened PR.
-		with _pr_lock:
-			proven = url in _child_opened.get(session_id, set())
-		return (session_id, url, False) if proven else None
+		return session_id, url, False
 	return None
 
 
 def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str, bool] | None:
 	"""(session_id, graphId, PR URL, nudge, opened by a child) for a planned session's
-	opened PR; subagents never plan, so a child's PR belongs to the parent's plan."""
+	opened PR; subagents never plan, so a child's PR belongs to the parent's current plan."""
 	opened = _opened_pr(payload)
 	if opened is None:
 		return None
@@ -364,6 +358,16 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	if record is None or not isinstance(record.get("plan"), dict):
 		return None
 	graph_id = str(record["plan"].get("graphId") or "")
+	# Proof is plan-scoped: a child's PR counts for the plan the parent had when it was opened, so a later
+	# delegate result that cites it after a new plan replaced that graph proves nothing for the new one.
+	if by_child:
+		with _pr_lock:
+			_child_opened.setdefault((session_id, graph_id), set()).add(url)
+	elif str(payload.get("tool_name") or "") == DELEGATE_TOOL:
+		with _pr_lock:
+			proven = url in _child_opened.get((session_id, graph_id), set())
+		if not proven:
+			return None  # a delegate result that merely cites a PR (a review, a failed attempt) is not an opened PR
 	nudge = (
 		f"Ultrathink: a pull request was opened for the tracked task (graph {graph_id}, {url}). "
 		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path}, graphId={graph_id} and prUrl={url}, "

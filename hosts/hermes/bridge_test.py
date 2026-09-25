@@ -471,6 +471,15 @@ def test_a_pr_a_subagent_really_opened_nudges_the_parent_and_a_cited_one_does_no
 		# Another session's delegate result citing that URL gets nothing: the proof belongs to this parent.
 		planned_session(home, "other")
 		assert pr_tool_result({**opened, "session_id": "other"}, env=env) is None
+		# After a new plan replaces the graph, a delegate result citing the old plan's PR proves nothing for the new one,
+		# and the old PR does not become the new plan's latest PR for the end-of-turn nudge.
+		record = json.loads(state.read_text())
+		record["plan"] = {"graphId": "g2"}
+		state.write_text(json.dumps(record))
+		assert pr_tool_result(opened, env=env) is None
+		queue_pr_nudge(opened, env=env)
+		assert take_pr_nudges({"session_id": "parent"}) == ""
+		assert ("parent", "g2") not in bridge._pr_latest
 
 
 def test_finishing_a_tracked_unsynced_turn_continues_once_with_a_sync_nudge():
