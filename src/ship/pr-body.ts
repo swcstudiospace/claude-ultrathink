@@ -34,6 +34,7 @@ export function buildPr(record: SessionRecord, assessment?: Assessment): { title
 
 	if (assessment) {
 		const lines = [`- Done: ${assessment.done ? "yes" : "no"}`, `- Confidence: ${assessment.confidence}`];
+		if (assessment.signals.gsdIgnored) lines.push("- GSD roadmap: excluded by the operator (`--ignore-gsd`)");
 		if (assessment.gaps.length > 0) {
 			lines.push("- Gaps:", ...assessment.gaps.map((gap) => `  - ${scrub(gap)}`));
 		}

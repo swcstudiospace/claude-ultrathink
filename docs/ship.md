@@ -70,6 +70,8 @@ The nudge fires once per session. Its time is recorded as `ship.nudgedAt` in the
 - the GSD roadmap (`gsd-tools.cjs query roadmap.analyze`) has incomplete phases;
 - the latest `.planning/phases/*/*-VERIFICATION.md` has a status other than `passed`.
 
+`assess --ignore-gsd` leaves the GSD roadmap and verification rules out. Use it only when you have decided the repository's `.planning/` roadmap is separate work from this change, for example planning that belongs to another effort. The judge still reads the request, the plan and the diff, and the PR body records `GSD roadmap: excluded by the operator`.
+
 When the rules pass, an LLM judge runs on the configured engine. It reads:
 
 - the original request and the spec,
@@ -163,7 +165,7 @@ The phase becomes `merged`. The skill then runs `ultrathink-sync` with the PR UR
 
 | Subcommand | Does |
 |---|---|
-| `assess` | Collect the git, GSD and graph signals and judge whether the task is done. |
+| `assess` | Collect the git, GSD and graph signals and judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out (see [Done assessment](#done-assessment)). |
 | `pr` | Push the branch and open or reuse the PR into the default branch. |
 | `review` | Run one Greptile review round in PR or CLI mode. Returns `pending` within `waitMs` while Greptile is still working. |
 | `merge` | Check the merge gate, merge, and delete the branch. |

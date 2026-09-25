@@ -15,6 +15,8 @@ Every step is idempotent: it reuses an open PR, reuses a review of the same head
 
 If `done` is false, a GSD phase verification is `human_needed` or `gaps_found`, or the roadmap still has incomplete phases: never ship. Hand back to the user with the `gaps` (gsd-autonomous pause semantics) and do NOT open a PR. Only when the gaps are clearly your own unfinished work in this same run may you finish it and run `assess` again.
 
+Exception, only on the user's explicit decision: when the user has said the repository's GSD roadmap is separate work (for example they chose not to run its phases for this change), run `bin/ultrathink-ship assess --state <stateFile> --ignore-gsd`. The roadmap and verification signals are left out, the judge still decides on the request, the plan and the diff, and the PR body records the exclusion. Never add the flag on your own initiative.
+
 ## 1. Commit your own finished work
 
 If `assess` reports dirty tracked files that you created or edited in this task, commit them first: stage by explicit path (`git add <file> ...`), never `git add -A` / `git add .`, and never commit other people's changes. If you are unsure whose a change is, stop and ask the user.

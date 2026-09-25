@@ -191,12 +191,12 @@ Exit codes: 0 on success, 1 on failure, 2 on a usage error (the usage text is pr
 Drives the [ship flow](ship.md). The `ultrathink-ship` skill calls it, and you rarely need it by hand.
 
 ```text
-usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.json> [--cwd <dir>]
+usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.json> [--cwd <dir>] [--ignore-gsd]
 ```
 
 | Subcommand | Effect |
 |---|---|
-| `assess` | Collects git, GSD and diff signals and asks the engine to judge whether the task is done. |
+| `assess` | Collects git, GSD and diff signals and asks the engine to judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out; use it only when that roadmap is separate work ([ship.md](ship.md#done-assessment)). |
 | `pr` | Pushes the branch and opens a PR into the repository's default branch, or reuses the open one. |
 | `review` | One Greptile review round. Returns `status: "pending"` within `ship.waitMs` while Greptile is still working, and running it again resumes the same review. |
 | `merge` | Checks the merge gate, merges, and cleans up the branch. |

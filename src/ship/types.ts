@@ -57,6 +57,8 @@ export interface GsdSignals {
 export interface ShipSignals {
 	git: GitSignals;
 	gsd?: GsdSignals;
+	/** The operator excluded the repository's GSD roadmap from this assessment (`assess --ignore-gsd`). */
+	gsdIgnored?: boolean;
 	graph?: { nodes: number; workflowUnits: number };
 }
 

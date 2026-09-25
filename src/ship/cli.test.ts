@@ -126,6 +126,20 @@ describe("runShip", () => {
 		expect(rules.output.gaps).toContain("no judge available");
 	});
 
+	test("assess --ignore-gsd leaves the GSD roadmap out of the assessment and records it", async () => {
+		const gsd = { phaseCount: 3, completedPhases: 0, trusted: true };
+		const d = { ...deps(), signals: () => ({ git: { branch: "feat", base: "master", onBase: false, ahead: 1, dirty: [], untracked: 0, pushed: true }, gsd }) };
+		const seen: ShipSignals[] = [];
+		const capture = { ...d, assess: async (i: Parameters<ShipDeps["assess"]>[0]) => (seen.push(i.signals), d.assess(i)) };
+		await runShip(["assess", "--state", statePath, "--cwd", dir], capture);
+		await runShip(["assess", "--state", statePath, "--cwd", dir, "--ignore-gsd"], capture);
+		expect(seen[0]).toMatchObject({ gsd });
+		expect(seen[0]?.gsdIgnored).toBeUndefined();
+		expect(seen[1]?.gsd).toBeUndefined();
+		expect(seen[1]?.gsdIgnored).toBe(true);
+		expect(readShip(statePath)?.assessment?.signals.gsdIgnored).toBe(true);
+	});
+
 	test("pr refuses when not assessed done", async () => {
 		await ship("assess", deps({ done: false }));
 		expect((await ship("pr", deps())).output.ok).toBe(false);

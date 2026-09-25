@@ -43,7 +43,8 @@ export interface ShipDeps {
 type Output = Record<string, unknown>;
 type ShipRecord = SessionRecord & { ship?: ShipState };
 
-const USAGE = "usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.json> [--cwd <dir>]";
+const USAGE =
+	"usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.json> [--cwd <dir>] [--ignore-gsd]";
 const NEXT_FIX = "fix the listed findings, commit only the files you edited, push, then run review again";
 const NEXT_PENDING = "Greptile review still running; run review again (safe to repeat, it resumes the same review)";
 
@@ -59,13 +60,16 @@ interface Ctx {
 	deps: ShipDeps;
 	statePath: string;
 	cwd: string;
+	/** Leave the repository's GSD roadmap out of the done assessment; the operator decided it is separate work. */
+	ignoreGsd: boolean;
 }
 
 async function stepAssess(ctx: Ctx): Promise<Output & { done: boolean }> {
 	const { deps, statePath, cwd } = ctx;
 	const record = readRecord(statePath);
 	if (!record) return { ok: false, done: false, reason: "state file missing or unreadable" };
-	const signals = deps.signals({ cwd, record, run: deps.run });
+	const probed = deps.signals({ cwd, record, run: deps.run });
+	const signals = ctx.ignoreGsd ? { ...probed, gsd: undefined, gsdIgnored: true } : probed;
 	const diff = signals.git.base ? deps.diff({ cwd, base: signals.git.base, run: deps.run }) : { stat: "", log: "" };
 	const complete = await deps.engine();
 	let assessment: Assessment = await deps.assess({ record, signals, diff, complete, now: deps.now });
@@ -262,13 +266,15 @@ export async function runShip(argv: string[], deps: ShipDeps): Promise<{ code: n
 	const [command, ...rest] = argv;
 	let state: string | undefined;
 	let cwd = process.cwd();
+	let ignoreGsd = false;
 	for (let i = 0; i < rest.length; i++) {
 		if (rest[i] === "--state") state = rest[++i];
 		else if (rest[i] === "--cwd") cwd = rest[++i] ?? cwd;
+		else if (rest[i] === "--ignore-gsd") ignoreGsd = true;
 		else return { code: 2, output: { ok: false, error: `unknown argument ${rest[i]}`, usage: USAGE } };
 	}
 	if (!state) return { code: 2, output: { ok: false, error: "--state is required", usage: USAGE } };
-	const ctx: Ctx = { deps, statePath: resolve(state), cwd: resolve(cwd) };
+	const ctx: Ctx = { deps, statePath: resolve(state), cwd: resolve(cwd), ignoreGsd };
 	try {
 		switch (command) {
 			case "assess":
