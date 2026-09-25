@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readControl, writeControl } from "../claude/state.ts";
 import type { Tracker } from "../track/gateway.ts";
 import { writePlanCarrier } from "./carrier.ts";
 import { detectHost } from "./detect.ts";
@@ -287,6 +288,30 @@ describe("planPrompt", () => {
 			expect(calls.engine).toBe(2);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an armed /ultrathink-skip is consumed by a trivial or bare-preamble prompt on Hermes and Omp, as on Claude", async () => {
+		for (const host of ["hermes", "omp"] as const) {
+			const { root, env, options } = planHarness();
+			const stateDir = env.ULTRATHINK_STATE_DIR!;
+			const hostEnv = { ...env, PI_CODING_AGENT_DIR: join(root, "omp") };
+			try {
+				for (const prompt of ["ok", HERMES_SKILL]) {
+					writeControl(stateDir, { skipOnce: true });
+					expect(await planPrompt({ host, prompt, cwd: root }, hostEnv, options)).toEqual({ context: "", skipped: "skip" });
+					expect(readControl(stateDir).skipOnce).toBe(false);
+				}
+				// Stateless skips that never consume the skip on Claude leave it armed here too.
+				writeControl(stateDir, { skipOnce: true });
+				expect(await planPrompt({ host, prompt: "<BUILD_PROMPT>x</BUILD_PROMPT>", cwd: root }, hostEnv, options)).toEqual({
+					context: "",
+					skipped: "skip",
+				});
+				expect(readControl(stateDir).skipOnce).toBe(true);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
 		}
 	});
 });

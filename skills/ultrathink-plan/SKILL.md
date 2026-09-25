@@ -11,7 +11,7 @@ The TypeScript engine already planned this prompt. Hook stdout is not a reliable
    - `$ULTRATHINK_STATE_DIR/last-plan.json`
    - `$GROK_PLUGIN_DATA/ultrathink/last-plan.json`
    - `~/.grok/plugin-data/ultrathink/last-plan.json`
-   - `$HERMES_HOME/ultrathink/last-plan.json`
+   - `$HERMES_HOME/ultrathink/last-plan.json`, or `~/.hermes/ultrathink/last-plan.json` when `HERMES_HOME` is unset
    - `$XDG_CONFIG_HOME/muse/ultrathink/last-plan.json` or `~/.config/muse/ultrathink/last-plan.json`
    - `$PI_CODING_AGENT_DIR/ultrathink/last-plan.json` or `~/.omp/agent/ultrathink/last-plan.json`
    - `~/.claude/ultrathink/last-plan.json`

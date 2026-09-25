@@ -58,12 +58,28 @@ function optionsLine(item: Clarification): string {
 	return `${labels}${recommended}`;
 }
 
-export function formatHitlAddendum(list: Clarification[]): string {
+export interface HitlAddendumOptions {
+	/** The host's question tool; `clarify` is Hermes' (at most 5 questions × 4 choices per call). Default: Claude's `AskUserQuestion`. */
+	questionTool?: "clarify";
+}
+
+const ASK_STEPS = [
+	"2. For questions still open that are marked blocking, call the `AskUserQuestion` tool ONCE with up to 4 of them, using the given header and options with the recommended default listed first. Users see the options as suggestions and may type their own answer.",
+	"5. If `AskUserQuestion` is unavailable (non-interactive run), proceed with the recommended defaults and list every assumption you made.",
+] as const;
+
+const CLARIFY_STEPS = [
+	'2. For questions still open that are marked blocking, call Hermes\' `clarify` tool ONCE with `{"questions": [{"question": "...", "choices": ["..."]}]}`: at most 5 questions, at most 4 choices each, with the recommended default as the first choice. Users see the choices as suggestions and may type their own answer.',
+	"5. If `clarify` is unavailable or answers that no user is available (non-interactive run), proceed with the recommended defaults and list every assumption you made.",
+] as const;
+
+export function formatHitlAddendum(list: Clarification[], options: HitlAddendumOptions = {}): string {
 	if (list.length === 0) return "";
 	const open = list.filter((item) => item.answer === undefined);
 	const blocking = open.filter((item) => item.blocking);
 	const nonBlocking = open.filter((item) => !item.blocking);
 	const answered = list.filter((item) => item.answer !== undefined);
+	const steps = options.questionTool === "clarify" ? CLARIFY_STEPS : ASK_STEPS;
 
 	const lines = [
 		"## Clarifications (HITL)",
@@ -71,10 +87,10 @@ export function formatHitlAddendum(list: Clarification[]): string {
 		"The planning pass flagged open questions whose answers change the implementation. Handle them before writing code:",
 		"",
 		"1. First try to resolve each open question from repository evidence (files, config, git history, the conversation). A question answered by a file read is settled; do not ask it.",
-		"2. For questions still open that are marked blocking, call the `AskUserQuestion` tool ONCE with up to 4 of them, using the given header and options with the recommended default listed first. Users see the options as suggestions and may type their own answer.",
+		steps[0],
 		"3. For non-blocking open questions, proceed with the recommended default and state the assumption explicitly in your first reply.",
 		'4. Never re-ask items listed under "Answered"; treat those answers as settled decisions.',
-		"5. If `AskUserQuestion` is unavailable (non-interactive run), proceed with the recommended defaults and list every assumption you made.",
+		steps[1],
 	];
 
 	if (blocking.length > 0) {

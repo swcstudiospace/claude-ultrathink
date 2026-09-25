@@ -23,7 +23,7 @@ A plan has one Graph of Thought with 5 to 8 nodes by default. Each node normally
 | Issue | one per graph node | `[<node id>] <node title>` | `blockedBy` lists the issues of the nodes it depends on. |
 | Sub-issue | one per rationale step | `<node title> — Step <n>: <step summary>` | Parent is the node's issue. |
 
-Each description ends with a footer, `ultrathink graph <graph id> · node <node id>`, plus ` · step <n>` on sub-issues. A re-run searches for this footer and reuses existing issues instead of creating duplicates.
+Each description ends with a footer, `ultrathink graph <graph id> · node <node id>`, plus ` · step <n>` on sub-issues. A re-run of `track complete` on a session record that already has `tracking` refs searches for this footer and reuses existing issues instead of creating duplicates.
 
 **Notion** (when `notion.dataSourceUrl` is set), in that database, as a three-level hierarchy linked through the `Parent Item` relation:
 
@@ -34,6 +34,8 @@ Each description ends with a footer, `ultrathink graph <graph id> · node <node 
 | `Sub-Issue` | one per rationale step | `Item`, `Step`, `Thought`, `Graph ID`, `Linear URL` / `Issue ID` | the node's Issue |
 
 ultrathink fetches the database schema first and writes only the properties the database has, so a database with fewer columns still works. A re-run finds existing rows by `Graph ID`.
+
+That adoption by Graph ID happens only when `track complete` re-runs on a session record that already has `tracking` refs. The first run on a record (always the case on Hermes, where the hook creates no rows) creates every row without looking for existing ones, so a first run interrupted before it records its refs leaves rows that a retry creates again. Delete the duplicates by `Graph ID` if that happens.
 
 The created links go into the spec's `<ISSUES>` block and into the session record (`tracking`), and the agent gets them as "Linked issues" TODO lines to copy into its TODO list.
 

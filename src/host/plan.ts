@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
 import { runPromptSubmit } from "../claude/hook.ts";
-import { readControl, sessionPath } from "../claude/state.ts";
+import { type ControlState, readControl, sessionPath } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
 import { decideUplift, isTrivial } from "../uplift/detect.ts";
@@ -93,6 +93,8 @@ export async function planPrompt(
 	const cwd = request.cwd?.trim() || process.cwd();
 	let text = request.prompt ?? "";
 	let skill: SkillInvocation | undefined;
+	const stateDir = resolveStateDir({ ...env, ULTRATHINK_HOST: host });
+	let control: ControlState = {};
 	try {
 		// `/ultrathink-<verb>` (and the older `/ultrathink:<verb>` / `/ultrathink <verb>`) is a control command, never a request to plan.
 		if (parseUltrathinkCommand(text)) return skip("ultrathink-command");
@@ -100,21 +102,25 @@ export async function planPrompt(
 		if ("skip" in target) return skip(target.skip);
 		text = target.text;
 		skill = target.skill;
-		// A Hermes skill loaded with no task (or only an ack) is a preamble, not a request to plan.
-		if (host === "hermes" && skill && (!skill.instruction || isTrivial(skill.instruction))) return skip("skill-preamble");
+		control = readControl(stateDir);
+		// A Hermes skill loaded with no task (or only an ack) is a preamble, not a request to plan. An armed
+		// /ultrathink-skip must still be consumed by runPromptSubmit, as a trivial prompt consumes it on Claude.
+		if (control.skipOnce !== true && host === "hermes" && skill && (!skill.instruction || isTrivial(skill.instruction)))
+			return skip("skill-preamble");
 	} catch {
 		// fail-open: a throwing skill parser plans the prompt as written
 	}
-	const stateDir = resolveStateDir({ ...env, ULTRATHINK_HOST: host });
 	try {
 		const config = loadConfig(claudeConfigPaths(cwd, env));
-		const control = readControl(stateDir);
-		// Stateless skips (raw:, commands, uplifted XML, graph hand-offs, acks) never pay for engine selection; runPromptSubmit still applies enabled/skipOnce.
-		const precheck = decideUplift(
-			{ text, source: "user", idle: true },
-			{ enabled: true, skipOnce: false, skipTrivial: config.uplift.skipTrivial },
-		);
-		if (precheck.action !== "uplift") return skip(`precheck-${precheck.action}`);
+		// Stateless skips (raw:, commands, uplifted XML, graph hand-offs, acks) never pay for engine selection; runPromptSubmit
+		// still applies enabled/skipOnce. With a skip armed they are left to runPromptSubmit, which consumes it as Claude does.
+		if (control.skipOnce !== true) {
+			const precheck = decideUplift(
+				{ text, source: "user", idle: true },
+				{ enabled: true, skipOnce: false, skipTrivial: config.uplift.skipTrivial },
+			);
+			if (precheck.action !== "uplift") return skip(`precheck-${precheck.action}`);
+		}
 		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd);
 		if ("skipped" in engine) return skip(engine.skipped);
 		const sessionId = request.session_id?.trim() || "unknown";

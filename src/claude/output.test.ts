@@ -378,6 +378,19 @@ describe("handoff", () => {
 		expect(out.length).toBeLessThan(6_000);
 	});
 
+	test("Hermes contexts ask through clarify and name todo/delegate_task; other hosts keep AskUserQuestion and Claude tool names", () => {
+		for (const hermes of [{ ...spec }, { result, statePath: "/s/x.json", skillHints: true }]) {
+			const out = formatPromptContext({ ...hermes, graph: FALLBACK_GRAPH, clarifications, plan });
+			expect(out).toContain("`clarify` tool ONCE");
+			expect(out).not.toContain("AskUserQuestion");
+			expect(out).toContain("On Hermes, TodoWrite is the `todo` tool and Task subagents are `delegate_task`.");
+		}
+		const claude = formatPromptContext({ result, statePath: "/s/x.json", graph: FALLBACK_GRAPH, clarifications, plan });
+		expect(claude).toContain("`AskUserQuestion` tool ONCE");
+		expect(claude).not.toContain("clarify");
+		expect(claude).not.toContain("On Hermes");
+	});
+
 	test("a long brief and a long Linked issues list give way so kickoff stays inside Hermes' spill threshold", () => {
 		const nodes = Array.from({ length: 8 }, (_, i) => `n${i + 1}`);
 		const bigPlan = {

@@ -58,7 +58,7 @@ It refuses unless the latest review is 5/5 with zero open comments, the reviewed
 
 ## 5. Record it
 
-Invoke the ultrathink-sync skill with the stateFile and the PR URL (status merged, or the current PR status if not merged).
+Invoke the ultrathink-sync skill with the stateFile and the PR URL (status merged, or the current PR status if not merged). On Hermes, load it with `skill_view name="ultrathink:ultrathink-sync"` (a bare `ultrathink-sync` does not reach plugin skills there), or read `<repo>/skills/ultrathink-sync/SKILL.md`, where `<repo>` is the plugin root (the `CLI:` path without its trailing `/bin/ultrathink-ship`). The ship CLI opens the PR itself, so no PR nudge fires for it: this step is what records the PR.
 
 ## 6. Report
 

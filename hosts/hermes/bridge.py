@@ -5,9 +5,10 @@
 pre_llm_call plans the prompt through hooks/engine.ts, inside the hook cap Hermes
 enforces (plugins.hook_callback_timeout): Bun gets min(540, cap - 15) seconds in its
 own process group, and the whole group is killed at that deadline. Slash commands
-and already-uplifted ultrathink XML never start Bun. When a planned session's
-tool call opens a pull request, transform_tool_result appends an ultrathink-sync
-nudge to that tool result, so the model sees it in the same turn. If no tool
+and already-uplifted ultrathink XML never start Bun, even behind a shared session's
+"[Name] " sender tag. When a planned session's tool call opens a pull request (or a
+delegate_task subagent's result names one), transform_tool_result appends an
+ultrathink-sync nudge to that tool result, so the model sees it in the same turn. If no tool
 result carried it, post_tool_call queues the nudge and the session's next
 pre_llm_call delivers it. Each PR URL is nudged once per session. When a coding
 turn is about to finish (pre_verify) and the session's tracked plan has not been
@@ -42,6 +43,9 @@ CONTROL_TIMEOUT_S = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
 SENDER_TAG_RE = re.compile(r"\[[^\]\n]*\]\s+")
+# Hermes' skill scaffold also opens with a bracket; it is the prompt, not a sender tag.
+SKILL_SCAFFOLD_PREFIX = "[IMPORTANT: The user has invoked the "
+DELEGATE_TOOL = "delegate_task"  # Hermes runs subagents through this tool; its result is the child's text
 
 # Ports of src/track/pr-detect.ts. JavaScript's \s, \b, and \d are spelled out
 # because Python's are Unicode-aware and disagree with them at the edges.
@@ -142,6 +146,16 @@ def message_text(message: Any) -> str:
 	return ""
 
 
+def strip_sender_tag(prompt: str) -> str:
+	"""The message without a shared session's leading "[Name] " sender tag; unchanged
+	when it has none. Hermes' "[IMPORTANT: …]" skill scaffold is not a tag."""
+	text = prompt.lstrip()
+	if text.startswith(SKILL_SCAFFOLD_PREFIX):
+		return prompt
+	tag = SENDER_TAG_RE.match(text)
+	return text[tag.end() :] if tag else prompt
+
+
 def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	"""Return context to inject, or "" when the engine should not run."""
 	parent = payload.get("parent_session_id") or payload.get("parentSessionId")
@@ -152,24 +166,27 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	prompt = message_text(payload.get("user_message") or payload.get("prompt"))
 	if not prompt.strip() or _take_quick(prompt):
 		return ""
+	prompt = strip_sender_tag(prompt)
 	# Hermes expands /skill commands into an "[IMPORTANT: The user has invoked …]" scaffold
 	# before pre_llm_call, so a prompt still starting with "/" is never a skill with a task.
-	if prompt.strip().startswith("/") or is_already_uplifted(prompt):
+	if not prompt.strip() or prompt.strip().startswith("/") or is_already_uplifted(prompt):
 		return ""
 	deadline = plan_deadline()
 	if deadline is None:
 		_warn_short_cap()
 		return ""
+	child_env = os.environ.copy()
+	child_env.update(env or {})
+	# Hermes passes no cwd to pre_llm_call; its tools run in TERMINAL_CWD.
+	cwd = payload.get("cwd") or child_env.get("TERMINAL_CWD", "").strip() or os.getcwd()
 	request = {
 		"host": "hermes",
 		"session_id": payload.get("session_id") or payload.get("sessionId") or "",
 		"prompt": prompt,
-		"cwd": payload.get("cwd") or os.getcwd(),
+		"cwd": cwd,
 		"platform": payload.get("platform") or "",
 		"parent_session_id": parent or "",
 	}
-	child_env = os.environ.copy()
-	child_env.update(env or {})
 	child_env["ULTRATHINK_HOST"] = "hermes"
 	bun = child_env.get("BUN")
 	# BUN is an explicit override; otherwise bin/run-bun finds bun even when
@@ -276,11 +293,13 @@ def _read_record(path: Path) -> dict[str, Any] | None:
 
 def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str, str, str, str] | None:
 	"""(session_id, graphId, PR URL, nudge) when this tool call opened a PR for a
-	planned session. Subagents never plan (plan() skips them), so they have no state file."""
+	planned session. Subagents never plan (plan() skips them), so they have no state
+	file: a PR URL in a delegate_task result is a PR event for the parent session."""
 	session_id = str(payload.get("session_id") or "").strip()
+	tool_name = str(payload.get("tool_name") or "")
 	args = payload.get("args")
 	command = (args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
-	if not session_id or not is_pr_creation_tool(str(payload.get("tool_name") or ""), str(command)):
+	if not session_id or not (tool_name == DELEGATE_TOOL or is_pr_creation_tool(tool_name, str(command))):
 		return None
 	url = extract_pr_url(_result_text(payload.get("result")))
 	if not url:
@@ -292,7 +311,7 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	graph_id = str(record["plan"].get("graphId") or "")
 	nudge = (
 		f"Ultrathink: a pull request was opened for the tracked task (graph {graph_id}, {url}). "
-		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path} and prUrl={url}, "
+		f"Invoke {skill_reference('ultrathink-sync')} now with stateFile={path}, graphId={graph_id} and prUrl={url}, "
 		"so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. "
 		"ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues."
 	)
@@ -383,7 +402,7 @@ def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> di
 	pr = f" and prUrl={url}" if url else ""
 	message = (
 		f"Ultrathink: this session's plan (graph {key[1]}) is tracked but not synced. "
-		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}{pr}. "
+		f"Before finishing, invoke {skill_reference('ultrathink-sync')} with stateFile={path}, graphId={key[1]}{pr}. "
 		"It only updates the existing Notion Task row and Linear issues found by Graph ID and never creates rows; "
 		"if Notion or Linear is down, report that in one line and finish without blocking."
 	)
@@ -421,9 +440,9 @@ def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, s
 def _take_quick(prompt: str) -> bool:
 	"""Consume one /ultrathink-quick marker for exactly this message, sender tag aside."""
 	text = prompt.strip()
-	tag = SENDER_TAG_RE.match(text)
+	untagged = strip_sender_tag(text)
 	with _quick_lock:
-		for key in (text, text[tag.end() :]) if tag else (text,):
+		for key in (text, untagged) if untagged != text else (text,):
 			count = _quick_pending.pop(key, 0)
 			if count > 1:
 				_quick_pending[key] = count - 1
