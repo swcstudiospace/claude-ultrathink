@@ -221,7 +221,8 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 					: NEXT_FIX;
 	return {
 		ok: true,
-		ready: gate.ok,
+		// An already-merged PR is ready for `merge`, which skips the merge and finishes the cleanup.
+		ready: gate.ok || merged,
 		reused: reusedRound,
 		status: result.status,
 		score: result.score,

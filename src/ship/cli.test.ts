@@ -221,6 +221,14 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.phase).toBe("ready");
 	});
 
+	test("run finishes the cleanup when the PR was merged outside the flow", async () => {
+		const out = await ship("run", deps({ existingPr: PR, status: { state: "MERGED" } }));
+		expect(out.output).toMatchObject({ ok: true, review: { ready: true }, merge: { ok: true, merged: true, alreadyMerged: true } });
+		expect(calls).toContain("delete:feat");
+		expect(calls).toContain("sync:master");
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+	});
+
 	test("merge refuses when autoMerge disabled", async () => {
 		writeShip(statePath, { pr: PR });
 		const out = await ship("merge", deps({ config: { autoMerge: false } }));
