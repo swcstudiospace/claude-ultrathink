@@ -134,9 +134,10 @@ def planned_session(home: str, session_id: str) -> Path:
 def fake_ctx(accepts: bool | None = True) -> SimpleNamespace:
 	"""A Hermes PluginContext stand-in. accepts=False refuses to inject (the TUI, or a gateway
 	without allow_gateway_injection); accepts=None is a Hermes without inject_message."""
-	ctx = SimpleNamespace(hooks=[], commands={}, injected=[])
+	ctx = SimpleNamespace(hooks=[], commands={}, injected=[], skills={})
 	ctx.register_hook = lambda name, callback: ctx.hooks.append(name)
 	ctx.register_command = lambda name, handler, description="", args_hint="": ctx.commands.__setitem__(name, handler)
+	ctx.register_skill = lambda name, path, description="", frontmatter=None: ctx.skills.__setitem__(name, (path, description))
 	if accepts is not None:
 
 		def inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool:
@@ -366,6 +367,44 @@ def test_registers_every_ultrathink_command_next_to_the_hooks():
 	assert older.hooks == ctx.hooks and older.commands == {}
 
 
+def test_registers_the_four_ultrathink_skills_with_their_descriptions():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+	assert sorted(ctx.skills) == ["ultrathink-kickoff", "ultrathink-plan", "ultrathink-ship", "ultrathink-sync"]
+	for name, (path, description) in ctx.skills.items():
+		assert path.is_absolute() and path.is_file() and path.as_posix().endswith(f"skills/{name}/SKILL.md"), path
+		frontmatter = path.read_text(encoding="utf-8").split("---")[1]
+		expected = next(line for line in frontmatter.splitlines() if line.startswith("description:"))
+		assert description and description == expected[len("description:") :].strip(), (name, description)
+
+
+def test_skill_registration_failures_leave_hooks_and_commands_registered():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+
+	def reject(*_args: object, **_kwargs: object) -> None:
+		raise ValueError("Invalid skill name")
+
+	failing = fake_ctx()
+	failing.register_skill = reject
+	plugin.register(failing)
+	assert failing.hooks == ctx.hooks and sorted(failing.commands) == sorted(ctx.commands)
+
+	older = fake_ctx()
+	del older.register_skill  # a Hermes before register_skill
+	plugin.register(older)
+	assert older.hooks == ctx.hooks and sorted(older.commands) == sorted(ctx.commands)
+
+
+def test_skill_description_is_empty_without_frontmatter():
+	with tempfile.TemporaryDirectory() as tmp:
+		path = Path(tmp) / "SKILL.md"
+		path.write_text("# No frontmatter\ndescription: body text\n")
+		assert plugin.skill_description(path) == ""
+		path.write_text("---\nname: x\n---\ndescription: body text\n")
+		assert plugin.skill_description(path) == ""
+
+
 def test_control_commands_run_the_cli_as_hermes_and_return_its_text():
 	with tempfile.TemporaryDirectory() as tmp:
 		ctx = fake_ctx()
@@ -440,6 +479,9 @@ if __name__ == "__main__":
 	test_tool_result_carries_the_nudge_once_and_only_for_a_planned_session()
 	test_next_turn_delivers_a_nudge_no_tool_result_carried_once()
 	test_registers_every_ultrathink_command_next_to_the_hooks()
+	test_registers_the_four_ultrathink_skills_with_their_descriptions()
+	test_skill_registration_failures_leave_hooks_and_commands_registered()
+	test_skill_description_is_empty_without_frontmatter()
 	test_control_commands_run_the_cli_as_hermes_and_return_its_text()
 	test_control_failures_come_back_as_one_line()
 	test_quick_sends_the_message_once_without_a_plan()

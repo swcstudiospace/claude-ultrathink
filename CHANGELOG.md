@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Hermes: the plugin registers `ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan` and `ultrathink-ship` as Hermes plugin skills (`skill_view name="ultrathink:<name>"`), and the plan's kickoff and ship instructions give each skill's load call and absolute `SKILL.md` path, since Hermes does not list plugin skills to the model.
+
 ### Fixed
 
 - Hermes: plans are no longer dropped by Hermes' 30 s plugin hook cap. Install now sets `hermes config set plugins.hook_callback_timeout 600`, and the planner reads the cap Hermes enforces and stops at `min(540, cap − 15)` seconds. Under a 105 s cap (a deadline under 90 s) it doesn't start Bun and logs one warning naming that command. On the deadline it kills Bun's whole process group, so no engine call outlives the hook.

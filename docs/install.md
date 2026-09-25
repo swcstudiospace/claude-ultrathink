@@ -172,7 +172,7 @@ rm ~/.grok/plugins/ultrathink
 
 ## Hermes Agent
 
-Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. The plugin also registers the `/ultrathink-<verb>` commands and a pull-request nudge for `ultrathink-sync`.
+Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` and returns the plan as context. The plugin also registers the `/ultrathink-<verb>` commands, a pull-request nudge for `ultrathink-sync`, and the four ultrathink skills. Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
 
 ### Install
 
@@ -188,7 +188,7 @@ The last command is required. Hermes stops waiting for a plugin hook after `plug
 
 The planner reads the cap Hermes enforces and stops the engine after `min(540, cap − 15)` seconds, which leaves 15 s for Hermes to take the plan. At a 600 s cap that is 540 s. `ULTRATHINK_HERMES_TIMEOUT` (seconds) replaces the 540. When the deadline is reached, the planner kills Bun's whole process group, including the engine calls Bun started, and the prompt goes through unplanned. Under a 105 s cap the deadline would be under 90 s, too short for a plan, so the planner doesn't start Bun at all. Every prompt then goes through unplanned, and the Hermes log gets one warning per process naming the fix, `hermes config set plugins.hook_callback_timeout 600`.
 
-ultrathink only registers hooks and commands. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`). The plugin resolves the symlink to find the engine, so keep the rest of `<clone>` in place.
+ultrathink only registers hooks, commands and skills. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`). The plugin resolves the symlink to find the engine, so keep the rest of `<clone>` in place.
 
 If another Hermes plugin already plans or rewrites prompts, disable it. Otherwise both will plan the same turn.
 

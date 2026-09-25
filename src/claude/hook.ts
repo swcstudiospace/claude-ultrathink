@@ -322,6 +322,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					ship: shipApplies(deps.config.ship, skill?.name),
 					trackingOff: deps.trackingOff,
 					providers,
+					skillHints: deps.surface === "hermes",
 				}),
 			},
 		};
