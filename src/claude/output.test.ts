@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import type { Clarification } from "../hitl/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
-import { formatPromptContext, formatSummary, SKILL_CONTEXT_HEADER, TRACKING_OFF_NOTE, truncateXml, UPLIFT_CONTEXT_HEADER } from "./output.ts";
+import { formatPromptContext, formatSummary, HANDOFF_MAX_CHARS, SKILL_CONTEXT_HEADER, TRACKING_OFF_NOTE, truncateXml, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 
 const result = { xml: "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>", original: "x", root: "BUILD_PROMPT", source: "llm" as const };
@@ -376,5 +376,40 @@ describe("handoff", () => {
 		const out = formatPromptContext({ ...spec, graph, clarifications: blocking, plan, skill: "gsd-quick", ship: true });
 		expect(out).toContain("## Clarifications (HITL)");
 		expect(out.length).toBeLessThan(6_000);
+	});
+
+	test("a long brief and a long Linked issues list give way so kickoff stays inside Hermes' spill threshold", () => {
+		const nodes = Array.from({ length: 8 }, (_, i) => `n${i + 1}`);
+		const bigPlan = {
+			...plan,
+			graphId: "g1",
+			issues: nodes.map((nodeId) => ({ graphId: "g1", nodeId, item: `Item ${nodeId} ${"x".repeat(80)}`, thought: "t" })),
+			subIssues: nodes.flatMap((nodeId) => Array.from({ length: 8 }, (_, s) => ({ graphId: "g1", nodeId, item: `Step ${s + 1} ${"y".repeat(80)}`, step: s + 1, thought: "t" }))),
+		};
+		const ref = (id: string) => ({ id, identifier: id, url: `https://linear.app/o/issue/${id}/${"slug-".repeat(12)}`, title: id });
+		const bigTracking: TrackingRefs = {
+			...complete,
+			linear: {
+				nodes: Object.fromEntries(nodes.map((n) => [n, ref(`SPE-${n}`)])),
+				steps: Object.fromEntries(bigPlan.subIssues.map((s) => [`${s.nodeId}.${s.step}`, ref(`SPE-${s.nodeId}-${s.step}`)])),
+			},
+		};
+		const brief = "observed history line\n".repeat(1_000);
+		for (const input of [
+			{ ...spec, brief },
+			{ ...spec, plan: bigPlan, tracking: bigTracking },
+			{ ...spec, brief, plan: bigPlan, tracking: bigTracking },
+		]) {
+			const out = formatPromptContext(input as Parameters<typeof formatPromptContext>[0]);
+			expect(out.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+			expect(out).toContain('skill_view name="ultrathink:ultrathink-kickoff"');
+		}
+		const briefOnly = formatPromptContext({ ...spec, brief });
+		expect(briefOnly).toContain("(brief truncated)");
+		const linkedOnly = formatPromptContext({ ...spec, plan: bigPlan, tracking: bigTracking } as Parameters<typeof formatPromptContext>[0]);
+		expect(linkedOnly).toContain("copy them from the ISSUES block of the specification file");
+		const small = formatPromptContext({ ...spec, brief: "one short brief line" });
+		expect(small).toContain("one short brief line");
+		expect(small).not.toContain("(brief truncated)");
 	});
 });

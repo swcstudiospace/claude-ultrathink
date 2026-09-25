@@ -323,7 +323,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					trackingOff: deps.trackingOff,
 					providers,
 					skillHints: deps.surface === "hermes",
-					handoff: deps.surface === "hermes",
+					// No spec file (the write failed) means nothing to point at: fall back to the inline spec.
+					handoff: deps.surface === "hermes" && specPath !== undefined,
 				}),
 			},
 		};

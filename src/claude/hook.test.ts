@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
@@ -200,6 +200,23 @@ describe("runPromptSubmit", () => {
 			expect(result.record?.plan?.task.repo).toBeUndefined();
 			expect(result.record?.plan?.task.branch).toBeUndefined();
 			expect(result.record?.plan?.issues).toHaveLength(5);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("Hermes gets a handoff to the saved spec, or the inline spec when the spec file could not be written", async () => {
+		const { deps, cleanup } = baseDeps({ surface: "hermes", complete: smartComplete() });
+		try {
+			const saved = (await runPromptSubmit(input, deps)).output?.hookSpecificOutput.additionalContext ?? "";
+			expect(saved).toContain(`Specification file: ${join(deps.stateDir, "sessions", "s1.xml")}`);
+			expect(saved).not.toContain("<BUILD_PROMPT>");
+			// A file where the state directory should be makes every state write fail.
+			rmSync(deps.stateDir, { recursive: true, force: true });
+			writeFileSync(deps.stateDir, "not a directory");
+			const unsaved = (await runPromptSubmit(input, deps)).output?.hookSpecificOutput.additionalContext ?? "";
+			expect(unsaved).toContain("<BUILD_PROMPT>");
+			expect(unsaved).not.toContain("Specification file:");
 		} finally {
 			cleanup();
 		}

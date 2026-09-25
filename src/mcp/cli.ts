@@ -332,6 +332,8 @@ function sessionMark(args: string[]): number {
 	if (!field) throw new UsageError(`session mark needs one of kicked-off, synced: ${marks.join(" ") || "(none)"}`);
 	const record = readRecord(statePath);
 	if (!record) return 1;
+	// Plan-scoped: the mark describes the plan now in the record; the session's next planned prompt replaces the record
+	// with a new graph whose kickedOff and synced start false, because that graph has not been kicked off or synced.
 	record[field] = true;
 	writeAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
 	return 0;

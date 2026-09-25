@@ -184,7 +184,7 @@ usage:
 | `auth logout <provider>` | Removes that provider's credentials. |
 | `check [provider...]` | Runs `initialize` and `tools/list` against each provider (all three by default) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
 | `track complete --state <file>` | Creates the rows still missing for a planned session, rewrites its spec and state file, and prints the linked TODO lines. `ultrathink-kickoff` runs this. Does nothing when `/ultrathink-track off` is set or no tracker is configured. |
-| `session mark --state <file> <kicked-off\|synced>` | Sets `kickedOff` or `synced` to `true` in the session record and prints nothing. `ultrathink-kickoff` runs it with `kicked-off` as its last step. A missing or unreadable record exits 1 and is left untouched. |
+| `session mark --state <file> <kicked-off\|synced>` | Sets `kickedOff` or `synced` to `true` in the session record and prints nothing. `ultrathink-kickoff` runs it with `kicked-off` as its last step. The marks describe the plan now in the record: the session's next planned prompt writes a new graph with both back at `false`. A missing or unreadable record exits 1 and is left untouched. |
 | `notion init --parent <page>` | Creates the Agent Task Graph database under a Notion page. `--title` sets its name. `--write-config` saves `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`. |
 
 Exit codes: 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr).

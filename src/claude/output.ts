@@ -22,6 +22,14 @@ import type { UpliftResult } from "../types.ts";
 
 /** Generous ceiling; the spec is normally far smaller. Over budget, RATIONALE bodies go first, then the tail. */
 export const DEFAULT_CONTEXT_CHARS = 90_000;
+/**
+ * Ceiling for a handoff. Hermes spills a hook context piece over 10,000 characters to a file and keeps only its first
+ * and last 500, which could hide the kickoff instruction in the middle.
+ */
+export const HANDOFF_MAX_CHARS = 9_000;
+const BRIEF_CUT = "\n(brief truncated)";
+const LINKED_POINTER =
+	"## Linked issues\n\nThe tracker rows' TODO lines are too long to repeat here: copy them from the ISSUES block of the specification file (or from kickoff's `track complete` output), keeping each identifier and URL.";
 
 const RATIONALE_RE = /(<RATIONALE>)[\s\S]*?(<\/RATIONALE>)/g;
 const RATIONALE_OMITTED = "(omitted — full text in the specification file)";
@@ -202,7 +210,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 	}
 
 	const brief = input.brief?.trim();
-	if (brief) parts.push(SUBSTRATE_CONTEXT_HEADER, brief);
+	const briefParts = brief ? [SUBSTRATE_CONTEXT_HEADER, brief] : [];
+	if (!input.handoff) parts.push(...briefParts);
 
 	const tail: string[] = [];
 	if (input.graph) {
@@ -213,7 +222,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 		if (waves) tail.push(`Workflow waves: ${waves}`);
 	}
 	const providers = input.providers ?? BOTH_PROVIDERS;
-	if (input.plan && input.tracking && !input.trackingOff) tail.push(formatLinkedIssues(input.plan, input.tracking, providers));
+	const linked = input.plan && input.tracking && !input.trackingOff ? formatLinkedIssues(input.plan, input.tracking, providers) : undefined;
+	if (linked) tail.push(linked);
 	if (input.clarifications?.length) {
 		const hitl = formatHitlAddendum(input.clarifications).trim();
 		if (hitl) tail.push(hitl);
@@ -243,11 +253,34 @@ export function formatPromptContext(input: PromptContextInput): string {
 		);
 	}
 
-	if (input.handoff) return [...parts, ...tail].join("\n\n");
+	if (input.handoff) return fitHandoff(parts, briefParts, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
 	const budget = Math.max(2_000, maxChars - fixed);
 	parts.push(truncateXml(input.result.xml, budget, input.specPath));
 	return [...parts, ...tail].join("\n\n");
+}
+
+/**
+ * Joins a handoff under `limit` so no section can fall into the part Hermes drops. The fixed sections (header, paths,
+ * orchestration, clarifications, kickoff, ship) always stay; the substrate brief is cut first, then the Linked issues
+ * list becomes a pointer to the spec's ISSUES block, which holds the same lines.
+ */
+function fitHandoff(parts: string[], briefParts: string[], tail: string[], linked: string | undefined, limit: number): string {
+	const join = (sections: string[]): string => sections.join("\n\n");
+	let body = tail;
+	const full = join([...parts, ...briefParts, ...body]);
+	if (full.length <= limit) return full;
+	for (;;) {
+		const bare = join([...parts, ...body]);
+		const [header, brief] = briefParts;
+		if (header && brief) {
+			const room = limit - bare.length - header.length - BRIEF_CUT.length - 4;
+			if (room >= brief.length) return join([...parts, header, brief, ...body]);
+			if (room > 200) return join([...parts, header, `${brief.slice(0, room)}${BRIEF_CUT}`, ...body]);
+		}
+		if (bare.length <= limit || !linked || body !== tail) return bare;
+		body = tail.map((section) => (section === linked ? LINKED_POINTER : section));
+	}
 }
 
 export function formatSummary(input: {
