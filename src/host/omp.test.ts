@@ -34,7 +34,7 @@ const wrap =
 function setup(
 	plan: (...args: Parameters<OmpPlanner>) => Promise<string | OmpPlan>,
 	raceMs = 1_000,
-	extra: { reuseMs?: number; now?: () => number; exists?: (path: string) => boolean; stateDir?: string; shipPrecheck?: (cwd: string) => ShipPrecheck; shipConfig?: (cwd: string) => ShipConfig } = {},
+	extra: { now?: () => number; exists?: (path: string) => boolean; stateDir?: string; shipPrecheck?: (cwd: string) => ShipPrecheck; shipConfig?: (cwd: string) => ShipConfig } = {},
 	ctxExtra: Record<string, unknown> = {},
 ) {
 	const handlers = new Map<string, AnyHandler>();
@@ -202,24 +202,28 @@ describe("omp extension", () => {
 		expect(sent).toHaveLength(1);
 	});
 
-	test("key plans again after reuseMs expires", async () => {
-		let clock = 0;
+	test("an identical resend after an inline plan is planned again", async () => {
 		let calls = 0;
-		const { run } = setup(
-			async () => {
-				calls++;
-				return "PLAN";
-			},
-			1_000,
-			{ reuseMs: 100, now: () => clock },
-		);
-		await run();
-		await flush();
-		clock = 99;
-		await run();
-		expect(calls).toBe(1);
-		clock = 100;
+		const { run, emit } = setup(async () => {
+			calls++;
+			return "PLAN";
+		});
 		expect(await run()).toEqual({ message: PLAN_MSG });
+		emit("turn_start");
+		expect(await run()).toEqual({ message: PLAN_MSG });
+		expect(calls).toBe(2);
+	});
+
+	test("an identical resend after an aside delivery is planned again", async () => {
+		const first = Promise.withResolvers<string>();
+		let calls = 0;
+		const { run, sent, emit } = setup(() => (++calls === 1 ? first.promise : Promise.resolve("PLAN 2")), 1);
+		expect(await run()).toEqual({ message: expect.objectContaining(PENDING_MSG) });
+		emit("turn_start");
+		first.resolve("PLAN 1");
+		await flush();
+		expect(sent).toEqual([{ message: { ...PLAN_MSG, content: "PLAN 1" }, options: { deliverAs: "aside" } }]);
+		expect(await run()).toEqual({ message: { ...PLAN_MSG, content: "PLAN 2" } });
 		expect(calls).toBe(2);
 	});
 
@@ -342,7 +346,7 @@ describe("omp extension", () => {
 		expect(t.renders() - before).toBe(1);
 	});
 
-	test("an older deferred flight stops writing the bar once a newer prompt begins", async () => {
+	test("a deferred plan that settles after a newer prompt began is dropped, not delivered", async () => {
 		const t = tuiCtx();
 		const flights = new Map<string, { onEvent: (event: ProgressEvent) => void; gate: PromiseWithResolvers<OmpPlan> }>();
 		const { run, sent, emit } = setup(
@@ -359,6 +363,7 @@ describe("omp extension", () => {
 		await run("A");
 		const a = flights.get("A")!;
 		a.onEvent({ type: "begin", at: 1, sessionId: "s1", engine: "grok" });
+		emit("turn_start");
 		await run("B");
 		const b = flights.get("B")!;
 		b.onEvent({ type: "begin", at: 2, sessionId: "s1", engine: "grok" });
@@ -369,13 +374,25 @@ describe("omp extension", () => {
 		a.onEvent({ type: "stage", at: 4, stage: "think", phase: "start" });
 		a.gate.resolve({ context: "PLAN A", view: VIEW });
 		await flush();
-		expect(sent).toEqual([
-			{ message: { ...PLAN_MSG, content: "PLAN A", details: VIEW }, options: { deliverAs: "aside" } },
-		]);
+		expect(sent).toEqual([]);
 		expect(t.line()).toBe(bLine);
 
 		b.onEvent({ type: "stage", at: 5, stage: "think", phase: "start" });
 		expect(t.line()).toContain("think");
+		b.gate.resolve({ context: "PLAN B" });
+		await flush();
+		expect(sent).toEqual([{ message: { ...PLAN_MSG, content: "PLAN B" }, options: { deliverAs: "aside" } }]);
+	});
+
+	test("a deferred plan still lands after its own turns start", async () => {
+		const gate = controlled();
+		const { run, sent, emit } = setup(gate.plan, 1);
+		await run();
+		emit("turn_start");
+		emit("turn_start");
+		gate.resolve("PLAN");
+		await flush();
+		expect(sent).toEqual([{ message: PLAN_MSG, options: { deliverAs: "aside" } }]);
 	});
 });
 
@@ -431,6 +448,31 @@ describe("slash commands", () => {
 			message: { customType: "ultrathink-plan", content: "PLAN", display: true, attribution: "agent" },
 		});
 		expect(planner.prompts).toEqual(["next"]);
+	});
+
+	test("a quick message drops the pending plan of an earlier prompt", async () => {
+		const gate = controlled();
+		const t = tuiCtx();
+		const { command, run, sent, emit } = setup(gate.plan, 1, { stateDir }, t.ctx);
+		emit("session_start");
+		await run("A");
+		emit("turn_start");
+		await command("ultrathink-quick", "hello");
+		expect(await run("hello")).toBeUndefined();
+		gate.resolve("PLAN A");
+		await flush();
+		expect(sent).toEqual([]);
+		expect(t.line()).toContain("superseded");
+	});
+
+	test("quick text sent again later as a normal prompt is planned", async () => {
+		const planner = counting();
+		const { command, run, emit } = setup(planner.plan, 1_000, { stateDir });
+		await command("ultrathink-quick", "hello");
+		await run("hello");
+		emit("turn_start");
+		await run("hello");
+		expect(planner.prompts).toEqual(["hello"]);
 	});
 
 	test("a quick message that never arrives does not swallow the next prompt", async () => {

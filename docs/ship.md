@@ -28,7 +28,7 @@ The skill drives `bin/ultrathink-ship`. Each gate is enforced by that CLI, not l
 | Requirement | Used for |
 |---|---|
 | `git` with an `origin` remote on GitHub | branch state, push, branch deletion |
-| `gh`, logged in (`gh auth status`) with rights to push, open PRs and merge | default branch, PR create and view, merge, PR comments |
+| `gh`, logged in (`gh auth status`) with rights to push, open PRs and merge | default branch, PR create and view, merge, PR comments, review threads |
 | A Greptile API key in the ultrathink credential store (`bin/ultrathink-mcp auth set-key greptile --stdin`) | PR mode review, when Greptile indexes the repository |
 | The Greptile CLI (tested with 3.4.1), logged in with `greptile login` | CLI mode review, when PR mode is not available |
 | A working engine: a Claude Code login, or `grok login` when `think.engine` is `"grok"` | the done judge |
@@ -103,7 +103,7 @@ The PR title comes from the graph goal, or the first line of the request when th
 | Used when | The Greptile API (through the credential store) lists the repository and reviews are not disabled for it | PR mode is not available |
 | Finds a review | Reuses Greptile's review of the PR head commit. Greptile reviews pushes to indexed repositories on its own. It triggers a review only when none exists for that commit or the last one failed. | `greptile review status --commit <head> --json` finds a finished or running review for the head commit. Only when none exists does it start `greptile review --json -b <base>`. |
 | Score | `Confidence Score: N/5` in the review body | `confidence` in the CLI's JSON |
-| Open comments | Greptile's unaddressed comments on the PR created since that review started. A fix commit does not mark older comments addressed; the new head review raises again anything still wrong. | The run's `comments` (fetched with `greptile review show <runId> --json` when needed) |
+| Open comments | The PR's Greptile review threads that are neither resolved nor outdated on GitHub (`gh api graphql`). Greptile reviews incrementally and does not repeat an unfixed finding, and it does not mark fixed ones addressed, so the thread state decides. A thread goes outdated when a commit changes its line. If the thread lookup fails, every unaddressed Greptile comment on the PR stays open. | The run's `comments` (fetched with `greptile review show <runId> --json` when needed) |
 
 A review that finishes gives a completed round with its score and comments. A failed review, or one with no score, gives a failed round.
 
@@ -115,7 +115,7 @@ If the review is still running when the wait ends, `review` returns `status: "pe
 
 A review of one head commit that stays pending longer than `ship.reviewTimeoutMs` (20 minutes) is recorded as a timed-out round.
 
-Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
+Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review re-reads the review threads, so a thread resolved since then no longer counts as open. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
 
 ## Fix loop and blocking
 
@@ -129,6 +129,15 @@ After each round the phase is one of:
 
 The skill also stops and reports when two rounds in a row return the same findings.
 
+In PR mode a fix closes its finding: the commit changes the line, so GitHub marks the thread outdated. A finding that is not actionable, because it is factually wrong or describes intended behavior, gets a one-line reply on its thread and is then resolved. The `review` output gives each finding's `threadId`:
+
+```sh
+gh api graphql -f query='mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }' -f thread=<threadId> -f body='<one-line reason>'
+gh api graphql -f query='mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } } }' -f thread=<threadId>
+```
+
+The agent never resolves a finding just to pass the gate.
+
 ## Merge gate
 
 `merge` checks the gate again and refuses unless every condition holds:
@@ -138,7 +147,7 @@ The skill also stops and reports when two rounds in a row return the same findin
 | A review round exists and it completed | `no review has run`, `review failed`, `review timeout` |
 | The reviewed commit is the current PR head | `review is for an older commit` or `PR head changed since last review` |
 | The review has a score of at least `ship.minScore` (5) | `review score N/5 is below 5/5` |
-| No open comments, when `ship.requireNoComments` is `true` | `N open review comment(s)` |
+| No open comments, when `ship.requireNoComments` is `true`. In PR mode these are the unresolved, non-outdated Greptile review threads; in CLI mode, the run's comments. | `N open review comment(s)` |
 | The PR is open | `PR closed without merge` (the phase becomes `blocked`) |
 | GitHub reports the PR mergeable | `merge conflicts`, or `GitHub has not computed mergeability yet` |
 | CI checks are neither failing nor pending | `CI checks failing`, `CI checks pending` |

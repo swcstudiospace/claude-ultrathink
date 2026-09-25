@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import type { ReviewThread, ReviewThreads } from "./github.ts";
 import { defaultRun } from "./run.ts";
 import type { ReviewComment, ReviewResult, Run, ShipConfig } from "./types.ts";
 
@@ -87,6 +88,13 @@ function mapComment(value: unknown): ReviewComment | undefined {
 	return comment;
 }
 
+/** Open findings in PR mode: Greptile threads neither resolved nor outdated (a fixing commit outdates its line). */
+export const openThreadComments = (threads: ReviewThread[]): ReviewComment[] =>
+	threads.flatMap((thread) => {
+		const comment = thread.isResolved || thread.isOutdated ? undefined : mapComment(thread);
+		return comment ? [{ ...comment, threadId: thread.id }] : [];
+	});
+
 function reviewTime(item: Obj): number {
 	const stamp = asStr(item.updatedAt) ?? asStr(item.createdAt) ?? "";
 	const parsed = Date.parse(stamp);
@@ -104,6 +112,8 @@ export async function reviewPr(input: {
 	headSha: string;
 	timeoutMs: number;
 	pollMs: number;
+	/** The PR's review threads on GitHub; without them, or on failure, every unaddressed Greptile comment stays open. */
+	reviewThreads?: () => ReviewThreads;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 }): Promise<ReviewResult> {
@@ -150,27 +160,23 @@ export async function reviewPr(input: {
 				if (score === null) {
 					return done({ status: "failed", reviewId, error: "score not found in Greptile review body" });
 				}
-				// Open findings are this review's: a fix commit addresses older comments without Greptile flipping
-				// `addressed`, and the head review re-raises anything still wrong. Undated comments stay open.
-				const since = Date.parse(asStr(latest?.createdAt) ?? "");
-				const comments = asArr(
-					asObj(
-						await input.client.call("list_merge_request_comments", {
-							...tuple,
-							prNumber: input.prNumber,
-							greptileGenerated: true,
-							addressed: false,
-						}),
-					)?.comments,
-				)
-					.filter((c) => {
-						const item = asObj(c);
-						if (item?.isGreptileComment === false || item?.addressed === true) return false;
-						const created = Date.parse(asStr(item?.createdAt) ?? "");
-						return Number.isNaN(since) || Number.isNaN(created) || created >= since;
-					})
-					.map(mapComment)
-					.filter((c): c is ReviewComment => c !== undefined);
+				// Greptile reviews incrementally and never flips `addressed` on a fix, so GitHub thread state decides.
+				// If threads are unavailable, fail closed: every unaddressed Greptile comment on the PR stays open.
+				const threads = input.reviewThreads?.();
+				const comments = threads?.ok
+					? openThreadComments(threads.threads)
+					: mapComments(
+							asArr(
+								asObj(
+									await input.client.call("list_merge_request_comments", {
+										...tuple,
+										prNumber: input.prNumber,
+										greptileGenerated: true,
+										addressed: false,
+									}),
+								)?.comments,
+							).filter((c) => asObj(c)?.isGreptileComment !== false && asObj(c)?.addressed !== true),
+						);
 				const url = asStr(asObj(detail?.mergeRequest)?.url);
 				return done({ status: "completed", reviewId, score, comments, ...(url ? { url } : {}) });
 			}
@@ -301,6 +307,7 @@ export async function runReview(input: {
 	base: string;
 	prNumber: number;
 	headSha: string;
+	reviewThreads?: () => ReviewThreads;
 }): Promise<ReviewResult> {
 	const found = input.client ? await findGreptileRepo(input.client, input.repo) : undefined;
 	if (input.client && found && found.reviewsEnabled !== false) {
@@ -312,6 +319,7 @@ export async function runReview(input: {
 			headSha: input.headSha,
 			timeoutMs: input.config.waitMs,
 			pollMs: input.config.pollMs,
+			...(input.reviewThreads ? { reviewThreads: input.reviewThreads } : {}),
 		});
 	}
 	return reviewCli({

@@ -127,7 +127,9 @@ Delete `~/.claude/ultrathink` if you also want to remove the planning state. If 
 
 Grok Build uses the plugin directory for skills and commands. It finds the plugin's `hooks/hooks.json` but does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs a global hook file, `~/.grok/hooks/ultrathink.json`. That file is a copy of `hooks/hooks.json` with absolute paths, `ULTRATHINK_HOST=grok-build` on every hook, and a 600 s timeout on the prompt hook in place of Grok's 30 s default.
 
-Grok also discards hook stdout, so the plan cannot be injected into the turn directly. Instead, the hook writes the plan to `~/.grok/plugin-data/ultrathink/last-plan.json`, and `apply` installs the rule `~/.grok/rules/ultrathink.md` (copied from `hosts/grok/ultrathink.md`). The rule tells the model to read that file before acting.
+Grok also discards hook stdout, so the plan cannot be injected into the turn directly. Instead, the hook writes the plan to `~/.grok/plugin-data/ultrathink/last-plan.json`, and `apply` installs the rule `~/.grok/rules/ultrathink.md`. The rule tells the model to read that file before acting. `last-plan.json` exists only for a prompt that was planned. The hook deletes it on every prompt it does not plan (`/ultrathink-quick`, control commands, skipped or trivial prompts, planning turned off), so the model never picks up an older plan.
+
+`apply` never overwrites the rule. If `~/.grok/rules/ultrathink.md` is missing, it writes the packaged rule from `hosts/grok/ultrathink.md`. If the file exists, it replaces only the block between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->`, or appends the block when there is none. Your own text in that file is kept.
 
 ### Install
 
@@ -144,7 +146,7 @@ bun scripts/setup.ts apply
 
 1. Run `bun scripts/setup.ts status` in `<clone>`. It should print `Grok rule: installed (…/rules/ultrathink.md)` and `Grok hooks: installed (…/hooks/ultrathink.json)`. The rule counts as installed only when it contains the `<!-- ultrathink:start -->` … `<!-- ultrathink:end -->` block.
 2. Start Grok and run `/ultrathink-status`. The prompt hook blocks the command and shows the state.
-3. Send a non-trivial prompt. `~/.grok/plugin-data/ultrathink/last-plan.json` should update, and the model should read the plan and invoke `ultrathink-plan`, then `ultrathink-kickoff`.
+3. Send a non-trivial prompt. `~/.grok/plugin-data/ultrathink/last-plan.json` should appear, and the model should read the plan and invoke `ultrathink-plan`, then `ultrathink-kickoff`. After a `/ultrathink-quick` message or a control command, the file is gone.
 
 Verified live on Grok Build 1.0.41: `/ultrathink-status` and `/ultrathink-quick` in `grok -p`. A quick message was answered. In headless mode a blocked control command prints nothing, so check status in the interactive UI or with `ULTRATHINK_HOST=grok-build <clone>/bin/ultrathink status`.
 
@@ -156,7 +158,7 @@ git pull
 bun scripts/setup.ts apply
 ```
 
-The symlink points at your clone, so skills and commands update with `git pull`. Re-running `apply` rewrites the global hook file and the rule when they changed. It is idempotent.
+The symlink points at your clone, so skills and commands update with `git pull`. Re-running `apply` rewrites the global hook file and refreshes the ultrathink block in the rule when they changed. It is idempotent.
 
 ### Uninstall
 
@@ -300,7 +302,7 @@ Delete `~/.omp/agent/ultrathink` to remove the state.
 
 | Subcommand | What it does |
 |---|---|
-| `apply` | 1. Installs the Grok rule `~/.grok/rules/ultrathink.md` (copied from `hosts/grok/ultrathink.md`) and the Grok hook file `~/.grok/hooks/ultrathink.json`, under `$GROK_HOME` if set.<br>2. If the `claude` CLI is installed, adds the hosted Notion (`https://mcp.notion.com/mcp`) and Linear (`https://mcp.linear.app/mcp`) HTTP MCP servers to Claude Code at user scope, unless `claude mcp list` already shows a server with that name.<br>3. Runs `claude plugin marketplace add <clone>` and `claude plugin install ultrathink@ultrathink`.<br>4. Merges a tracking block into `~/.claude/CLAUDE.md` (`$CLAUDE_CONFIG_DIR/CLAUDE.md` if set) between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->`, updating it in place on re-runs.<br>5. Records which MCP servers it added in `~/.claude/ultrathink-setup-state.json`.<br>6. Prints the install commands for Hermes, Muse and Omp.<br>Without the `claude` CLI, steps 2 to 5 are skipped with the notice `Claude Code: claude CLI not found — skipped …`. |
+| `apply` | 1. Writes the Grok hook file `~/.grok/hooks/ultrathink.json` and installs the Grok rule `~/.grok/rules/ultrathink.md`, under `$GROK_HOME` if set. The rule is written from `hosts/grok/ultrathink.md` when missing; otherwise only its ultrathink marker block is replaced, or appended when absent, and the rest of the file is kept.<br>2. If the `claude` CLI is installed, adds the hosted Notion (`https://mcp.notion.com/mcp`) and Linear (`https://mcp.linear.app/mcp`) HTTP MCP servers to Claude Code at user scope, unless `claude mcp list` already shows a server with that name.<br>3. Runs `claude plugin marketplace add <clone>` and `claude plugin install ultrathink@ultrathink`.<br>4. Merges a tracking block into `~/.claude/CLAUDE.md` (`$CLAUDE_CONFIG_DIR/CLAUDE.md` if set) between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->`, updating it in place on re-runs.<br>5. Records which MCP servers it added in `~/.claude/ultrathink-setup-state.json`.<br>6. Prints the install commands for Hermes, Muse and Omp.<br>Without the `claude` CLI, steps 2 to 5 are skipped with the notice `Claude Code: claude CLI not found — skipped …`. |
 | `status` | Reports whether the Grok rule (with its marker block) and the Grok hook file are installed. With the `claude` CLI, it also reports whether Claude Code has `notion` and `linear` MCP servers and whether the `CLAUDE.md` block is present. Without it, it prints `Claude Code: claude CLI not found` followed by the Grok lines. |
 | `rollback` | Removes the Grok hook file and the Grok rule (the whole file if it holds only the ultrathink block, otherwise just the block). Removes the `CLAUDE.md` block. Removes the `notion` and `linear` Claude Code MCP servers only if `apply` added them. It does not uninstall the Claude Code plugin. |
 

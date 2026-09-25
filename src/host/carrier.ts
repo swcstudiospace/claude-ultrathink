@@ -6,7 +6,7 @@
  * is the carrier those hosts can actually read. The text is plugin-authored
  * data, not a grant of tools or a command to ignore the user.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { HostId } from "./types.ts";
 
@@ -25,6 +25,15 @@ export interface CarrierInput {
 
 export function carrierPath(stateDir: string): string {
 	return join(stateDir, "last-plan.json");
+}
+
+/** Removes the carrier so a turn without a plan never inherits the previous prompt's. Fail-open. */
+export function clearPlanCarrier(stateDir: string): void {
+	try {
+		unlinkSync(carrierPath(stateDir));
+	} catch {
+		// missing is the goal; any other failure must not block the prompt
+	}
 }
 
 /** Returns the carrier path, or undefined when there is nothing safe to point at. */

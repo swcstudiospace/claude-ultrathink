@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	apply,
 	claudeMdPath,
@@ -11,7 +11,8 @@ import {
 	ensurePluginInstalled,
 	grokHooksConfig,
 	installGrokHooks,
-	mergeClaudeMd,
+	installGrokRule,
+	mergeBlock,
 	readSetupState,
 	rollback,
 	status,
@@ -76,27 +77,19 @@ describe("claudeMdPath", () => {
 	});
 });
 
-describe("mergeClaudeMd", () => {
-	test("appends the block to empty or existing content", () => {
-		expect(mergeClaudeMd("")).toContain("<!-- ultrathink:start -->");
-		const withContent = mergeClaudeMd("# My project rules\n");
-		expect(withContent.startsWith("# My project rules")).toBe(true);
-		expect(withContent).toContain("<!-- ultrathink:start -->");
+describe("mergeBlock", () => {
+	const BLOCK = RULE.trimEnd();
+
+	test("appends the block after a blank line to existing content, or writes it alone into empty content", () => {
+		expect(mergeBlock("", BLOCK)).toBe(RULE);
+		expect(mergeBlock("# My project rules\n", BLOCK)).toBe(`# My project rules\n\n${RULE}`);
 	});
 
 	test("replaces an existing block in place instead of duplicating", () => {
-		const first = mergeClaudeMd("# Rules\n");
-		const second = mergeClaudeMd(first);
+		const first = mergeBlock("# Rules\n", BLOCK);
+		const second = mergeBlock(first, BLOCK);
 		expect(second.match(/<!-- ultrathink:start -->/g)).toHaveLength(1);
 		expect(second).toBe(first);
-	});
-
-	test("defers to the configured Notion database and Linear team instead of naming a workspace", () => {
-		const block = mergeClaudeMd("");
-		expect(block).toContain("notion.dataSourceUrl");
-		expect(block).toContain("linear.team");
-		expect(block).not.toContain("collection://");
-		expect(block).not.toContain("Spectrum Web Co");
 	});
 });
 
@@ -180,6 +173,20 @@ describe("apply / status / rollback", () => {
 		}
 	});
 
+	test("the CLAUDE.md block defers to the configured Notion database and Linear team instead of naming a workspace", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
+			const text = readFileSync(claudeMdPath(env), "utf8");
+			expect(text).toContain("notion.dataSourceUrl");
+			expect(text).toContain("linear.team");
+			expect(text).not.toContain("collection://");
+			expect(text).not.toContain("Spectrum Web Co");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("without the claude CLI, apply skips every Claude step but still installs Grok; status says so", () => {
 		const { env, repo, rulePath, hooksPath, cleanup } = tempSetup();
 		const run = fakeRun(noClaude);
@@ -214,6 +221,21 @@ describe("apply / status / rollback", () => {
 
 			expect(rollback(env, run).grok.rule.removed).toBe(false);
 			expect(readFileSync(rulePath, "utf8")).toBe("# My Grok rules\n");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("apply then rollback restores a user's Grok rule file to its original text", () => {
+		const { env, repo, rulePath, cleanup } = tempSetup();
+		const run = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+		try {
+			const original = "# My Grok rules\n\nAlways answer in English.\n";
+			mkdirSync(dirname(rulePath), { recursive: true });
+			writeFileSync(rulePath, original);
+			expect(apply(repo, run, env).grok.rule.changed).toBe(true);
+			expect(rollback(env, run).grok.rule.removed).toBe(true);
+			expect(readFileSync(rulePath, "utf8")).toBe(original);
 		} finally {
 			cleanup();
 		}
@@ -321,6 +343,53 @@ describe("grok global hooks", () => {
 			expect(JSON.parse(readFileSync(first.path, "utf8"))).toEqual(grokHooksConfig(root));
 			expect(readFileSync(first.path, "utf8").endsWith("}\n")).toBe(true);
 			expect(installGrokHooks(root, hooksDir).changed).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("installGrokRule", () => {
+	test("an update replaces only the marker block, keeps the user's text around it byte-for-byte, and reports changed only when the bytes change", () => {
+		const { repo, rulePath, cleanup } = tempSetup();
+		try {
+			// As a String.replace replacement string, `$&` and `$'` would expand instead of landing verbatim.
+			const packaged = "<!-- ultrathink:start -->\nRead $GROK_PLUGIN_DATA/ultrathink/last-plan.json; keep $& and $' as written.\n<!-- ultrathink:end -->\n";
+			writeFileSync(join(repo, "hosts", "grok", "ultrathink.md"), packaged);
+			const above = "# My Grok rules\n\n\nPrefer small diffs.  \n\n";
+			const below = "\n\n\n## Notes\nNo trailing newline";
+			mkdirSync(dirname(rulePath), { recursive: true });
+			writeFileSync(rulePath, `${above}<!-- ultrathink:start -->\nAn older rule.\n<!-- ultrathink:end -->${below}`);
+			const updated = `${above}${packaged.trimEnd()}${below}`;
+
+			expect(installGrokRule(repo, dirname(rulePath))).toEqual({ path: rulePath, changed: true });
+			expect(readFileSync(rulePath, "utf8")).toBe(updated);
+			expect(installGrokRule(repo, dirname(rulePath))).toEqual({ path: rulePath, changed: false });
+			expect(readFileSync(rulePath, "utf8")).toBe(updated);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("appends the block after a blank line to a rule file without one, keeping its text", () => {
+		const { repo, rulePath, cleanup } = tempSetup();
+		try {
+			mkdirSync(dirname(rulePath), { recursive: true });
+			writeFileSync(rulePath, "# My Grok rules\nAlways answer in English.\n");
+			expect(installGrokRule(repo, dirname(rulePath))).toEqual({ path: rulePath, changed: true });
+			expect(readFileSync(rulePath, "utf8")).toBe(`# My Grok rules\nAlways answer in English.\n\n${RULE}`);
+			expect(installGrokRule(repo, dirname(rulePath)).changed).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("creates a missing rule file and its directory with the packaged rule", () => {
+		const { repo, rulePath, cleanup } = tempSetup();
+		try {
+			expect(existsSync(dirname(rulePath))).toBe(false);
+			expect(installGrokRule(repo, dirname(rulePath))).toEqual({ path: rulePath, changed: true });
+			expect(readFileSync(rulePath, "utf8")).toBe(RULE);
 		} finally {
 			cleanup();
 		}

@@ -299,7 +299,6 @@ export function createOmpExtension(
 		plan?: OmpPlanner;
 		raceMs?: number;
 		maxRunMs?: number;
-		reuseMs?: number;
 		now?: () => number;
 		ui?: boolean;
 		/** MCP readiness source; defaults to the local credential store. */
@@ -317,7 +316,6 @@ export function createOmpExtension(
 	const plan = options.plan ?? spawnEnginePlanner;
 	const raceMs = options.raceMs ?? 25_000;
 	const maxRunMs = options.maxRunMs ?? 600_000;
-	const reuseMs = options.reuseMs ?? 120_000;
 	const now = options.now ?? Date.now;
 	const uiEnabled = options.ui ?? true;
 	const readMcp = options.mcp ?? readMcpState;
@@ -328,6 +326,9 @@ export function createOmpExtension(
 	return (pi) => {
 		interface Flight {
 			result: Promise<OmpPlan>;
+			/** The session's `turn_start` count when planning began; with `prompt`, identifies the submission. */
+			submission: number;
+			prompt: string;
 			/** Pending was returned; the aside is the only delivery. */
 			deferred: boolean;
 			/** Start order; only the latest flight writes to the bar store. */
@@ -337,11 +338,14 @@ export function createOmpExtension(
 			view?: PlanView;
 			/** Detail of the planner's `end` event, used as the skip reason. */
 			endDetail?: string;
-			/** Set once settled; entry is reused for re-entries until then. */
-			expiresAt: number;
 		}
-		// Omp may re-run before_agent_start for one delivery; each plan creates
-		// tracker rows, so settled entries are kept for reuseMs to avoid replanning.
+		// Omp re-runs before_agent_start for one submission (agent-start policy retries, a restored
+		// queued batch) and each plan creates tracker rows, so a re-run reuses the flight. The hook
+		// carries no submission id, but every submission reaches the agent as a turn: a `turn_start`
+		// since the last run means a new submission, even with identical text.
+		const turns = new Map<string, number>();
+		// The latest submission's flight per session. A deferred plan whose flight was replaced is
+		// dropped: delivered later, it would steer the newer request toward the old one.
 		const flights = new Map<string, Flight>();
 		// Overlapping flights share one bar; a newer prompt owns it, older flights only deliver messages.
 		let latestGeneration = 0;
@@ -419,9 +423,16 @@ export function createOmpExtension(
 			attach(ctx);
 			scheduleMount();
 		});
-		for (const event of ["agent_start", "agent_end", "turn_start", "turn_end", "tool_execution_start", "tool_execution_end"] as const) {
+		for (const event of ["agent_start", "agent_end", "turn_end", "tool_execution_start", "tool_execution_end"] as const) {
 			pi.on(event, scheduleMount);
 		}
+		pi.on("turn_start", (_event, ctx) => {
+			scheduleMount();
+			guard(() => {
+				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				turns.set(sessionId, (turns.get(sessionId) ?? 0) + 1);
+			});
+		});
 		pi.on("input", () => {
 			scheduleMount();
 		});
@@ -491,10 +502,10 @@ export function createOmpExtension(
 			});
 		});
 
-		// `/ultrathink-quick <message>` arms this for exactly that message: its before_agent_start
-		// (and Omp's re-runs of it within reuseMs) skip planning, tracking and the bar. Any other
-		// prompt disarms it, so a quick message queued as a steer never swallows the next one.
-		let quick: { key: string; expiresAt: number } | undefined;
+		// `/ultrathink-quick <message>` arms this for exactly that message: its submission (and Omp's
+		// re-runs of it) skip planning, tracking and the bar. Any other prompt disarms it, so a quick
+		// message queued as a steer never swallows the next one.
+		let quick: { sessionId: string; text: string; submission?: number } | undefined;
 		if (typeof pi.registerCommand === "function") {
 			for (const verb of Object.keys(COMMANDS) as UltrathinkVerb[]) {
 				const name = `ultrathink-${verb}`;
@@ -515,7 +526,7 @@ export function createOmpExtension(
 								if (verb === "quick") {
 									if (!text || typeof pi.sendUserMessage !== "function") return ctx?.ui?.notify?.(QUICK_USAGE, "info");
 									// Armed before sending: Omp may emit before_agent_start before sendUserMessage returns.
-									quick = { key: `${ctx?.sessionManager?.getSessionId?.() ?? ""}\u0000${text}`, expiresAt: Number.POSITIVE_INFINITY };
+									quick = { sessionId: ctx?.sessionManager?.getSessionId?.() ?? "", text };
 									try {
 										pi.sendUserMessage(text);
 									} catch {
@@ -533,7 +544,7 @@ export function createOmpExtension(
 			}
 		}
 
-		const start = (request: OmpPlanRequest, key: string): Flight => {
+		const start = (request: OmpPlanRequest, submission: number): Flight => {
 			const generation = ++latestGeneration;
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
@@ -543,18 +554,22 @@ export function createOmpExtension(
 				});
 			const flight: Flight = {
 				result: plan(request, AbortSignal.timeout(maxRunMs), onEvent).catch(() => ({ context: "" })),
+				submission,
+				prompt: request.prompt,
 				deferred: false,
 				generation,
 				settled: false,
 				content: "",
-				expiresAt: Number.POSITIVE_INFINITY,
 			};
-			flights.set(key, flight);
+			flights.set(request.sessionId, flight);
 			void flight.result.then((result) => {
 				flight.settled = true;
 				flight.content = result?.context ?? "";
 				flight.view = result?.view;
-				flight.expiresAt = now() + reuseMs;
+				if (flight.deferred && flights.get(request.sessionId) !== flight) {
+					barWrite(generation, () => store.skipped("superseded by a newer prompt", now()));
+					return;
+				}
 				barWrite(generation, () => {
 					if (!flight.content) store.skipped(flight.endDetail ?? "no plan", now());
 					else if (flight.deferred) store.delivered("aside", flight.view, now());
@@ -572,26 +587,26 @@ export function createOmpExtension(
 			scheduleMount();
 			if (isSubagentSession(ctx, exists)) return;
 			try {
-				const t = now();
-				for (const [k, f] of flights) if (f.expiresAt <= t) flights.delete(k);
 				const request: OmpPlanRequest = {
 					prompt: event?.prompt ?? "",
 					cwd: ctx?.cwd || process.cwd(),
 					sessionId: ctx?.sessionManager?.getSessionId?.() ?? "",
 				};
-				const key = `${request.sessionId}\u0000${request.prompt}`;
+				const submission = turns.get(request.sessionId) ?? 0;
 				if (quick) {
-					if (quick.key === `${request.sessionId}\u0000${request.prompt.trim()}` && t < quick.expiresAt) {
-						if (quick.expiresAt === Number.POSITIVE_INFINITY) quick.expiresAt = t + reuseMs;
+					if (quick.sessionId === request.sessionId && quick.text === request.prompt.trim() && (quick.submission ?? submission) === submission) {
+						// The quick message is now the session's latest submission; an older pending plan must not land in it.
+						if (quick.submission === undefined) flights.delete(request.sessionId);
+						quick.submission = submission;
 						return;
 					}
 					quick = undefined;
 				}
-				const existing = flights.get(key);
-				if (existing?.deferred) return existing.settled ? undefined : { message: pendingMessage() };
-				if (existing?.settled)
-					return existing.content ? { message: planMessage(existing.content, existing.view) } : undefined;
-				const flight = existing ?? start(request, key);
+				const existing = flights.get(request.sessionId);
+				const same = existing?.submission === submission && existing.prompt === request.prompt ? existing : undefined;
+				if (same?.deferred) return same.settled ? undefined : { message: pendingMessage() };
+				if (same?.settled) return same.content ? { message: planMessage(same.content, same.view) } : undefined;
+				const flight = same ?? start(request, submission);
 				const timeout = Promise.withResolvers<null>();
 				const timer = setTimeout(() => timeout.resolve(null), raceMs);
 				const result = await Promise.race([flight.result, timeout.promise]);

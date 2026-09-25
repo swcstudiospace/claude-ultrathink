@@ -59,6 +59,7 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 
 - Grok does not dispatch plugin hooks, so the commands only get a no-model-turn answer after `bun scripts/setup.ts apply` has installed the global hook file `~/.grok/hooks/ultrathink.json` (see [Install](install.md)). Without that file, Grok still loads the command files from the plugin directory, and the model runs `bin/ultrathink` itself.
 - With the hook file installed, the hook returns a block decision for a control command. Grok blocks the prompt and shows the reply in the interactive UI. `grok -p` prints nothing for a blocked command.
+- `/ultrathink-quick` and the control commands delete the plan carrier `last-plan.json`, as every prompt that isn't planned does, so the model never picks up the previous prompt's plan for them.
 - Grok wraps what you typed in a `<user_query>` element before hooks see it. Commands are parsed inside that wrapper.
 
 ### Muse Code

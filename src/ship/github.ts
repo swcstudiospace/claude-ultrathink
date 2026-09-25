@@ -3,6 +3,19 @@
 import { defaultRun } from "./run.ts";
 import type { PrRef, PrStatus, Run, ShipConfig } from "./types.ts";
 
+/** A Greptile review thread on the PR, keyed by its first comment. */
+export interface ReviewThread {
+	id: string;
+	isResolved: boolean;
+	isOutdated: boolean;
+	author: string;
+	path?: string;
+	line?: number;
+	body: string;
+}
+
+export type ReviewThreads = { ok: true; threads: ReviewThread[] } | { ok: false; error: string };
+
 export interface Github {
 	repo(): { name: string; defaultBranch: string } | undefined;
 	push(branch: string): { ok: boolean; error?: string };
@@ -15,6 +28,8 @@ export interface Github {
 	comment(number: number, body: string): { ok: boolean; error?: string };
 	mergeMethods(): ShipConfig["mergeMethod"][];
 	syncBase(input: { base: string; branch: string }): { ok: boolean; error?: string };
+	/** The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed. */
+	reviewThreads(prNumber: number): ReviewThreads;
 }
 
 const LONG_TIMEOUT_MS = 180_000;
@@ -28,6 +43,16 @@ const FAILED_CONCLUSIONS: Record<string, true> = {
 };
 const FAILED_STATES: Record<string, true> = { FAILURE: true, ERROR: true };
 const DONE_STATUSES: Record<string, true> = { COMPLETED: true, SUCCESS: true };
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+	repository(owner: $owner, name: $name) {
+		pullRequest(number: $number) {
+			reviewThreads(first: 100) {
+				pageInfo { hasNextPage }
+				nodes { id isResolved isOutdated comments(first: 1) { nodes { author { login } path line originalLine body } } }
+			}
+		}
+	}
+}`;
 
 function parseJson(text: string): unknown {
 	try {
@@ -74,6 +99,40 @@ export function classifyChecks(rollup: unknown): PrStatus["checks"] {
 		if (progress && !DONE_STATUSES[progress]) pending = true;
 	}
 	return pending ? "pending" : "passing";
+}
+
+function parseReviewThreads(stdout: string): ReviewThreads {
+	const root = obj(parseJson(stdout));
+	if (!root) return { ok: false, error: "unparseable review threads response" };
+	const errors = root.errors;
+	if (Array.isArray(errors) && errors.length > 0) {
+		return { ok: false, error: str(obj(errors[0])?.message)?.slice(0, 300) ?? "graphql error" };
+	}
+	const threads = obj(obj(obj(obj(root.data)?.repository)?.pullRequest)?.reviewThreads);
+	if (!threads || !Array.isArray(threads.nodes)) return { ok: false, error: "pull request review threads missing" };
+	if (obj(threads.pageInfo)?.hasNextPage === true) return { ok: false, error: "more than 100 review threads" };
+	const out: ReviewThread[] = [];
+	for (const node of threads.nodes) {
+		const thread = obj(node);
+		const id = str(thread?.id);
+		const comments = obj(thread?.comments)?.nodes;
+		const first = obj(Array.isArray(comments) ? comments[0] : undefined);
+		const author = str(obj(first?.author)?.login);
+		const body = str(first?.body);
+		if (!thread || !id || !first) return { ok: false, error: "malformed review thread" };
+		// The Greptile app posts as `greptile-apps[bot]`; GraphQL reports the login without the suffix.
+		if (!author?.toLowerCase().startsWith("greptile")) continue;
+		if (!body || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean") {
+			return { ok: false, error: "malformed review thread" };
+		}
+		const entry: ReviewThread = { id, isResolved: thread.isResolved, isOutdated: thread.isOutdated, author, body };
+		const path = str(first.path);
+		if (path) entry.path = path;
+		const line = typeof first.line === "number" ? first.line : first.originalLine;
+		if (typeof line === "number") entry.line = line;
+		out.push(entry);
+	}
+	return { ok: true, threads: out };
 }
 
 export function createGithub(input: { cwd: string; run?: Run }): Github {
@@ -164,6 +223,18 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			const exists = exec(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).exitCode === 0;
 			if (exists && current !== branch) exec(["git", "branch", "-D", branch]);
 			return { ok: true };
+		},
+		reviewThreads(prNumber) {
+			const [owner, name] = gh.repo()?.name.split("/") ?? [];
+			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
+			const r = exec([
+				"gh", "api", "graphql",
+				"-f", `query=${THREADS_QUERY}`,
+				"-f", `owner=${owner}`,
+				"-f", `name=${name}`,
+				"-F", `number=${prNumber}`,
+			]);
+			return r.exitCode === 0 ? parseReviewThreads(r.stdout) : { ok: false, error: errorOf(r) };
 		},
 	};
 	return gh;

@@ -78,6 +78,8 @@ export interface ReviewComment {
 	body: string;
 	severity?: string;
 	securityIssue?: boolean;
+	/** GitHub review thread id (PR mode), for replying to and resolving the finding. */
+	threadId?: string;
 }
 
 export interface ReviewResult {

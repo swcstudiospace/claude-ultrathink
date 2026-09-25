@@ -17,7 +17,7 @@ import { storePath } from "../mcp/store.ts";
 import { assessDone } from "./assess.ts";
 import { createGithub } from "./github.ts";
 import type { Github } from "./github.ts";
-import { runReview } from "./greptile.ts";
+import { openThreadComments, runReview } from "./greptile.ts";
 import type { ToolCaller } from "./greptile.ts";
 import { mergeGate } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
@@ -147,7 +147,13 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 				base: pr.base,
 				prNumber: pr.number,
 				headSha: status.headSha,
+				reviewThreads: () => github.reviewThreads(pr.number),
 			});
+	if (reusedRound && result.source === "pr") {
+		// Threads resolved since the round (non-actionable findings) close without a new commit; unknown keeps the old list.
+		const threads = github.reviewThreads(pr.number);
+		if (threads.ok) result = { ...result, comments: openThreadComments(threads.threads) };
+	}
 	const maxRounds = deps.config.maxRounds;
 	if (result.status === "pending") {
 		const same = ship.pending?.headSha === status.headSha ? ship.pending : undefined;
@@ -160,7 +166,7 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 		}
 		result = { ...result, status: "timeout", error: `review still pending after ${deps.config.reviewTimeoutMs}ms` };
 	}
-	const rounds: ReviewResult[] = reusedRound ? ship.rounds : [...ship.rounds, result];
+	const rounds: ReviewResult[] = reusedRound ? [...ship.rounds.slice(0, -1), result] : [...ship.rounds, result];
 	const gate = mergeGate({ config: deps.config, status, latest: result });
 	const failedTwice =
 		result.status !== "completed" && prior !== undefined && prior.status !== "completed" && prior.headSha === result.headSha;

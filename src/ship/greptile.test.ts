@@ -139,25 +139,48 @@ describe("reviewPr", () => {
 		expect(calls.some((c) => c.name === "trigger_code_review")).toBe(false);
 	});
 
-	test("open comments are the head review's: older reviews' unaddressed comments do not block", async () => {
+	const headReviews = {
+		list_code_reviews: () => ({
+			codeReviews: [
+				{ id: "2", status: "COMPLETED", commitSha: "new", createdAt: "2026-09-25T05:35:34Z" },
+				{ id: "1", status: "COMPLETED", commitSha: "old", createdAt: "2026-09-25T05:32:49Z" },
+			],
+		}),
+		get_code_review: () => ({ codeReview: { body: "Confidence Score: 5/5" } }),
+	};
+	const thread = { author: "greptile-apps", isResolved: false, isOutdated: false };
+
+	test("open comments are the unresolved, non-outdated threads, older reviews' included", async () => {
+		const { client, calls } = fakeClient(headReviews);
+		const stale = '<img alt="P1" src="p1.svg"> raised two reviews ago, not repeated';
+		const threads = [
+			{ ...thread, id: "T1", body: stale, path: "a.ts", line: 4 },
+			{ ...thread, id: "T2", body: "fixed: its line changed", path: "b.ts", isOutdated: true },
+			{ ...thread, id: "T3", body: "resolved as intended behavior", path: "c.ts", isResolved: true },
+			{ ...thread, id: "T4", body: "raised by the head review", path: "d.ts" },
+		];
+		const result = await reviewPr({ client, ...base, ...clock(), reviewThreads: () => ({ ok: true, threads }) });
+		expect(result.comments).toEqual([
+			{ body: stale, path: "a.ts", line: 4, severity: "P1", threadId: "T1" },
+			{ body: "raised by the head review", path: "d.ts", threadId: "T4" },
+		]);
+		expect(calls.some((c) => c.name === "list_merge_request_comments")).toBe(false);
+	});
+
+	test("a failed thread lookup keeps every unaddressed Greptile comment open, however old", async () => {
 		const { client } = fakeClient({
-			list_code_reviews: () => ({
-				codeReviews: [
-					{ id: "2", status: "COMPLETED", commitSha: "new", createdAt: "2026-09-25T05:35:34Z" },
-					{ id: "1", status: "COMPLETED", commitSha: "old", createdAt: "2026-09-25T05:32:49Z" },
-				],
-			}),
-			get_code_review: () => ({ codeReview: { body: "Confidence Score: 5/5" } }),
+			...headReviews,
 			list_merge_request_comments: () => ({
 				comments: [
-					{ body: "fixed by the next commit", filePath: "a.ts", createdAt: "2026-09-25T05:34:48Z", addressed: false },
+					{ body: "raised before the head review", filePath: "a.ts", createdAt: "2026-09-25T05:34:48Z", addressed: false },
 					{ body: "raised by the head review", filePath: "b.ts", createdAt: "2026-09-25T05:36:10Z", addressed: false },
-					{ body: "undated stays open", filePath: "c.ts", addressed: false },
+					{ body: "addressed", filePath: "c.ts", createdAt: "2026-09-25T05:36:10Z", addressed: true },
 				],
 			}),
 		});
-		const result = await reviewPr({ client, ...base, ...clock() });
-		expect(result.comments.map((c) => c.body)).toEqual(["raised by the head review", "undated stays open"]);
+		const result = await reviewPr({ client, ...base, ...clock(), reviewThreads: () => ({ ok: false, error: "gh: 502" }) });
+		expect(result).toMatchObject({ status: "completed", score: 5 });
+		expect(result.comments.map((c) => c.body)).toEqual(["raised before the head review", "raised by the head review"]);
 	});
 
 	test("re-triggers when the only review for headSha failed, ignoring it afterwards", async () => {

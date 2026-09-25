@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Github } from "./github.ts";
+import type { Github, ReviewThreads } from "./github.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
 import { readShip, writeShip } from "./state.ts";
@@ -51,6 +51,8 @@ interface FakeOpts {
 	/** Local `git rev-parse HEAD`; defaults to the PR head sha. */
 	head?: string;
 	now?: number;
+	/** GitHub review threads; defaults to a failed lookup. */
+	threads?: ReviewThreads;
 }
 
 function deps(o: FakeOpts = {}): ShipDeps {
@@ -68,6 +70,7 @@ function deps(o: FakeOpts = {}): ShipDeps {
 		deleteRemoteBranch: (b) => (calls.push(`delete:${b}`), { ok: true }),
 		comment: (n, body) => (calls.push(`comment:${n}`), comments.push(body), { ok: true }),
 		syncBase: (i) => (calls.push(`sync:${i.base}`), { ok: true }),
+		reviewThreads: () => o.threads ?? { ok: false, error: "no threads" },
 	};
 	return {
 		config: { ...CONFIG, ...o.config },
@@ -244,6 +247,19 @@ describe("runShip", () => {
 		const out = await ship("review", deps({ head: "unpushed" }));
 		expect(out.output).toMatchObject({ reused: true, ready: true, round: 1 });
 		expect(calls).toEqual([]);
+	});
+
+	test("a reused PR round re-reads threads: a resolved finding clears, a failed lookup keeps it", async () => {
+		const open = { body: "intended behavior", path: "a.ts", threadId: "T1" };
+		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [open], headSha: "abc", at: 1 };
+		writeShip(statePath, { pr: PR, rounds: [round] });
+		const kept = await ship("review", deps());
+		expect(kept.output).toMatchObject({ reused: true, ready: false, comments: [open] });
+		const resolved = { id: "T1", isResolved: true, isOutdated: false, author: "greptile-apps", body: "intended behavior" };
+		const cleared = await ship("review", deps({ threads: { ok: true, threads: [resolved] } }));
+		expect(cleared.output).toMatchObject({ reused: true, ready: true, round: 1, comments: [] });
+		expect(readShip(statePath)?.rounds).toMatchObject([{ comments: [] }]);
+		expect((await ship("merge", deps())).output).toMatchObject({ ok: true, merged: true });
 	});
 
 	test("review refuses when local HEAD differs from the PR head", async () => {

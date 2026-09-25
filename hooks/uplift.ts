@@ -15,7 +15,7 @@ import { defaultStateDir, readControl, sessionPath } from "../src/claude/state.t
 import { recentConversationFromTranscript } from "../src/claude/transcript.ts";
 import { parseUltrathinkCommand, runControl, trackingEnabled, trackingOff } from "../src/uplift/commands.ts";
 import { planningTarget } from "../src/uplift/skill.ts";
-import { writePlanCarrier } from "../src/host/carrier.ts";
+import { clearPlanCarrier, writePlanCarrier } from "../src/host/carrier.ts";
 import { claimTurn } from "../src/host/claim.ts";
 import { detectHost } from "../src/host/detect.ts";
 import { selectEngine } from "../src/host/engine.ts";
@@ -43,6 +43,7 @@ async function main(): Promise<void> {
 	if (isChildInvocation()) return;
 	if (process.env.ULTRATHINK_UPLIFT === "0") {
 		log("skipped: ULTRATHINK_UPLIFT=0");
+		if (detectHost() === "grok-build") clearPlanCarrier(defaultStateDir());
 		return;
 	}
 
@@ -55,15 +56,22 @@ async function main(): Promise<void> {
 		return;
 	}
 	const cwd = raw.cwd?.trim() || process.cwd();
+	const host = detectHost();
+	const stateDir = defaultStateDir();
+	// Grok's rule reads last-plan.json every turn, so a turn that ends without a plan must
+	// not leave the previous prompt's carrier behind.
+	const grok = host === "grok-build";
 	// `/ultrathink-<verb>` runs before planning. quick: the host's command template delivers
 	// the message, so plan nothing. Other verbs: answer with a block so no model turn runs.
 	const command = parseUltrathinkCommand(raw.prompt ?? "");
 	if (command?.verb === "quick") {
 		log("skipped: quick");
+		if (grok) clearPlanCarrier(stateDir);
 		return;
 	}
 	if (command) {
-		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir: defaultStateDir(), cwd });
+		if (grok) clearPlanCarrier(stateDir);
+		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir, cwd });
 		process.stdout.write(JSON.stringify({ decision: "block", reason }));
 		return;
 	}
@@ -74,22 +82,24 @@ async function main(): Promise<void> {
 		// must not wait on the engine.
 		if ("skip" in target) {
 			log(`skipped: ${target.skip}`);
+			if (grok) clearPlanCarrier(stateDir);
 			return;
 		}
 		if (target.skill) input = { ...raw, prompt: target.text, skill: target.skill };
 	} catch {
 		// fail-open: a throwing skill parser plans the prompt as written
 	}
-	const host = detectHost();
-	const stateDir = defaultStateDir();
-	// Grok may dispatch this hook twice per turn (global hook file plus plugin hooks); only the first plans.
-	const promptId = envelope.prompt_id ?? envelope.promptId;
-	const turnSessionId = typeof raw.session_id === "string" ? raw.session_id.trim() : "";
-	if (host === "grok-build" && typeof promptId === "string" && promptId.trim() && turnSessionId) {
-		if (!claimTurn(stateDir, `${turnSessionId}:${promptId.trim()}`)) {
+	if (grok) {
+		// Grok may dispatch this hook twice per turn (global hook file plus plugin hooks); only the
+		// first plans, and it owns the carrier: a duplicate must not clear the plan it writes.
+		const promptId = envelope.prompt_id ?? envelope.promptId;
+		const turnSessionId = typeof raw.session_id === "string" ? raw.session_id.trim() : "";
+		if (typeof promptId === "string" && promptId.trim() && turnSessionId && !claimTurn(stateDir, `${turnSessionId}:${promptId.trim()}`)) {
 			log("skipped: duplicate hook for this turn");
 			return;
 		}
+		// Start the owned turn with no carrier: every exit below that plans nothing leaves none.
+		clearPlanCarrier(stateDir);
 	}
 	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);

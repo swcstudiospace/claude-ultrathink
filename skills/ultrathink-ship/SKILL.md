@@ -38,6 +38,16 @@ Always `git push` before `review`: it refuses when the local HEAD differs from t
 - Stop the loop and report when the phase is `blocked` (config `maxRounds`, default 5, reached or the review failed) or when two consecutive rounds return identical findings. On `blocked` the CLI has already posted a PR comment and left the PR open for a human; do not retry or merge.
 - Never lower the bar: the only passing result is exactly 5/5 with zero open comments.
 - `needs-fixes`: fix the findings in greploop order — `securityIssue` first, then P0, P1, P2. Make the smallest correct fix; never suppress lint rules, weaken or delete tests, or skip checks to satisfy the reviewer. Stage only the files you edited, commit `address greptile review feedback`, `git push`, then run `review` again.
+  - In PR mode the open findings are the PR's Greptile review threads that are neither resolved nor outdated. Changing a finding's line makes its thread outdated, so a real fix closes it.
+  - A finding that is not actionable (factually wrong, or intended behavior) has no fix. Reply on its thread with a one-line reason, then resolve it, using the finding's `threadId` from the `review` output:
+
+    ```sh
+    gh api graphql -f query='mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }' -f thread=<threadId> -f body='<one-line reason>'
+    gh api graphql -f query='mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } } }' -f thread=<threadId>
+    ```
+
+    Then run `review` again; it re-reads the threads for the same head without a new round.
+  - Never resolve a finding just to pass the gate. Resolve only when you can state why it is wrong or intended.
 
 ## 4. Merge
 

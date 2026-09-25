@@ -81,10 +81,12 @@ export function writeSetupState(state: SetupState, env: Record<string, string | 
 	writeFileSync(path, JSON.stringify(state));
 }
 
-export function mergeClaudeMd(current: string): string {
-	if (BLOCK_RE.test(current)) return current.replace(BLOCK_RE, CLAUDE_MD_BLOCK);
+/** Replaces the marker block in `current` with `block`, keeping the text around it byte-for-byte; appends `block` after a blank line when there is none. */
+export function mergeBlock(current: string, block: string): string {
+	// A replacer function inserts `block` literally; as a replacement string, `$&` or `$'` in it would expand.
+	if (BLOCK_RE.test(current)) return current.replace(BLOCK_RE, () => block);
 	const trimmed = current.trimEnd();
-	return trimmed ? `${trimmed}\n\n${CLAUDE_MD_BLOCK}\n` : `${CLAUDE_MD_BLOCK}\n`;
+	return trimmed ? `${trimmed}\n\n${block}\n` : `${block}\n`;
 }
 
 export type Run = (cmd: string[]) => { stdout: string; stderr: string; code: number };
@@ -140,12 +142,15 @@ export interface ApplyResult {
 	grok: { rule: { path: string; changed: boolean }; hooks: { path: string; changed: boolean } };
 }
 
+/** Merges the packaged rule's marker block into the rule file; text a user added around the block stays. */
 export function installGrokRule(repoRoot: string, rulesDir: string): { path: string; changed: boolean } {
 	const source = join(repoRoot, "hosts", "grok", "ultrathink.md");
 	const path = join(rulesDir, "ultrathink.md");
-	const next = existsSync(source) ? readFileSync(source, "utf8") : "";
+	const block = BLOCK_RE.exec(existsSync(source) ? readFileSync(source, "utf8") : "")?.[0];
+	if (!block) return { path, changed: false };
 	const before = existsSync(path) ? readFileSync(path, "utf8") : "";
-	if (!next || next === before) return { path, changed: false };
+	const next = mergeBlock(before, block);
+	if (next === before) return { path, changed: false };
 	mkdirSync(rulesDir, { recursive: true });
 	writeFileSync(path, next);
 	return { path, changed: true };
@@ -218,7 +223,7 @@ export function apply(
 
 	const path = claudeMdPath(env);
 	const before = existsSync(path) ? readFileSync(path, "utf8") : "";
-	const after = mergeClaudeMd(before);
+	const after = mergeBlock(before, CLAUDE_MD_BLOCK);
 	if (after !== before) {
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, after);

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionRecord } from "../claude/state.ts";
 import { classifyChecks, createGithub } from "./github.ts";
+import type { ReviewThreads } from "./github.ts";
 import { mergeGate } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
 import { DEFAULT_SHIP_CONFIG } from "./types.ts";
@@ -156,6 +157,56 @@ describe("createGithub", () => {
 		expect(createGithub({ cwd: "/w", run }).mergeMethods()).toEqual(["squash", "rebase"]);
 		expect(createGithub({ cwd: "/w", run: fakeRun(() => ({ exitCode: 1 })).run }).mergeMethods()).toEqual([]);
 		expect(createGithub({ cwd: "/w", run: fakeRun(() => ({ stdout: "x" })).run }).mergeMethods()).toEqual([]);
+	});
+
+	const node = (o: { resolved?: boolean; outdated?: boolean; login?: string | null; line?: number | null } = {}) => ({
+		id: "T1",
+		isResolved: o.resolved ?? false,
+		isOutdated: o.outdated ?? false,
+		comments: {
+			nodes: [
+				{
+					author: o.login === null ? null : { login: o.login ?? "greptile-apps" },
+					path: "a.ts",
+					line: o.line === undefined ? 3 : o.line,
+					originalLine: 9,
+					body: "fix",
+				},
+			],
+		},
+	});
+	const graphql = (nodes: unknown[], hasNextPage = false) => ({
+		stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage }, nodes } } } } }),
+	});
+	const thread = { id: "T1", isResolved: false, isOutdated: false, author: "greptile-apps", path: "a.ts", line: 3, body: "fix" };
+
+	test.each<[string, Reply, ReviewThreads]>([
+		["open", graphql([node()]), { ok: true, threads: [thread] }],
+		["resolved", graphql([node({ resolved: true })]), { ok: true, threads: [{ ...thread, isResolved: true }] }],
+		[
+			"outdated falls back to its original line",
+			graphql([node({ outdated: true, line: null })]),
+			{ ok: true, threads: [{ ...thread, isOutdated: true, line: 9 }] },
+		],
+		["non-Greptile and deleted authors are dropped", graphql([node({ login: "octocat" }), node({ login: null })]), { ok: true, threads: [] }],
+		["gh failure", { exitCode: 1, stderr: "gh: HTTP 502\nmore" }, { ok: false, error: "gh: HTTP 502" }],
+		["graphql errors", { stdout: JSON.stringify({ errors: [{ message: "Could not resolve to a PullRequest" }] }) }, { ok: false, error: "Could not resolve to a PullRequest" }],
+		["missing pull request", { stdout: JSON.stringify({ data: { repository: { pullRequest: null } } }) }, { ok: false, error: "pull request review threads missing" }],
+		["truncated at 100 threads", graphql([node()], true), { ok: false, error: "more than 100 review threads" }],
+	])("reviewThreads: %s", (_name, reply, expected) => {
+		const { run, calls } = fakeRun((argv) =>
+			argv[1] === "repo" ? { stdout: JSON.stringify({ nameWithOwner: "o/r", defaultBranchRef: { name: "master" } }) } : reply,
+		);
+		expect(createGithub({ cwd: "/w", run }).reviewThreads(7)).toEqual(expected);
+		const argv = calls[1]?.argv ?? [];
+		expect(argv.slice(0, 3)).toEqual(["gh", "api", "graphql"]);
+		expect(argv.slice(-6)).toEqual(["-f", "owner=o", "-f", "name=r", "-F", "number=7"]);
+	});
+
+	test("reviewThreads fails without a resolvable repo", () => {
+		const { run, calls } = fakeRun(() => ({ exitCode: 1 }));
+		expect(createGithub({ cwd: "/w", run }).reviewThreads(7)).toEqual({ ok: false, error: "could not resolve GitHub repo" });
+		expect(calls.length).toBe(1);
 	});
 
 	test("syncBase deletes the local branch when it exists and is not current", () => {
