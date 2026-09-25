@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import type { Clarification } from "../hitl/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
-import { formatPromptContext, formatSummary, SKILL_CONTEXT_HEADER, TRACKING_OFF_NOTE, truncateXml, UPLIFT_CONTEXT_HEADER } from "./output.ts";
+import { formatPromptContext, formatSummary, HANDOFF_MAX_CHARS, SKILL_CONTEXT_HEADER, TRACKING_OFF_NOTE, truncateXml, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 
 const result = { xml: "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>", original: "x", root: "BUILD_PROMPT", source: "llm" as const };
@@ -315,5 +315,107 @@ describe("tracking", () => {
 		expect(out).toContain(TRACKING_OFF_NOTE);
 		expect(out).toContain("invoke the ultrathink-ship skill with stateFile=/s/x.json");
 		expect(formatSummary({ result, tracked: false, trackingOff: true })).toBe("Prompt Uplift · BUILD_PROMPT · llm · Tracking · off");
+	});
+});
+
+describe("handoff", () => {
+	const bigXml = `<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n<GRAPH_OF_THOUGHT>\n${"<N>node rationale</N>\n".repeat(3_000)}</GRAPH_OF_THOUGHT>\n</BUILD_PROMPT>`;
+	const spec = { result: { ...result, xml: bigXml }, specPath: "/s/spec.xml", statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", handoff: true };
+
+	test("points at the spec, state file and Graph ID instead of carrying the XML, and names each skill's load call and SKILL.md", () => {
+		const out = formatPromptContext({ ...spec, graph: FALLBACK_GRAPH, plan, ship: true });
+		expect(out).toContain("Specification file: /s/spec.xml");
+		expect(out).toContain("State file: /s/x.json");
+		expect(out).toContain("Graph ID: g1");
+		expect(out).toContain("Read that file in full before starting");
+		for (const tag of ["<UPLIFTED_PROMPT", "<BUILD_PROMPT", "<GRAPH_OF_THOUGHT", "<ORIGINAL>"]) expect(out).not.toContain(tag);
+		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {
+			expect(out).toContain(`skill_view name="ultrathink:${name}"`);
+			const path = new RegExp(`read (/\\S+/skills/${name}/SKILL\\.md)\\)`).exec(out)?.[1];
+			expect(path && existsSync(path)).toBe(true);
+		}
+		expect(out).not.toContain("if your host does not list that skill");
+		expect(out).toContain("Workflow waves:");
+		expect(out.indexOf("## Ultrathink tracking")).toBeLessThan(out.indexOf("## Ship"));
+	});
+
+	test("Graph ID falls back to the tracking refs and is omitted when neither is known", () => {
+		expect(formatPromptContext({ ...spec, tracking: { ...complete, graphId: "g9" } })).toContain("Graph ID: g9");
+		expect(formatPromptContext({ ...spec, plan, tracking: { ...complete, graphId: "g9" } })).toContain("Graph ID: g1");
+		expect(formatPromptContext({ ...spec })).not.toContain("Graph ID:");
+	});
+
+	test("a skill invocation keeps the skill framing and still sends the model to the spec file", () => {
+		const out = formatPromptContext({ ...spec, skill: "gsd-quick" });
+		expect(out).toContain('invoked the "gsd-quick" skill');
+		expect(out).toContain("authoritative for HOW");
+		expect(out).toContain("Read that file in full before starting");
+		expect(out).not.toContain("<BUILD_PROMPT");
+	});
+
+	test("an 8-node graph with 4 blocking clarifications stays under 6,000 characters", () => {
+		const graph = {
+			goal: "g",
+			nodes: Array.from({ length: 8 }, (_, i) => ({
+				id: `n${i + 1}`,
+				title: `Node ${i + 1}`,
+				kind: "decompose" as const,
+				question: "q".repeat(200),
+				dependsOn: i === 0 ? [] : [`n${Math.ceil(i / 2)}`],
+				thinking: "t".repeat(2_000),
+				conclusion: "c".repeat(1_200),
+			})),
+		};
+		const blocking: Clarification[] = Array.from({ length: 4 }, (_, i) => ({
+			...clarifications[0],
+			id: `q${i}`,
+			question: `Which database should the new service layer use, question ${i}?`,
+			why: "Schema, migrations and the deployment topology all depend on it",
+			options: [{ label: "Postgres" }, { label: "SQLite" }, { label: "MySQL" }, { label: "DynamoDB" }],
+		}));
+		const out = formatPromptContext({ ...spec, graph, clarifications: blocking, plan, skill: "gsd-quick", ship: true });
+		expect(out).toContain("## Clarifications (HITL)");
+		expect(out.length).toBeLessThan(6_000);
+	});
+
+	test("a long brief and a long Linked issues list give way so kickoff stays inside Hermes' spill threshold", () => {
+		const nodes = Array.from({ length: 8 }, (_, i) => `n${i + 1}`);
+		const bigPlan = {
+			...plan,
+			graphId: "g1",
+			issues: nodes.map((nodeId) => ({ graphId: "g1", nodeId, item: `Item ${nodeId} ${"x".repeat(80)}`, thought: "t" })),
+			subIssues: nodes.flatMap((nodeId) => Array.from({ length: 8 }, (_, s) => ({ graphId: "g1", nodeId, item: `Step ${s + 1} ${"y".repeat(80)}`, step: s + 1, thought: "t" }))),
+		};
+		const ref = (id: string) => ({ id, identifier: id, url: `https://linear.app/o/issue/${id}/${"slug-".repeat(12)}`, title: id });
+		const bigTracking: TrackingRefs = {
+			...complete,
+			linear: {
+				nodes: Object.fromEntries(nodes.map((n) => [n, ref(`SPE-${n}`)])),
+				steps: Object.fromEntries(bigPlan.subIssues.map((s) => [`${s.nodeId}.${s.step}`, ref(`SPE-${s.nodeId}-${s.step}`)])),
+			},
+		};
+		const brief = "observed history line\n".repeat(1_000);
+		for (const input of [
+			{ ...spec, brief },
+			{ ...spec, plan: bigPlan, tracking: bigTracking },
+			{ ...spec, brief, plan: bigPlan, tracking: bigTracking },
+		]) {
+			const out = formatPromptContext(input as Parameters<typeof formatPromptContext>[0]);
+			expect(out.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+			expect(out).toContain('skill_view name="ultrathink:ultrathink-kickoff"');
+		}
+		const briefOnly = formatPromptContext({ ...spec, brief });
+		expect(briefOnly).toContain("(brief truncated)");
+		const linkedOnly = formatPromptContext({ ...spec, plan: bigPlan, tracking: bigTracking } as Parameters<typeof formatPromptContext>[0]);
+		expect(linkedOnly).toContain("copy them from the ISSUES block of the specification file");
+		const small = formatPromptContext({ ...spec, brief: "one short brief line" });
+		expect(small).toContain("one short brief line");
+		expect(small).not.toContain("(brief truncated)");
+		// The list is also in the spec's ISSUES block; the brief is saved nowhere, so the list gives way and the brief stays whole.
+		const mediumBrief = "cross-agent warning line\n".repeat(80).trim();
+		const both = formatPromptContext({ ...spec, brief: mediumBrief, plan: bigPlan, tracking: bigTracking } as Parameters<typeof formatPromptContext>[0]);
+		expect(both.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+		expect(both).toContain(mediumBrief);
+		expect(both).toContain("copy them from the ISSUES block of the specification file");
 	});
 });

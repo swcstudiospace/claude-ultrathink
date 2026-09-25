@@ -45,10 +45,12 @@ A tracking run ends in one of three states: `complete` (every row exists in ever
 |---|---|---|
 | 1. Planner | The prompt hook or host entry, before the agent sees the prompt (not on Hermes) | Creates the Linear issues, then the sub-issues, level by level in dependency order, then the Notion Task, Issue and Sub-Issue rows. Limited by `track.budgetMs` (60 seconds by default) and `track.concurrency` parallel calls. Rows not finished in time are left for step 2. |
 | 2. `track complete` | The `ultrathink-kickoff` skill runs it once when tracking is not `complete` | `bin/ultrathink-mcp track complete --state <stateFile>` creates only the missing rows, updates the session record and spec, and prints the Linked issues TODO lines. On Hermes this creates every row. |
-| 3. `ultrathink-kickoff` | The agent, at the start of its turn | Runs step 2 if needed. Only when that command cannot run does it create the missing rows by hand through the Notion and Linear MCP tools. Then it resolves blocking questions and sets the Task `Status` to `Implementing`. |
+| 3. `ultrathink-kickoff` | The agent, at the start of its turn | Runs step 2 if needed. Only when that command cannot run (the file or `bun` is missing) does it create the missing rows by hand through the Notion and Linear MCP tools. Then it resolves blocking questions, sets the Task `Status` to `Implementing`, and records that it ran with `bin/ultrathink-mcp session mark --state <stateFile> kicked-off` (`kickedOff: true` in the session record). |
 | 4. `ultrathink-sync` | The agent, after it opens a PR or at a stopping point | Never creates rows. Finds the Task by `Graph ID` and updates `PR URL`, `PR #`, `Repo`, `Branch`, `PR State`, `Checks`, `Reviewers`, `Status`, `Completed` and `Linear State`, and moves the Linear issues to the matching workflow state. |
 
 On Hermes the hook only plans and skips step 1. Hermes cuts plugin hooks off at `plugins.hook_callback_timeout`, so rows created inside the hook could be left behind by a plan that never reached the agent. Instead `ultrathink-kickoff` creates all of them at the start of the agent's turn by running `ultrathink-mcp track complete --state <file>`. The tracking settings and `bin/ultrathink status` work as on the other hosts; only the moment the rows are created moves.
+
+Kickoff fails open. When `track complete` reports that Notion or Linear is down, unreachable, rate-limited or unauthorised, or returns errors, kickoff creates no rows by hand. It tells you in one line which tracker failed and carries on with your task. Run `track complete` again later to fill in the missing rows.
 
 No rows are created when:
 

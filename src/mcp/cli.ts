@@ -35,6 +35,7 @@ const USAGE = `usage:
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
   ultrathink-mcp track complete --state <sessions/<id>.json>
+  ultrathink-mcp session mark --state <sessions/<id>.json> <kicked-off|synced>
   ultrathink-mcp notion init --parent <notion page url or id> [--title <title>] [--write-config]`;
 
 class UsageError extends Error {}
@@ -266,13 +267,8 @@ async function trackComplete(args: string[]): Promise<number> {
 		err("ultrathink-mcp: tracking is off (/ultrathink-track on to enable)");
 		return 0;
 	}
-	let record: SessionRecord;
-	try {
-		record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
-	} catch {
-		err(`ultrathink-mcp: cannot read session record: ${statePath}`);
-		return 1;
-	}
+	const record = readRecord(statePath);
+	if (!record) return 1;
 	const plan = record.plan;
 	if (!plan) {
 		err(`ultrathink-mcp: session record has no plan: ${statePath}`);
@@ -294,13 +290,9 @@ async function trackComplete(args: string[]): Promise<number> {
 	record.tracking = tracking;
 	const xml = injectTrackingXml(record.result.xml, plan, tracking);
 	record.result = { ...record.result, xml };
-	const tmp = `${statePath}.${process.pid}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
-	renameSync(tmp, statePath);
+	writeAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
 	const specPath = statePath.replace(/\.json$/, ".xml");
-	const specTmp = `${specPath}.${process.pid}.tmp`;
-	writeFileSync(specTmp, xml);
-	renameSync(specTmp, specPath);
+	writeAtomic(specPath, xml);
 	out(
 		`tracking ${tracking.status} · ${Object.keys(tracking.linear.nodes).length} issues · ${Object.keys(tracking.linear.steps).length} sub-issues · graph ${tracking.graphId}`,
 	);
@@ -308,6 +300,43 @@ async function trackComplete(args: string[]): Promise<number> {
 	out("");
 	out(formatTrackingTodos(plan, tracking));
 	return tracking.status === "failed" ? 1 : 0;
+}
+
+/** Reads a session record, or reports one stderr line and returns undefined. */
+function readRecord(statePath: string): SessionRecord | undefined {
+	try {
+		const record = JSON.parse(readFileSync(statePath, "utf8")) as Partial<SessionRecord> | null;
+		if (record && typeof record === "object" && record.result && typeof record.result === "object") {
+			return record as SessionRecord;
+		}
+	} catch {
+		// Reported below.
+	}
+	err(`ultrathink-mcp: cannot read session record: ${statePath}`);
+	return undefined;
+}
+
+/** Temp file in the same directory, then rename, so readers never see a partial record. */
+function writeAtomic(path: string, text: string): void {
+	const tmp = `${path}.${process.pid}.tmp`;
+	writeFileSync(tmp, text);
+	renameSync(tmp, path);
+}
+
+function sessionMark(args: string[]): number {
+	const statePath = flag(args, "--state");
+	if (!statePath) throw new UsageError("session mark needs --state <path>");
+	const marks = args.filter((arg, index) => arg !== "--state" && args[index - 1] !== "--state");
+	const mark = marks.length === 1 ? marks[0] : undefined;
+	const field = mark === "kicked-off" ? "kickedOff" : mark === "synced" ? "synced" : undefined;
+	if (!field) throw new UsageError(`session mark needs one of kicked-off, synced: ${marks.join(" ") || "(none)"}`);
+	const record = readRecord(statePath);
+	if (!record) return 1;
+	// Plan-scoped: the mark describes the plan now in the record; the session's next planned prompt replaces the record
+	// with a new graph whose kickedOff and synced start false, because that graph has not been kicked off or synced.
+	record[field] = true;
+	writeAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
+	return 0;
 }
 
 async function notionInit(args: string[], deps: AuthDeps): Promise<number> {
@@ -367,6 +396,7 @@ export async function main(argv: string[]): Promise<number> {
 			return failed ? 1 : 0;
 		}
 		if (command === "track" && rest[0] === "complete") return await trackComplete(rest.slice(1));
+		if (command === "session" && rest[0] === "mark") return sessionMark(rest.slice(1));
 		if (command === "notion" && rest[0] === "init") return await notionInit(rest.slice(1), deps);
 		if (command === "auth") {
 			const [sub, ...args] = rest;

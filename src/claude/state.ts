@@ -35,9 +35,12 @@ export interface SessionRecord {
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
 	plan?: TrackPlan;
-	/** Set true once ultrathink-kickoff has run for this session's plan. */
+	/**
+	 * Set true once ultrathink-kickoff has run for the plan in this record. Plan-scoped: the record holds the session's
+	 * latest plan, so the next planned prompt writes a new graph with kickedOff and synced false again.
+	 */
 	kickedOff?: boolean;
-	/** Set true once ultrathink-sync has run at least once for this session's plan. */
+	/** Set true once ultrathink-sync has run at least once for the plan in this record (plan-scoped, like kickedOff). */
 	synced?: boolean;
 	/** Tracker rows the planner created (Linear issues/sub-issues, Notion rows). */
 	tracking?: TrackingRefs;

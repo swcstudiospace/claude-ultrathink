@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Hermes: the plugin registers `ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan` and `ultrathink-ship` as Hermes plugin skills (`skill_view name="ultrathink:<name>"`), and the plan's kickoff and ship instructions give each skill's load call and absolute `SKILL.md` path, since Hermes does not list plugin skills to the model.
+- `ultrathink-mcp session mark --state <file> <kicked-off|synced>` sets `kickedOff` or `synced` in a session record. `ultrathink-kickoff` runs it with `kicked-off` as its last step.
+
+### Changed
+
+- Hermes: the plan reaches the model as a short handoff (spec path, state file, Graph ID and kickoff instruction) instead of the full specification, because Hermes replays hook context in every turn and spills pieces over 10,000 characters to a file.
+- `ultrathink-kickoff` fails open when Notion or Linear is down, unreachable, rate-limited or unauthorised: it creates no rows by hand, says which tracker failed in one line, and continues. The manual MCP fallback is only for when `track complete` itself cannot run. On Hermes it asks blocking questions with one `clarify` call (at most 5 questions of up to 4 choices, default first) and uses the defaults when no user is available.
 
 ### Fixed
 
