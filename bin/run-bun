@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Locate bun when a host hook PATH does not include it.
+# A missing runtime must not block the prompt: exit 0, never 127.
+trap 'exit 0' EXIT
+
+find_bun() {
+	if [ -n "${BUN:-}" ] && [ -x "$BUN" ]; then
+		printf '%s\n' "$BUN"
+		return 0
+	fi
+	if command -v bun >/dev/null 2>&1; then
+		command -v bun
+		return 0
+	fi
+	for candidate in \
+		"${BUN_INSTALL:-}/bin/bun" \
+		"${HOME:-}/.bun/bin/bun" \
+		/usr/local/bin/bun \
+		/opt/homebrew/bin/bun \
+		"${HOME:-}"/.local/share/*/bun/bin/bun
+	do
+		if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	printf '%s\n' "ultrathink: bun not found" >&2
+	return 1
+}
+
+BUN_BIN=$(find_bun) || exit 0
+export PATH="$(dirname "$BUN_BIN"):${PATH:-/usr/bin:/bin}"
+exec "$BUN_BIN" "$@"

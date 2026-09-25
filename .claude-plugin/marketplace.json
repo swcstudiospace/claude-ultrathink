@@ -3,18 +3,20 @@
 	"name": "ultrathink",
 	"owner": { "name": "SWC Studio", "email": "noreply@swcstudio.space" },
 	"metadata": {
-		"description": "Ultrathink plugin marketplace. Prompt Uplift with Graph of Thought, per-node rationale/conclusion fills, HITL clarifications, tracked in Notion + Linear.",
-		"version": "0.1.1"
+		"description": "Ultrathink plugin marketplace: plans every prompt into a spec + Graph of Thought and tracks it in Linear/Notion.",
+		"version": "0.3.0"
 	},
 	"plugins": [
 		{
 			"name": "ultrathink",
-			"description": "Prompt Uplift on every prompt via a pluggable engine (Claude default, Grok optional), Graph of Thought + per-node rationale/conclusion fills, HITL clarifications, Notion Agent Task Graph + Linear tracking via ultrathink-kickoff/ultrathink-sync skills.",
+			"description": "Plans every prompt into a spec + Graph of Thought with HITL clarifications on a pluggable engine (Claude default, Grok optional), tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR.",
 			"source": "./",
-			"version": "0.1.1",
+			"version": "0.3.0",
 			"author": { "name": "SWC Studio" },
+			"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+			"license": "AGPL-3.0-or-later",
 			"category": "productivity",
-			"keywords": ["uplift", "prompt", "xml", "got", "cot", "hitl", "notion", "linear"]
+			"keywords": ["planning", "prompt", "graph-of-thought", "hitl", "agent", "linear", "notion", "greptile"]
 		}
 	]
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { MAX_HEADER_CHARS } from "./types.ts";
 
 const MAX_PLACEHOLDER = "{{MAX}}";

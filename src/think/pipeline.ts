@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
+import { nodeStepTitles } from "../track/plan.ts";
 import type { UpliftResult } from "../types.ts";
 import {
 	dependencyLevels,
@@ -24,7 +27,23 @@ export interface RunThinkOptions {
 	onProgress?: (message: string) => void;
 	/** Fill independent nodes concurrently, level by level. Default 1 (sequential). */
 	concurrency?: number;
+	/** Structured progress, called synchronously (graph once, then node start/done pairs). */
+	onEvent?: (event: ThinkEvent) => void;
 }
+
+export type ThinkEvent =
+	| { type: "graph"; total: number; nodes: Array<{ id: string; title: string; kind: string; dependsOn: string[] }> }
+	| {
+			type: "node";
+			phase: "start" | "done";
+			id: string;
+			title: string;
+			kind: string;
+			index: number;
+			total: number;
+			fallback?: boolean;
+			steps?: string[];
+	  };
 
 function isAbortError(error: unknown): boolean {
 	if (error instanceof Error) return error.name === "AbortError";
@@ -88,6 +107,11 @@ async function fillNode(
 	graph: ThoughtGraph,
 	node: ThoughtNode,
 ): Promise<void> {
+	const index = graph.nodes.indexOf(node);
+	const total = graph.nodes.length;
+	const base = { id: node.id, title: node.title, kind: node.kind, index, total };
+	opts.onEvent?.({ type: "node", phase: "start", ...base });
+	let fallback = false;
 	try {
 		const raw = await opts.complete(COT_SYSTEM_PROMPT, cotUserPayload(opts.uplift, graph, node), opts.signal);
 		const fill = parseNodeFill(raw);
@@ -97,7 +121,12 @@ async function fillNode(
 		if (isAbortError(error)) throw error;
 		node.thinking = node.question;
 		node.conclusion = node.question;
+		fallback = true;
 	}
+	const steps = nodeStepTitles(node);
+	opts.onEvent?.(
+		fallback ? { type: "node", phase: "done", ...base, fallback: true, steps } : { type: "node", phase: "done", ...base, steps },
+	);
 }
 
 async function fillLevel(opts: RunThinkOptions, graph: ThoughtGraph, group: ThoughtNode[], limit: number): Promise<void> {
@@ -119,6 +148,11 @@ export async function runThink(opts: RunThinkOptions): Promise<ThinkResult> {
 	opts.onProgress?.("Graph of Thought…");
 	const graph = await buildGraph(opts, minNodes, maxNodes);
 	graph.nodes = topoSort(graph.nodes);
+	opts.onEvent?.({
+		type: "graph",
+		total: graph.nodes.length,
+		nodes: graph.nodes.map((node) => ({ id: node.id, title: node.title, kind: node.kind, dependsOn: [...node.dependsOn] })),
+	});
 
 	if (concurrency === 1) {
 		for (let index = 0; index < graph.nodes.length; index++) {

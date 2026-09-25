@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { extractPrFromOutput, isGhPrCreateCommand } from "./pr-detect.ts";
+import { extractPrFromOutput, isGhPrCreateCommand, isPrCreationTool } from "./pr-detect.ts";
 
 describe("isGhPrCreateCommand", () => {
 	test("matches gh pr create in various forms", () => {
@@ -17,6 +19,29 @@ describe("isGhPrCreateCommand", () => {
 
 	test("is a simple substring heuristic on the command text — a command that merely mentions the phrase elsewhere (e.g. inside a commit message) also matches; accepted false-positive, since it only costs an unnecessary nudge, never a missed one", () => {
 		expect(isGhPrCreateCommand("git commit -m 'wip: will gh pr create later'")).toBe(true);
+	});
+});
+
+describe("isPrCreationTool", () => {
+	test("shell tools count only when the command runs gh pr create", () => {
+		for (const tool of ["Bash", "run_terminal_command", "shell"]) {
+			expect(isPrCreationTool(tool, "gh pr create --fill")).toBe(true);
+			expect(isPrCreationTool(tool, "gh pr list")).toBe(false);
+		}
+		expect(isPrCreationTool("Bash", undefined)).toBe(false);
+	});
+
+	test("PR-creation tool names match regardless of server prefix or casing", () => {
+		expect(isPrCreationTool("mcp__aio__github_create_pull_request", undefined)).toBe(true);
+		expect(isPrCreationTool("github_create_pull_request", undefined)).toBe(true);
+		expect(isPrCreationTool("createPullRequest", undefined)).toBe(true);
+	});
+
+	test("other tools never match, even with a gh pr create command", () => {
+		expect(isPrCreationTool("Read", "gh pr create")).toBe(false);
+		expect(isPrCreationTool("Edit", undefined)).toBe(false);
+		expect(isPrCreationTool("mcp__linear__save_issue", undefined)).toBe(false);
+		expect(isPrCreationTool(undefined, "gh pr create")).toBe(false);
 	});
 });
 

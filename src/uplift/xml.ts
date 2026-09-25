@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { ROOT_TAGS } from "../types.ts";
 
 const ALLOWED_ROOTS: Record<string, true> = Object.fromEntries(

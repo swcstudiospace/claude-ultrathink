@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { applyAnswers } from "./answers.ts";
 import type { Clarification } from "./types.ts";

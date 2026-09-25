@@ -1,11 +1,16 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig } from "../config.ts";
+import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { Clarification } from "../hitl/types.ts";
+import type { ProgressEvent } from "../host/progress.ts";
+import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import { runPromptSubmit, type HookDeps, type PromptSubmitInput } from "./hook.ts";
 import { readSession, writeSession } from "./state.ts";
+import type { TrackingRefs } from "../track/types.ts";
 
 function tempStateDir(): { dir: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-hook-"));
@@ -35,14 +40,22 @@ function smartComplete(): (system: string, user: string) => Promise<string> {
 			const steps = Array.from({ length: 5 }, (_, i) => `${i + 1}. ${id} step ${i + 1}`).join(" ");
 			return `<node><rationale>${steps}</rationale><conclusion>c ${id}</conclusion></node>`;
 		}
-		return graphJson(3);
+		return graphJson(5);
 	};
+}
+
+/** Both trackers configured, as a user who set up Linear and Notion would have. */
+function trackedConfig(): UltrathinkConfig {
+	const config = defaultConfig();
+	config.linear.team = "Team";
+	config.notion.dataSourceUrl = "collection://ds";
+	return config;
 }
 
 function baseDeps(overrides: Partial<HookDeps> = {}): { deps: HookDeps; cleanup: () => void } {
 	const { dir, cleanup } = tempStateDir();
 	const deps: HookDeps = {
-		config: defaultConfig(),
+		config: trackedConfig(),
 		control: {},
 		complete: async () => "<BUILD_PROMPT><ORIGINAL>add a widget</ORIGINAL></BUILD_PROMPT>",
 		engine: "claude:sonnet",
@@ -107,11 +120,11 @@ describe("runPromptSubmit", () => {
 			const plan = result.record?.plan;
 			expect(plan?.task.repo).toBe("acme/widgets");
 			expect(plan?.task.branch).toBe("feat/widget");
-			expect(plan?.issues).toHaveLength(3);
-			// 3 nodes × 5 rationale steps: one Sub-Issue (and Linear sub-issue) per step, not per node.
-			expect(plan?.subIssues).toHaveLength(15);
-			expect(plan?.linearSubIssues).toHaveLength(15);
-			for (const id of ["n1", "n2", "n3"]) {
+			expect(plan?.issues).toHaveLength(5);
+			// 5 nodes × 5 rationale steps: one Sub-Issue (and Linear sub-issue) per step, not per node.
+			expect(plan?.subIssues).toHaveLength(25);
+			expect(plan?.linearSubIssues).toHaveLength(25);
+			for (const id of ["n1", "n2", "n3", "n4", "n5"]) {
 				expect(plan?.subIssues.filter((row) => row.nodeId === id).map((row) => row.step)).toEqual([1, 2, 3, 4, 5]);
 			}
 
@@ -186,7 +199,130 @@ describe("runPromptSubmit", () => {
 			const result = await runPromptSubmit(input, deps);
 			expect(result.record?.plan?.task.repo).toBeUndefined();
 			expect(result.record?.plan?.task.branch).toBeUndefined();
-			expect(result.record?.plan?.issues).toHaveLength(3);
+			expect(result.record?.plan?.issues).toHaveLength(5);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("gateway tracking", () => {
+	const trackCmd = "/opt/ultrathink/bin/ultrathink-mcp track complete";
+	const url = "https://linear.app/spectrum/issue/SPE-12/understand";
+
+	test("tracker refs land in the context, the spec file, and the session record", async () => {
+		let seenSignal: AbortSignal | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			trackCommand: trackCmd,
+			track: async ({ plan, signal }) => {
+				seenSignal = signal;
+				const refs: TrackingRefs = {
+					graphId: plan.graphId,
+					status: "partial",
+					linearTeam: "Team",
+					linear: { nodes: { n1: { id: "uuid-1", identifier: "SPE-12", url, title: "T1" } }, steps: {} },
+					notion: { nodes: {}, steps: {} },
+					errors: ["notion: login required"],
+					updatedAt: 1_000,
+				};
+				return refs;
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(seenSignal).toBeInstanceOf(AbortSignal);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Linked issues");
+			expect(ctx).toContain("SPE-12");
+			expect(ctx).toContain(url);
+			const spec = readFileSync(join(deps.stateDir, "sessions", "s1.xml"), "utf8");
+			expect(spec).toContain("<ISSUES");
+			expect(spec).toContain('identifier="SPE-12"');
+			const persisted = readSession(deps.stateDir, "s1");
+			expect(persisted?.tracking?.status).toBe("partial");
+			expect(persisted?.tracking?.linear.nodes.n1?.identifier).toBe("SPE-12");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a throwing tracker never blocks the prompt; kickoff is told to run the track command", async () => {
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			trackCommand: trackCmd,
+			track: async () => {
+				throw new Error("gateway down");
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Graph of Thought");
+			expect(ctx).not.toContain("## Linked issues");
+			expect(ctx).toContain(trackCmd);
+			expect(result.record?.plan).toBeDefined();
+			expect(result.record?.tracking).toBeUndefined();
+			const spec = readFileSync(join(deps.stateDir, "sessions", "s1.xml"), "utf8");
+			expect(spec).not.toContain("<ISSUES");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("tracking off: no tracker call, no kickoff or Linked issues, one note, plan still recorded", async () => {
+		let called = false;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			trackCommand: trackCmd,
+			trackingOff: true,
+			track: async () => {
+				called = true;
+				return undefined;
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(called).toBe(false);
+			expect(ctx).toContain("## Graph of Thought");
+			expect(ctx).not.toContain("## Ultrathink tracking");
+			expect(ctx).not.toContain("ultrathink-kickoff");
+			expect(ctx).not.toContain("## Linked issues");
+			expect(ctx).not.toContain(trackCmd);
+			expect(ctx).toContain(TRACKING_OFF_NOTE);
+			expect(result.output?.systemMessage).toContain("Tracking · off");
+			expect(result.output?.systemMessage).not.toContain("kickoff");
+			expect(result.record?.plan?.issues).toHaveLength(5);
+			expect(readSession(deps.stateDir, "s1")?.plan?.graphId).toBe(result.record?.plan?.graphId);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("Linear-only config counts only missing Linear rows and never mentions a Notion task", async () => {
+		const config = defaultConfig();
+		config.linear.team = "Team";
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			config,
+			track: async ({ plan }) => ({
+				graphId: plan.graphId,
+				status: "partial",
+				linearTeam: "Team",
+				linear: { nodes: { n1: { id: "uuid-1", identifier: "SPE-12", url, title: "T1" } }, steps: {} },
+				notion: { nodes: {}, steps: {} },
+				errors: [],
+				updatedAt: 1_000,
+			}),
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			// 5 nodes, 25 steps: 4 node issues + 25 sub-issues missing in Linear; Notion is not configured.
+			expect(result.output?.systemMessage).toContain("Tracking · partial (29 missing)");
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("Tracker rows created before this turn: 1 Linear issues, 0 sub-issues (graph");
+			expect(ctx).not.toContain("Notion task");
 		} finally {
 			cleanup();
 		}
@@ -251,6 +387,152 @@ describe("substrate brief", () => {
 			const result = await runPromptSubmit(input, deps);
 			expect(result.skipped).toBeUndefined();
 			expect(result.output?.hookSpecificOutput.additionalContext).toContain("## Prompt Uplift");
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("progress events", () => {
+	const label = (e: ProgressEvent): string =>
+		e.type === "stage" ? `${e.stage}:${e.phase}` : e.type === "node" ? `node:${e.phase}` : e.type;
+
+	test("a planned prompt streams begin, ordered stages, graph and node events, then end planned", async () => {
+		const events: ProgressEvent[] = [];
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), progress: (e) => events.push(e) });
+		try {
+			await runPromptSubmit(input, deps);
+			const labels = events.map(label);
+			expect(labels[0]).toBe("begin");
+			expect(labels.at(-1)).toBe("end");
+			expect(events.at(-1)).toMatchObject({ type: "end", outcome: "planned" });
+			const order = ["uplift:start", "uplift:end", "think:start", "graph", "think:end", "clarify:start", "clarify:end", "plan:start", "plan:end", "state:start", "state:end"];
+			const positions = order.map((l) => labels.indexOf(l));
+			expect(positions.every((p) => p >= 0)).toBe(true);
+			expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+			expect(labels).not.toContain("track:start");
+			expect(labels.filter((l) => l === "node:done")).toHaveLength(5);
+			expect(events.find((e) => e.type === "graph")).toMatchObject({ total: 5 });
+			expect(events.find((e) => e.type === "stage" && e.stage === "think" && e.phase === "end")).toMatchObject({ ok: true, detail: "5 nodes" });
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("begin announces whether planner-side tracking will run", async () => {
+		const untracked: ProgressEvent[] = [];
+		const tracked: ProgressEvent[] = [];
+		const plain = baseDeps({ complete: smartComplete(), progress: (e) => untracked.push(e) });
+		const withTracker = baseDeps({
+			complete: smartComplete(),
+			progress: (e) => tracked.push(e),
+			track: async () => {
+				throw new Error("gateway down");
+			},
+		});
+		try {
+			await runPromptSubmit(input, plain.deps);
+			await runPromptSubmit(input, withTracker.deps);
+			expect(untracked[0]).toMatchObject({ type: "begin", track: false });
+			expect(tracked[0]).toMatchObject({ type: "begin", track: true });
+		} finally {
+			plain.cleanup();
+			withTracker.cleanup();
+		}
+	});
+
+	test("a throwing sink leaves the output unchanged", async () => {
+		const quiet = baseDeps({ complete: smartComplete() });
+		const loud = baseDeps({
+			complete: smartComplete(),
+			progress: () => {
+				throw new Error("sink closed");
+			},
+		});
+		try {
+			const a = await runPromptSubmit(input, quiet.deps);
+			const b = await runPromptSubmit(input, loud.deps);
+			expect(b.output).toBeDefined();
+			expect(b.output?.systemMessage).toBe(a.output?.systemMessage);
+		} finally {
+			quiet.cleanup();
+			loud.cleanup();
+		}
+	});
+
+	test("a trivial prompt emits nothing", async () => {
+		const events: ProgressEvent[] = [];
+		const { deps, cleanup } = baseDeps({ progress: (e) => events.push(e) });
+		try {
+			await runPromptSubmit({ ...input, prompt: "ok" }, deps);
+			expect(events).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("skill invocations", () => {
+	const skillInput: PromptSubmitInput = {
+		...input,
+		prompt: "fix the login redirect",
+		skill: { name: "gsd-quick", instruction: "fix the login redirect", summary: "Fast atomic task.", source: "omp" },
+	};
+
+	test("plans the instruction under the skill: ORIGINAL, conversation line, record, begin, header and summary", async () => {
+		const payloads: string[] = [];
+		const events: ProgressEvent[] = [];
+		const complete = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			complete: async (system, user) => {
+				payloads.push(user);
+				return complete(system, user);
+			},
+			progress: (e) => events.push(e),
+		});
+		try {
+			const result = await runPromptSubmit(skillInput, deps);
+			const uplift = payloads.find((p) => p.includes("<user_request>")) ?? "";
+			expect(uplift).toContain("<user_request>\nfix the login redirect\n</user_request>");
+			expect(uplift).toContain('The user invoked the "gsd-quick" skill with this message. Skill summary: Fast atomic task.');
+			expect(result.record?.skill).toEqual({ name: "gsd-quick", summary: "Fast atomic task.", source: "omp" });
+			expect(readSession(deps.stateDir, "s1")?.skill?.name).toBe("gsd-quick");
+			expect(events[0]).toMatchObject({ type: "begin", skill: "gsd-quick" });
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain('invoked the "gsd-quick" skill');
+			expect(ctx).not.toContain(UPLIFT_CONTEXT_HEADER);
+			expect(result.output?.systemMessage).toContain("Skill · gsd-quick");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a plain prompt keeps the original header and no skill anywhere", async () => {
+		const events: ProgressEvent[] = [];
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), progress: (e) => events.push(e) });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.output?.hookSpecificOutput.additionalContext.startsWith(UPLIFT_CONTEXT_HEADER)).toBe(true);
+			expect(result.output?.systemMessage).not.toContain("Skill ·");
+			expect(result.record?.skill).toBeUndefined();
+			expect(events[0]).not.toHaveProperty("skill");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a gsd-* skill run asks for ultrathink-ship; other skills and plain prompts do not", async () => {
+		const { deps, cleanup } = baseDeps({ complete: smartComplete() });
+		try {
+			const gsd = await runPromptSubmit(skillInput, deps);
+			expect(gsd.output?.hookSpecificOutput.additionalContext).toMatch(
+				/## Ship\n\n.*invoke the ultrathink-ship skill with stateFile=.*s1\.json/,
+			);
+			const docx = { name: "docx", instruction: "fix the login redirect", source: "omp" as const };
+			const other = await runPromptSubmit({ ...skillInput, skill: docx }, deps);
+			expect(other.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
+			const plain = await runPromptSubmit(input, deps);
+			expect(plain.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
 		} finally {
 			cleanup();
 		}

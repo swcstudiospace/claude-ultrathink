@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	controlPath,
 	defaultStateDir,
 	readControl,
 	readLast,
@@ -46,6 +49,14 @@ describe("control state", () => {
 		writeControl(dir, { engine: "bogus" as unknown as "grok" });
 		expect(readControl(dir).engine).toBeUndefined();
 		expect(readControl(dir).hitlEnabled).toBe(false);
+	});
+
+	test("trackEnabled persists; a hand-edited non-boolean value is dropped", () => {
+		const dir = tempDir();
+		writeControl(dir, { trackEnabled: false });
+		expect(readControl(dir)).toEqual({ trackEnabled: false });
+		writeFileSync(controlPath(dir), JSON.stringify({ trackEnabled: "off", hitlEnabled: true }));
+		expect(readControl(dir)).toEqual({ hitlEnabled: true });
 	});
 });
 

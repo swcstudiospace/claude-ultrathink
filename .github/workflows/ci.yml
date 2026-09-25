@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Check and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun run check
+
+      # The runner has no git identity and git refuses to commit without one; set it in case a test shells out to git.
+      - name: Configure git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+
+      - name: Test
+        run: bun test
+
+      - name: Hermes bridge test
+        run: python3 hosts/hermes/bridge_test.py

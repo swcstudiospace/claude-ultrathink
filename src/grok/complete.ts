@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
- * Grok 4.6 completion for the Ultrathink pre-pass.
+ * Grok 4.7 completion for the Ultrathink pre-pass.
  *
  * Default transport talks directly to the Grok CLI chat proxy (`/responses`)
  * with the user's existing `grok login` session; the `cli` transport shells
  * out to the Grok Build CLI instead so the same login is reused either way.
+ * The `shunt` transport posts Anthropic Messages to a local gateway
+ * (`http://127.0.0.1:3001/v1/messages`) that owns its own upstream auth.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -38,7 +42,15 @@ export interface GrokCompleteOptions {
 	cwd?: string;
 	/** Test seam for the CLI-driven token refresh; default `ensureFreshGrokAuth`. */
 	refresh?: (opts: EnsureFreshOptions) => Promise<GrokAuth | undefined>;
+	/** `shunt` transport: gateway base URL (`/v1/messages` is appended). */
+	shuntBaseUrl?: string;
+	/** `shunt` transport: wire model; overrides `model` because the gateway route pins the effort. */
+	shuntModel?: string;
+	/** `shunt` transport: Anthropic `max_tokens`. */
+	shuntMaxTokens?: number;
 }
+
+export const SHUNT_ANTHROPIC_VERSION = "2023-06-01";
 
 const LOGIN_HINT = "run `grok login`";
 
@@ -90,14 +102,49 @@ function abortError(): Error {
 	return error;
 }
 
-async function completeHttp(system: string, user: string, opts: GrokCompleteOptions, model: string, effort: GrokEffort): Promise<string> {
-	const refresh = opts.refresh ?? ensureFreshGrokAuth;
-	const refreshOpts: EnsureFreshOptions = { home: opts.home, bin: opts.bin, timeoutMs: 20_000 };
-	const auth = await refresh(refreshOpts);
-	if (!auth) throw new GrokAuthError(`Grok login missing: ${LOGIN_HINT}`);
-	if (isGrokAuthExpired(auth)) throw new GrokAuthError(`Grok login expired: ${LOGIN_HINT}`);
+/** Anthropic Messages body for the shunt gateway. No `thinking` param: the route pins the effort. */
+export function buildShuntBody(system: string, user: string, model: string, maxTokens: number): Record<string, unknown> {
+	return { model, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] };
+}
 
-	const baseUrl = (opts.baseUrl?.trim() || DEFAULT_GROK_CONFIG.baseUrl).replace(/\/+$/, "");
+/** Shape of an Anthropic `/v1/messages` reply; each field is still checked at use because it is upstream JSON. */
+interface ShuntReply {
+	type?: unknown;
+	content?: unknown;
+	error?: unknown;
+}
+
+/** Extracts assistant text from an Anthropic Messages reply, skipping `thinking`/`redacted_thinking` blocks. */
+export function parseShuntText(json: unknown): string {
+	const reply: ShuntReply = json && typeof json === "object" ? json : {};
+	if (reply.type === "error") {
+		const err = reply.error && typeof reply.error === "object" ? (reply.error as { type?: unknown; message?: unknown }) : {};
+		const message = typeof err.message === "string" ? err.message : JSON.stringify(reply.error ?? null);
+		const kind = typeof err.type === "string" ? err.type : "error";
+		throw new GrokHttpError(`shunt ${kind}: ${redactSecrets(message).slice(0, 500)}`, 0, redactSecrets(message).slice(0, 500));
+	}
+	const parts: string[] = [];
+	if (Array.isArray(reply.content)) {
+		for (const raw of reply.content) {
+			if (!raw || typeof raw !== "object") continue;
+			const block: ResponsesContentBlock = raw;
+			if (block.type === "text" && typeof block.text === "string" && block.text) parts.push(block.text);
+		}
+	}
+	const text = parts.join("\n");
+	if (!text.trim()) throw new Error("grok returned no text");
+	return text;
+}
+
+/** Shared per-call timeout + caller-abort wiring for the fetch-based transports. */
+interface CallGuard {
+	signal: AbortSignal;
+	/** Maps a fetch rejection to the abort/timeout error the caller expects, else passes it through. */
+	wrap: (error: unknown) => unknown;
+	release: () => void;
+}
+
+function callGuard(opts: GrokCompleteOptions): CallGuard {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_GROK_CONFIG.callTimeoutMs;
 	const controller = new AbortController();
 	let timedOut = false;
@@ -109,6 +156,59 @@ async function completeHttp(system: string, user: string, opts: GrokCompleteOpti
 		: undefined;
 	const onAbort = (): void => controller.abort();
 	opts.signal?.addEventListener("abort", onAbort, { once: true });
+	return {
+		signal: controller.signal,
+		wrap: (error: unknown): unknown => {
+			if (opts.signal?.aborted) return abortError();
+			if (timedOut) return new Error(`grok timed out after ${timeoutMs}ms`);
+			return error;
+		},
+		release: () => {
+			clearTimeout(timer);
+			opts.signal?.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+async function completeShunt(system: string, user: string, opts: GrokCompleteOptions): Promise<string> {
+	const baseUrl = (opts.shuntBaseUrl?.trim() || DEFAULT_GROK_CONFIG.shuntBaseUrl).replace(/\/+$/, "");
+	const model = opts.shuntModel?.trim() || DEFAULT_GROK_CONFIG.shuntModel;
+	const maxTokens =
+		typeof opts.shuntMaxTokens === "number" && Number.isInteger(opts.shuntMaxTokens) && opts.shuntMaxTokens > 0
+			? opts.shuntMaxTokens
+			: DEFAULT_GROK_CONFIG.shuntMaxTokens;
+	const guard = callGuard(opts);
+	try {
+		let res: Response;
+		try {
+			res = await (opts.fetch ?? fetch)(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "anthropic-version": SHUNT_ANTHROPIC_VERSION, accept: "application/json" },
+				body: JSON.stringify(buildShuntBody(system, user, model, maxTokens)),
+				signal: guard.signal,
+			});
+		} catch (error) {
+			throw guard.wrap(error);
+		}
+		if (!res.ok) {
+			const body = redactSecrets(await res.text().catch(() => "")).slice(0, 500);
+			throw new GrokHttpError(`shunt HTTP ${res.status}${body ? `: ${body}` : ""}`, res.status, body);
+		}
+		return parseShuntText(await res.json());
+	} finally {
+		guard.release();
+	}
+}
+
+async function completeHttp(system: string, user: string, opts: GrokCompleteOptions, model: string, effort: GrokEffort): Promise<string> {
+	const refresh = opts.refresh ?? ensureFreshGrokAuth;
+	const refreshOpts: EnsureFreshOptions = { home: opts.home, bin: opts.bin, timeoutMs: 20_000 };
+	const auth = await refresh(refreshOpts);
+	if (!auth) throw new GrokAuthError(`Grok login missing: ${LOGIN_HINT}`);
+	if (isGrokAuthExpired(auth)) throw new GrokAuthError(`Grok login expired: ${LOGIN_HINT}`);
+
+	const baseUrl = (opts.baseUrl?.trim() || DEFAULT_GROK_CONFIG.baseUrl).replace(/\/+$/, "");
+	const guard = callGuard(opts);
 	const version = grokClientVersion(opts.home);
 	const body = JSON.stringify(buildResponsesBody(system, user, model, effort));
 
@@ -118,12 +218,10 @@ async function completeHttp(system: string, user: string, opts: GrokCompleteOpti
 				method: "POST",
 				headers: { ...grokHeaders(session, model, version), "content-type": "application/json", accept: "application/json" },
 				body,
-				signal: controller.signal,
+				signal: guard.signal,
 			});
 		} catch (error) {
-			if (opts.signal?.aborted) throw abortError();
-			if (timedOut) throw new Error(`grok timed out after ${timeoutMs}ms`);
-			throw error;
+			throw guard.wrap(error);
 		}
 	}
 
@@ -146,8 +244,7 @@ async function completeHttp(system: string, user: string, opts: GrokCompleteOpti
 		}
 		return parseResponsesText(await res.json());
 	} finally {
-		clearTimeout(timer);
-		opts.signal?.removeEventListener("abort", onAbort);
+		guard.release();
 	}
 }
 
@@ -268,9 +365,14 @@ export async function grokComplete(system: string, user: string, opts: GrokCompl
 	if (opts.signal?.aborted) throw abortError();
 	const model = opts.model?.trim() || DEFAULT_GROK_CONFIG.model;
 	const effort = opts.reasoningEffort ?? DEFAULT_GROK_CONFIG.reasoningEffort;
-	return opts.transport === "cli"
-		? completeCli(system, user, opts, model, effort)
-		: completeHttp(system, user, opts, model, effort);
+	switch (opts.transport) {
+		case "shunt":
+			return completeShunt(system, user, opts);
+		case "cli":
+			return completeCli(system, user, opts, model, effort);
+		default:
+			return completeHttp(system, user, opts, model, effort);
+	}
 }
 
 export function createGrokCompleter(opts: Omit<GrokCompleteOptions, "signal">): Completer {

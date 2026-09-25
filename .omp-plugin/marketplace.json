@@ -1,0 +1,25 @@
+{
+	"$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+	"name": "ultrathink",
+	"owner": {
+		"name": "SWC Studio",
+		"email": "noreply@swcstudio.space"
+	},
+	"metadata": {
+		"description": "Shared ultrathink engine for Omp, Claude Code, Grok Build, Hermes Agent, and Muse",
+		"version": "0.3.0"
+	},
+	"plugins": [
+		{
+			"name": "ultrathink",
+			"description": "Plans every prompt into a spec + Graph of Thought, tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR, on a shared engine",
+			"source": "./",
+			"version": "0.3.0",
+			"author": { "name": "SWC Studio" },
+			"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+			"license": "AGPL-3.0-or-later",
+			"category": "development",
+			"keywords": ["ultrathink", "planning", "graph-of-thought", "hitl", "agent", "linear", "notion", "greptile"]
+		}
+	]
+}

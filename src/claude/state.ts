@@ -1,28 +1,36 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Clarification } from "../hitl/types.ts";
 import type { ThoughtGraph } from "../think/types.ts";
-import type { TrackPlan } from "../track/types.ts";
+import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
+import type { SkillInvocation } from "../uplift/skill.ts";
+import { resolveStateDir } from "../host/paths.ts";
+import type { ShipState } from "../ship/types.ts";
 
 export interface ControlState {
 	enabled?: boolean;
 	skipOnce?: boolean;
 	thinkEnabled?: boolean;
 	hitlEnabled?: boolean;
+	/** Create Linear/Notion rows; overrides `track.enabled` from config. `false` also stops kickoff from creating them. */
+	trackEnabled?: boolean;
 	engine?: "grok" | "claude";
 }
 
 export interface SessionRecord {
 	sessionId: string;
 	at: number;
-	/** Thinking engine label, e.g. "grok-4.6@xhigh" or "claude:sonnet". */
+	/** Thinking engine label, e.g. "grok-4.7@xhigh", "grok-4.7-xhigh@shunt" or "claude:sonnet". */
 	engine?: string;
+	/** Host that planned this prompt. Absent on records written before multi-host support. */
+	host?: string;
 	result: UpliftResult;
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
@@ -31,13 +39,16 @@ export interface SessionRecord {
 	kickedOff?: boolean;
 	/** Set true once ultrathink-sync has run at least once for this session's plan. */
 	synced?: boolean;
+	/** Tracker rows the planner created (Linear issues/sub-issues, Notion rows). */
+	tracking?: TrackingRefs;
+	/** The skill the user invoked; the plan covers its instruction, the skill owns the workflow. */
+	skill?: { name: string; summary?: string; source: SkillInvocation["source"] };
+	/** Ship lifecycle (assess -> PR -> review -> merge) after a GSD skill run. */
+	ship?: ShipState;
 }
 
 export function defaultStateDir(env: Record<string, string | undefined> = process.env): string {
-	const override = env.ULTRATHINK_STATE_DIR?.trim();
-	if (override) return override;
-	const home = env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
-	return join(home, "ultrathink");
+	return resolveStateDir(env);
 }
 
 function readJson(path: string): unknown {
@@ -67,6 +78,7 @@ export function readControl(dir: string): ControlState {
 	if (typeof rec.skipOnce === "boolean") out.skipOnce = rec.skipOnce;
 	if (typeof rec.thinkEnabled === "boolean") out.thinkEnabled = rec.thinkEnabled;
 	if (typeof rec.hitlEnabled === "boolean") out.hitlEnabled = rec.hitlEnabled;
+	if (typeof rec.trackEnabled === "boolean") out.trackEnabled = rec.trackEnabled;
 	if (rec.engine === "grok" || rec.engine === "claude") out.engine = rec.engine;
 	return out;
 }

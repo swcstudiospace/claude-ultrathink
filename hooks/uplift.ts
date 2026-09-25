@@ -1,23 +1,26 @@
 #!/usr/bin/env bun
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 /**
  * Claude Code UserPromptSubmit hook entry (and `--ctl` control CLI).
  *
- * stdin: hook JSON from Claude Code. stdout: hook JSON with additionalContext.
+ * stdin: hook JSON from Claude Code. stdout: hook JSON with additionalContext, or a
+ * block decision answering an `/ultrathink-<verb>` command (src/uplift/commands.ts).
  * Always exits 0 so the user's prompt is never blocked by a plugin failure.
  */
-import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../src/config.ts";
-import { grokAuthStatusFresh, redactSecrets } from "../src/grok/auth.ts";
-import { createGrokCompleter } from "../src/grok/complete.ts";
-import { formatHitlEcho } from "../src/hitl/format.ts";
-import { graphSketch } from "../src/think/graph.ts";
-import { type ClaudeCompleter, createClaudeCompleter, isChildInvocation } from "../src/claude/complete.ts";
+import { claudeConfigPaths, loadConfig } from "../src/config.ts";
+import { isChildInvocation } from "../src/claude/complete.ts";
 import { runPromptSubmit, type PromptSubmitInput } from "../src/claude/hook.ts";
-import { type ControlState, defaultStateDir, readControl, readLast, writeControl } from "../src/claude/state.ts";
+import { defaultStateDir, readControl, sessionPath } from "../src/claude/state.ts";
 import { recentConversationFromTranscript } from "../src/claude/transcript.ts";
-import { isCommandPrompt } from "../src/uplift/detect.ts";
-
-const CTL_SCOPES = ["think", "hitl", "grok"] as const;
-type CtlScope = (typeof CTL_SCOPES)[number] | "uplift";
+import { parseUltrathinkCommand, runControl, trackingEnabled, trackingOff } from "../src/uplift/commands.ts";
+import { planningTarget } from "../src/uplift/skill.ts";
+import { writePlanCarrier } from "../src/host/carrier.ts";
+import { claimTurn } from "../src/host/claim.ts";
+import { detectHost } from "../src/host/detect.ts";
+import { selectEngine } from "../src/host/engine.ts";
+import { createGatewayTracker, trackCommand } from "../src/track/gateway.ts";
+import { isSubagentEnvelope, parseEnvelope } from "../src/host/envelope.ts";
 
 function log(message: string): void {
 	if (process.env.ULTRATHINK_DEBUG === "1") process.stderr.write(`[ultrathink] ${message}\n`);
@@ -31,175 +34,10 @@ async function readStdin(): Promise<string> {
 	}
 }
 
-function parseInput(raw: string): PromptSubmitInput {
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		return parsed && typeof parsed === "object" ? (parsed as PromptSubmitInput) : {};
-	} catch {
-		return {};
-	}
-}
-
-interface Engine {
-	label: string;
-	complete: ClaudeCompleter;
-	/** First error the completer threw, redacted; undefined until one happens. */
-	error: () => string | undefined;
-}
-
-/** Grok selected but nobody is logged in and fallback is off: fail visibly, never swap silently. */
-const GROK_LOGIN_REQUIRED = "Prompt Uplift skipped · Grok 4.6 login required (run `grok login`)";
-
-function captureFirstError(label: string, complete: ClaudeCompleter): Engine {
-	let first: string | undefined;
-	return {
-		label,
-		complete: async (system, user, signal) => {
-			try {
-				return await complete(system, user, signal);
-			} catch (error) {
-				first ??= redactSecrets(error instanceof Error ? error.message : String(error));
-				throw error;
-			}
-		},
-		error: () => first,
-	};
-}
-
-function claudeEngine(config: UltrathinkConfig, cwd: string, suffix = ""): Engine {
-	return captureFirstError(
-		`claude:${config.claude.model || "session default"}${suffix}`,
-		createClaudeCompleter({
-			bin: config.claude.bin,
-			model: config.claude.model || undefined,
-			settingSources: config.claude.settingSources,
-			thinking: config.claude.thinking,
-			cwd,
-			timeoutMs: config.claude.callTimeoutMs,
-		}),
-	);
-}
-
-async function selectEngine(config: UltrathinkConfig, state: ControlState, cwd: string): Promise<Engine | { skipped: string }> {
-	const engine = state.engine ?? config.think.engine;
-	if (engine !== "grok" || !config.grok.enabled) return claudeEngine(config, cwd);
-	const auth = await grokAuthStatusFresh({ home: config.grok.home || undefined, bin: config.grok.bin });
-	if (!auth.loggedIn || auth.expired) {
-		if (config.grok.fallbackToClaude) return claudeEngine(config, cwd, " (grok fallback)");
-		return { skipped: GROK_LOGIN_REQUIRED };
-	}
-	return captureFirstError(
-		`${config.grok.model}@${config.grok.reasoningEffort}`,
-		createGrokCompleter({
-			baseUrl: config.grok.baseUrl,
-			model: config.grok.model,
-			reasoningEffort: config.grok.reasoningEffort,
-			timeoutMs: config.grok.callTimeoutMs,
-			home: config.grok.home || undefined,
-			transport: config.grok.transport,
-			bin: config.grok.bin,
-			cwd,
-		}),
-	);
-}
-
-function engineLabel(config: UltrathinkConfig, state: ControlState): string {
-	const engine = state.engine ?? config.think.engine;
-	return engine === "grok" && config.grok.enabled
-		? `${config.grok.model}@${config.grok.reasoningEffort}`
-		: `claude:${config.claude.model || "session default"}`;
-}
-
-async function grokOauthLine(config: UltrathinkConfig): Promise<string> {
-	const auth = await grokAuthStatusFresh({ home: config.grok.home || undefined, bin: config.grok.bin });
-	if (!auth.loggedIn) return "SuperGrok OAuth: not logged in (run grok login)";
-	if (auth.expired) return "SuperGrok OAuth: expired (run grok login)";
-	return `SuperGrok OAuth: ${auth.email ?? "logged in"}${auth.expiresAt ? ` · expires ${auth.expiresAt}` : ""}`;
-}
-
-async function control(args: string[]): Promise<string> {
-	const cwd = process.cwd();
-	const stateDir = defaultStateDir();
-	const config = loadConfig(claudeConfigPaths(cwd));
-	const [scope, verb]: [CtlScope, string] = (CTL_SCOPES as readonly string[]).includes(args[0] ?? "")
-		? [args[0] as CtlScope, args[1] ?? "status"]
-		: ["uplift", args[0] ?? "status"];
-	const state = readControl(stateDir);
-	const flag = (value: boolean | undefined, fallback: boolean): string => ((value ?? fallback) ? "on" : "off");
-
-	if (scope === "hitl") {
-		switch (verb) {
-			case "on":
-			case "off":
-				writeControl(stateDir, { hitlEnabled: verb === "on" });
-				return `HITL clarifications ${verb}`;
-			case "last":
-				return formatHitlEcho(readLast(stateDir)?.clarifications ?? []);
-			default:
-				return `HITL clarifications ${flag(state.hitlEnabled, config.hitl.enabled)} · max ${config.hitl.maxQuestions}`;
-		}
-	}
-	if (scope === "grok") {
-		switch (verb) {
-			case "engine": {
-				const arg = args[2];
-				if (arg !== "grok" && arg !== "claude") return "Usage: grok engine grok|claude";
-				writeControl(stateDir, { engine: arg });
-				return `Thinking engine set to ${engineLabel(config, { ...state, engine: arg })}`;
-			}
-			default:
-				return [`Engine: ${engineLabel(config, state)}`, await grokOauthLine(config)].join("\n");
-		}
-	}
-	if (scope === "think") {
-		switch (verb) {
-			case "on":
-			case "off":
-				writeControl(stateDir, { thinkEnabled: verb === "on" });
-				return `Graph of Thought ${verb}`;
-			case "last": {
-				const last = readLast(stateDir);
-				return last?.graph ? `${last.graph.goal}\n\n${graphSketch(last.graph)}` : "No thought graph recorded yet";
-			}
-			default:
-				return `Graph of Thought ${flag(state.thinkEnabled, config.think.enabled)}`;
-		}
-	}
-	switch (verb) {
-		case "on":
-		case "off":
-			writeControl(stateDir, { enabled: verb === "on" });
-			return `Prompt Uplift ${verb}`;
-		case "skip":
-			writeControl(stateDir, { skipOnce: true });
-			return "Prompt Uplift will skip the next prompt";
-		case "last": {
-			const last = readLast(stateDir);
-			return last ? `${last.result.root} · ${last.result.source}\n\n${last.result.xml}` : "No uplift recorded yet";
-		}
-		default: {
-			const last = readLast(stateDir);
-			const lines = [
-				`Prompt Uplift ${flag(state.enabled, config.uplift.enabled)}${state.skipOnce ? " (skipping next prompt)" : ""}`,
-				`Engine: ${engineLabel(config, state)}`,
-				await grokOauthLine(config),
-				`Graph of Thought ${flag(state.thinkEnabled, config.think.enabled)}`,
-				`HITL clarifications ${flag(state.hitlEnabled, config.hitl.enabled)} · max ${config.hitl.maxQuestions}`,
-				`Notion: ${config.notion.dataSourceUrl}`,
-				`Linear team: ${config.linear.team}`,
-				`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
-				`State: ${stateDir}`,
-			];
-			if (last) lines.push(`Last: ${last.result.root} · ${last.result.source}${last.graph ? ` · ${last.graph.nodes.length} nodes` : ""}`);
-			return lines.join("\n");
-		}
-	}
-}
-
 async function main(): Promise<void> {
 	const argv = process.argv.slice(2);
 	if (argv[0] === "--ctl") {
-		process.stdout.write(`${await control(argv.slice(1))}\n`);
+		process.stdout.write(`${await runControl(argv.slice(1), { stateDir: defaultStateDir(), cwd: process.cwd() })}\n`);
 		return;
 	}
 	if (isChildInvocation()) return;
@@ -208,22 +46,58 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const input = parseInput(await readStdin());
-	if (input.hook_event_name && input.hook_event_name !== "UserPromptSubmit") return;
-	// Yield before engine select: slash expansion and Skill dispatch must not wait on the
-	// engine, and must not receive a login-required systemMessage that eats the command.
-	if (isCommandPrompt(input.prompt ?? "")) {
-		log("skipped: slash command");
+	const envelope = parseEnvelope(await readStdin());
+	const raw = envelope as PromptSubmitInput;
+	if (raw.hook_event_name && raw.hook_event_name !== "UserPromptSubmit") return;
+	// Grok runs UserPromptSubmit inside subagents too; only the main session plans and tracks.
+	if (isSubagentEnvelope(envelope)) {
+		log("skipped: subagent");
 		return;
 	}
-	const cwd = input.cwd?.trim() || process.cwd();
-	const config = loadConfig(claudeConfigPaths(cwd));
+	const cwd = raw.cwd?.trim() || process.cwd();
+	// `/ultrathink-<verb>` runs before planning. quick: the host's command template delivers
+	// the message, so plan nothing. Other verbs: answer with a block so no model turn runs.
+	const command = parseUltrathinkCommand(raw.prompt ?? "");
+	if (command?.verb === "quick") {
+		log("skipped: quick");
+		return;
+	}
+	if (command) {
+		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir: defaultStateDir(), cwd });
+		process.stdout.write(JSON.stringify({ decision: "block", reason }));
+		return;
+	}
+	let input = raw;
+	try {
+		const target = planningTarget(raw.prompt ?? "", { cwd });
+		// Yield before engine select: built-in slash commands and ultrathink's own skills
+		// must not wait on the engine.
+		if ("skip" in target) {
+			log(`skipped: ${target.skip}`);
+			return;
+		}
+		if (target.skill) input = { ...raw, prompt: target.text, skill: target.skill };
+	} catch {
+		// fail-open: a throwing skill parser plans the prompt as written
+	}
+	const host = detectHost();
 	const stateDir = defaultStateDir();
+	// Grok may dispatch this hook twice per turn (global hook file plus plugin hooks); only the first plans.
+	const promptId = envelope.prompt_id ?? envelope.promptId;
+	const turnSessionId = typeof raw.session_id === "string" ? raw.session_id.trim() : "";
+	if (host === "grok-build" && typeof promptId === "string" && promptId.trim() && turnSessionId) {
+		if (!claimTurn(stateDir, `${turnSessionId}:${promptId.trim()}`)) {
+			log("skipped: duplicate hook for this turn");
+			return;
+		}
+	}
+	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);
 	const engine = await selectEngine(config, state, cwd);
 	if ("skipped" in engine) {
 		log("skipped: grok engine selected but not logged in (fallbackToClaude=false)");
-		process.stdout.write(JSON.stringify({ systemMessage: engine.skipped }));
+		// A skill invocation must never receive a login-required systemMessage that eats the command.
+		if (!input.skill) process.stdout.write(JSON.stringify({ systemMessage: engine.skipped }));
 		return;
 	}
 
@@ -234,14 +108,39 @@ async function main(): Promise<void> {
 		engine: engine.label,
 		engineError: engine.error,
 		stateDir,
+		surface: host,
 		conversation: recentConversationFromTranscript,
 		log,
+		track: trackingEnabled(config, state) ? createGatewayTracker(config) : undefined,
+		trackingOff: trackingOff(config, state),
+		trackCommand: trackCommand(),
 	});
 	if (result.skipped) log(`skipped: ${result.skipped}`);
-	if (result.output) process.stdout.write(JSON.stringify(result.output));
+	if (result.output) {
+		// Claude reads stdout first, so a carrier failure can never cost it the plan.
+		// Grok discards stdout; last-plan.json is the carrier there.
+		process.stdout.write(JSON.stringify(result.output));
+		const sessionId = input.session_id?.trim() || "";
+		try {
+			writePlanCarrier({
+				host,
+				stateDir,
+				sessionId,
+				specPath: sessionId ? sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml") : undefined,
+				statePath: sessionId ? sessionPath(stateDir, sessionId) : undefined,
+				graphId: result.record?.plan?.graphId,
+				context: result.output.hookSpecificOutput.additionalContext,
+			});
+		} catch (error) {
+			log(`carrier write failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
 }
 
-main().catch((error) => {
-	log(`fatal: ${error instanceof Error ? error.message : String(error)}`);
-	process.exit(0);
-});
+// Exit explicitly once stdout drains: a lingering handle (in-flight upstream request)
+// must not keep the hook alive past the tracker budget.
+main()
+	.catch((error) => {
+		log(`fatal: ${error instanceof Error ? error.message : String(error)}`);
+	})
+	.finally(() => process.stdout.write("", () => process.exit(0)));

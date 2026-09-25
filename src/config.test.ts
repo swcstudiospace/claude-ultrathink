@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeConfigPaths, defaultConfig, loadConfig, mergeConfig } from "./config.ts";
+import { claudeConfigPaths, defaultConfig, loadConfig, mergeConfig, userConfigPath } from "./config.ts";
 
 function tempConfigFile(content: unknown): { path: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-config-"));
@@ -16,10 +18,10 @@ describe("defaultConfig", () => {
 		expect(defaultConfig().think.engine).toBe("claude");
 	});
 
-	test("points at the live Agent Task Graph data source and the Spectrum Web Co Linear team", () => {
+	test("tracks nowhere until the user configures a Linear team or Notion data source", () => {
 		const config = defaultConfig();
-		expect(config.notion.dataSourceUrl).toBe("collection://be3418f0-d2d8-411b-8677-fa8a95ee63be");
-		expect(config.linear.team).toBe("Spectrum Web Co");
+		expect(config.notion.dataSourceUrl).toBe("");
+		expect(config.linear.team).toBe("");
 	});
 });
 
@@ -71,6 +73,43 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ grok: { reasoningEffort: "extreme" } }, base).grok.reasoningEffort).toBe(base.grok.reasoningEffort);
 	});
 
+	test("grok defaults are grok-4.7 @ xhigh over the http transport, with shunt defaults populated", () => {
+		const grok = defaultConfig().grok;
+		expect(grok.model).toBe("grok-4.7");
+		expect(grok.reasoningEffort).toBe("xhigh");
+		expect(grok.transport).toBe("http");
+		expect(grok.shuntBaseUrl).toBe("http://127.0.0.1:3001");
+		expect(grok.shuntModel).toBe("grok-4.7-xhigh");
+		expect(grok.shuntMaxTokens).toBe(8192);
+	});
+
+	test("grok transport accepts http, cli and shunt; anything else falls back", () => {
+		const base = defaultConfig();
+		expect(mergeConfig({ grok: { transport: "shunt" } }, base).grok.transport).toBe("shunt");
+		expect(mergeConfig({ grok: { transport: "cli" } }, base).grok.transport).toBe("cli");
+		expect(mergeConfig({ grok: { transport: "http" } }, base).grok.transport).toBe("http");
+		expect(mergeConfig({ grok: { transport: "proxy" } }, base).grok.transport).toBe("http");
+		expect(mergeConfig({ grok: { transport: 3 } }, base).grok.transport).toBe("http");
+	});
+
+	test("grok shunt keys are validated: http(s) URL with trailing slash stripped, non-empty model, positive integer max_tokens", () => {
+		const base = defaultConfig();
+		const merged = mergeConfig(
+			{ grok: { transport: "shunt", shuntBaseUrl: "http://10.0.0.5:3001/", shuntModel: "grok-4.7", shuntMaxTokens: 4096 } },
+			base,
+		);
+		expect(merged.grok.shuntBaseUrl).toBe("http://10.0.0.5:3001");
+		expect(merged.grok.shuntModel).toBe("grok-4.7");
+		expect(merged.grok.shuntMaxTokens).toBe(4096);
+		const bad = mergeConfig({ grok: { shuntBaseUrl: "not a url", shuntModel: "  ", shuntMaxTokens: 0 } }, base).grok;
+		expect(bad.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(bad.shuntModel).toBe(base.grok.shuntModel);
+		expect(bad.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
+		expect(mergeConfig({ grok: { shuntBaseUrl: "ftp://x" } }, base).grok.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(mergeConfig({ grok: { shuntMaxTokens: 1.5 } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
+		expect(mergeConfig({ grok: { shuntMaxTokens: "8192" } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
+	});
+
 	test("hitl maxQuestions is clamped to 1-4", () => {
 		const base = defaultConfig();
 		expect(mergeConfig({ hitl: { maxQuestions: 0 } }, base).hitl.maxQuestions).toBe(base.hitl.maxQuestions);
@@ -79,17 +118,68 @@ describe("mergeConfig", () => {
 	});
 
 	test("notion dataSourceUrl and linear team accept a non-empty override, reject an empty string", () => {
-		const base = defaultConfig();
+		const base = mergeConfig({ notion: { dataSourceUrl: "collection://mine" }, linear: { team: "Mine" } }, defaultConfig());
+		expect(base.notion.dataSourceUrl).toBe("collection://mine");
 		expect(mergeConfig({ notion: { dataSourceUrl: "collection://other" } }, base).notion.dataSourceUrl).toBe("collection://other");
-		expect(mergeConfig({ notion: { dataSourceUrl: "" } }, base).notion.dataSourceUrl).toBe(base.notion.dataSourceUrl);
+		expect(mergeConfig({ notion: { dataSourceUrl: "" } }, base).notion.dataSourceUrl).toBe("collection://mine");
 		expect(mergeConfig({ linear: { team: "Other Team" } }, base).linear.team).toBe("Other Team");
+		expect(mergeConfig({ linear: { team: "  " } }, base).linear.team).toBe("Mine");
 	});
 });
 
-describe("claudeConfigPaths", () => {
-	test("home then project, in that order", () => {
-		const paths = claudeConfigPaths("/repo", { CLAUDE_CONFIG_DIR: "/home/.claude" });
-		expect(paths).toEqual(["/home/.claude/ultrathink.json", "/repo/.claude/ultrathink.json"]);
+describe("track config", () => {
+	test("defaults", () => {
+		expect(defaultConfig().track).toEqual({ enabled: true, budgetMs: 60_000, concurrency: 6 });
+	});
+
+	test("accepts valid overrides and rejects invalid values", () => {
+		const base = defaultConfig();
+		expect(mergeConfig({ track: { enabled: false, budgetMs: 5000, concurrency: 2.7 } }, base).track).toEqual({
+			enabled: false,
+			budgetMs: 5000,
+			concurrency: 2,
+		});
+		expect(mergeConfig({ track: { enabled: "no", budgetMs: 0, concurrency: 0 } }, base).track).toEqual(base.track);
+		expect(mergeConfig({ track: { budgetMs: -1, concurrency: Number.NaN } }, base).track).toEqual(base.track);
+	});
+});
+
+describe("config paths", () => {
+	test("user config lives under XDG_CONFIG_HOME, else ~/.config", () => {
+		expect(userConfigPath({ XDG_CONFIG_HOME: "/xdg" })).toBe("/xdg/ultrathink/config.json");
+		expect(userConfigPath({})).toBe(join(homedir(), ".config", "ultrathink", "config.json"));
+	});
+
+	test("user, then Claude home, then project, in that order", () => {
+		expect(claudeConfigPaths("/repo", { XDG_CONFIG_HOME: "/xdg", CLAUDE_CONFIG_DIR: "/home/.claude" })).toEqual([
+			"/xdg/ultrathink/config.json",
+			"/home/.claude/ultrathink.json",
+			"/repo/.claude/ultrathink.json",
+		]);
+		expect(claudeConfigPaths("/repo", {})[1]).toBe(join(homedir(), ".claude", "ultrathink.json"));
+	});
+
+	test("the project file overrides ~/.claude, which overrides the user config", () => {
+		const root = mkdtempSync(join(tmpdir(), "ultrathink-paths-"));
+		const env = { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") };
+		const [user, claude, project] = claudeConfigPaths(join(root, "repo"), env) as [string, string, string];
+		const files: [string, unknown][] = [
+			[user, { linear: { team: "User" }, notion: { dataSourceUrl: "collection://user" }, hitl: { maxQuestions: 1 } }],
+			[claude, { linear: { team: "Claude" }, notion: { dataSourceUrl: "collection://claude" } }],
+			[project, { notion: { dataSourceUrl: "collection://project" } }],
+		];
+		try {
+			for (const [path, content] of files) {
+				mkdirSync(join(path, ".."), { recursive: true });
+				writeFileSync(path, JSON.stringify(content));
+			}
+			const config = loadConfig(claudeConfigPaths(join(root, "repo"), env));
+			expect(config.hitl.maxQuestions).toBe(1);
+			expect(config.linear.team).toBe("Claude");
+			expect(config.notion.dataSourceUrl).toBe("collection://project");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -105,5 +195,26 @@ describe("loadConfig", () => {
 			home.cleanup();
 			project.cleanup();
 		}
+	});
+});
+
+describe("ship config", () => {
+	const base = defaultConfig();
+	test("defaults gate gsd- skills with strict review", () => {
+		expect(base.ship).toMatchObject({ enabled: true, skills: ["gsd-"], minScore: 5, mergeMethod: "squash", maxRounds: 5, waitMs: 100_000 });
+	});
+	test("valid overrides apply", () => {
+		const ship = mergeConfig(
+			{ ship: { autoMerge: false, skills: [], mergeMethod: "rebase", maxRounds: 2, minScore: 4, waitMs: 30_000 } },
+			base,
+		).ship;
+		expect(ship).toMatchObject({ autoMerge: false, skills: [], mergeMethod: "rebase", maxRounds: 2, minScore: 4, waitMs: 30_000 });
+	});
+	test("invalid values fall back to defaults", () => {
+		const ship = mergeConfig(
+			{ ship: { enabled: "yes", skills: ["gsd-", ""], mergeMethod: "force", maxRounds: 0, minScore: 9, pollMs: -1, waitMs: 0 } },
+			base,
+		).ship;
+		expect(ship).toEqual(base.ship);
 	});
 });

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
 import { ROOT_TAGS, type UpliftDecision, type UpliftState } from "../types.ts";
 
 const ALREADY_TAGS = [...ROOT_TAGS, "uplifted", "ultrathink"] as const;
