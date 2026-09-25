@@ -223,14 +223,28 @@ describe("reviewPr", () => {
 		expect(calls.some((c) => c.name === "trigger_code_review")).toBe(false);
 	});
 
-	test("tool error -> failed", async () => {
+	test("a thrown tool error is pending, not a failed review, so the next call retries", async () => {
 		const { client } = fakeClient({
 			list_code_reviews: () => ({ codeReviews: [] }),
 			trigger_code_review: () => {
 				throw new Error("boom");
 			},
 		});
-		expect(await reviewPr({ client, ...base, ...clock() })).toMatchObject({ status: "failed", error: "boom" });
+		expect(await reviewPr({ client, ...base, ...clock() })).toMatchObject({ status: "pending", error: "boom", score: null });
+	});
+
+	test("a transient list error after the review started keeps its id so the next call resumes it", async () => {
+		const { client } = fakeClient({
+			list_code_reviews: (_args, n) => {
+				if (n === 1) return { codeReviews: [{ id: "31", status: "REVIEWING_FILES", commitSha: "new" }] };
+				throw new Error("list_code_reviews: Repository not found");
+			},
+		});
+		expect(await reviewPr({ client, ...base, ...clock() })).toMatchObject({
+			status: "pending",
+			reviewId: "31",
+			error: "list_code_reviews: Repository not found",
+		});
 	});
 });
 
@@ -402,7 +416,7 @@ describe("runReview", () => {
 		const { run, argvs } = cliRun();
 		const result = await runReview({ ...input, client, run });
 		expect(argvs.length).toBe(0);
-		expect(result).toMatchObject({ source: "pr", status: "failed", headSha: "new" });
+		expect(result).toMatchObject({ source: "pr", status: "pending", error: "stop", headSha: "new" });
 		expect(calls.find((c) => c.name === "trigger_code_review")?.args).toMatchObject({ name: "acme/app", remote: "github", defaultBranch: "master", prNumber: 7 });
 	});
 });

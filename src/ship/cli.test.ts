@@ -392,6 +392,17 @@ describe("runShip", () => {
 			expect(state?.phase).toBe("needs-fixes");
 		});
 
+		test("a tool error that persists to the timeout stays in the timed-out round's error", async () => {
+			writeShip(statePath, { pr: PR, pending: { headSha: "abc", source: "pr", since: 2000 } });
+			const failing = { ...pendingReview, source: "pr" as const, error: "list_code_reviews: Repository not found" };
+			const early = await ship("review", deps({ review: failing, now: 2500 }));
+			expect(early.output).toMatchObject({ status: "pending", error: "list_code_reviews: Repository not found", round: 0 });
+			await ship("review", deps({ review: failing, now: 3001 }));
+			expect(readShip(statePath)?.rounds).toMatchObject([
+				{ status: "timeout", error: "review still pending after 1000ms (last error: list_code_reviews: Repository not found)" },
+			]);
+		});
+
 		test("a terminal result clears it", async () => {
 			writeShip(statePath, { pr: PR, pending: { headSha: "abc", source: "cli", since: 900 } });
 			const out = await ship("review", deps());
