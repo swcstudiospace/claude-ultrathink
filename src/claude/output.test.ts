@@ -201,7 +201,7 @@ const ref = (identifier: string) => ({ id: identifier, identifier, url: `https:/
 const complete: TrackingRefs = {
 	graphId: "g1",
 	status: "complete",
-	linear: { nodes: { n1: ref("SPE-1"), n2: ref("SPE-2") }, steps: { "n1.1": ref("SPE-3") } },
+	linear: { nodes: { n1: ref("ENG-1"), n2: ref("ENG-2") }, steps: { "n1.1": ref("ENG-3") } },
 	notion: { taskUrl: "https://www.notion.so/t", nodes: { n1: "https://www.notion.so/1", n2: "https://www.notion.so/2" }, steps: { "n1.1": "https://www.notion.so/3" } },
 	errors: [],
 	updatedAt: 1,
@@ -209,7 +209,7 @@ const complete: TrackingRefs = {
 const partial: TrackingRefs = {
 	...complete,
 	status: "partial",
-	linear: { nodes: { n1: ref("SPE-1") }, steps: {} },
+	linear: { nodes: { n1: ref("ENG-1") }, steps: {} },
 	notion: { nodes: {}, steps: {} },
 	errors: ["notion: login required"],
 };
@@ -220,8 +220,8 @@ describe("tracking", () => {
 		expect(out).toContain(
 			"Tracker rows created before this turn: 2 Linear issues, 1 sub-issues, Notion task https://www.notion.so/t (graph g1, status complete).",
 		);
-		expect(out).toContain("- [ ] n1 · [SPE-1](https://linear.app/o/issue/SPE-1) · Understand · notion: https://www.notion.so/1");
-		expect(out).toContain("`Refs SPE-12`");
+		expect(out).toContain("- [ ] n1 · [ENG-1](https://linear.app/o/issue/ENG-1) · Understand · notion: https://www.notion.so/1");
+		expect(out).toContain("`Refs ENG-12`");
 		expect(out.indexOf("Workflow waves:")).toBeLessThan(out.indexOf("## Linked issues"));
 		expect(out.indexOf("## Linked issues")).toBeLessThan(out.indexOf("## Clarifications (HITL)"));
 	});
@@ -250,6 +250,12 @@ describe("tracking", () => {
 		expect(without).not.toContain("## Linked issues");
 	});
 
+	test("a state file path with a space is single-quoted in the track command", () => {
+		const statePath = "/Users/Jane Doe/.claude/ultrathink/sessions/x.json";
+		const out = formatPromptContext({ result, plan, tracking: partial, statePath, trackCommand: "/r/bin/ultrathink-mcp track complete" });
+		expect(out).toContain(`\`/r/bin/ultrathink-mcp track complete --state '${statePath}'\``);
+	});
+
 	test("skill hints: a host that does not list plugin skills gets each skill's load call and an existing SKILL.md path", () => {
 		const out = formatPromptContext({ result, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", ship: true, skillHints: true });
 		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {
@@ -265,7 +271,7 @@ describe("tracking", () => {
 	});
 
 	test("truncation keeps the ISSUES block and re-appends it before the root close", () => {
-		const issues = '<ISSUES graphId="g1" status="complete">\n\t<ISSUE node="n1" identifier="SPE-1">[n1] A</ISSUE>\n</ISSUES>';
+		const issues = '<ISSUES graphId="g1" status="complete">\n\t<ISSUE node="n1" identifier="ENG-1">[n1] A</ISSUE>\n</ISSUES>';
 		const xml = ["<BUILD_PROMPT>", "<GRAPH_OF_THOUGHT>", "<N>x</N>\n".repeat(500), "</GRAPH_OF_THOUGHT>", issues, "<Z>tail</Z>\n".repeat(500), "</BUILD_PROMPT>"].join("\n");
 		const out = truncateXml(xml, 600, "/s/spec.xml");
 		expect(out.length).toBeLessThanOrEqual(600);
@@ -403,8 +409,8 @@ describe("handoff", () => {
 		const bigTracking: TrackingRefs = {
 			...complete,
 			linear: {
-				nodes: Object.fromEntries(nodes.map((n) => [n, ref(`SPE-${n}`)])),
-				steps: Object.fromEntries(bigPlan.subIssues.map((s) => [`${s.nodeId}.${s.step}`, ref(`SPE-${s.nodeId}-${s.step}`)])),
+				nodes: Object.fromEntries(nodes.map((n) => [n, ref(`ENG-${n}`)])),
+				steps: Object.fromEntries(bigPlan.subIssues.map((s) => [`${s.nodeId}.${s.step}`, ref(`ENG-${s.nodeId}-${s.step}`)])),
 			},
 		};
 		const brief = "observed history line\n".repeat(1_000);

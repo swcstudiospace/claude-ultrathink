@@ -1,6 +1,6 @@
 ---
 name: ultrathink-kickoff
-description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner may already have created some or all of the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway (Claude Code, Grok, Muse, Omp) or left all of them to this skill (Hermes); this skill finishes or creates them with one command (manual MCP fallback only if that command cannot run), registers the graph in the Agent Substrate index, resolves blocking clarifications, sets the Task to Implementing, hands back the full spec plus linked TODO lines and marks the session kicked off. Do not invoke this for any other purpose.
+description: Invoked with a stateFile path after the ultrathink planner ran an uplift+Graph-of-Thought+HITL pass on any host (the Claude Code or Grok UserPromptSubmit hook, or the Hermes/Muse/Omp entry). The planner may already have created some or all of the Linear issues/sub-issues and Notion Task/Issue/Sub-Issue rows through the shared MCP gateway (Claude Code, Grok, Muse, Omp) or left all of them to this skill (Hermes); this skill finishes or creates them with one command (manual MCP fallback only if that command cannot run), resolves blocking clarifications, sets the Task to Implementing, hands back the full spec plus linked TODO lines and marks the session kicked off. Do not invoke this for any other purpose.
 ---
 
 # ultrathink-kickoff
@@ -62,7 +62,7 @@ Rows go to the Notion data source `notion.dataSourceUrl` (a `collection://…` U
 
 ## 2. Manual fallback (only when step 1's command could not run)
 
-Create only what `tracking` does not already contain.
+Create only what `tracking` does not already contain. This step needs the Notion and Linear MCP tools in this session; if a tracker's tools are not available, tell the user once to register them with `bun <repo>/scripts/mcp-register.ts` (or connect the official Notion/Linear MCP servers), skip that tracker and continue — never block the work.
 
 **Linear** (team = `tracking.linearTeam`, else the configured `linear.team`; skip Linear when neither is set):
 
@@ -78,9 +78,9 @@ Create only what `tracking` does not already contain.
 
 Keep every identifier/URL you created; steps 3 and 5 use them.
 
-## 3. Register the graph in the substrate index
+## 3. Optional: register the graph with an Agent Substrate server
 
-Only when an MCP server named `substrate` is connected in this session (you have its `graph_register` tool); otherwise skip this step without logging anything. Call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
+This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
 
 | Field | Value |
 |---|---|
@@ -103,7 +103,7 @@ Only when an MCP server named `substrate` is connected in this session (you have
 
 ## 5. Set Implementing and emit the final prompt
 
-1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent).
+1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent). If the Notion MCP tools are not available in this session, tell the user once to register them with `bun <repo>/scripts/mcp-register.ts` (or connect the official Notion MCP server), skip this update and continue — never block the work.
 2. The final prompt is the **full spec file** (`sessions/<id>.xml`, the spec path from the prompt context), which already carries the `<ISSUES>` block with identifiers and URLs. Do not use `plan.task.upliftedPrompt` — that copy is truncated to 1900 characters.
 3. Copy every **Linked issues** TODO line into the host TODO tool verbatim, keeping the identifier and URL on each line. When step 1 ran `track complete`, take the lines from its output — the prompt-context lines are stale then (they still show `(pending)` rows); otherwise take them from the prompt context.
 4. Mark the session kicked off, once: `<repo>/bin/ultrathink-mcp session mark --state <stateFile> kicked-off`. Fail open: if it errors, ignore it and continue.

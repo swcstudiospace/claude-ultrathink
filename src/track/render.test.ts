@@ -33,8 +33,8 @@ const tracking: TrackingRefs = {
 	graphId: "g1",
 	status: "partial",
 	linear: {
-		nodes: { n1: { id: "i1", identifier: "SPE-12", url: 'https://linear.app/o/issue/SPE-12/a?x=1&y="2"', title: "Understand" } },
-		steps: { "n1.1": { id: "i2", identifier: "SPE-13", url: "https://linear.app/o/issue/SPE-13", title: "Step 1" } },
+		nodes: { n1: { id: "i1", identifier: "ENG-12", url: 'https://linear.app/o/issue/ENG-12/a?x=1&y="2"', title: "Understand" } },
+		steps: { "n1.1": { id: "i2", identifier: "ENG-13", url: "https://linear.app/o/issue/ENG-13", title: "Step 1" } },
 	},
 	notion: { taskUrl: "https://www.notion.so/task", nodes: { n1: "https://www.notion.so/n1" }, steps: {} },
 	errors: [],
@@ -57,7 +57,7 @@ describe("injectTrackingXml", () => {
 	test("links only NODE tags that have refs and escapes attribute values", () => {
 		const out = injectTrackingXml(graphXml, plan, tracking);
 		expect(out).toContain(
-			'<NODE id="n1" kind="decompose" title="Understand" issue="SPE-12" issueUrl="https://linear.app/o/issue/SPE-12/a?x=1&amp;y=&quot;2&quot;" notionUrl="https://www.notion.so/n1">',
+			'<NODE id="n1" kind="decompose" title="Understand" issue="ENG-12" issueUrl="https://linear.app/o/issue/ENG-12/a?x=1&amp;y=&quot;2&quot;" notionUrl="https://www.notion.so/n1">',
 		);
 		expect(out).toContain('<NODE id="n2" kind="synthesize" title="Build">');
 	});
@@ -65,9 +65,9 @@ describe("injectTrackingXml", () => {
 	test("places one ISSUES block after the graph with pending rows and escaped text", () => {
 		const out = injectTrackingXml(graphXml, plan, tracking);
 		expect(out).toContain('</GRAPH_OF_THOUGHT>\n<ISSUES graphId="g1" status="partial" notionTaskUrl="https://www.notion.so/task">');
-		expect(out).toContain('<ISSUE node="n1" identifier="SPE-12"');
+		expect(out).toContain('<ISSUE node="n1" identifier="ENG-12"');
 		expect(out).toContain(">[n1] Understand &lt;A &amp; B&gt;");
-		expect(out).toContain('<SUBISSUE step="1" identifier="SPE-13" url="https://linear.app/o/issue/SPE-13">Step 1: first</SUBISSUE>');
+		expect(out).toContain('<SUBISSUE step="1" identifier="ENG-13" url="https://linear.app/o/issue/ENG-13">Step 1: first</SUBISSUE>');
 		expect(out).toContain('<SUBISSUE step="2" status="pending">Step 2: second</SUBISSUE>');
 		expect(out).toContain('<ISSUE node="n2" status="pending">[n2] Build');
 		expect(out.indexOf("Step 1: first")).toBeLessThan(out.indexOf("Step 2: second"));
@@ -81,13 +81,13 @@ describe("injectTrackingXml", () => {
 			status: "complete",
 			linear: {
 				...tracking.linear,
-				nodes: { ...tracking.linear.nodes, n2: { id: "i3", identifier: "SPE-14", url: "https://linear.app/o/issue/SPE-14", title: "Build" } },
+				nodes: { ...tracking.linear.nodes, n2: { id: "i3", identifier: "ENG-14", url: "https://linear.app/o/issue/ENG-14", title: "Build" } },
 			},
 		};
 		const twice = injectTrackingXml(once, plan, updated);
 		expect(twice.match(/<ISSUES\b/g)).toHaveLength(1);
-		expect(twice.match(/issue="SPE-12"/g)).toHaveLength(1);
-		expect(twice).toContain('<NODE id="n2" kind="synthesize" title="Build" issue="SPE-14"');
+		expect(twice.match(/issue="ENG-12"/g)).toHaveLength(1);
+		expect(twice).toContain('<NODE id="n2" kind="synthesize" title="Build" issue="ENG-14"');
 		expect(twice).toContain('status="complete"');
 		expect(injectTrackingXml(twice, plan, updated)).toBe(twice);
 	});
@@ -105,7 +105,7 @@ describe("injectTrackingXml", () => {
 		expect(out).toContain(original);
 		expect(out).toContain("<SCOPE>s</SCOPE>");
 		expect(out).toContain('<NODE id="n2" kind="synthesize" title="Build">');
-		expect(out).toContain('title="Understand" issue="SPE-12"');
+		expect(out).toContain('title="Understand" issue="ENG-12"');
 		expect(out.match(/<ISSUES graphId=/g)).toHaveLength(1);
 		expect(out.indexOf('<ISSUES graphId="g1"')).toBe(out.lastIndexOf("</GRAPH_OF_THOUGHT>") + "</GRAPH_OF_THOUGHT>\n".length);
 	});
@@ -115,8 +115,8 @@ describe("formatTrackingTodos", () => {
 	test("one line per node then indented steps, linked or pending", () => {
 		expect(formatTrackingTodos(plan, tracking)).toBe(
 			[
-				'- [ ] n1 · [SPE-12](https://linear.app/o/issue/SPE-12/a?x=1&y="2") · Understand <A & B> · notion: https://www.notion.so/n1',
-				"  - [ ] n1.1 · [SPE-13](https://linear.app/o/issue/SPE-13) · Step 1: first",
+				'- [ ] n1 · [ENG-12](https://linear.app/o/issue/ENG-12/a?x=1&y="2") · Understand <A & B> · notion: https://www.notion.so/n1',
+				"  - [ ] n1.1 · [ENG-13](https://linear.app/o/issue/ENG-13) · Step 1: first",
 				"  - [ ] n1.2 · (pending) · Step 2: second",
 				"- [ ] n2 · (pending) · Build",
 				"  - [ ] n2.1 · (pending) · Step 1: only",

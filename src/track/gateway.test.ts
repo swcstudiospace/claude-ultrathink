@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import { resolveAuthHeader } from "../mcp/oauth.ts";
 import { writeStore } from "../mcp/store.ts";
-import { createGatewayTracker } from "./gateway.ts";
+import { createGatewayTracker, shellArg, trackCommand } from "./gateway.ts";
 import type { TrackPlan } from "./types.ts";
 
 let dir: string;
@@ -51,6 +51,17 @@ function recordingFetch(urls: string[]): typeof fetch {
 		return new Response("{}", { status: 500 });
 	}) as typeof fetch;
 }
+
+describe("trackCommand", () => {
+	test("a plain clone path is printed as-is", () => {
+		expect(trackCommand("/opt/ultrathink")).toBe("/opt/ultrathink/bin/ultrathink-mcp track complete");
+	});
+
+	test("a clone path with a space or a quote is single-quoted so the command still runs", () => {
+		expect(trackCommand("/Users/Jane Doe/ultrathink")).toBe("'/Users/Jane Doe/ultrathink/bin/ultrathink-mcp' track complete");
+		expect(shellArg("/Users/o'neil/x")).toBe(`'/Users/o'\\''neil/x'`);
+	});
+});
 
 describe("createGatewayTracker", () => {
 	test("is undefined when neither Linear nor Notion is configured", () => {

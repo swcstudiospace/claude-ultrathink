@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { readControl, writeControl } from "../claude/state.ts";
 import type { Tracker } from "../track/gateway.ts";
@@ -132,6 +132,18 @@ describe("resolveStateDir", () => {
 		expect(resolveStateDir({ ULTRATHINK_HOST: "hermes", HERMES_HOME: "/hermes" })).toBe(join("/hermes", "ultrathink"));
 		expect(resolveStateDir({ ULTRATHINK_HOST: "muse", XDG_CONFIG_HOME: "/xdg" })).toBe(join("/xdg", "muse", "ultrathink"));
 		expect(resolveStateDir({ ULTRATHINK_HOST: "omp", PI_CODING_AGENT_DIR: "/omp" })).toBe(join("/omp", "ultrathink"));
+	});
+
+	test("Grok state goes under GROK_PLUGIN_DATA, else GROK_HOME, else ~/.grok", () => {
+		const grok = { GROK_SESSION_ID: "g1" };
+		const underHome = join("/grok-home", "plugin-data", "ultrathink");
+		expect(resolveStateDir({ ...grok, GROK_HOME: "/grok-home" })).toBe(underHome);
+		expect(resolveStateDir({ ...grok, GROK_HOME: "/grok-home", GROK_PLUGIN_DATA: "/grok-data" })).toBe(join("/grok-data", "ultrathink"));
+		expect(resolveStateDir({ ...grok, GROK_HOME: "  ", GROK_PLUGIN_DATA: " " })).toBe(
+			join(homedir(), ".grok", "plugin-data", "ultrathink"),
+		);
+		// A planning-tree override is still refused in favour of the GROK_HOME directory.
+		expect(resolveStateDir({ ...grok, GROK_HOME: "/grok-home", ULTRATHINK_STATE_DIR: "/repo/.planning/ultrathink" })).toBe(underHome);
 	});
 });
 

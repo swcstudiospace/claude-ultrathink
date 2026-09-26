@@ -12,4 +12,4 @@ while [ -L "$self" ]; do
 	esac
 done
 root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd)
-exec "$root/bin/run-bun" "$root/src/ship/cli.ts" "$@"
+ULTRATHINK_BUN_REQUIRED=1 exec "$root/bin/run-bun" "$root/src/ship/cli.ts" "$@"

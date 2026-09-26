@@ -11,6 +11,7 @@ import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
 import { resolveStateDir } from "../host/paths.ts";
+import { resolveSubstrate } from "../substrate/brief.ts";
 import { graphSketch } from "../think/graph.ts";
 import { grokUserQuery, parseSlashCommand } from "./skill.ts";
 
@@ -95,11 +96,28 @@ function trackingLines(config: UltrathinkConfig, state: ControlState): string[] 
 	];
 }
 
-/** `Grok: <model> @ <effort> · transport <t>` plus the gateway URL when shunt is active. */
+/** `Grok: <model> @ <effort> · transport <t>` plus the gateway URL and wire model when shunt is active. */
 function grokTransportLine(config: UltrathinkConfig): string {
 	const { grok } = config;
 	const base = `Grok: ${grok.model} @ ${grok.reasoningEffort} · transport ${grok.transport}`;
-	return grok.transport === "shunt" ? `${base} · ${grok.shuntBaseUrl}/v1/messages · wire model ${grok.shuntModel} · max_tokens ${grok.shuntMaxTokens}` : base;
+	if (grok.transport !== "shunt") return base;
+	const gateway = grok.shuntBaseUrl ? `${grok.shuntBaseUrl}/v1/messages` : "shunt gateway not configured (set grok.shuntBaseUrl)";
+	return `${base} · ${gateway} · wire model ${grok.shuntModel || grok.model} · max_tokens ${grok.shuntMaxTokens}`;
+}
+
+/** Where the Agent Substrate brief comes from, if anywhere; the same rule the hooks use. */
+function substrateLine(config: UltrathinkConfig, env: Record<string, string | undefined>): string {
+	if (env.SUBSTRATE_DISABLED === "1") return "Substrate: off (SUBSTRATE_DISABLED=1)";
+	const target = resolveSubstrate(env, config.substrate.url);
+	return target ? `Substrate: ${target.url} (${target.source})` : "Substrate: off (optional: set substrate.url or SUBSTRATE_URL)";
+}
+
+/** Ship is opt-in; `ULTRATHINK_SHIP=0` turns it off for this shell whatever the config says. */
+function shipLine(config: UltrathinkConfig, env: Record<string, string | undefined>): string {
+	const { ship } = config;
+	if (!ship.enabled) return "Ship: off (opt-in: set ship.enabled)";
+	if (env.ULTRATHINK_SHIP === "0") return "Ship: off (ULTRATHINK_SHIP=0)";
+	return `Ship: on · auto-merge ${ship.autoMerge ? "on" : "off"} · delete branch ${ship.deleteBranch ? "on" : "off"}`;
 }
 
 async function grokOauthLine(config: UltrathinkConfig): Promise<string> {
@@ -120,6 +138,8 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		`Graph of Thought ${flag(state.thinkEnabled, config.think.enabled)}`,
 		`HITL clarifications ${flag(state.hitlEnabled, config.hitl.enabled)} · max ${config.hitl.maxQuestions}`,
 		...trackingLines(config, state),
+		substrateLine(config, process.env),
+		shipLine(config, process.env),
 		`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
 		`State: ${stateDir}`,
 	];

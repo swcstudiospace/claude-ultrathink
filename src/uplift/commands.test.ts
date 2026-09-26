@@ -108,7 +108,14 @@ describe("trackingOff", () => {
 });
 
 describe("runControl", () => {
-	const ENV_KEYS = ["XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "ULTRATHINK_TRACK"] as const;
+	const ENV_KEYS = [
+		"XDG_CONFIG_HOME",
+		"CLAUDE_CONFIG_DIR",
+		"ULTRATHINK_TRACK",
+		"ULTRATHINK_SHIP",
+		"SUBSTRATE_URL",
+		"SUBSTRATE_DISABLED",
+	] as const;
 	const saved: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
 	let dir: string;
 	let io: { stateDir: string; cwd: string };
@@ -126,7 +133,7 @@ describe("runControl", () => {
 		// User-level config on the machine running the tests must not leak in.
 		process.env.XDG_CONFIG_HOME = join(dir, "xdg");
 		process.env.CLAUDE_CONFIG_DIR = join(dir, "claude");
-		delete process.env.ULTRATHINK_TRACK;
+		for (const key of ["ULTRATHINK_TRACK", "ULTRATHINK_SHIP", "SUBSTRATE_URL", "SUBSTRATE_DISABLED"] as const) delete process.env[key];
 		projectConfig({});
 	});
 
@@ -178,6 +185,45 @@ describe("runControl", () => {
 		expect(await runControl(["track"], io)).toStartWith(kickoff);
 		expect(await runControl(["track", "on"], io)).toStartWith(kickoff);
 		expect(await runControl(["track", "off"], io)).toStartWith("Tracking: off (Linear/Notion rows)");
+	});
+
+	/** The one status line starting with `prefix`. */
+	async function statusLine(prefix: string): Promise<string | undefined> {
+		return (await runControl(["status"], io)).split("\n").find((line) => line.startsWith(prefix));
+	}
+
+	test("status shows the substrate as off until a URL is set; SUBSTRATE_URL beats config, SUBSTRATE_DISABLED beats both", async () => {
+		expect(await statusLine("Substrate:")).toBe("Substrate: off (optional: set substrate.url or SUBSTRATE_URL)");
+		projectConfig({ substrate: { url: "https://substrate.example/" } });
+		expect(await statusLine("Substrate:")).toBe("Substrate: https://substrate.example (config)");
+		process.env.SUBSTRATE_URL = "http://localhost:9000";
+		expect(await statusLine("Substrate:")).toBe("Substrate: http://localhost:9000 (SUBSTRATE_URL)");
+		process.env.SUBSTRATE_DISABLED = "1";
+		expect(await statusLine("Substrate:")).toBe("Substrate: off (SUBSTRATE_DISABLED=1)");
+	});
+
+	test("status shows ship as off by default, its merge settings when enabled, and off again under ULTRATHINK_SHIP=0", async () => {
+		expect(await statusLine("Ship:")).toBe("Ship: off (opt-in: set ship.enabled)");
+		projectConfig({ ship: { enabled: true } });
+		expect(await statusLine("Ship:")).toBe("Ship: on · auto-merge off · delete branch off");
+		projectConfig({ ship: { enabled: true, autoMerge: true, deleteBranch: true } });
+		expect(await statusLine("Ship:")).toBe("Ship: on · auto-merge on · delete branch on");
+		process.env.ULTRATHINK_SHIP = "0";
+		expect(await statusLine("Ship:")).toBe("Ship: off (ULTRATHINK_SHIP=0)");
+	});
+
+	test("the shunt status names the missing gateway setting and the model actually sent", async () => {
+		const grok = { home: join(dir, "grok"), model: "grok-test", transport: "shunt" };
+		projectConfig({ grok });
+		const unset = await statusLine("Grok:");
+		expect(unset).toContain("shunt gateway not configured (set grok.shuntBaseUrl)");
+		expect(unset).toContain("wire model grok-test");
+		expect(unset).not.toContain("/v1/messages");
+
+		projectConfig({ grok: { ...grok, shuntBaseUrl: "https://gateway.example", shuntModel: "wire-x" } });
+		const set = await statusLine("Grok:");
+		expect(set).toContain("https://gateway.example/v1/messages");
+		expect(set).toContain("wire model wire-x");
 	});
 
 	test("the legacy think, hitl, grok and last scopes keep working", async () => {

@@ -6,7 +6,11 @@ import { shipPrecheck } from "./precheck.ts";
 import { DEFAULT_SHIP_CONFIG, type Run } from "./types.ts";
 
 describe("shipApplies", () => {
-	const config = DEFAULT_SHIP_CONFIG;
+	const config = { ...DEFAULT_SHIP_CONFIG, enabled: true };
+	test("the default config never ships: ship is opt-in", () => {
+		expect(shipApplies(DEFAULT_SHIP_CONFIG, "gsd-autonomous", {})).toBe(false);
+		expect(shipApplies({ ...DEFAULT_SHIP_CONFIG, skills: [] }, undefined, {})).toBe(false);
+	});
 	test("matches gsd- prefix only", () => {
 		expect(shipApplies(config, "gsd-autonomous", {})).toBe(true);
 		expect(shipApplies(config, "ultrathink-plan", {})).toBe(false);

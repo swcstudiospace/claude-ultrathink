@@ -4,17 +4,23 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
 	apply,
+	applyReport,
 	claudeMdPath,
 	ensureMcpServer,
 	ensurePluginInstalled,
 	grokHooksConfig,
+	hermesHint,
 	installGrokHooks,
 	installGrokRule,
 	mergeBlock,
 	readSetupState,
+	repoRootFromModule,
 	rollback,
+	rollbackReport,
+	setupStatePath,
 	status,
 	type Run,
 } from "./setup.ts";
@@ -70,6 +76,38 @@ function fakeRun(script: (cmd: string[]) => { stdout: string; stderr: string; co
 	return Object.assign(run, { calls });
 }
 
+/** `claude mcp get` finds nothing (exit 1), `claude mcp list` prints `list`, every other claude call succeeds. */
+function mcpRun(list: string): Run & { calls: string[][] } {
+	return fakeRun((cmd) => {
+		if (cmd[1] === "mcp" && cmd[2] === "get") return { stdout: "", stderr: `No MCP server named "${cmd[3]}".`, code: 1 };
+		if (cmd[1] === "mcp" && cmd[2] === "list") return { stdout: list, stderr: "", code: 0 };
+		return { stdout: "", stderr: "", code: 0 };
+	});
+}
+
+const LOOKALIKES = [
+	"Checking MCP server health…",
+	"",
+	"notion-foo: https://example.com/mcp (HTTP) - ✔ Connected",
+	"claude.ai Notion: https://mcp.notion.com/mcp - ✔ Connected",
+	"docs: https://mcp.notion.com/mcp (HTTP) - ✔ Connected",
+	"my-linear: npx linear-mcp - ✔ Connected",
+].join("\n");
+
+type Reply = { stdout: string; stderr: string; code: number };
+
+/** `claude mcp get` output for the hosted entry `apply` adds (user scope, HTTP, setup's URL). */
+function setupEntry(name: string): Reply {
+	const url = name === "notion" ? "https://mcp.notion.com/mcp" : "https://mcp.linear.app/mcp";
+	const stdout = `${name}:\n  Scope: User config (available in all your projects)\n  Status: ✔ Connected\n  Type: http\n  URL: ${url}\n\nTo remove this server, run: claude mcp remove ${name} -s user\n`;
+	return { stdout, stderr: "", code: 0 };
+}
+
+/** Rollback-time claude: `get` shows setup's own entry and every other call succeeds, unless `script` answers first. */
+function ownedRun(script: (cmd: string[]) => Reply | undefined = () => undefined): Run & { calls: string[][] } {
+	return fakeRun((cmd) => script(cmd) ?? (cmd[2] === "get" ? setupEntry(cmd[3]) : { stdout: "", stderr: "", code: 0 }));
+}
+
 describe("claudeMdPath", () => {
 	test("uses CLAUDE_CONFIG_DIR when set, else ~/.claude", () => {
 		expect(claudeMdPath({ CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join("/cfg", "CLAUDE.md"));
@@ -94,22 +132,35 @@ describe("mergeBlock", () => {
 });
 
 describe("ensureMcpServer", () => {
-	test("skips when already configured", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "notion\nlinear\n", stderr: "", code: 0 } : { stdout: "", stderr: "", code: 0 }));
+	test("skips when `claude mcp get` finds the server by name", () => {
+		const run = fakeRun(() => ({ stdout: "notion:\n  Type: http", stderr: "", code: 0 }));
 		const result = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
 		expect(result.added).toBe(false);
-		expect(run.calls).toEqual([["claude", "mcp", "list"]]);
+		expect(run.calls).toEqual([["claude", "mcp", "get", "notion"]]);
+	});
+
+	test("falls back to an exact first-field match in `claude mcp list` when `claude mcp get` fails", () => {
+		const run = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\n");
+		expect(ensureMcpServer("notion", "https://mcp.notion.com/mcp", run).added).toBe(false);
+		expect(run.calls.some((cmd) => cmd[2] === "add")).toBe(false);
+	});
+
+	test("a lookalike name or a URL that mentions the server does not count as configured", () => {
+		const run = mcpRun(LOOKALIKES);
+		expect(ensureMcpServer("notion", "https://mcp.notion.com/mcp", run).added).toBe(true);
+		expect(ensureMcpServer("linear", "https://mcp.linear.app/mcp", run).added).toBe(true);
+		expect(run.calls).toContainEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "notion", "https://mcp.notion.com/mcp"]);
 	});
 
 	test("adds when missing", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "added", stderr: "", code: 0 }));
+		const run = mcpRun("");
 		const result = ensureMcpServer("linear", "https://mcp.linear.app/mcp", run);
 		expect(result.added).toBe(true);
-		expect(run.calls[1]).toEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "linear", "https://mcp.linear.app/mcp"]);
+		expect(run.calls.at(-1)).toEqual(["claude", "mcp", "add", "--transport", "http", "--scope", "user", "linear", "https://mcp.linear.app/mcp"]);
 	});
 
 	test("reports failure without throwing", () => {
-		const run = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "", stderr: "network down", code: 1 }));
+		const run = fakeRun((cmd) => (cmd[2] === "add" ? { stdout: "", stderr: "network down", code: 1 } : { stdout: "", stderr: "", code: 1 }));
 		const result = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
 		expect(result.added).toBe(false);
 		expect(result.message).toContain("network down");
@@ -149,10 +200,18 @@ describe("apply / status / rollback", () => {
 			const rolledBack = rollback(env, run);
 			expect(rolledBack.claudeMd.changed).toBe(true);
 			expect(rolledBack.grok).toEqual({ rule: { path: rulePath, removed: true }, hooks: { path: hooksPath, removed: true } });
+			expect(rolledBack.state).toEqual({ path: setupStatePath(env), status: "removed" });
 			expect(readFileSync(claudeMdPath(env), "utf8")).not.toContain("<!-- ultrathink:start -->");
 			expect(existsSync(rulePath)).toBe(false);
 			expect(existsSync(hooksPath)).toBe(false);
+			expect(existsSync(setupStatePath(env))).toBe(false);
 			expect(status(env, statusRun)).toContain(`Grok rule: missing — run: bun scripts/setup.ts apply (${rulePath})`);
+
+			// The plugin itself is only named for the user to remove; rollback never runs the uninstall.
+			const report = rollbackReport(rolledBack).join("\n");
+			expect(report).toContain("claude plugin uninstall ultrathink@ultrathink");
+			expect(report).toContain("claude plugin marketplace remove ultrathink");
+			expect(run.calls.some((cmd) => cmd[1] === "plugin" && (cmd[2] === "uninstall" || cmd[3] === "remove"))).toBe(false);
 		} finally {
 			cleanup();
 		}
@@ -173,15 +232,30 @@ describe("apply / status / rollback", () => {
 		}
 	});
 
-	test("the CLAUDE.md block defers to the configured Notion database and Linear team instead of naming a workspace", () => {
+	test("the CLAUDE.md block defers to the configured Notion database and Linear team and tells the agent how to check", () => {
 		const { env, repo, cleanup } = tempSetup();
 		try {
 			apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
 			const text = readFileSync(claudeMdPath(env), "utf8");
 			expect(text).toContain("notion.dataSourceUrl");
 			expect(text).toContain("linear.team");
+			expect(text).toContain("bin/ultrathink status");
+			expect(text).toContain("When tracking is configured");
+			// Unconditional claims would be false on a machine without tracking configured.
+			expect(text).not.toMatch(/All Claude Code work in this project is tracked/i);
 			expect(text).not.toContain("collection://");
 			expect(text).not.toContain("Spectrum Web Co");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("status decides MCP presence by exact server name", () => {
+		const { env, cleanup } = tempSetup();
+		try {
+			const text = status(env, mcpRun(`${LOOKALIKES}\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n`));
+			expect(text).toContain("Notion MCP: missing — run: claude mcp add");
+			expect(text).toContain("Linear MCP: configured");
 		} finally {
 			cleanup();
 		}
@@ -243,20 +317,42 @@ describe("apply / status / rollback", () => {
 
 	test("apply records added:true for a server it actually adds; rollback then removes it", () => {
 		const { env, repo, cleanup } = tempSetup();
-		// "list" reports neither server configured, so ensureMcpServer adds both.
-		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "", stderr: "", code: 0 } : { stdout: "added", stderr: "", code: 0 }));
+		// Neither server is configured, so ensureMcpServer adds both.
+		const applyRun = mcpRun("");
 		try {
 			apply(repo, applyRun, env);
 			const state = readSetupState(env);
 			expect(state.notionAdded).toBe(true);
 			expect(state.linearAdded).toBe(true);
 
-			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const rollbackRun = ownedRun();
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(true);
 			expect(result.linear.removed).toBe(true);
-			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "notion"]);
-			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "linear"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("re-running apply keeps servers an earlier apply added recorded, so rollback still removes them", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			// The second run finds both servers present (added by the first run) and adds nothing.
+			const rerun = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n");
+			const again = apply(repo, rerun, env);
+			expect(again.claude?.notion.added).toBe(false);
+			expect(again.claude?.linear.added).toBe(false);
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
+
+			const rollbackRun = ownedRun();
+			const result = rollback(env, rollbackRun);
+			expect(result.notion.removed).toBe(true);
+			expect(result.linear.removed).toBe(true);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
 		} finally {
 			cleanup();
 		}
@@ -264,8 +360,8 @@ describe("apply / status / rollback", () => {
 
 	test("apply records added:false for a server that was already configured; rollback does not remove it", () => {
 		const { env, repo, cleanup } = tempSetup();
-		// "list" reports both servers already configured, so ensureMcpServer skips both.
-		const applyRun = fakeRun((cmd) => (cmd[2] === "list" ? { stdout: "notion\nlinear\n", stderr: "", code: 0 } : { stdout: "", stderr: "", code: 0 }));
+		// `claude mcp list` shows both servers already configured, so ensureMcpServer skips both.
+		const applyRun = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n");
 		try {
 			apply(repo, applyRun, env);
 			const state = readSetupState(env);
@@ -276,8 +372,8 @@ describe("apply / status / rollback", () => {
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(false);
 			expect(result.linear.removed).toBe(false);
-			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "notion"]);
-			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "linear"]);
+			expect(rollbackRun.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+			expect(rollbackReport(result).join("\n")).toContain("Notion MCP: left in place (setup did not add it)");
 		} finally {
 			cleanup();
 		}
@@ -299,6 +395,209 @@ describe("apply / status / rollback", () => {
 			cleanup();
 		}
 	});
+
+	test("rollback deletes the setup state, so a later rollback cannot remove servers the user added since", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			expect(existsSync(setupStatePath(env))).toBe(true);
+			expect(rollback(env, ownedRun()).state.status).toBe("removed");
+			expect(existsSync(setupStatePath(env))).toBe(false);
+
+			const again = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			expect(rollback(env, again).state.status).toBe("absent");
+			expect(again.calls).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a failed removal is reported with its error and stays recorded, so the next rollback retries only that server", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const failing = ownedRun((cmd) =>
+				cmd[2] === "remove" && cmd.at(-1) === "notion" ? { stdout: "", stderr: "claude: not found", code: 127 } : undefined,
+			);
+			const first = rollback(env, failing);
+			expect(first.notion).toEqual({ removed: false, error: "exit 127: claude: not found" });
+			expect(first.linear.removed).toBe(true);
+			expect(first.state.status).toBe("kept");
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: false });
+			const report = rollbackReport(first).join("\n");
+			expect(report).toContain("Notion MCP: removal failed (exit 127: claude: not found)");
+			expect(report).toContain("claude mcp remove --scope user notion");
+
+			const retry = ownedRun();
+			const second = rollback(env, retry);
+			expect(retry.calls).toEqual([
+				["claude", "mcp", "get", "notion"],
+				["claude", "mcp", "remove", "--scope", "user", "notion"],
+			]);
+			expect(second.notion.removed).toBe(true);
+			expect(second.state.status).toBe("removed");
+			expect(existsSync(setupStatePath(env))).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("rollback leaves a server the user replaced since setup added it, and forgets it; setup's unchanged entry is removed", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			// notion now points at a gateway the user registered in place of setup's hosted server.
+			const gateway: Reply = {
+				stdout: "notion:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: /opt/tools/bin/ultrathink-mcp\n  Args: serve notion\n",
+				stderr: "",
+				code: 0,
+			};
+			const run = ownedRun((cmd) => (cmd[2] === "get" && cmd[3] === "notion" ? gateway : undefined));
+			const result = rollback(env, run);
+			expect(result.notion).toEqual({ removed: false, kept: "changed" });
+			expect(result.linear.removed).toBe(true);
+			expect(run.calls).not.toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(run.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
+			expect(rollbackReport(result).join("\n")).toContain("left in place: notion was changed since setup added it");
+			expect(result.state.status).toBe("removed");
+			expect(existsSync(setupStatePath(env))).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a user-scope server at another URL counts as changed", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const otherUrl = setupEntry("notion");
+			otherUrl.stdout = otherUrl.stdout.replace("https://mcp.notion.com/mcp", "https://notion.example.com/mcp");
+			const run = ownedRun((cmd) => (cmd[2] === "get" && cmd[3] === "notion" ? otherUrl : undefined));
+			const result = rollback(env, run);
+			expect(result.notion.kept).toBe("changed");
+			expect(run.calls).not.toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	describe("a project entry shadowing the user-scope server", () => {
+		/** `claude mcp get` shows a project-scope entry with the same name, which wins over the user scope. */
+		const shadowed = (cmd: string[]): Reply | undefined =>
+			cmd[2] === "get"
+				? { stdout: `${cmd[3]}:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx other-mcp\n`, stderr: "", code: 0 }
+				: undefined;
+		const claudeJson = (env: Record<string, string>) => join(env.CLAUDE_CONFIG_DIR, ".claude.json");
+
+		test("setup's user-scope entry in ~/.claude.json is still removed at user scope", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(
+					claudeJson(env),
+					JSON.stringify({
+						mcpServers: {
+							notion: { type: "http", url: "https://mcp.notion.com/mcp" },
+							linear: { type: "http", url: "https://mcp.linear.app/mcp" },
+						},
+					}),
+				);
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion.removed).toBe(true);
+				expect(result.linear.removed).toBe(true);
+				expect(run.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+				expect(result.state.status).toBe("removed");
+			} finally {
+				cleanup();
+			}
+		});
+
+		test("with no user-scope entry, the server counts as already removed and the record is dropped", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(claudeJson(env), JSON.stringify({ mcpServers: {} }));
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion).toEqual({ removed: false, kept: "gone" });
+				expect(rollbackReport(result).join("\n")).toContain("Notion MCP: already removed");
+				expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+				expect(existsSync(setupStatePath(env))).toBe(false);
+			} finally {
+				cleanup();
+			}
+		});
+
+		test("when ~/.claude.json cannot be read, the record is kept for a retry", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(claudeJson(env), "{ not json");
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion.error).toContain(claudeJson(env));
+				expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+				expect(result.state.status).toBe("kept");
+				expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	test("without the claude CLI, rollback keeps both servers recorded so a later rollback can still check and remove them", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const result = rollback(env, fakeRun(noClaude));
+			expect(result.notion.error).toContain("exit 127");
+			expect(result.state.status).toBe("kept");
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("any checkout path", () => {
+	test("the repo root is decoded from the module URL, so spaces and non-ASCII are kept verbatim", () => {
+		const root = join(tmpdir(), "my clones", "ultrathink-é");
+		expect(repoRootFromModule(pathToFileURL(join(root, "scripts", "setup.ts")).href)).toBe(root);
+	});
+
+	test("apply from a clone whose path has a space writes that path verbatim and prints pasteable commands", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink setup "));
+		try {
+			const repo = join(dir, "my clone");
+			writeRepo(repo);
+			const env = { CLAUDE_CONFIG_DIR: join(dir, "claude"), GROK_HOME: join(dir, "grok"), HERMES_HOME: join(dir, "hermes home") };
+			const result = apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
+			const hooks = readFileSync(result.grok.hooks.path, "utf8");
+			expect(hooks).toContain(`${repo}/hooks/uplift.ts`);
+			expect(hooks).not.toContain("%20");
+			const report = applyReport(repo, result, env).join("\n");
+			expect(report).toContain(`omp plugin link '${repo}'`);
+			expect(report).toContain(`muse plugins install '${repo}' --scope user`);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("hermesHint", () => {
+	test("links into HERMES_HOME when set, else ~/.hermes, and states the global hook cap", () => {
+		const hint = hermesHint("/src/ultrathink", { HERMES_HOME: "/opt/hermes home" });
+		expect(hint).toContain(
+			`mkdir -p '/opt/hermes home/plugins' && ln -sfn '/src/ultrathink/hosts/hermes' '/opt/hermes home/plugins/ultrathink' && hermes plugins enable ultrathink`,
+		);
+		expect(hint).toContain("hermes config set plugins.hook_callback_timeout 600");
+		expect(hint).toContain("at least 105 s");
+		expect(hint).toContain("global Hermes setting");
+		expect(hint).toContain("disable any other prompt-planning plugin");
+		expect(hint).not.toContain("prompt-uplift");
+		expect(hermesHint("/src/ultrathink", {})).toContain(`${join(".hermes", "plugins", "ultrathink")}'`);
+	});
 });
 
 describe("grok global hooks", () => {
@@ -311,7 +610,7 @@ describe("grok global hooks", () => {
 	test("grokHooksConfig resolves the plugin root, forces the grok host, and raises only the prompt timeout", () => {
 		const { root, cleanup } = tempRepo();
 		try {
-			// A trailing slash (main() passes a URL pathname) must not produce `//` paths.
+			// A root given with a trailing slash must not produce `//` paths.
 			const config = grokHooksConfig(`${root}/`) as {
 				hooks: Record<string, { matcher?: string; hooks: { command: string; timeout: number; env: Record<string, string> }[] }[]>;
 			};

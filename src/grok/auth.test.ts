@@ -27,7 +27,7 @@ const TOKEN = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEyMyIsImV4
 const EXPIRES_AT = "2026-09-16T12:00:00.000Z";
 
 function tempHome(auth?: unknown): string {
-	const home = mkdtempSync(join(tmpdir(), "aio-grok-auth-"));
+	const home = mkdtempSync(join(tmpdir(), "ultrathink-grok-auth-"));
 	dirs.push(home);
 	if (auth !== undefined) writeFileSync(join(home, "auth.json"), typeof auth === "string" ? auth : JSON.stringify(auth));
 	return home;

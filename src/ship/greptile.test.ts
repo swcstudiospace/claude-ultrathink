@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { findGreptileRepo, parseScore, reviewCli, reviewPr, runReview, type ToolCaller } from "./greptile.ts";
+import {
+	findGreptileRepo,
+	GREPTILE_SETUP,
+	parseScore,
+	reviewCli,
+	reviewPr,
+	runReview,
+	tenantReason,
+	type ToolCaller,
+} from "./greptile.ts";
 import type { Run, ShipConfig } from "./types.ts";
 
 const repo = { name: "acme/app", remote: "github" as const, defaultBranch: "master" };
@@ -14,6 +23,7 @@ const config: ShipConfig = {
 	maxRounds: 5,
 	mergeMethod: "squash",
 	deleteBranch: true,
+	greptileOrganization: "",
 	reviewTimeoutMs: 1000,
 	pollMs: 100,
 	waitMs: 1000,
@@ -418,5 +428,100 @@ describe("runReview", () => {
 		expect(argvs.length).toBe(0);
 		expect(result).toMatchObject({ source: "pr", status: "pending", error: "stop", headSha: "new" });
 		expect(calls.find((c) => c.name === "trigger_code_review")?.args).toMatchObject({ name: "acme/app", remote: "github", defaultBranch: "master", prNumber: 7 });
+	});
+
+	test("organization rides on every Greptile MCP call when set, and is absent when empty", async () => {
+		const handlers = {
+			list_repositories: () => ({ repositories: [{ ...repo, reviewsEnabled: true }], total: 1 }),
+			list_code_reviews: () => ({ codeReviews: [{ id: "9", status: "COMPLETED", commitSha: "new" }] }),
+			get_code_review: () => ({ codeReview: { body: "Confidence Score: 5/5" } }),
+			list_merge_request_comments: () => ({ comments: [] }),
+		};
+		const withOrg = fakeClient(handlers);
+		const org = await runReview({ ...input, config: { ...config, greptileOrganization: "acme-eng" }, client: withOrg.client, run: cliRun().run });
+		expect(org).toMatchObject({ source: "pr", status: "completed", score: 5 });
+		expect(withOrg.calls.map((c) => c.name)).toEqual([
+			"list_repositories",
+			"list_code_reviews",
+			"get_code_review",
+			"list_merge_request_comments",
+		]);
+		for (const call of withOrg.calls) expect(call.args.organization).toBe("acme-eng");
+
+		const without = fakeClient(handlers);
+		await runReview({ ...input, client: without.client, run: cliRun().run });
+		expect(without.calls.length).toBe(4);
+		for (const call of without.calls) expect("organization" in call.args).toBe(false);
+	});
+
+	test("organization also rides on trigger_code_review", async () => {
+		const { client, calls } = fakeClient({
+			list_repositories: () => ({ repositories: [repo], total: 1 }),
+			list_code_reviews: () => ({ codeReviews: [] }),
+			trigger_code_review: () => {
+				throw new Error("stop");
+			},
+		});
+		await runReview({ ...input, config: { ...config, greptileOrganization: "acme-eng" }, client, run: cliRun().run });
+		expect(calls.find((c) => c.name === "trigger_code_review")?.args.organization).toBe("acme-eng");
+	});
+
+	test("tenant_required while finding the repo blocks the review with the setting to set, and runs no CLI review", async () => {
+		const { client } = fakeClient({
+			list_repositories: () => {
+				throw new Error('list_repositories: {"error":"tenant_required","candidates":[{"id":"o1","handle":"acme"},{"id":"o2","handle":"beta"}]}');
+			},
+		});
+		const { run, argvs } = cliRun();
+		const result = await runReview({ ...input, client, run });
+		expect(result).toMatchObject({ status: "blocked", score: null, comments: [], headSha: "new" });
+		expect(result.error).toContain("set ship.greptileOrganization");
+		expect(result.error).toContain("acme, beta");
+		expect(argvs).toEqual([]);
+	});
+
+	test("tenant_required during a PR review blocks instead of polling again", async () => {
+		const { client } = fakeClient({
+			list_code_reviews: () => {
+				throw new Error("list_code_reviews: tenant_required: pass organization. candidates: acme, beta");
+			},
+		});
+		const result = await reviewPr({ client, repo, prNumber: 7, headSha: "new", timeoutMs: 1000, pollMs: 100, ...clock() });
+		expect(result.status).toBe("blocked");
+		expect(result.error).toContain("ship.greptileOrganization");
+		expect(result.error).toContain("acme, beta");
+	});
+
+	test("without a Greptile MCP credential and without a signed-in CLI, review is blocked before any round", async () => {
+		for (const whoami of [
+			{ exitCode: 127, stderr: "spawn greptile ENOENT" },
+			{ exitCode: 0, stdout: "Not signed in. Run `greptile login` or `greptile login --api-key`." },
+		]) {
+			const { run, argvs } = fakeRun((argv) => (argv[1] === "whoami" ? whoami : cliOut));
+			const result = await runReview({ ...input, run });
+			expect(result).toMatchObject({ source: "cli", status: "blocked", error: GREPTILE_SETUP, score: null });
+			expect(argvs).toEqual([["greptile", "whoami"]]);
+		}
+	});
+
+	test("without a Greptile MCP credential a signed-in CLI, or a whoami that merely failed (network), still reviews", async () => {
+		for (const whoami of [
+			{ exitCode: 0, stdout: "Signed in as dev@example.com" },
+			{ exitCode: 1, stderr: "request to https://api.greptile.com failed: ETIMEDOUT" },
+		]) {
+			const { run, argvs } = fakeRun((argv) => (argv[1] === "whoami" ? whoami : argv[2] === "status" ? { exitCode: 1 } : cliOut));
+			expect(await runReview({ ...input, run })).toMatchObject({ source: "cli", status: "completed", score: 2 });
+			expect(argvs.at(-1)).toEqual(["greptile", "review", "--json", "-b", "master"]);
+		}
+	});
+});
+
+describe("tenantReason", () => {
+	test("only tenant_required errors get a reason; candidates are listed when the error names them", () => {
+		expect(tenantReason("list_code_reviews: Repository not found")).toBeUndefined();
+		expect(tenantReason("tenant_required")).toBe(
+			"Greptile account has several organizations; set ship.greptileOrganization in ~/.config/ultrathink/config.json",
+		);
+		expect(tenantReason('x: {"error":{"code":"tenant_required","candidates":["acme","beta"]}}')).toEndWith("(one of: acme, beta)");
 	});
 });

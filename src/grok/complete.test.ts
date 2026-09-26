@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { type EnsureFreshOptions, type GrokAuth, GrokAuthError, GrokHttpError, readGrokAuth } from "./auth.ts";
 import {
 	buildResponsesBody,
@@ -24,7 +24,7 @@ const TOKEN = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEyMyIsImV4
 const FRESH_TOKEN = "fresh.tok.en";
 
 function tempHome(opts: { expiresAt?: string; version?: string; token?: string } = {}): string {
-	const home = mkdtempSync(join(tmpdir(), "aio-grok-complete-"));
+	const home = mkdtempSync(join(tmpdir(), "ultrathink-grok-complete-"));
 	dirs.push(home);
 	writeAuth(home, opts);
 	if (opts.version) writeFileSync(join(home, "version.json"), JSON.stringify({ version: opts.version }));
@@ -232,7 +232,7 @@ describe("grokComplete (http)", () => {
 
 	test("missing login fails before any request", async () => {
 		const { fetch, calls } = fakeFetch(() => responsesReply("never"));
-		const home = mkdtempSync(join(tmpdir(), "aio-grok-empty-"));
+		const home = mkdtempSync(join(tmpdir(), "ultrathink-grok-empty-"));
 		dirs.push(home);
 		const error = await rejection(grokComplete("S", "U", { home, fetch }));
 		expect(error).toBeInstanceOf(GrokAuthError);
@@ -262,13 +262,13 @@ describe("grokComplete (http)", () => {
 	});
 });
 
-/** Anthropic Messages reply the shunt gateway returns for `grok-4.7-xhigh` (thinking block first). */
+/** Anthropic Messages reply the shunt gateway returns for `grok-shunt-route` (thinking block first). */
 function shuntReply(text: string, extra: Record<string, unknown>[] = []): Response {
 	return Response.json({
 		id: "msg_1",
 		type: "message",
 		role: "assistant",
-		model: "grok-4.7-xhigh",
+		model: "grok-shunt-route",
 		content: [{ type: "thinking", thinking: "hidden reasoning", signature: "sig" }, ...extra, { type: "text", text }],
 		stop_reason: "end_turn",
 		usage: { input_tokens: 1, output_tokens: 1 },
@@ -277,8 +277,8 @@ function shuntReply(text: string, extra: Record<string, unknown>[] = []): Respon
 
 describe("buildShuntBody", () => {
 	test("produces an Anthropic Messages payload without a thinking param", () => {
-		const body = buildShuntBody("SYS", "USER", "grok-4.7-xhigh", 4096);
-		expect(body).toEqual({ model: "grok-4.7-xhigh", max_tokens: 4096, system: "SYS", messages: [{ role: "user", content: "USER" }] });
+		const body = buildShuntBody("SYS", "USER", "grok-shunt-route", 4096);
+		expect(body).toEqual({ model: "grok-shunt-route", max_tokens: 4096, system: "SYS", messages: [{ role: "user", content: "USER" }] });
 		expect("thinking" in body).toBe(false);
 	});
 });
@@ -320,12 +320,14 @@ describe("parseShuntText", () => {
 });
 
 describe("grokComplete (shunt)", () => {
+	const shuntBaseUrl = "http://gateway.test:8080";
+
 	test("posts Anthropic Messages to {shuntBaseUrl}/v1/messages with no auth and returns the text", async () => {
 		const { fetch, calls } = fakeFetch(() => shuntReply("<UPLIFT/>"));
 		const text = await grokComplete("SYS", "USER", {
 			transport: "shunt",
-			shuntBaseUrl: "http://gateway.test:3001/",
-			shuntModel: "grok-4.7-xhigh",
+			shuntBaseUrl: "http://gateway.test:8080/",
+			shuntModel: "grok-shunt-route",
 			shuntMaxTokens: 2048,
 			model: "grok-4.7",
 			reasoningEffort: "xhigh",
@@ -334,7 +336,7 @@ describe("grokComplete (shunt)", () => {
 		expect(text).toBe("<UPLIFT/>");
 		expect(calls).toHaveLength(1);
 		const call = calls[0]!;
-		expect(call.url).toBe("http://gateway.test:3001/v1/messages");
+		expect(call.url).toBe("http://gateway.test:8080/v1/messages");
 		expect(call.init.method).toBe("POST");
 		const headers = new Headers(call.init.headers);
 		expect(headers.get("content-type")).toBe("application/json");
@@ -343,29 +345,42 @@ describe("grokComplete (shunt)", () => {
 		expect(headers.get("x-api-key")).toBeNull();
 		expect(headers.get("x-xai-token-auth")).toBeNull();
 		expect(JSON.parse(String(call.init.body))).toEqual({
-			model: "grok-4.7-xhigh",
+			model: "grok-shunt-route",
 			max_tokens: 2048,
 			system: "SYS",
 			messages: [{ role: "user", content: "USER" }],
 		});
 	});
 
-	test("defaults to 127.0.0.1:3001, grok-4.7-xhigh and 8192 max_tokens, without touching grok login", async () => {
-		const { fetch, calls } = fakeFetch(() => shuntReply("ok"));
-		const home = mkdtempSync(join(tmpdir(), "aio-grok-empty-"));
+	test("an unset shuntBaseUrl throws naming the setting, without fetching or touching grok login", async () => {
+		const { fetch, calls } = fakeFetch(() => shuntReply("never"));
+		const home = mkdtempSync(join(tmpdir(), "ultrathink-grok-empty-"));
 		dirs.push(home);
-		const complete = createGrokCompleter({ transport: "shunt", home, fetch });
+		for (const url of [undefined, "", "  "]) {
+			const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl: url, shuntModel: "m", home, fetch }));
+			expect(error.message).toContain("grok.shuntBaseUrl");
+			expect(error.message).toContain("~/.config/ultrathink/config.json");
+			expect(isGrokAuthError(error)).toBe(false);
+		}
+		expect(calls).toHaveLength(0);
+	});
+
+	test("an unset shuntModel sends model, and max_tokens defaults to 8192, without touching grok login", async () => {
+		const { fetch, calls } = fakeFetch(() => shuntReply("ok"));
+		const home = mkdtempSync(join(tmpdir(), "ultrathink-grok-empty-"));
+		dirs.push(home);
+		const complete = createGrokCompleter({ transport: "shunt", shuntBaseUrl, shuntModel: "", model: "grok-4.6", home, fetch });
 		expect(await complete("S", "U")).toBe("ok");
-		expect(calls[0]!.url).toBe("http://127.0.0.1:3001/v1/messages");
+		expect(calls[0]!.url).toBe("http://gateway.test:8080/v1/messages");
 		const body = JSON.parse(String(calls[0]!.init.body));
-		expect(body.model).toBe("grok-4.7-xhigh");
+		expect(body.model).toBe("grok-4.6");
 		expect(body.max_tokens).toBe(8192);
 		expect(body.thinking).toBeUndefined();
 	});
 
 	test("non-2xx becomes a GrokHttpError with a redacted body", async () => {
 		const { fetch } = fakeFetch(() => new Response(`route missing for Bearer ${TOKEN}`, { status: 502 }));
-		const error = await rejection(grokComplete("S", "U", { transport: "shunt", fetch }));
+		const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl, fetch }));
 		expect(error).toBeInstanceOf(GrokHttpError);
 		if (!(error instanceof GrokHttpError)) return;
 		expect(error.status).toBe(502);
@@ -376,7 +391,7 @@ describe("grokComplete (shunt)", () => {
 
 	test("a 200 carrying an Anthropic error body is still an error", async () => {
 		const { fetch } = fakeFetch(() => Response.json({ type: "error", error: { type: "api_error", message: "upstream" } }));
-		const error = await rejection(grokComplete("S", "U", { transport: "shunt", fetch }));
+		const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl, fetch }));
 		expect(error).toBeInstanceOf(GrokHttpError);
 		expect(error.message).toBe("shunt api_error: upstream");
 	});
@@ -385,7 +400,7 @@ describe("grokComplete (shunt)", () => {
 		const { fetch, calls } = fakeFetch(() => shuntReply("never"));
 		const controller = new AbortController();
 		controller.abort();
-		const error = await rejection(grokComplete("S", "U", { transport: "shunt", fetch, signal: controller.signal }));
+		const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl, fetch, signal: controller.signal }));
 		expect(error.name).toBe("AbortError");
 		expect(calls).toHaveLength(0);
 	});
@@ -393,12 +408,12 @@ describe("grokComplete (shunt)", () => {
 	test("abort during the request surfaces as AbortError", async () => {
 		const controller = new AbortController();
 		const fetch = hangingFetch(() => controller.abort());
-		const error = await rejection(grokComplete("S", "U", { transport: "shunt", fetch, signal: controller.signal }));
+		const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl, fetch, signal: controller.signal }));
 		expect(error.name).toBe("AbortError");
 	});
 
 	test("timeout surfaces as a timed-out error", async () => {
-		const error = await rejection(grokComplete("S", "U", { transport: "shunt", fetch: hangingFetch(), timeoutMs: 20 }));
+		const error = await rejection(grokComplete("S", "U", { transport: "shunt", shuntBaseUrl, fetch: hangingFetch(), timeoutMs: 20 }));
 		expect(error.message).toBe("grok timed out after 20ms");
 	});
 });
@@ -406,7 +421,7 @@ describe("grokComplete (shunt)", () => {
 describe("grokComplete (cli)", () => {
 	/** Writes a fake `grok` binary that records argv/env/cwd and prints `reply(prompt)` as its JSON output. */
 	function fakeGrok(replyJs: string): { bin: string; argsPath: string } {
-		const dir = mkdtempSync(join(tmpdir(), "aio-grok-cli-"));
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-grok-cli-"));
 		dirs.push(dir);
 		const bin = join(dir, "grok");
 		const argsPath = join(dir, "args.json");
@@ -418,7 +433,7 @@ describe("grokComplete (cli)", () => {
 		return { bin, argsPath };
 	}
 
-	test("spawns the grok CLI tool-free in a scratch cwd and parses .text", async () => {
+	test("spawns the grok CLI tool-free in a private per-process scratch cwd and parses .text", async () => {
 		const { bin, argsPath } = fakeGrok('{ text: "<X>" + prompt + "</X>", stopReason: "end_turn" }');
 		const home = tempHome();
 		const text = await grokComplete("SYS", "USER TEXT", { transport: "cli", bin, home, model: "grok-4.6", reasoningEffort: "high", cwd: "/nonexistent" });
@@ -431,7 +446,9 @@ describe("grokComplete (cli)", () => {
 		};
 		expect(seen.prompt).toBe("USER TEXT");
 		expect(seen.env).toEqual({ GROK_HOME: home, GROK_SUBAGENTS: "0", GROK_MEMORY: "0", GROK_WEB_FETCH: "0" });
-		expect(seen.cwd).toBe(join(tmpdir(), "aio-grok-scratch"));
+		expect(realpathSync(dirname(seen.cwd))).toBe(realpathSync(tmpdir()));
+		expect(basename(seen.cwd)).toMatch(/^ultrathink-grok-.+$/);
+		expect(statSync(seen.cwd).mode & 0o777).toBe(0o700);
 		expect(seen.args.slice(0, 4)).toEqual(["-m", "grok-4.6", "--reasoning-effort", "high"]);
 		const after = (flag: string) => seen.args[seen.args.indexOf(flag) + 1];
 		expect(after("--tools")).toBe("none");
@@ -443,6 +460,20 @@ describe("grokComplete (cli)", () => {
 		expect(denied).toEqual(["Bash", "Edit", "Write"]);
 		for (const flag of ["--no-plan", "--no-subagents", "--disable-web-search", "--verbatim"]) expect(seen.args).toContain(flag);
 		expect(after("--system-prompt-override")).toBe("SYS");
+	});
+
+	test("reuses one scratch cwd within the process", async () => {
+		const first = fakeGrok('{ text: "a" }');
+		const second = fakeGrok('{ text: "b" }');
+		await grokComplete("SYS", "USER", { transport: "cli", bin: first.bin, home: tempHome() });
+		await grokComplete("SYS", "USER", { transport: "cli", bin: second.bin, home: tempHome() });
+		const firstSeen = JSON.parse(await Bun.file(first.argsPath).text()) as { cwd: string };
+		const secondSeen = JSON.parse(await Bun.file(second.argsPath).text()) as { cwd: string };
+		const firstCwd = firstSeen.cwd;
+		const secondCwd = secondSeen.cwd;
+		expect(basename(firstCwd)).toMatch(/^ultrathink-grok-/);
+		expect(secondCwd).toBe(firstCwd);
+		expect(statSync(firstCwd).isDirectory()).toBe(true);
 	});
 
 	test("a non-end_turn stopReason is an error even when partial text is present", async () => {

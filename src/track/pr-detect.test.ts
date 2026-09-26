@@ -24,7 +24,7 @@ describe("isGhPrCreateCommand", () => {
 
 describe("isPrCreationTool", () => {
 	test("shell tools count only when the command runs gh pr create", () => {
-		for (const tool of ["Bash", "run_terminal_command", "shell"]) {
+		for (const tool of ["Bash", "run_terminal_cmd", "run_terminal_command", "shell"]) {
 			expect(isPrCreationTool(tool, "gh pr create --fill")).toBe(true);
 			expect(isPrCreationTool(tool, "gh pr list")).toBe(false);
 		}
@@ -32,9 +32,17 @@ describe("isPrCreationTool", () => {
 	});
 
 	test("PR-creation tool names match regardless of server prefix or casing", () => {
-		expect(isPrCreationTool("mcp__aio__github_create_pull_request", undefined)).toBe(true);
+		expect(isPrCreationTool("mcp__acme__github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("github_create_pull_request", undefined)).toBe(true);
 		expect(isPrCreationTool("createPullRequest", undefined)).toBe(true);
+		expect(isPrCreationTool("mcp__github__pull_request_create", undefined)).toBe(true);
+		expect(isPrCreationTool("mcp__x__create-pull-request", undefined)).toBe(true);
+		expect(isPrCreationTool("CreatePullRequest", undefined)).toBe(true);
+	});
+
+	test("PR review and Copilot tools are not PR creation", () => {
+		expect(isPrCreationTool("mcp__github__create_pull_request_review", undefined)).toBe(false);
+		expect(isPrCreationTool("mcp__github__create_pull_request_with_copilot", undefined)).toBe(false);
 	});
 
 	test("other tools never match, even with a gh pr create command", () => {

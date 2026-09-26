@@ -21,7 +21,7 @@ const events: ProgressEvent[] = [
 	{ type: "begin", at: 6, sessionId: "s", engine: "grok", skill: "gsd-plan-phase" },
 	{ type: "graph", at: 6, total: 2, nodes: [{ id: "n1", title: "A", kind: "understand", dependsOn: [] }, { id: "n2", title: "B", kind: "generate", dependsOn: ["n1"] }] },
 	{ type: "node", at: 6, phase: "done", id: "n1", title: "A", kind: "understand", index: 0, total: 2, steps: ["Step 1: read"] },
-	{ type: "issue", at: 6, provider: "linear", nodeId: "n1", step: 2, identifier: "SPE-1", url: "https://linear.app/o/issue/SPE-1" },
+	{ type: "issue", at: 6, provider: "linear", nodeId: "n1", step: 2, identifier: "ENG-1", url: "https://linear.app/o/issue/ENG-1" },
 	{ type: "issue", at: 6, provider: "notion", nodeId: "n1", url: "https://www.notion.so/p" },
 	{ type: "end", at: 6, outcome: "planned" },
 ];

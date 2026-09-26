@@ -47,7 +47,7 @@ const view: PlanView = {
 	engine: "grok",
 	elapsedMs: 34_000,
 	nodes: [
-		{ id: "n1", title: "Design", kind: "analysis", wave: 0, dependsOn: [], issue: { identifier: "SPE-12", url: "https://l/SPE-12" }, steps: [{ step: 1, title: "a", identifier: "SPE-13" }] },
+		{ id: "n1", title: "Design", kind: "analysis", wave: 0, dependsOn: [], issue: { identifier: "ENG-12", url: "https://l/ENG-12" }, steps: [{ step: 1, title: "a", identifier: "ENG-13" }] },
 		{ id: "n2", title: "Build", kind: "task", wave: 1, dependsOn: ["n1"], steps: [] },
 	],
 	waves: [["n1"], ["n2"]],
@@ -91,7 +91,7 @@ describe("bar store", () => {
 		expect(store.get().delivery).toBe("pending");
 		store.delivered("aside", view, 5);
 		expect(store.get().phase).toBe("delivered");
-		expect(store.get().last).toEqual({ root: "BUILD_PROMPT", nodes: 2, issues: 2, subIssues: 1, firstIssue: "SPE-12", trackingStatus: "complete", elapsedMs: 34_000 });
+		expect(store.get().last).toEqual({ root: "BUILD_PROMPT", nodes: 2, issues: 2, subIssues: 1, firstIssue: "ENG-12", trackingStatus: "complete", elapsedMs: 34_000 });
 		expect(notified).toBe(5);
 	});
 
@@ -145,7 +145,7 @@ describe("renderBarLine", () => {
 		expect(line("planning")).toContain("0:34");
 		expect(line("pending")).toContain("→ plan arrives as aside");
 		expect(line("delivered")).toContain("BUILD_PROMPT · 2 nodes");
-		expect(line("delivered")).toContain("2 issues · 1 sub-issues (SPE-12)");
+		expect(line("delivered")).toContain("2 issues · 1 sub-issues (ENG-12)");
 		expect(line("delivered")).toContain("linear OK notion WW greptile ..");
 		expect(line("delivered")).toContain("grok");
 		expect(line("idle")).toContain("idle");
@@ -239,7 +239,7 @@ describe("renderBarLine", () => {
 		const partial = createBarStore();
 		partial.delivered("inline", { ...view, tracking: { status: "partial", errors: ["x"], issues: 1, subIssues: 0 } }, 1);
 		const raw = renderBarLine(partial.get(), fakeTheme(), 300, 1);
-		expect(plain(raw)).toContain("1 issues · 0 sub-issues (SPE-12) · partial");
+		expect(plain(raw)).toContain("1 issues · 0 sub-issues (ENG-12) · partial");
 		expect(raw).toContain("<warning> · partial");
 
 		const failed = createBarStore();
@@ -348,14 +348,14 @@ describe("live graph", () => {
 		const store = liveStore();
 		store.apply({ type: "node", at: 2_500, phase: "start", id: "a", title: "Design the schema", kind: "analysis", index: 0, total: 3 });
 		expect(store.get().model?.nodes[0]?.status).toBe("running");
-		store.apply({ type: "issue", at: 2_600, provider: "linear", nodeId: "a", step: 2, identifier: "SPE-2", url: "https://l/2" });
-		expect(store.get().model?.nodes[0]?.steps).toEqual([{ step: 2, title: "Step 2", issue: { identifier: "SPE-2", url: "https://l/2", at: 2_600 } }]);
+		store.apply({ type: "issue", at: 2_600, provider: "linear", nodeId: "a", step: 2, identifier: "ENG-2", url: "https://l/2" });
+		expect(store.get().model?.nodes[0]?.steps).toEqual([{ step: 2, title: "Step 2", issue: { identifier: "ENG-2", url: "https://l/2", at: 2_600 } }]);
 		store.apply({ type: "node", at: 3_000, phase: "done", id: "a", title: "Design the schema", kind: "analysis", index: 0, total: 3, steps: ["Step 1: x", "Step 2: y"] });
 		const node = store.get().model?.nodes[0];
 		expect(node?.status).toBe("done");
 		expect(node?.steps).toEqual([
 			{ step: 1, title: "Step 1: x", appearedAt: 3_000, issue: undefined },
-			{ step: 2, title: "Step 2: y", appearedAt: 3_000, issue: { identifier: "SPE-2", url: "https://l/2", at: 2_600 } },
+			{ step: 2, title: "Step 2: y", appearedAt: 3_000, issue: { identifier: "ENG-2", url: "https://l/2", at: 2_600 } },
 		]);
 		store.apply({ type: "node", at: 3_100, phase: "done", id: "b", title: "Build the API", kind: "task", index: 1, total: 3, fallback: true });
 		expect(store.get().model?.nodes[1]?.status).toBe("fallback");
@@ -363,15 +363,15 @@ describe("live graph", () => {
 
 	test("notion refs mark the node and never replace a linear ref", () => {
 		const store = liveStore();
-		store.apply({ type: "issue", at: 2_100, provider: "linear", nodeId: "a", identifier: "SPE-1", url: "https://l/1" });
+		store.apply({ type: "issue", at: 2_100, provider: "linear", nodeId: "a", identifier: "ENG-1", url: "https://l/1" });
 		store.apply({ type: "issue", at: 2_200, provider: "notion", nodeId: "a", url: "https://n/1" });
 		store.apply({ type: "issue", at: 2_300, provider: "notion", nodeId: "b", url: "https://n/2" });
 		const [a, b] = store.get().model?.nodes ?? [];
 		expect(a?.notion).toBe(true);
-		expect(a?.issue?.identifier).toBe("SPE-1");
+		expect(a?.issue?.identifier).toBe("ENG-1");
 		expect(b?.issue?.url).toBe("https://n/2");
-		store.apply({ type: "issue", at: 2_400, provider: "linear", nodeId: "b", identifier: "SPE-3", url: "https://l/3" });
-		expect(store.get().model?.nodes[1]?.issue?.identifier).toBe("SPE-3");
+		store.apply({ type: "issue", at: 2_400, provider: "linear", nodeId: "b", identifier: "ENG-3", url: "https://l/3" });
+		expect(store.get().model?.nodes[1]?.issue?.identifier).toBe("ENG-3");
 	});
 
 	test("delivered without events builds a settled model from the view", () => {
@@ -383,7 +383,7 @@ describe("live graph", () => {
 			["n1", "done", undefined, []],
 			["n2", "done", undefined, ["n1"]],
 		]);
-		expect(model?.nodes[0]?.issue).toEqual({ identifier: "SPE-12", url: "https://l/SPE-12" });
+		expect(model?.nodes[0]?.issue).toEqual({ identifier: "ENG-12", url: "https://l/ENG-12" });
 	});
 
 	test("delivery settles a node aborted mid-fill and stops animating after the linger window", () => {

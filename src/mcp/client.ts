@@ -35,6 +35,16 @@ interface ToolResult {
 	isError?: boolean;
 }
 
+/**
+ * What to run when `provider` has no usable credential: OAuth login, plus the API-key route where the provider
+ * takes one (a personal key created in the provider's account settings).
+ */
+export function loginHint(provider: ProviderId): string {
+	const login = `ultrathink-mcp auth login ${provider}`;
+	if (!PROVIDERS[provider].apiKey) return `run: ${login}`;
+	return `run: ${login} (OAuth) or ultrathink-mcp auth set-key ${provider} --stdin (API key from your ${PROVIDERS[provider].label} account settings)`;
+}
+
 function short(text: string): string {
 	const line = text.replace(/\s+/g, " ").trim();
 	return line.length > 200 ? `${line.slice(0, 197)}...` : line;
@@ -64,9 +74,7 @@ export function createMcpClient(provider: ProviderId, deps: McpClientDeps): McpC
 	const relay = createRelay({
 		url: PROVIDERS[provider].url,
 		userAgent: USER_AGENT,
-		loginHint: PROVIDERS[provider].apiKey
-			? `run: ultrathink-mcp auth set-key ${provider} --stdin`
-			: `run: ultrathink-mcp auth login ${provider}`,
+		loginHint: loginHint(provider),
 		fetch: deps.fetch,
 		auth: {
 			header: () => resolveAuthHeader(provider, authDeps),

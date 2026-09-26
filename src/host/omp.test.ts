@@ -682,7 +682,7 @@ describe("pr sync", () => {
 		track(PLAN);
 		const { emit, sent } = setup(async () => "", 1_000, { stateDir: dir });
 		emit("tool_result", result("github", { op: "pr_create", title: "Feat" }, `# Created Pull Request #12: Feat\n\nURL: ${PR}`));
-		emit("tool_result", result("mcp__aio_github_create_pull_request", { owner: "o", repo: "r" }, JSON.stringify({ number: 13, html_url: PR_13 })));
+		emit("tool_result", result("mcp__acme_github_create_pull_request", { owner: "o", repo: "r" }, JSON.stringify({ number: 13, html_url: PR_13 })));
 		expect(sent).toMatchObject([
 			{ message: { customType: "ultrathink-sync", details: { url: PR, number: 12 } } },
 			{ message: { customType: "ultrathink-sync", details: { url: PR_13, number: 13 } } },
@@ -697,7 +697,7 @@ describe("ship nudge", () => {
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-	const CONFIG: ShipConfig = { ...DEFAULT_SHIP_CONFIG, skills: ["gsd-"] };
+	const CONFIG: ShipConfig = { ...DEFAULT_SHIP_CONFIG, enabled: true, skills: ["gsd-"] };
 	const OK: ShipPrecheck = { ok: true, reason: "ok", branch: "feat/x", base: "master", ahead: 2 };
 	const record = (extra: Record<string, unknown> = {}) =>
 		writeSession(dir, {

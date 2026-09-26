@@ -10,4 +10,4 @@ Ultrathink control command. The Ultrathink prompt hook normally answers it befor
 "${CLAUDE_PLUGIN_ROOT}/bin/ultrathink" status $ARGUMENTS
 ```
 
-If that path is not absolute, run `bin/ultrathink status` from the installed Ultrathink plugin directory instead.
+If `CLAUDE_PLUGIN_ROOT` is not set in your shell, that path does not exist. Do not search for or run any other `bin/ultrathink`. Ask the user for the directory where they installed Ultrathink (the one that contains both `bin/ultrathink` and `hooks/hooks.json`). Only after they give it, run `"<that directory>/bin/ultrathink" status $ARGUMENTS` and reply with its output only.

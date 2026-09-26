@@ -14,6 +14,11 @@ pre_llm_call delivers it. Each PR URL is nudged once per session. When a coding
 turn is about to finish (pre_verify) and the session's tracked plan has not been
 synced, the turn continues once with a nudge to run ultrathink-sync.
 
+When Hermes does not report its hook cap, the bridge reads plugins.hook_callback_timeout
+from ${HERMES_HOME:-~/.hermes}/config.yaml, else assumes Hermes' 30 s default. When the
+engine is not beside the plugin (a copied directory, not a symlink into a clone), Bun never
+starts. Each case logs one warning naming the fix.
+
 The /ultrathink-<verb> slash commands run bin/ultrathink against the engine's
 state directory; /ultrathink-quick sends one message that pre_llm_call leaves
 unplanned.
@@ -39,6 +44,8 @@ CLI = REPO_ROOT / "bin" / "ultrathink"
 DEFAULT_TIMEOUT_S = 540  # planning takes minutes; stay below Hermes' 600s hook cap maximum
 HOOK_MARGIN_S = 15  # the bridge's deadline ends this long before Hermes abandons the hook
 MIN_PLAN_S = 90  # below this a plan cannot finish, so Bun is not started at all
+HERMES_DEFAULT_CAP_S = 30.0  # Hermes' plugins.hook_callback_timeout when its config sets none
+HERMES_MAX_CAP_S = 600.0  # Hermes clamps a larger plugins.hook_callback_timeout to this
 CONTROL_TIMEOUT_S = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
@@ -47,14 +54,16 @@ SENDER_TAG_RE = re.compile(r"\[([^\]\n]*)\]\s+")
 SKILL_SCAFFOLD_PREFIX = "[IMPORTANT: The user has invoked the "
 
 # Ports of src/track/pr-detect.ts. JavaScript's \s, \b, and \d are spelled out
-# because Python's are Unicode-aware and disagree with them at the edges.
+# because Python's are Unicode-aware and disagree with them at the edges; its $
+# (no m flag) is \Z, since Python's $ also matches before a trailing newline.
 JS_SPACE = r"\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 GH_PR_CREATE_RE = re.compile(rf"(?<![A-Za-z0-9_])gh[{JS_SPACE}]+pr[{JS_SPACE}]+create(?![A-Za-z0-9_])")
 PR_URL_RE = re.compile(rf"https://github\.com/[^{JS_SPACE}/]+/[^{JS_SPACE}/]+/pull/[0-9]+")
+# The name must end in the verb: create_pull_request_review or _with_copilot does not open a PR.
 PR_TOOL_RE = re.compile(
-	r"create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest", re.ASCII | re.IGNORECASE
+	r"(?:create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest)\Z", re.ASCII | re.IGNORECASE
 )
-SHELL_TOOLS = frozenset({"Bash", "bash", "run_terminal_command", "shell", "exec", "terminal"})
+SHELL_TOOLS = frozenset({"Bash", "bash", "run_terminal_command", "run_terminal_cmd", "shell", "exec", "terminal"})
 
 # Port of src/uplift/detect.ts isAlreadyUplifted: ROOT_TAGS (src/types.ts) plus "uplifted"
 # and "ultrathink", case-insensitive. JavaScript's \w is ASCII.
@@ -64,9 +73,15 @@ UPLIFTED_ROOTS = frozenset(
 )
 UPLIFTED_TAG_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_.-]*)")
 
+# config.yaml, read line by line when Hermes does not report its hook cap. A YAML
+# comment starts with "#" at the start of a line or after whitespace.
+YAML_COMMENT_RE = re.compile(r"(?:^|\s)#.*")
+PLUGINS_KEY_RE = re.compile(r"plugins\s*:")
+HOOK_CAP_KEY_RE = re.compile(r"hook_callback_timeout\s*:(?:\s+(.*))?")
+
 logger = logging.getLogger(__name__)
-_cap_lock = threading.Lock()
-_cap_warned = False  # the short-cap warning is logged once per process
+_warn_lock = threading.Lock()
+_warned: set[str] = set()  # warnings this process already logged, each once: "cap" (hook cap), "engine"
 
 # Hooks fire from the agent thread and from parallel tool workers.
 _pr_lock = threading.Lock()
@@ -95,15 +110,115 @@ def timeout_seconds() -> int:
 	return value if value > 0 else DEFAULT_TIMEOUT_S
 
 
+def _first_warning(key: str) -> bool:
+	"""True only the first time this process asks to log warning `key`."""
+	with _warn_lock:
+		if key in _warned:
+			return False
+		_warned.add(key)
+		return True
+
+
 def host_hook_cap() -> float | None:
 	"""The pre_llm_call cap Hermes enforces right now, resolved the way Hermes does per
-	hook invocation; None outside Hermes."""
+	hook invocation; None outside Hermes (hermes_cli.plugins not importable). A Hermes
+	whose private resolver is missing or fails gets plugins.hook_callback_timeout from
+	the active profile's config.yaml (_hermes_config_file), else Hermes' 30 s default,
+	and one warning."""
 	try:
-		from hermes_cli.plugins import _resolve_hook_callback_timeout  # type: ignore[import-not-found]
-
-		return float(_resolve_hook_callback_timeout())
+		from hermes_cli import plugins as hermes_plugins  # type: ignore[import-not-found]
 	except Exception:
 		return None
+	try:
+		return float(hermes_plugins._resolve_hook_callback_timeout())
+	except Exception:
+		pass
+	config = _hermes_config_file()
+	configured = None if config is None else _config_hook_cap(config)
+	cap = HERMES_DEFAULT_CAP_S if configured is None else configured
+	if _first_warning("cap"):
+		if configured is not None:
+			source = f"plugins.hook_callback_timeout = {cap:g} from {config}"
+		elif config is not None:
+			source = f"Hermes' {cap:g}s default, as {config} sets no plugins.hook_callback_timeout"
+		else:
+			source = f"Hermes' {cap:g}s default, as the active Hermes profile (active_profile) has no directory"
+		logger.warning(
+			"ultrathink: this Hermes does not report its plugin hook cap, so ultrathink uses %s; "
+			"prompts are planned only when the cap is at least %ss (`hermes config set plugins.hook_callback_timeout 600`)",
+			source,
+			MIN_PLAN_S + HOOK_MARGIN_S,
+		)
+	return cap
+
+
+def _hermes_config_file() -> Path | None:
+	"""The config.yaml Hermes reads, resolved like its profile override (and scripts/mcp-register.ts
+	hermesConfigFile): a HERMES_HOME that is a `<root>/profiles/<name>` directory is used as is;
+	otherwise a non-default `active_profile` in the Hermes root selects `profiles/<name>` under
+	HERMES_HOME (or ~/.hermes). None when that profile cannot be resolved, which Hermes refuses to run with."""
+	native = Path.home() / ".hermes"
+	raw = os.environ.get("HERMES_HOME", "").strip()
+	# Expanded the way Hermes expands HERMES_HOME.
+	env_home = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
+	if env_home is not None and env_home.parent.name == "profiles":
+		return env_home / "config.yaml"
+	base = env_home or native
+	env_path = None if env_home is None else env_home.absolute()
+	root = native if env_path is None or env_path == native or native in env_path.parents else base
+	try:
+		active = (root / "active_profile").read_text(encoding="utf-8").strip().lower()
+	except (OSError, ValueError):
+		active = ""
+	if not active or active == "default":
+		return base / "config.yaml"
+	if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", active) is None:
+		return None
+	profile = base / "profiles" / active
+	return profile / "config.yaml" if profile.exists() else None
+
+
+def _config_hook_cap(path: Path) -> float | None:
+	"""plugins.hook_callback_timeout in the Hermes config.yaml at `path`, applied the way
+	Hermes applies it: a negative value is ignored, one over HERMES_MAX_CAP_S is clamped.
+	A line parser, not YAML: only a `hook_callback_timeout:` key at the indentation of the
+	top-level `plugins:` block's own keys counts. None when unreadable, unset or not a number."""
+	try:
+		lines = path.read_text(encoding="utf-8-sig").splitlines()
+	except (OSError, ValueError):
+		return None
+	raw: str | None = None
+	in_plugins = False
+	key_indent: int | None = None  # the indentation of the plugins: block's keys, from its first line
+	for line in lines:
+		text = YAML_COMMENT_RE.sub("", line).rstrip()
+		if not text.strip():
+			continue
+		indent = len(text) - len(text.lstrip(" "))
+		if indent == 0:
+			# A repeated top-level plugins: replaces the earlier block, as a duplicate YAML key does.
+			in_plugins = PLUGINS_KEY_RE.fullmatch(text) is not None
+			key_indent = None
+			if in_plugins:
+				raw = None
+			continue
+		if not in_plugins:
+			continue
+		if key_indent is None:
+			key_indent = indent
+		match = HOOK_CAP_KEY_RE.fullmatch(text[indent:]) if indent == key_indent else None
+		if match is not None:
+			raw = match.group(1) or ""
+	if raw is None:
+		return None
+	value = raw.strip()
+	if len(value) > 1 and value[0] == value[-1] and value[0] in "'\"":
+		value = value[1:-1]
+	try:
+		cap = float(value)
+	except ValueError:
+		return None
+	return None if cap < 0 else min(cap, HERMES_MAX_CAP_S)
 
 
 def plan_deadline() -> float | None:
@@ -126,17 +241,13 @@ def is_already_uplifted(text: str) -> bool:
 
 
 def _warn_short_cap() -> None:
-	global _cap_warned
-	with _cap_lock:
-		if _cap_warned:
-			return
-		_cap_warned = True
-	logger.warning(
-		"ultrathink: Hermes hook cap %ss leaves under %ss to plan, so prompts go unplanned; "
-		"run `hermes config set plugins.hook_callback_timeout 600`",
-		host_hook_cap(),
-		MIN_PLAN_S,
-	)
+	if _first_warning("cap"):
+		logger.warning(
+			"ultrathink: Hermes hook cap %ss leaves under %ss to plan, so prompts go unplanned; "
+			"run `hermes config set plugins.hook_callback_timeout 600`",
+			host_hook_cap(),
+			MIN_PLAN_S,
+		)
 
 
 def message_text(message: Any) -> str:
@@ -213,6 +324,16 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 	}
 	child_env["ULTRATHINK_HOST"] = "hermes"
 	bun = child_env.get("BUN")
+	# A plugin directory copied out of its clone has no engine (nor bin/run-bun) beside it.
+	missing = next((path for path in ((ENGINE,) if bun else (ENGINE, RUN_BUN)) if not path.exists()), None)
+	if missing is not None:
+		if _first_warning("engine"):
+			logger.warning(
+				"ultrathink: %s not found; install hosts/hermes as a symlink into a full clone of ultrathink "
+				"(docs/install.md#hermes-agent)",
+				missing,
+			)
+		return ""
 	# BUN is an explicit override; otherwise bin/run-bun finds bun even when
 	# PATH lacks it, and exits 0 with no output when bun is missing.
 	command = [bun, str(ENGINE)] if bun else [str(RUN_BUN), str(ENGINE)]
@@ -499,7 +620,7 @@ def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, s
 	text = completed.stdout.strip()
 	if completed.returncode == 0 and text:
 		return True, text
-	# bin/run-bun exits 0 with no output when bun is missing and says so on stderr.
+	# A failing CLI says why on stderr: without bun, bin/ultrathink exits 127 with an install hint.
 	lines = [line.strip() for line in f"{completed.stderr}\n{text}".splitlines() if line.strip()]
 	detail = next((line for line in lines if line.startswith("error:")), lines[0] if lines else "")
 	return False, f"{label} failed: {detail or f'exit code {completed.returncode}'}"

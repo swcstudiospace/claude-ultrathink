@@ -261,7 +261,7 @@ describe("buildPr", () => {
 			graph: { goal: "x".repeat(100), nodes: [] },
 			plan: { graphId: "g-1" },
 			tracking: {
-				linear: { nodes: { n1: { id: "1", identifier: "SPE-12", url: "https://linear.app/i/SPE-12", title: "Do\u0007 it" } }, steps: {} },
+				linear: { nodes: { n1: { id: "1", identifier: "ENG-12", url: "https://linear.app/i/ENG-12", title: "Do\u0007 it" } }, steps: {} },
 				notion: { taskUrl: "https://notion.so/t", nodes: {}, steps: {} },
 			},
 		} as unknown as SessionRecord;
@@ -277,7 +277,7 @@ describe("buildPr", () => {
 		expect(title).toHaveLength(72);
 		expect(title.endsWith("…")).toBe(true);
 		expect(body).toContain("## Summary\n\nAll phases verified");
-		expect(body).toContain("Fixes SPE-12 — Do it\nhttps://linear.app/i/SPE-12");
+		expect(body).toContain("Fixes ENG-12 — Do it\nhttps://linear.app/i/ENG-12");
 		expect(body).toContain("https://notion.so/t");
 		expect(body).toContain("- Done: yes");
 		expect(body).toContain("  - docs");

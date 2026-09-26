@@ -20,7 +20,8 @@ export function stateDirForHost(host: HostId, env: Record<string, string | undef
 		case "grok-build": {
 			const data = env.GROK_PLUGIN_DATA?.trim();
 			if (data) return join(data, "ultrathink");
-			return join(homedir(), ".grok", "plugin-data", "ultrathink");
+			const home = env.GROK_HOME?.trim() || join(homedir(), ".grok");
+			return join(home, "plugin-data", "ultrathink");
 		}
 		case "hermes": {
 			const home = env.HERMES_HOME?.trim() || join(homedir(), ".hermes");

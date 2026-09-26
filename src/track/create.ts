@@ -34,7 +34,7 @@ export interface CreateTrackingDeps {
 
 const LINEAR_URL_RE = /https:\/\/linear\.app\/\S+?\/issue\/[A-Z][A-Z0-9]*-\d+[^\s"')\]]*/;
 const IDENTIFIER_RE = /\b[A-Z][A-Z0-9]*-\d+\b/;
-const NOTION_URL_RE = /https:\/\/(?:www\.)?notion\.(?:so|site)\/[^\s"')\]<>]+/g;
+const NOTION_URL_RE = /https:\/\/(?:(?:www\.)?notion\.(?:so|site)|app\.notion\.com)\/[^\s"')\]<>]+/g;
 const NOTION_BATCH = 25;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -103,7 +103,42 @@ function latestVerification(cwd: string): GsdSignals["verification"] {
 	return undefined;
 }
 
-function collectGsd(run: Run, cwd: string, gsdTools: string): GsdSignals | undefined {
+type Env = Record<string, string | undefined>;
+
+/** Where GSD installs gsd-tools.cjs, in lookup order: project-local installs (incl. legacy), then each host's config dir, then the legacy home path. */
+export function gsdToolsCandidates(cwd: string, env: Env, home: string): string[] {
+	const tool = (dir: string): string => join(dir, "gsd-core", "bin", "gsd-tools.cjs");
+	return [
+		tool(cwd),
+		tool(join(cwd, ".claude")),
+		tool(join(cwd, ".codex")),
+		join(cwd, ".claude", "get-shit-done", "bin", "gsd-tools.cjs"),
+		...(env.CLAUDE_CONFIG_DIR ? [tool(env.CLAUDE_CONFIG_DIR)] : []),
+		tool(join(home, ".claude")),
+		tool(join(home, ".agents")),
+		tool(env.HERMES_HOME || join(home, ".hermes")),
+		tool(env.CODEX_HOME || join(home, ".codex")),
+		tool(env.GEMINI_CONFIG_DIR || join(home, ".gemini")),
+		tool(join(home, ".cursor")),
+		tool(join(env.XDG_CONFIG_HOME || join(home, ".config"), "opencode")),
+		join(home, ".claude", "get-shit-done", "bin", "gsd-tools.cjs"),
+	];
+}
+
+/** `GSD_TOOLS` when set, else the first installed gsd-tools.cjs; undefined when GSD is not installed anywhere known. */
+export function resolveGsdTools(input: {
+	cwd: string;
+	env?: Env;
+	home?: string;
+	exists?: (path: string) => boolean;
+}): string | undefined {
+	const env = input.env ?? process.env;
+	if (env.GSD_TOOLS) return env.GSD_TOOLS;
+	const exists = input.exists ?? existsSync;
+	return gsdToolsCandidates(input.cwd, env, input.home ?? homedir()).find((path) => exists(path));
+}
+
+function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSignals | undefined {
 	if (!existsSync(join(cwd, ".planning", "ROADMAP.md"))) return undefined;
 	const trusted =
 		run(["git", "ls-files", "--error-unmatch", ".planning/ROADMAP.md"], { cwd }).exitCode === 0 ||
@@ -114,10 +149,16 @@ function collectGsd(run: Run, cwd: string, gsdTools: string): GsdSignals | undef
 	} catch {
 		state = undefined;
 	}
-	// Roadmap counts fail open to 0/0; trust and state still gate shipping.
+	// Roadmap counts fail open to 0/0; trust and state still gate shipping. Tools or node that are not installed are a gap.
 	let phaseCount = 0;
 	let completedPhases = 0;
-	const text = out(run, ["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], cwd);
+	const verification = latestVerification(cwd);
+	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification, toolsMissing: true };
+	const analyzed = run(["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], { cwd });
+	if (analyzed.exitCode === 127 || /ENOENT/.test(analyzed.stderr)) {
+		return { phaseCount, completedPhases, trusted, state, verification, nodeMissing: true };
+	}
+	const text = analyzed.exitCode === 0 ? analyzed.stdout.trim() : "";
 	try {
 		const parsed = text ? (JSON.parse(text) as { phase_count?: unknown; completed_phases?: unknown }) : {};
 		if (typeof parsed.phase_count === "number") phaseCount = parsed.phase_count;
@@ -125,7 +166,7 @@ function collectGsd(run: Run, cwd: string, gsdTools: string): GsdSignals | undef
 	} catch {
 		phaseCount = 0;
 	}
-	return { phaseCount, completedPhases, trusted, state, verification: latestVerification(cwd) };
+	return { phaseCount, completedPhases, trusted, state, verification };
 }
 
 function collectGraph(record: SessionRecord): ShipSignals["graph"] {
@@ -136,10 +177,16 @@ function collectGraph(record: SessionRecord): ShipSignals["graph"] {
 	return { nodes: graph.nodes.length, workflowUnits };
 }
 
-export function collectSignals(input: { cwd: string; record: SessionRecord; run?: Run; gsdTools?: string }): ShipSignals {
+export function collectSignals(input: {
+	cwd: string;
+	record: SessionRecord;
+	run?: Run;
+	gsdTools?: string;
+	env?: Env;
+	home?: string;
+}): ShipSignals {
 	const run = input.run ?? defaultRun;
-	const gsdTools =
-		input.gsdTools ?? process.env.GSD_TOOLS ?? join(homedir(), ".agents", "gsd-core", "bin", "gsd-tools.cjs");
+	const gsdTools = input.gsdTools ?? resolveGsdTools({ cwd: input.cwd, env: input.env, home: input.home });
 	return {
 		git: collectGit(run, input.cwd),
 		gsd: collectGsd(run, input.cwd, gsdTools),

@@ -9,7 +9,8 @@
  * tracking contract into the global ~/.claude/CLAUDE.md between marker
  * comments. Without `claude` those steps are skipped. It always installs the
  * Grok rule and global hooks under $GROK_HOME (default ~/.grok). Idempotent —
- * re-running updates in place rather than duplicating.
+ * re-running updates in place rather than duplicating. rollback undoes what
+ * apply recorded and prints (never runs) the Claude Code plugin uninstall.
  *
  * Unlike the source repo's claude-setup.ts, this never touches
  * ~/.claude/settings.json — this plugin has no env vars or local proxy to
@@ -18,6 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const START_MARKER = "<!-- ultrathink:start -->";
 const END_MARKER = "<!-- ultrathink:end -->";
@@ -26,28 +28,28 @@ const BLOCK_RE = /<!-- ultrathink:start -->[\s\S]*?<!-- ultrathink:end -->/;
 const CLAUDE_MD_BLOCK = `${START_MARKER}
 ## Ultrathink task tracking
 
-All Claude Code work in this project is tracked in Notion and Linear via the
-\`ultrathink\` plugin:
-
-- Notion: the configured Notion database (\`notion.dataSourceUrl\`).
-- Linear: the configured Linear team (\`linear.team\`).
-
-Both come from the ultrathink config (\`~/.config/ultrathink/config.json\`,
+The \`ultrathink\` plugin can track Claude Code work in Notion and Linear.
+Tracking is configured when \`/ultrathink-status\` (or \`bin/ultrathink status\`
+run from the ultrathink plugin directory) shows a Notion database
+(\`notion.dataSourceUrl\`) or a Linear team (\`linear.team\`). Both come from the
+ultrathink config (\`~/.config/ultrathink/config.json\`,
 \`~/.claude/ultrathink.json\`, \`<project>/.claude/ultrathink.json\`; later files
-win). A tracker that is not configured is skipped.
+win), and a tracker that is not configured is skipped.
 
-Workflow (handled automatically by the plugin's hooks and skills — you do not
-need to do this by hand):
+When tracking is configured, the plugin's hooks and skills do the following for
+each configured tracker automatically — you do not need to do it by hand:
 1. Every uplifted prompt creates one Notion \`Task\` row (\`ultrathink-kickoff\` skill).
-2. Every Graph-of-Thought node creates one Notion \`Issue\` row plus a matching Linear issue.
-3. Every node's Chain-of-Thought fill creates one Notion \`Sub-Issue\` row plus a matching Linear sub-issue.
+2. Every Graph-of-Thought node creates one Notion \`Issue\` row and one Linear issue.
+3. Every node's Chain-of-Thought fill creates one Notion \`Sub-Issue\` row and one Linear sub-issue.
 4. Issues nest under their Task, Sub-Issues under their Issue, via \`Parent Item\`.
 5. Each Issue/Sub-Issue carries its Linear URL; each Task carries PR URL/number/repo/branch once opened (\`ultrathink-sync\` skill).
 6. Rows are found by \`Graph ID\` and updated in place — never duplicated.
 
-If you are asked to do Notion/Linear tracking work outside of a prompt the
-\`ultrathink\` hook already tagged, invoke the \`ultrathink-kickoff\` or
-\`ultrathink-sync\` skill directly rather than improvising the field mapping.
+When tracking is configured and you are asked to do Notion/Linear tracking work
+outside of a prompt the \`ultrathink\` hook already tagged, invoke the
+\`ultrathink-kickoff\` or \`ultrathink-sync\` skill directly rather than
+improvising the field mapping. When it is not configured, ultrathink creates no
+Notion or Linear rows.
 ${END_MARKER}`;
 
 export function claudeMdPath(env: Record<string, string | undefined> = process.env): string {
@@ -110,11 +112,26 @@ export function grokHome(env: Record<string, string | undefined> = process.env):
 	return env.GROK_HOME?.trim() || join(homedir(), ".grok");
 }
 
-export function ensureMcpServer(name: string, url: string, run: Run = defaultRun): { added: boolean; message: string } {
-	const list = run(["claude", "mcp", "list"]);
-	if (list.code === 0 && list.stdout.includes(name)) {
-		return { added: false, message: `${name}: already configured` };
+/** Server names from `claude mcp list`: the text before the first `": "` of each line (`<name>: <command or url> - <health>`). */
+export function mcpListNames(stdout: string): string[] {
+	const names: string[] = [];
+	for (const raw of stdout.split("\n")) {
+		const line = raw.trim();
+		const end = line.indexOf(": ");
+		if (end > 0) names.push(line.slice(0, end));
 	}
+	return names;
+}
+
+/** Exact-name lookup: `claude mcp get <name>` exits 0 only for that server; otherwise an exact first-field match in `claude mcp list` (CLIs without `get`). */
+export function mcpServerConfigured(name: string, run: Run = defaultRun): boolean {
+	if (run(["claude", "mcp", "get", name]).code === 0) return true;
+	const list = run(["claude", "mcp", "list"]);
+	return list.code === 0 && mcpListNames(list.stdout).includes(name);
+}
+
+export function ensureMcpServer(name: string, url: string, run: Run = defaultRun): { added: boolean; message: string } {
+	if (mcpServerConfigured(name, run)) return { added: false, message: `${name}: already configured` };
 	const add = run(["claude", "mcp", "add", "--transport", "http", "--scope", "user", name, url]);
 	if (add.code !== 0) return { added: false, message: `${name}: failed — ${add.stderr.trim() || add.stdout.trim()}` };
 	return { added: true, message: `${name}: added` };
@@ -170,9 +187,9 @@ interface HookGroup {
 
 /**
  * Grok 1.0.40 discovers the plugin's hooks/hooks.json but never dispatches plugin
- * hooks; only `~/.grok/hooks/*.json` runs. This mirrors hooks.json with absolute
- * paths. GROK_PLUGIN_DATA is unset there, so paths.ts falls back to
- * ~/.grok/plugin-data/ultrathink — the path the installed rule points at.
+ * hooks; only `${GROK_HOME:-~/.grok}/hooks/*.json` runs. This mirrors hooks.json
+ * with absolute paths. GROK_PLUGIN_DATA is unset there, so paths.ts falls back to
+ * ${GROK_HOME:-~/.grok}/plugin-data/ultrathink, the path the installed rule points at.
  */
 export function grokHooksConfig(repoRoot: string): { hooks: Record<string, unknown[]> } {
 	const root = resolve(repoRoot);
@@ -217,8 +234,8 @@ export function apply(
 	};
 	if (!claudeAvailable(run)) return { grok };
 
-	const notion = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
-	const linear = ensureMcpServer("linear", "https://mcp.linear.app/mcp", run);
+	const notion = ensureMcpServer("notion", SETUP_MCP_URLS.notion, run);
+	const linear = ensureMcpServer("linear", SETUP_MCP_URLS.linear, run);
 	const plugin = ensurePluginInstalled(repoRoot, run);
 
 	const path = claudeMdPath(env);
@@ -229,7 +246,9 @@ export function apply(
 		writeFileSync(path, after);
 	}
 
-	writeSetupState({ notionAdded: notion.added, linearAdded: linear.added }, env);
+	// A re-run finds the servers it added earlier already present; keep them recorded so rollback still removes them.
+	const previous = readSetupState(env);
+	writeSetupState({ notionAdded: notion.added || previous.notionAdded, linearAdded: linear.added || previous.linearAdded }, env);
 
 	return { claude: { notion, linear, plugin, claudeMd: { path, changed: after !== before } }, grok };
 }
@@ -243,15 +262,14 @@ export function status(env: Record<string, string | undefined> = process.env, ru
 		`Grok rule: ${ruleOk ? "installed" : "missing — run: bun scripts/setup.ts apply"} (${rulePath})`,
 		`Grok hooks: ${existsSync(hooksPath) ? "installed" : "missing — run: bun scripts/setup.ts apply"} (${hooksPath})`,
 	];
-	const mcpList = run(["claude", "mcp", "list"]);
-	if (mcpList.code === 127) return ["Claude Code: claude CLI not found", ...grok].join("\n");
+	if (!claudeAvailable(run)) return ["Claude Code: claude CLI not found", ...grok].join("\n");
 	const path = claudeMdPath(env);
 	const claudeMdOk = existsSync(path) && BLOCK_RE.test(readFileSync(path, "utf8"));
-	const notionOk = mcpList.code === 0 && mcpList.stdout.includes("notion");
-	const linearOk = mcpList.code === 0 && mcpList.stdout.includes("linear");
+	const notionOk = mcpServerConfigured("notion", run);
+	const linearOk = mcpServerConfigured("linear", run);
 	return [
-		`Notion MCP: ${notionOk ? "configured" : "missing — run: claude mcp add --transport http --scope user notion https://mcp.notion.com/mcp"}`,
-		`Linear MCP: ${linearOk ? "configured" : "missing — run: claude mcp add --transport http --scope user linear https://mcp.linear.app/mcp"}`,
+		`Notion MCP: ${notionOk ? "configured" : `missing — run: claude mcp add --transport http --scope user notion ${SETUP_MCP_URLS.notion}`}`,
+		`Linear MCP: ${linearOk ? "configured" : `missing — run: claude mcp add --transport http --scope user linear ${SETUP_MCP_URLS.linear}`}`,
 		`CLAUDE.md contract: ${claudeMdOk ? `present at ${path}` : `missing at ${path} — run: bun scripts/setup.ts apply`}`,
 		...grok,
 	].join("\n");
@@ -268,18 +286,103 @@ function removeBlock(path: string, deleteEmpty: boolean): boolean {
 	return true;
 }
 
+/** The hosted servers `apply` adds at user scope. */
+export const SETUP_MCP_URLS = { notion: "https://mcp.notion.com/mcp", linear: "https://mcp.linear.app/mcp" } as const;
+
+/**
+ * `error`: the check or removal failed; the server stays recorded so a later rollback retries it.
+ * `kept`: nothing to undo any more — `changed` (the user replaced setup's entry) or `gone` (no server by that name).
+ */
+export interface McpRemoval {
+	removed: boolean;
+	error?: string;
+	kept?: "changed" | "gone";
+}
+
 export interface RollbackResult {
 	claudeMd: { changed: boolean };
-	notion: { removed: boolean };
-	linear: { removed: boolean };
+	notion: McpRemoval;
+	linear: McpRemoval;
+	/** `kept` when a removal failed and the file still records what is left to undo. */
+	state: { path: string; status: "removed" | "kept" | "absent" };
 	grok: { rule: { path: string; removed: boolean }; hooks: { path: string; removed: boolean } };
+}
+
+/** Plugin removal is left to the user: uninstalling from a running Claude Code session is theirs to decide. */
+export const PLUGIN_UNINSTALL_COMMANDS = ["claude plugin uninstall ultrathink@ultrathink", "claude plugin marketplace remove ultrathink"] as const;
+
+function commandError(result: { stdout: string; stderr: string; code: number }): string {
+	return `exit ${result.code}: ${result.stderr.trim() || result.stdout.trim() || "no output"}`;
+}
+
+/** Claude Code's user-scope MCP servers live in the top-level `mcpServers` of this file (the path scripts/mcp-register.ts reads). */
+export function claudeJsonPath(env: Record<string, string | undefined> = process.env): string {
+	return join(env.CLAUDE_CONFIG_DIR?.trim() || homedir(), ".claude.json");
+}
+
+type UserEntry = { found: false } | { found: true; type?: string; url?: string } | { error: string };
+
+/**
+ * The user-scope entry for `name`. `claude mcp get` prints the entry that wins by precedence (local > project > user);
+ * when another scope wins (or the output has no `Scope:` line to tell), the user entry comes from ~/.claude.json.
+ */
+function userScopeEntry(name: string, run: Run, claudeJson: string): UserEntry {
+	const current = run(["claude", "mcp", "get", name]);
+	if (current.code !== 0) {
+		if (current.code !== 127 && /No MCP server named/i.test(`${current.stdout}\n${current.stderr}`)) return { found: false };
+		return { error: commandError(current) };
+	}
+	// `  Scope: User config (…)`, `  Type: http`, `  URL: …`; the first occurrence of each key is the server's own.
+	const fields: Record<string, string> = {};
+	for (const line of current.stdout.split("\n")) {
+		const match = /^\s+([A-Za-z]+):\s*(.*)$/.exec(line);
+		if (match && !(match[1] in fields)) fields[match[1]] = match[2].trim();
+	}
+	if (/^User config\b/i.test(fields.Scope ?? "")) return { found: true, type: fields.Type?.toLowerCase(), url: fields.URL };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(claudeJson, "utf8"));
+	} catch {
+		return { error: `could not read the user-scope entry from ${claudeJson}` };
+	}
+	if (typeof parsed !== "object" || parsed === null) return { error: `could not read the user-scope entry from ${claudeJson}` };
+	const servers = "mcpServers" in parsed ? parsed.mcpServers : undefined;
+	const entry = typeof servers === "object" && servers !== null && name in servers ? Reflect.get(servers, name) : undefined;
+	if (entry === undefined) return { found: false };
+	const type = typeof entry === "object" && entry !== null && "type" in entry ? entry.type : undefined;
+	const url = typeof entry === "object" && entry !== null && "url" in entry ? entry.url : undefined;
+	return { found: true, type: typeof type === "string" ? type.toLowerCase() : undefined, url: typeof url === "string" ? url : undefined };
+}
+
+/**
+ * Removes a server `apply` added, but only while the user-scope entry is still setup's own (HTTP, the hosted URL) —
+ * a server the user replaced since (e.g. with the gateway) stays, and a same-named local/project entry is never judged.
+ */
+function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run: Run, claudeJson: string): McpRemoval {
+	if (!added) return { removed: false };
+	const entry = userScopeEntry(name, run, claudeJson);
+	if ("error" in entry) return { removed: false, error: entry.error };
+	if (!entry.found) return { removed: false, kept: "gone" };
+	if (entry.type !== "http" || entry.url !== SETUP_MCP_URLS[name]) return { removed: false, kept: "changed" };
+	const result = run(["claude", "mcp", "remove", "--scope", "user", name]);
+	return result.code === 0 ? { removed: true } : { removed: false, error: commandError(result) };
 }
 
 export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): RollbackResult {
 	const claudeMdChanged = removeBlock(claudeMdPath(env), false);
 	const state = readSetupState(env);
-	const notion = state.notionAdded ? run(["claude", "mcp", "remove", "notion"]) : undefined;
-	const linear = state.linearAdded ? run(["claude", "mcp", "remove", "linear"]) : undefined;
+	const claudeJson = claudeJsonPath(env);
+	const notion = removeMcpServer("notion", state.notionAdded, run, claudeJson);
+	const linear = removeMcpServer("linear", state.linearAdded, run, claudeJson);
+	const statePath = setupStatePath(env);
+	const left: SetupState = { notionAdded: notion.error !== undefined, linearAdded: linear.error !== undefined };
+	let stateStatus: RollbackResult["state"]["status"] = existsSync(statePath) ? "removed" : "absent";
+	if (left.notionAdded || left.linearAdded) {
+		writeSetupState(left, env);
+		stateStatus = "kept";
+	} else {
+		rmSync(statePath, { force: true });
+	}
 	const grokDir = grokHome(env);
 	const rulePath = join(grokDir, "rules", "ultrathink.md");
 	const hooksPath = join(grokDir, "hooks", "ultrathink.json");
@@ -287,42 +390,91 @@ export function rollback(env: Record<string, string | undefined> = process.env, 
 	rmSync(hooksPath, { force: true });
 	return {
 		claudeMd: { changed: claudeMdChanged },
-		notion: { removed: notion !== undefined && notion.code === 0 },
-		linear: { removed: linear !== undefined && linear.code === 0 },
+		notion,
+		linear,
+		state: { path: statePath, status: stateStatus },
 		// The rule is ours only through its marker block; text a user added around it stays.
 		grok: { rule: { path: rulePath, removed: removeBlock(rulePath, true) }, hooks: { path: hooksPath, removed: hadHooks } },
 	};
 }
 
+/** The checkout root for a module URL two levels down (`<root>/scripts/setup.ts`); decoded, so spaces and non-ASCII survive. */
+export function repoRootFromModule(moduleUrl: string): string {
+	return dirname(dirname(fileURLToPath(moduleUrl)));
+}
+
+export function hermesHome(env: Record<string, string | undefined> = process.env): string {
+	return env.HERMES_HOME?.trim() || join(homedir(), ".hermes");
+}
+
+/** POSIX single-quoting, so printed commands can be pasted as-is for any path. */
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+export function hermesHint(repoRoot: string, env: Record<string, string | undefined> = process.env): string {
+	const pluginsDir = join(hermesHome(env), "plugins");
+	// -n replaces an existing link instead of nesting a new one inside the linked directory on a re-paste; Hermes plugins are opt-in, hence enable.
+	const link = `mkdir -p ${shellQuote(pluginsDir)} && ln -sfn ${shellQuote(join(repoRoot, "hosts", "hermes"))} ${shellQuote(join(pluginsDir, "ultrathink"))} && hermes plugins enable ultrathink`;
+	return `Hermes: ${link}; then hermes config set plugins.hook_callback_timeout 600 — the hook cap must be at least 105 s, 600 recommended (Hermes drops slower hooks after 30 s by default; this is a global Hermes setting that applies to every plugin); then disable any other prompt-planning plugin so two planners do not plan the same turn.`;
+}
+
+export function applyReport(repoRoot: string, result: ApplyResult, env: Record<string, string | undefined> = process.env): string[] {
+	const { claude, grok } = result;
+	const lines = claude
+		? [
+				`Notion MCP: ${claude.notion.message}`,
+				`Linear MCP: ${claude.linear.message}`,
+				`Plugin: ${claude.plugin.message}`,
+				`CLAUDE.md: ${claude.claudeMd.changed ? "updated" : "already up to date"} (${claude.claudeMd.path})`,
+			]
+		: [
+				"Claude Code: claude CLI not found — skipped the Notion/Linear MCP servers, plugin install and CLAUDE.md block; install Claude Code and re-run apply to add them.",
+			];
+	return [
+		...lines,
+		`Grok rule: ${grok.rule.changed ? "installed" : "already up to date"} (${grok.rule.path})`,
+		`Grok hooks: ${grok.hooks.changed ? "installed" : "already up to date"} (${grok.hooks.path})`,
+		hermesHint(repoRoot, env),
+		`Muse: muse plugins install ${shellQuote(repoRoot)} --scope user && muse plugins approve ultrathink`,
+		`Omp: omp plugin link ${shellQuote(repoRoot)}`,
+	];
+}
+
+function mcpRemovalLine(label: string, name: string, removal: McpRemoval): string {
+	if (removal.removed) return `${label}: removed`;
+	if (removal.kept === "changed") return `${label}: left in place: ${name} was changed since setup added it`;
+	if (removal.kept === "gone") return `${label}: already removed`;
+	if (removal.error === undefined) return `${label}: left in place (setup did not add it)`;
+	return `${label}: removal failed (${removal.error}) — fix that, then re-run rollback or run: claude mcp remove --scope user ${name}`;
+}
+
+export function rollbackReport(result: RollbackResult): string[] {
+	const stateLine = {
+		removed: "removed",
+		kept: "kept, so a re-run of rollback retries the failed removal",
+		absent: "not found",
+	}[result.state.status];
+	return [
+		`CLAUDE.md: ${result.claudeMd.changed ? "block removed" : "no block found"}`,
+		mcpRemovalLine("Notion MCP", "notion", result.notion),
+		mcpRemovalLine("Linear MCP", "linear", result.linear),
+		`Setup state: ${stateLine} (${result.state.path})`,
+		`Grok rule: ${result.grok.rule.removed ? "removed" : "not installed"} (${result.grok.rule.path})`,
+		`Grok hooks: ${result.grok.hooks.removed ? "removed" : "not installed"} (${result.grok.hooks.path})`,
+		`Claude Code plugin: still installed if you added it — to remove it, run: ${PLUGIN_UNINSTALL_COMMANDS.join(" && ")}`,
+	];
+}
+
 async function main(): Promise<void> {
 	const cmd = process.argv[2] ?? "status";
-	const repoRoot = new URL("..", import.meta.url).pathname;
+	const repoRoot = repoRootFromModule(import.meta.url);
 	if (cmd === "apply") {
-		const { claude, grok } = apply(repoRoot);
-		if (claude) {
-			console.log(`Notion MCP: ${claude.notion.message}`);
-			console.log(`Linear MCP: ${claude.linear.message}`);
-			console.log(`Plugin: ${claude.plugin.message}`);
-			console.log(`CLAUDE.md: ${claude.claudeMd.changed ? "updated" : "already up to date"} (${claude.claudeMd.path})`);
-		} else {
-			console.log(
-				"Claude Code: claude CLI not found — skipped the Notion/Linear MCP servers, plugin install and CLAUDE.md block; install Claude Code and re-run apply to add them.",
-			);
-		}
-		console.log(`Grok rule: ${grok.rule.changed ? "installed" : "already up to date"} (${grok.rule.path})`);
-		console.log(`Grok hooks: ${grok.hooks.changed ? "installed" : "already up to date"} (${grok.hooks.path})`);
-		console.log(`Hermes: symlink ${join(repoRoot, "hosts/hermes")} to ~/.hermes/plugins/ultrathink, run hermes config set plugins.hook_callback_timeout 600 (Hermes drops hooks after 30s by default), then disable prompt-uplift so both do not plan the same turn.`);
-		console.log(`Muse: muse plugins install ${repoRoot} --scope user && muse plugins approve ultrathink`);
-		console.log(`Omp: omp plugin link ${repoRoot}`);
+		for (const line of applyReport(repoRoot, apply(repoRoot))) console.log(line);
 		return;
 	}
 	if (cmd === "rollback") {
-		const result = rollback();
-		console.log(`CLAUDE.md: ${result.claudeMd.changed ? "block removed" : "no block found"}`);
-		console.log(`Notion MCP: ${result.notion.removed ? "removed" : "not removed (may not have existed)"}`);
-		console.log(`Linear MCP: ${result.linear.removed ? "removed" : "not removed (may not have existed)"}`);
-		console.log(`Grok rule: ${result.grok.rule.removed ? "removed" : "not installed"} (${result.grok.rule.path})`);
-		console.log(`Grok hooks: ${result.grok.hooks.removed ? "removed" : "not installed"} (${result.grok.hooks.path})`);
+		for (const line of rollbackReport(rollback())) console.log(line);
 		return;
 	}
 	console.log(status());

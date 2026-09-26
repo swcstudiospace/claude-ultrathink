@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Github, ReviewThreads } from "./github.ts";
+import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
 import { readShip, writeShip } from "./state.ts";
@@ -19,6 +20,7 @@ const CONFIG: ShipConfig = {
 	maxRounds: 2,
 	mergeMethod: "squash",
 	deleteBranch: true,
+	greptileOrganization: "",
 	reviewTimeoutMs: 1000,
 	pollMs: 10,
 	waitMs: 100,
@@ -143,6 +145,23 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.assessment?.signals.gsdIgnored).toBe(true);
 	});
 
+	test("a roadmap without gsd-tools.cjs is a gap naming GSD_TOOLS; --ignore-gsd drops it", async () => {
+		const git = { branch: "feat", base: "master", onBase: false, ahead: 1, dirty: [], untracked: 0, pushed: true };
+		const gsd = { phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true };
+		const d = { ...deps(), signals: () => ({ git, gsd }), assess: assessDone, engine: async () => undefined };
+		const missing = await runShip(["assess", "--state", statePath, "--cwd", dir], d);
+		expect(missing.output.done).toBe(false);
+		expect(missing.output.gaps).toContain(
+			"GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd",
+		);
+		const ignored = await runShip(["assess", "--state", statePath, "--cwd", dir, "--ignore-gsd"], {
+			...d,
+			config: { ...CONFIG, autoMerge: false },
+		});
+		expect(ignored.output.gaps).toEqual([]);
+		expect(ignored.output.done).toBe(true);
+	});
+
 	test("pr refuses when not assessed done", async () => {
 		await ship("assess", deps({ done: false }));
 		expect((await ship("pr", deps())).output.ok).toBe(false);
@@ -183,6 +202,21 @@ describe("runShip", () => {
 		const good = await ship("review", deps());
 		expect(good.output).toMatchObject({ ready: true, score: 5, next: "run merge" });
 		expect(readShip(statePath)?.phase).toBe("ready");
+	});
+
+	test("a blocked review (Greptile not set up) records no round, posts no comment and stops the run", async () => {
+		const setup = "Greptile is not set up: run `bin/ultrathink-mcp auth set-key greptile --stdin`";
+		const blocked = deps({ review: { status: "blocked", score: null, error: setup } });
+		writeShip(statePath, { pr: PR, phase: "pr-open" });
+		const out = await ship("review", blocked);
+		expect(out.output).toMatchObject({ ok: false, ready: false, blocked: true, status: "blocked", reason: setup, next: `stop: ${setup}` });
+		expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: setup, rounds: [] });
+		expect(comments).toEqual([]);
+
+		const run = await ship("run", blocked);
+		expect(run.output).toMatchObject({ ok: false, review: { blocked: true }, next: `stop: ${setup}` });
+		expect(run.output.merge).toBeUndefined();
+		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
 	});
 
 	test("a passing review that waits on CI or mergeability is not a failed round, even at maxRounds", async () => {

@@ -50,7 +50,7 @@ export interface HookDeps {
 	config: UltrathinkConfig;
 	control: ControlState;
 	complete: ClaudeCompleter;
-	/** Thinking engine label recorded and echoed, e.g. "grok-4.7@xhigh", "grok-4.7-xhigh@shunt" or "claude:sonnet". */
+	/** Thinking engine label recorded and echoed, e.g. "grok-4.7@xhigh", "<shuntModel or model>@shunt" or "claude:sonnet". */
 	engine: string;
 	stateDir: string;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
@@ -59,7 +59,7 @@ export interface HookDeps {
 	/** Test seam for git remote/branch resolution; default reads the real repo at cwd. */
 	git?: (cwd: string) => { repo?: string; branch?: string };
 	conversation?: (transcriptPath?: string) => string;
-	/** Test seam for the Agent Substrate brief; defaults to the real fail-open HTTP call. */
+	/** Test seam for the Agent Substrate brief; defaults to the real fail-open HTTP call against `config.substrate.url`. */
 	brief?: (input: { repo?: string; branch?: string; surface?: string }) => Promise<string>;
 	/** Host that asked for the brief. Defaults to Claude so existing callers stay stable. */
 	surface?: string;
@@ -151,7 +151,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// planned knowing what other agents already did, and the round trip
 		// overlaps the uplift call instead of adding to it.
 		stage("brief", "start");
-		const briefPromise = (deps.brief ?? fetchBrief)({
+		const fetchSessionBrief = deps.brief ?? ((brief) => fetchBrief(brief, process.env, deps.config.substrate.url));
+		const briefPromise = fetchSessionBrief({
 			repo: git.repo,
 			branch: git.branch,
 			surface: deps.surface ?? "claude-code",

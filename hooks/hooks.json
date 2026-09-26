@@ -24,7 +24,7 @@
 				]
 			},
 			{
-				"matcher": "Bash",
+				"matcher": "^(Bash|bash|run_terminal_cmd|run_terminal_command|shell|exec|terminal)$",
 				"hooks": [
 					{
 						"type": "command",
@@ -34,7 +34,7 @@
 				]
 			},
 			{
-				"matcher": "mcp__aio__github_create_pull_request|github_create_pull_request|mcp__github__create_pull_request|github__create_pull_request",
+				"matcher": ".*([Cc]reate[_-]?[Pp]ull[_-]?[Rr]equest|[Pp]ull[_-]?[Rr]equest[_-]?[Cc]reate)$",
 				"hooks": [
 					{
 						"type": "command",

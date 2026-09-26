@@ -10,19 +10,34 @@ permissions:
 
 jobs:
   test:
-    name: Check and test
-    runs-on: ubuntu-latest
+    name: Check and test (${{ matrix.os }}, Bun ${{ matrix.bun }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # 1.2.x is the minimum in package.json "engines"; latest catches regressions early.
+        bun: [1.2.x, latest]
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ matrix.bun }}
 
+      # hosts/hermes needs Python 3.10+ (plugin.yaml); pin the minimum so newer syntax is caught.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ultrathink has no runtime dependencies; `bun install` only fetches type definitions for the type check.
+      # bun.lock uses a lockfile format Bun 1.2 cannot read, so the minimum-Bun leg runs the tests without it.
       - name: Install dependencies
+        if: matrix.bun == 'latest'
         run: bun install --frozen-lockfile
 
       - name: Type check
+        if: matrix.bun == 'latest'
         run: bun run check
 
       # The runner has no git identity and git refuses to commit without one; set it in case a test shells out to git.

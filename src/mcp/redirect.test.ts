@@ -113,11 +113,12 @@ describe("readTailscaleDns", () => {
 describe("planRedirect", () => {
 	const remoteEnv = { SSH_CONNECTION: SSH, USER: "alice" };
 
-	test("the --redirect flag beats the environment override", () => {
+	test("the --redirect flag beats the environment override and a Tailscale opt-in", () => {
 		const plan = planRedirect({
 			env: { ...remoteEnv, ULTRATHINK_OAUTH_REDIRECT: "https://env.example.com/cb" },
 			port: 8765,
 			redirect: "https://flag.example.com/oauth/cb",
+			tailscale: true,
 			tailscaleDns: unreachable,
 		});
 		expect(plan.mode).toBe("override");
@@ -127,10 +128,11 @@ describe("planRedirect", () => {
 		expect(plan.hint.join("\n")).toContain("127.0.0.1:8765");
 	});
 
-	test("the environment override beats Tailscale", () => {
+	test("the environment override beats an opted-in Tailscale", () => {
 		const plan = planRedirect({
 			env: { ...remoteEnv, ULTRATHINK_OAUTH_REDIRECT: "http://localhost:9000/cb" },
 			port: 9000,
+			tailscale: true,
 			tailscaleDns: unreachable,
 		});
 		expect(plan).toMatchObject({ mode: "override", redirectUri: "http://localhost:9000/cb", port: 9000 });
@@ -138,17 +140,19 @@ describe("planRedirect", () => {
 
 	test("accepts http only for loopback hosts", () => {
 		for (const redirect of ["http://127.0.0.1:8765/cb", "http://[::1]:8765/cb", "https://auth.example.com/cb"]) {
-			expect(planRedirect({ env: {}, port: 8765, redirect, tailscaleDns: unreachable }).mode).toBe("override");
+			expect(planRedirect({ env: {}, port: 8765, redirect, tailscale: false, tailscaleDns: unreachable }).mode).toBe(
+				"override",
+			);
 		}
 		for (const redirect of ["http://auth.example.com/cb", "http://constructor/cb", "ftp://127.0.0.1/cb", "not a url"]) {
-			expect(() => planRedirect({ env: {}, port: 8765, redirect, tailscaleDns: unreachable })).toThrow(
+			expect(() => planRedirect({ env: {}, port: 8765, redirect, tailscale: false, tailscaleDns: unreachable })).toThrow(
 				"invalid redirect URL",
 			);
 		}
 	});
 
-	test("remote with Tailscale routes the callback through a serve path handler", () => {
-		const plan = planRedirect({ env: remoteEnv, port: 8765, tailscaleDns: () => DNS });
+	test("remote with Tailscale opted in routes the callback through a serve path handler", () => {
+		const plan = planRedirect({ env: remoteEnv, port: 8765, tailscale: true, tailscaleDns: () => DNS });
 		expect(plan).toEqual({
 			mode: "tailscale",
 			redirectUri: `https://${DNS}/ultrathink-oauth/callback`,
@@ -161,8 +165,8 @@ describe("planRedirect", () => {
 		expect(plan.hint.join("\n")).toContain(`https://${DNS}/ultrathink-oauth/callback`);
 	});
 
-	test("remote without Tailscale explains port forwarding", () => {
-		const plan = planRedirect({ env: remoteEnv, port: 9123, tailscaleDns: () => undefined });
+	test("remote without the opt-in never probes Tailscale and explains port forwarding and --tailscale", () => {
+		const plan = planRedirect({ env: remoteEnv, port: 9123, tailscale: false, tailscaleDns: unreachable });
 		expect(plan).toMatchObject({
 			mode: "loopback",
 			redirectUri: "http://127.0.0.1:9123/callback",
@@ -175,13 +179,25 @@ describe("planRedirect", () => {
 		expect(hint).toContain("127.0.0.1:9123");
 		expect(hint).toContain("ssh -L 9123:127.0.0.1:9123 alice@203.0.113.7");
 		expect(hint).toContain("pasting the redirected URL");
+		expect(hint).toContain("--tailscale");
+		expect(hint).toContain("ULTRATHINK_OAUTH_TAILSCALE=1");
+	});
+
+	test("remote with the opt-in but no usable Tailscale falls back to port forwarding", () => {
+		const plan = planRedirect({ env: remoteEnv, port: 9123, tailscale: true, tailscaleDns: () => undefined });
+		expect(plan).toMatchObject({ mode: "loopback", redirectUri: "http://127.0.0.1:9123/callback", remote: true });
+		expect(plan.mount).toBeUndefined();
+		const hint = plan.hint.join("\n");
+		expect(hint).toContain("ssh -L 9123:127.0.0.1:9123 alice@203.0.113.7");
+		expect(hint).not.toContain("--tailscale");
 	});
 
 	test("remote with a malformed SSH_CONNECTION omits the ssh line", () => {
 		const plan = planRedirect({
 			env: { SSH_CONNECTION: "198.51.100.4 51234 1.2.3.4;rm -rf 22", SSH_TTY: "/dev/pts/0" },
 			port: 8765,
-			tailscaleDns: () => undefined,
+			tailscale: false,
+			tailscaleDns: unreachable,
 		});
 		expect(plan).toMatchObject({ mode: "loopback", remote: true });
 		const hint = plan.hint.join("\n");
@@ -190,15 +206,17 @@ describe("planRedirect", () => {
 		expect(hint).not.toContain("rm -rf");
 	});
 
-	test("local sessions keep the plain loopback login without probing Tailscale", () => {
-		const plan = planRedirect({ env: {}, port: 8765, tailscaleDns: unreachable });
-		expect(plan).toMatchObject({
-			mode: "loopback",
-			redirectUri: "http://127.0.0.1:8765/callback",
-			callbackPaths: ["/callback"],
-			remote: false,
-		});
-		expect(plan.hint).toHaveLength(1);
+	test("local sessions keep the plain loopback login without probing Tailscale, even when opted in", () => {
+		for (const tailscale of [false, true]) {
+			const plan = planRedirect({ env: {}, port: 8765, tailscale, tailscaleDns: unreachable });
+			expect(plan).toMatchObject({
+				mode: "loopback",
+				redirectUri: "http://127.0.0.1:8765/callback",
+				callbackPaths: ["/callback"],
+				remote: false,
+			});
+			expect(plan.hint).toHaveLength(1);
+		}
 	});
 });
 

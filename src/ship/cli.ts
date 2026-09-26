@@ -13,7 +13,7 @@ import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { selectEngine } from "../host/engine.ts";
 import { createMcpClient } from "../mcp/client.ts";
 import type { McpClient } from "../mcp/client.ts";
-import { storePath } from "../mcp/store.ts";
+import { readStore, storePath } from "../mcp/store.ts";
 import { assessDone } from "./assess.ts";
 import { createGithub } from "./github.ts";
 import type { Github } from "./github.ts";
@@ -164,6 +164,12 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 			return { ok: false, ready: false, reason: `could not read review threads: ${threads.error}`, next: "run review again" };
 		}
 		result = { ...result, comments: openThreadComments(threads.threads) };
+	}
+	if (result.status === "blocked") {
+		// Greptile is unusable as configured: no round is recorded and the flow stops until the user fixes the setup.
+		const reason = result.error ?? "Greptile review blocked";
+		writeShip(statePath, { phase: "blocked", blockedReason: reason, pending: undefined }, deps.now());
+		return { ok: false, ready: false, blocked: true, status: "blocked", reason, round: ship.rounds.length, next: `stop: ${reason}` };
 	}
 	const maxRounds = deps.config.maxRounds;
 	if (result.status === "pending") {
@@ -370,6 +376,9 @@ async function main(): Promise<number> {
 			return "skipped" in selected ? undefined : selected.complete;
 		},
 		greptile: () => {
+			// No stored Greptile credential means no MCP mode; review then needs a signed-in greptile CLI.
+			const credential = readStore(storePath()).providers.greptile;
+			if (!credential || (credential.kind === "oauth" && (credential.needsLogin || !credential.tokens))) return undefined;
 			try {
 				client ??= createMcpClient("greptile", { storePath: storePath() });
 			} catch {

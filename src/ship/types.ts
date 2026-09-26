@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 export interface ShipConfig {
+	/** Ship is opt-in: false means a skill run never pushes, opens a PR or merges. */
 	enabled: boolean;
 	autoMerge: boolean;
 	/** Skill-name prefixes that trigger ship; empty = every skill run. */
@@ -10,6 +11,8 @@ export interface ShipConfig {
 	maxRounds: number;
 	mergeMethod: "squash" | "merge" | "rebase";
 	deleteBranch: boolean;
+	/** Greptile organization id or handle passed on every Greptile MCP call; "" = let Greptile pick (single-org accounts). */
+	greptileOrganization: string;
 	reviewTimeoutMs: number;
 	pollMs: number;
 	/** Longest a single `review` call blocks before returning "pending"; fits every host's default shell timeout. */
@@ -19,14 +22,15 @@ export interface ShipConfig {
 export const MERGE_METHODS: readonly ShipConfig["mergeMethod"][] = ["squash", "merge", "rebase"];
 
 export const DEFAULT_SHIP_CONFIG: ShipConfig = {
-	enabled: true,
-	autoMerge: true,
+	enabled: false,
+	autoMerge: false,
 	skills: ["gsd-"],
 	minScore: 5,
 	requireNoComments: true,
 	maxRounds: 5,
 	mergeMethod: "squash",
-	deleteBranch: true,
+	deleteBranch: false,
+	greptileOrganization: "",
 	reviewTimeoutMs: 1_200_000,
 	pollMs: 20_000,
 	waitMs: 100_000,
@@ -52,6 +56,10 @@ export interface GsdSignals {
 	/** STATE.md frontmatter `status:`, when present. */
 	state?: string;
 	verification?: { phase: string; status: string };
+	/** A roadmap exists but gsd-tools.cjs was found neither via `GSD_TOOLS` nor in any standard GSD install location. */
+	toolsMissing?: boolean;
+	/** gsd-tools.cjs resolved but `node` could not be spawned to run it (exit 127 / ENOENT). */
+	nodeMissing?: boolean;
 }
 
 export interface ShipSignals {
@@ -84,8 +92,11 @@ export interface ReviewComment {
 
 export interface ReviewResult {
 	source: "pr" | "cli";
-	/** "pending": the review is still running server-side; call again to resume it. */
-	status: "completed" | "pending" | "timeout" | "failed";
+	/**
+	 * "pending": the review is still running server-side; call again to resume it.
+	 * "blocked": Greptile is not usable as configured (no credential or CLI, organization not chosen); `error` says how to fix it.
+	 */
+	status: "completed" | "pending" | "timeout" | "failed" | "blocked";
 	score: number | null;
 	comments: ReviewComment[];
 	headSha?: string;
