@@ -362,32 +362,39 @@ function classifyMergeError(error: string, headSha: string): MergeStep {
 	return transient;
 }
 
+/** Why the stored review alone refuses the merge (none, or not passing), or undefined when it passed. No GitHub read. */
+function storedReviewRefusal(config: ShipConfig, latest: ReviewResult | undefined, url: string): string | undefined {
+	if (latest && reviewPasses(config, latest)) return undefined;
+	// The review side of the gate alone: a mergeable, check-free stand-in for the PR at the stored head.
+	const standIn: PrStatus = { state: "OPEN", headSha: latest?.headSha ?? "", mergeable: "MERGEABLE", checks: "none", url };
+	return mergeGate({ config, status: standIn, latest }).reason;
+}
+
 /**
- * One merge poll: merges only when the latest review passed for the PR's exact head commit. The stored review is
- * checked before any GitHub read, so an unreadable PR is only ever retried for a head whose review passed.
+ * One merge poll: merges only when the latest review passed for the PR's exact head commit. A closed PR, or one merged
+ * outside the flow, blocks; a stored review that does not pass goes back to the agent and never waits, even when the
+ * PR cannot be read.
  */
 function mergeOnce(config: ShipConfig, github: Github, ship: ShipState, pr: PrRef): MergeStep {
 	let latest = ship.rounds.at(-1);
-	if (ship.phase !== "merged" && (!latest || !reviewPasses(config, latest))) {
-		const storedHead = latest?.headSha ?? "";
-		// The review side of the gate alone: a mergeable, check-free stand-in for the PR at the stored head.
-		const standIn: PrStatus = { state: "OPEN", headSha: storedHead, mergeable: "MERGEABLE", checks: "none", url: pr.url };
-		const { reason } = mergeGate({ config, status: standIn, latest });
-		return { kind: "needs-agent", reason, next: `${reason}; run review again`, headSha: storedHead };
-	}
+	// After a recorded merge the stored review no longer matters: an unreadable PR is simply retried for the cleanup.
+	const refusal = ship.phase === "merged" ? undefined : storedReviewRefusal(config, latest, pr.url);
 	const status = github.prStatus(pr.number);
-	if (!status) return { kind: "transient", reason: "could not read PR status" };
+	if (!status) {
+		if (!refusal) return { kind: "transient", reason: "could not read PR status" };
+		return { kind: "needs-agent", reason: refusal, next: `${refusal}; run review again`, headSha: latest?.headSha ?? "" };
+	}
 	const headSha = status.headSha;
 	if (status.state === "CLOSED") return { kind: "blocked", reason: "PR closed without merge", headSha, comment: false };
 	if (status.state === "MERGED") {
 		// Cleanup only for a merge this flow made or one whose exact head passed review; anything else is reported, never recorded.
-		if (ship.phase === "merged" || (latest?.headSha === headSha && reviewPasses(config, latest))) {
+		if (ship.phase === "merged" || (latest?.headSha === headSha && !refusal)) {
 			return { kind: "merged", headSha, score: latest?.score, method: config.mergeMethod, alreadyMerged: true };
 		}
 		return { kind: "blocked", reason: MERGED_OUTSIDE, headSha, comment: false };
 	}
-	if (!latest) {
-		const reason = "no review has run";
+	if (refusal || !latest) {
+		const reason = refusal ?? "no review has run";
 		return { kind: "needs-agent", reason, next: `${reason}; run review again`, headSha };
 	}
 	if (latest.headSha !== headSha) {

@@ -560,39 +560,47 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.phase).toBe("merged");
 	});
 
-	test("merge on a PR merged outside the flow after a review of another head blocks without cleanup", async () => {
+	test("merge on a PR merged outside the flow without a passing review of its head blocks without cleanup", async () => {
 		const reason = "PR was merged outside the ship flow before its review passed";
-		writeShip(statePath, { pr: PR, rounds: [{ ...PASSED, headSha: "old" }], phase: "pr-open" });
-		const out = await ship("merge", deps({ status: { state: "MERGED" } }));
-		expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason });
-		expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: reason });
+		for (const rounds of [[], [{ ...PASSED, score: 4 }], [{ ...PASSED, headSha: "old" }]]) {
+			writeShip(statePath, { pr: PR, rounds, phase: "pr-open", blockedReason: undefined });
+			const out = await ship("merge", deps({ status: { state: "MERGED" } }));
+			expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason });
+			expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: reason });
+		}
 		expect(calls).toEqual([]);
 		expect(comments).toEqual([]);
 	});
 
-	test("merge without a passing stored review goes back to the agent before reading GitHub, even when the PR is unreadable", async () => {
+	test("merge without a passing stored review goes back to the agent and never waits, even when the PR is unreadable", async () => {
 		const cases: [ReviewResult[], string][] = [
 			[[], "no review has run; run review again"],
 			[[{ ...PASSED, score: 3 }], "review score 3/5 is below 5/5; run review again"],
 		];
 		for (const [rounds, next] of cases) {
-			writeShip(statePath, { pr: PR, rounds, phase: "needs-fixes" });
-			const out = await ship("merge", deps({ statuses: [null] }));
-			expect(out.output).toMatchObject({ ok: false, merged: false, next });
-			expect(out.output.waiting).toBeUndefined();
-			expect(readShip(statePath)?.phase).toBe("needs-fixes");
-			expect(readShip(statePath)?.waiting).toBeUndefined();
+			for (const statuses of [[null], []]) {
+				writeShip(statePath, { pr: PR, rounds, phase: "needs-fixes" });
+				const out = await ship("merge", deps({ statuses }));
+				expect(out.output).toMatchObject({ ok: false, merged: false, next });
+				expect(out.output.waiting).toBeUndefined();
+				expect(readShip(statePath)?.phase).toBe("needs-fixes");
+				expect(readShip(statePath)?.waiting).toBeUndefined();
+			}
 		}
 		expect(sleeps).toEqual([]);
 		expect(calls).toEqual([]);
 		expect(comments).toEqual([]);
 	});
 
-	test("merge on closed PR blocks without deleting", async () => {
-		writeShip(statePath, { pr: PR, rounds: [PASSED] });
-		expect((await ship("merge", deps({ status: { state: "CLOSED" } }))).output.ok).toBe(false);
-		expect(readShip(statePath)?.phase).toBe("blocked");
+	test("merge on closed PR blocks without deleting, with or without a review", async () => {
+		for (const rounds of [[], [PASSED]]) {
+			writeShip(statePath, { pr: PR, rounds, phase: "pr-open", blockedReason: undefined });
+			const out = await ship("merge", deps({ status: { state: "CLOSED" } }));
+			expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason: "PR closed without merge" });
+			expect(readShip(statePath)?.phase).toBe("blocked");
+		}
 		expect(calls).toEqual([]);
+		expect(comments).toEqual([]);
 	});
 
 	describe("review restart for a failed round without a review id", () => {
