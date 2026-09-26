@@ -169,9 +169,10 @@ function normalizeSettledItem(raw: Record<string, unknown>, index: number, claim
 /**
  * Validate the clarifier's JSON: open questions (ids q1.., at most `maxQuestions`) followed by questions a
  * knowledge-base document settled (ids k1.., at most MAX_SETTLED). With `knowledgeDocs`, an item is settled only
- * when its `knowledge` object has a non-empty answer of at most 500 chars citing one of `knowledgeDocs` and fewer
- * than MAX_SETTLED items are settled. A rejected claim is never dropped: it becomes an open question (subject to
- * `maxQuestions`) with its own options, or, short of two, "As stated" (the claimed answer) / "Something else".
+ * when it is not blocking (a blocking question is the user's decision) and its `knowledge` object has a non-empty
+ * answer of at most 500 chars citing one of `knowledgeDocs`, while fewer than MAX_SETTLED items are settled. A
+ * rejected claim is never dropped: it becomes an open question (subject to `maxQuestions`, keeping `blocking`) with
+ * its own options, or, short of two, "As stated" (the claimed answer) / "Something else".
  * Items without a knowledge object, and every item without `knowledgeDocs`, need two options or are dropped.
  */
 export function normalizeClarifications(raw: unknown, maxQuestions: number, knowledgeDocs?: string[]): Clarification[] {
@@ -190,7 +191,7 @@ export function normalizeClarifications(raw: unknown, maxQuestions: number, know
 		if (open.length >= max && (docs.size === 0 || settled.length >= MAX_SETTLED)) break;
 		const obj = docs.size > 0 && item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
 		const knowledge = obj?.knowledge && typeof obj.knowledge === "object" ? (obj.knowledge as Record<string, unknown>) : undefined;
-		const claim = knowledge && settled.length < MAX_SETTLED ? knowledgeClaim(knowledge, docs) : undefined;
+		const claim = knowledge && obj?.blocking !== true && settled.length < MAX_SETTLED ? knowledgeClaim(knowledge, docs) : undefined;
 		let clarification: Clarification | undefined;
 		if (obj && claim) clarification = normalizeSettledItem(obj, settled.length, claim);
 		else if (open.length < max) {

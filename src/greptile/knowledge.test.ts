@@ -173,19 +173,48 @@ describe("createKnowledgeReader", () => {
 		}
 	});
 
-	test("a document that fails to read is dropped while the rest is still used", async () => {
+	test("any selected document that fails to read makes the whole lookup an error with no digest", async () => {
+		const failures: Array<{ handler: Handler; reason: string }> = [
+			{
+				handler: () => {
+					throw new Error("get_knowledge_base_document: not found");
+				},
+				reason: "get_knowledge_base_document: not found",
+			},
+			{ handler: () => ({ document: { content: 42 } }), reason: "docs/shipping-workflow.md: no document content" },
+		];
+		for (const { handler, reason } of failures) {
+			const fake = fakeClient(
+				happyHandlers({
+					get_knowledge_base_document: (args) =>
+						args.path === "docs/shipping-workflow.md" ? handler(args) : { document: { content: args.path === "index.md" ? INDEX : "body" } },
+				}),
+			);
+			const { lookup, digest } = await createKnowledgeReader({ client: () => fake.client })
+				.start({ repo: "acme/widgets" })
+				.read(SHIP_TOPIC);
+			expect(lookup.outcome).toBe("error");
+			expect(lookup.docs).toEqual([]);
+			expect(lookup.chars).toBe(0);
+			expect(lookup.reason).toBe(reason);
+			expect(digest).toBe("");
+		}
+	});
+
+	test("a selected document read that outlasts the budget is an error, not a partial digest", async () => {
 		const fake = fakeClient(
 			happyHandlers({
-				get_knowledge_base_document: (args) => {
-					if (args.path === "docs/shipping-workflow.md") throw new Error("get_knowledge_base_document: not found");
-					return { document: { content: args.path === "index.md" ? INDEX : "body" } };
-				},
+				get_knowledge_base_document: (args) =>
+					args.path === "index.md" ? { document: { content: INDEX } } : Promise.withResolvers<never>().promise,
 			}),
 		);
-		const { lookup } = await createKnowledgeReader({ client: () => fake.client }).start({ repo: "acme/widgets" }).read(SHIP_TOPIC);
-		expect(lookup.outcome).toBe("used");
-		expect(lookup.docs).not.toContain("docs/shipping-workflow.md");
-		expect(lookup.docs[0]).toBe("index.md");
+		const { lookup, digest } = await createKnowledgeReader({ client: () => fake.client, timeoutMs: 50 })
+			.start({ repo: "acme/widgets" })
+			.read(SHIP_TOPIC);
+		expect(lookup.outcome).toBe("error");
+		expect(lookup.reason).toBe("timed out after 50ms");
+		expect(lookup.docs).toEqual([]);
+		expect(digest).toBe("");
 	});
 
 	test("listed paths with whitespace or control characters are never read", async () => {

@@ -160,6 +160,8 @@ export async function reviewPr(input: {
 	reviewThreads?: () => ReviewThreads;
 	/** Review ids already recorded as failed or timed out for headSha: ignored, so a fresh review is triggered. */
 	staleReviewIds?: string[];
+	/** A failed round for headSha has no review id to mark stale: every review listed for headSha on the first listing is stale. */
+	restart?: boolean;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 }): Promise<ReviewResult> {
@@ -182,15 +184,15 @@ export async function reviewPr(input: {
 		const stale = new Set<string>(input.staleReviewIds);
 		let triggered = false;
 		let delay = input.pollMs;
+		let first = true;
 		while (true) {
 			const listed = asObj(await input.client.call("list_code_reviews", { ...tuple, prNumber: input.prNumber, limit: 20 }));
-			const latest = asArr(listed?.codeReviews)
+			const forHead = asArr(listed?.codeReviews)
 				.map(asObj)
-				.filter(
-					(item): item is Obj =>
-						item !== undefined && reviewSha(item) === input.headSha && !stale.has(String(item.id)),
-				)
-				.sort((a, b) => reviewTime(b) - reviewTime(a))[0];
+				.filter((item): item is Obj => item !== undefined && reviewSha(item) === input.headSha);
+			if (first && input.restart) for (const item of forHead) stale.add(String(item.id));
+			first = false;
+			const latest = forHead.filter((item) => !stale.has(String(item.id))).sort((a, b) => reviewTime(b) - reviewTime(a))[0];
 			const status = asStr(latest?.status)?.toUpperCase();
 			const failed = status === "FAILED" || status === "ERROR" || status === "SKIPPED";
 			const reviewId = latest && (asStr(latest.id) ?? (asNum(latest.id) !== undefined ? String(latest.id) : undefined));
@@ -280,6 +282,8 @@ export async function reviewCli(input: {
 	pollMs: number;
 	/** Run ids already recorded as failed or timed out for headSha: a status record naming one counts as no review. */
 	staleRunIds?: string[];
+	/** A failed round for headSha has no run id to mark stale: skip the status lookup and start a new review. */
+	restart?: boolean;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 }): Promise<ReviewResult> {
@@ -314,7 +318,7 @@ export async function reviewCli(input: {
 	const deadline = now() + input.waitMs;
 	let delay = input.pollMs;
 	const staleRuns = new Set(input.staleRunIds);
-	while (true) {
+	while (!input.restart) {
 		const checked = run(["greptile", "review", "status", "--commit", input.headSha, "--json"], {
 			cwd,
 			timeoutMs: CLI_QUERY_TIMEOUT_MS,
@@ -385,6 +389,8 @@ export async function runReview(input: {
 	reviewThreads?: () => ReviewThreads;
 	/** reviewIds of rounds for headSha that failed or timed out; those reviews are re-triggered instead of reused. */
 	staleReviewIds?: string[];
+	/** A failed or timed-out round for headSha has no reviewId: never reuse a listed review for headSha, start a fresh one. */
+	restart?: boolean;
 	now?: () => number;
 }): Promise<ReviewResult> {
 	const run = input.run ?? defaultRun;
@@ -419,6 +425,7 @@ export async function runReview(input: {
 				organization,
 				...(input.reviewThreads ? { reviewThreads: input.reviewThreads } : {}),
 				...(input.staleReviewIds ? { staleReviewIds: input.staleReviewIds } : {}),
+				...(input.restart ? { restart: true } : {}),
 			});
 		}
 	}
@@ -430,5 +437,6 @@ export async function runReview(input: {
 		waitMs: input.config.waitMs,
 		pollMs: input.config.pollMs,
 		...(input.staleReviewIds ? { staleRunIds: input.staleReviewIds } : {}),
+		...(input.restart ? { restart: true } : {}),
 	});
 }

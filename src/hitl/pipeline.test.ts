@@ -139,6 +139,19 @@ describe("normalizeClarifications with knowledge-base answers", () => {
 		}
 	});
 
+	test("a blocking item is never settled, even with a valid citation: it is asked, still blocking", () => {
+		const blocking = { ...settledItem("Which db?"), options: twoOptions, default: "SQLite", blocking: true };
+		const [asked] = normalizeClarifications([blocking], 4, docs);
+		expect(asked).toMatchObject({ id: "q1", blocking: true, default: "SQLite", options: twoOptions });
+		expect(asked?.answer).toBeUndefined();
+		expect(asked?.source).toBeUndefined();
+		expect(asked?.evidence).toBeUndefined();
+
+		const [bare] = normalizeClarifications([{ ...settledItem("Which db?"), blocking: true }], 4, docs);
+		expect(bare).toMatchObject({ id: "q1", blocking: true, default: "As stated" });
+		expect(bare?.answer).toBeUndefined();
+	});
+
 	test("a rejected knowledge claim without two options is asked with As stated / Something else, never dropped", () => {
 		const [unread] = normalizeClarifications([settledItem("Which db?", "docs/other.md")], 4, docs);
 		expect(unread).toEqual({

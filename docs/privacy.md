@@ -55,7 +55,7 @@ On a fresh install, only the first row applies: tracking, ship, the Greptile kno
 - The planner finds the knowledge base by the `origin` remote's `owner/repo`, reads `index.md`, then picks up to 3 documents from its routing table that match the request. The matching happens on your machine: the request itself never goes to Greptile.
 - The documents read, at most 24 000 characters, go to the planning engine inside the clarification call, marked as untrusted Greptile-synthesized evidence. They are also named (paths only) in the context your agent sees.
 - The session record keeps the lookup's outcome, repository, namespace id, version, document paths, digest length and timing, not the document text. A question the documents settled is kept with the clarifications, with its one-sentence answer and the document it cites.
-- Without a stored credential nothing is contacted. Each Greptile stage has a 20-second budget, and any failure means the clarification call runs exactly as with the feature off.
+- Without a stored credential nothing is contacted. Each Greptile stage has a 20-second budget, and any failure means the clarification call runs exactly as with the feature off. That includes a single selected document that fails to read or times out: none of the documents then go to the planning engine.
 
 ### GitHub and pull request bodies
 

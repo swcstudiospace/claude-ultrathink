@@ -42,7 +42,11 @@ export interface KnowledgeResult {
 }
 
 export interface KnowledgeSession {
-	/** Picks and reads the documents that match `topic`. Never rejects; a second call returns the same promise. */
+	/**
+	 * Picks and reads the documents that match `topic`. Any selected document that fails to read, times out or has no
+	 * string content makes the whole lookup `error`, never a partial digest. Never rejects; a second call returns the
+	 * same promise.
+	 */
 	read(topic: string): Promise<KnowledgeResult>;
 	/** Releases the MCP client. Idempotent. */
 	close(): void;
@@ -343,30 +347,31 @@ export function createKnowledgeReader(opts: {
 						const { outcome, reason, namespaceId, version } = pre;
 						return finish({ outcome, reason, namespaceId, version, docs: [], chars: 0 });
 					}
-					const failures: unknown[] = [];
 					const selected = selectDocuments({ index: pre.index, paths: pre.paths, topic, maxDocs });
+					// Every selected document is read or the lookup is an error: a partial digest would let the clarifier settle
+					// questions from an incomplete picture, so any failed read falls back to the feature-off path.
 					const fetched = await Promise.all(
-						selected.map(async (path) => {
+						selected.map(async (path): Promise<{ path: string; content: string } | { error: unknown }> => {
 							try {
 								const content = documentContent(
 									await call(dl, pre.caller, "get_knowledge_base_document", { namespaceId: pre.namespaceId, path }),
 								);
-								return content === undefined ? undefined : { path, content };
+								return content === undefined ? { error: new Error(`${path}: no document content`) } : { path, content };
 							} catch (error) {
-								failures.push(error);
-								return undefined;
+								return { error };
 							}
 						}),
 					);
 					const ids = { namespaceId: pre.namespaceId, version: pre.version };
 					if (signal.aborted) return finish({ outcome: "error", ...ids, docs: [], chars: 0, reason: "aborted" });
+					const failed = fetched.find((doc) => "error" in doc);
+					if (failed && "error" in failed) return finish({ outcome: "error", ...ids, docs: [], chars: 0, reason: dl.reason(failed.error) });
 					const docs = [
 						...(pre.index !== undefined ? [{ path: INDEX, content: pre.index }] : []),
-						...fetched.filter((doc): doc is { path: string; content: string } => doc !== undefined),
+						...fetched.filter((doc): doc is { path: string; content: string } => "content" in doc),
 					];
 					if (docs.length === 0) {
-						const reason = failures.length > 0 ? dl.reason(failures[0]) : "no knowledge-base document matches the request";
-						return finish({ outcome: failures.length > 0 ? "error" : "none", ...ids, docs: [], chars: 0, reason });
+						return finish({ outcome: "none", ...ids, docs: [], chars: 0, reason: "no knowledge-base document matches the request" });
 					}
 					const digest = buildDigest({ repoName: pre.repoName, version: pre.version, docs, maxChars });
 					return finish({ outcome: "used", ...ids, docs: docs.map((doc) => doc.path), chars: digest.length }, digest);

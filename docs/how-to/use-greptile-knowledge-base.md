@@ -73,7 +73,7 @@ Then send a prompt that gets planned. The one-line summary after the plan (shown
 | `Knowledge · 3 docs · 1 settled` | Documents were read and passed to the clarifier; one question was settled from them. ` · <n> settled` appears only when at least one was. |
 | `Knowledge · none` | No repository slug, the repository isn't in the knowledge-base list, or it has no published documents. |
 | `Knowledge · off (no Greptile login)` | No usable Greptile credential; nothing was contacted. |
-| `Knowledge · error` | A Greptile or network error, the organization choice above, a timeout, or a cancelled plan. The questions are the same as with the feature off. |
+| `Knowledge · error` | A Greptile or network error, the organization choice above, a timeout, or a cancelled plan. One selected document that fails to read or times out is enough: the lookup never goes on with only some of them. The questions are the same as with the feature off. |
 
 For the reason and timing, run the host with `ULTRATHINK_DEBUG=1` (Claude Code, Grok Build and Muse; see [Configuration](../configuration.md#environment-variables)). The prompt hook writes one line per lookup to stderr: `greptile knowledge base: <outcome>`, then the documents read or the reason, then the elapsed time. For example:
 
@@ -88,7 +88,7 @@ Every host also records the lookup as `knowledge` in the session record (`<state
 1. While the uplift runs, the planner finds the repository's knowledge base by the `origin` remote's `owner/repo`, lists its documents and reads `index.md`.
 2. After the Graph of Thought, it picks up to 3 documents from the index's routing table that match the request and reads them.
 3. At most 24 000 characters of those documents go to the clarifier, marked as untrusted evidence. Each Greptile stage has a 20-second budget.
-4. The clarifier may mark a question as settled only by citing one of the documents it was given, with a one-sentence answer. A settled question is not asked. A claim that cites a document that was not read, has an empty or overlong answer, or goes past the limit of 4 settled questions is asked as an ordinary question, never dropped. Product decisions (what you want, as opposed to how the repository works) are still asked.
+4. The clarifier may mark a question as settled only by citing one of the documents it was given, with a one-sentence answer. A settled question is not asked. A claim that cites a document that was not read, has an empty or overlong answer, or goes past the limit of 4 settled questions is asked as an ordinary question, never dropped. Product decisions (what you want, as opposed to how the repository works) and any question the clarifier marks blocking are always asked, never settled from the knowledge base.
 
 Settled questions show up:
 
@@ -98,7 +98,7 @@ Settled questions show up:
 
 Settled answers are not carried to the next prompt in the session; your own answers are. If a document is wrong, answer the question yourself in a later prompt or turn the feature off.
 
-Everything fails open: without a credential, with no knowledge base, on an error or after a timeout, the planner asks exactly the questions it would ask with the feature off.
+Everything fails open: without a credential, with no knowledge base, on an error or after a timeout, the planner asks exactly the questions it would ask with the feature off. That includes a lookup where any of the selected documents fails to read or times out: the whole lookup is then `error`, and the clarifier gets none of the documents.
 
 Only list and read calls go to Greptile (organization, knowledge-base id, document paths). Nothing from your prompt or your code is sent to Greptile. The documents read go to the planning engine inside the clarify call. See [Privacy](../privacy.md).
 

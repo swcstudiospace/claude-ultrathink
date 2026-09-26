@@ -25,7 +25,7 @@ import { defaultRun } from "./run.ts";
 import { collectSignals, gatherDiff } from "./signals.ts";
 import { appendAttempts, readShip, writeShip } from "./state.ts";
 import { GREPTILE_MAX_SCORE } from "./types.ts";
-import type { Assessment, PrRef, ReviewComment, ReviewResult, Run, ShipAttempt, ShipConfig, ShipState } from "./types.ts";
+import type { Assessment, PrRef, PrStatus, ReviewComment, ReviewResult, Run, ShipAttempt, ShipConfig, ShipState } from "./types.ts";
 
 export interface ShipDeps {
 	config: ShipConfig;
@@ -61,8 +61,13 @@ const TRANSIENT_GATE: Record<string, true> = { "CI checks pending": true, "GitHu
 /** GitHub merge errors that clear without a new commit: branch protection awaiting a human (bounded by mergeTimeoutMs) or rate limits. */
 const TRANSIENT_MERGE_ERROR = /base branch policy prohibits|rate limit/i;
 /** GitHub merge errors no retry or new commit fixes: a human must act. */
-const TERMINAL_MERGE_ERROR =
-	/approv|review(s)? required|changes requested|permission|forbidden|not authori[sz]ed|pull request is closed|PR is CLOSED/i;
+const TERMINAL_MERGE_ERROR = new RegExp(
+	[
+		"approv|review(s)? required|changes requested|permission|forbidden|not authori[sz]ed|pull request is closed|PR is CLOSED",
+		"resource not accessible|must have (admin|write|push|maintain)|insufficient (scopes|permissions)|not permitted",
+	].join("|"),
+	"i",
+);
 /** GitHub merge errors the agent fixes with a new commit and review. */
 const AGENT_MERGE_ERROR = /conflict|not mergeable|out of date|behind|update the branch|head branch was modified|head commit/i;
 const MAX_POLL_MS = 60_000;
@@ -202,9 +207,11 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 		}
 	}
 	// Reviews of this head that failed or timed out are never resumed: the next call triggers a fresh one.
-	const staleReviewIds = ship.rounds.flatMap((round) =>
-		isFailedReview(round) && round.headSha === status.headSha && round.reviewId ? [round.reviewId] : [],
-	);
+	const failedHere = ship.rounds.filter((round) => isFailedReview(round) && round.headSha === status.headSha);
+	const staleReviewIds = failedHere.flatMap((round) => (round.reviewId ? [round.reviewId] : []));
+	// One without an id cannot be marked stale: restart ignores every existing review of the head, unless the fresh
+	// review it started is still pending (then it is resumed, not restarted again).
+	const restart = failedHere.some((round) => !round.reviewId) && ship.pending?.headSha !== status.headSha;
 	let result: ReviewResult = reusedRound
 		? prior
 		: await deps.review({
@@ -218,6 +225,7 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 				headSha: status.headSha,
 				reviewThreads: () => github.reviewThreads(pr.number),
 				staleReviewIds,
+				...(restart ? { restart: true } : {}),
 			});
 	if (reusedRound && result.source === "pr") {
 		// Threads resolved since the round (non-actionable findings) close without a new commit. A failed refresh must not
@@ -261,7 +269,7 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	const passed = reviewPasses(deps.config, result);
 	// A failed or timed-out review is re-triggered up to reviewRetries times per head; `used` includes this one.
 	const failure = isFailedReview(result) ? (result.status === "timeout" ? "timed out" : "failed") : undefined;
-	const used = failure ? ship.rounds.filter((round) => isFailedReview(round) && round.headSha === status.headSha).length + 1 : 0;
+	const used = failure ? failedHere.length + 1 : 0;
 	const retries = deps.config.reviewRetries;
 	const errorSuffix = result.error ? `: ${result.error}` : "";
 	// A PR merged outside the flow is ready only for cleanup, and only when its review passed.
@@ -354,13 +362,23 @@ function classifyMergeError(error: string, headSha: string): MergeStep {
 	return transient;
 }
 
-/** One merge poll: re-reads the PR and merges only when the latest review passed for its exact head commit. */
+/**
+ * One merge poll: merges only when the latest review passed for the PR's exact head commit. The stored review is
+ * checked before any GitHub read, so an unreadable PR is only ever retried for a head whose review passed.
+ */
 function mergeOnce(config: ShipConfig, github: Github, ship: ShipState, pr: PrRef): MergeStep {
+	let latest = ship.rounds.at(-1);
+	if (ship.phase !== "merged" && (!latest || !reviewPasses(config, latest))) {
+		const storedHead = latest?.headSha ?? "";
+		// The review side of the gate alone: a mergeable, check-free stand-in for the PR at the stored head.
+		const standIn: PrStatus = { state: "OPEN", headSha: storedHead, mergeable: "MERGEABLE", checks: "none", url: pr.url };
+		const { reason } = mergeGate({ config, status: standIn, latest });
+		return { kind: "needs-agent", reason, next: `${reason}; run review again`, headSha: storedHead };
+	}
 	const status = github.prStatus(pr.number);
 	if (!status) return { kind: "transient", reason: "could not read PR status" };
 	const headSha = status.headSha;
 	if (status.state === "CLOSED") return { kind: "blocked", reason: "PR closed without merge", headSha, comment: false };
-	let latest = ship.rounds.at(-1);
 	if (status.state === "MERGED") {
 		// Cleanup only for a merge this flow made or one whose exact head passed review; anything else is reported, never recorded.
 		if (ship.phase === "merged" || (latest?.headSha === headSha && reviewPasses(config, latest))) {
