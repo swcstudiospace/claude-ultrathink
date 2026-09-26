@@ -201,11 +201,13 @@ describe("collectSignals", () => {
 			join(cwd, ".planning", "milestones", "v2.0-MILESTONE-AUDIT.md"),
 			"---\nmilestone: v2.0\nstatus: tech_debt\nscores:\n  requirements: 12/12\n  phases: \"2/3\"\n  nyquist: '0.9'\ngaps: []\n---\n# Audit\n",
 		);
+		// 03-c has no verification file: it is reported as "missing", never dropped.
 		const milestone = {
 			version: "v2.0",
 			verifications: [
 				{ phase: "01-a", status: "passed" },
 				{ phase: "02-b", status: "gaps_found" },
+				{ phase: "03-c", status: "missing" },
 			],
 			audit: { status: "tech_debt", scores: { requirements: "12/12", phases: "2/3", nyquist: "0.9" } },
 		};
@@ -528,6 +530,18 @@ describe("assessDone modes", () => {
 			expect(a.gaps).toEqual(["archived milestone v2.0: 02-ui verification is gaps_found"]);
 		});
 	}
+
+	test("archived milestone with no phase verifications is a rule gap", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals({}, { ...MILESTONE_GSD, milestone: { version: "v2.0", verifications: [] } } as ShipSignals["gsd"]),
+			diff: DIFF,
+			mode: "advisory",
+			complete: judge({ done: true, confidence: 1, summary: "", gaps: [] }),
+		});
+		expect(a).toMatchObject({ done: false, source: "rules" });
+		expect(a.gaps).toEqual(["archived milestone v2.0 has no phase verifications"]);
+	});
 
 	test("all-passed archived milestone is no gap; judge prompt carries the milestone line", async () => {
 		let prompt = "";

@@ -149,19 +149,22 @@ async function stepAssess(ctx: Ctx): Promise<Output & { done: boolean }> {
 	const signals = ctx.ignoreGsd ? { ...probed, gsd: undefined, gsdIgnored: true } : probed;
 	let pr = record.ship?.pr;
 	if (record.ship && pr) {
-		// One session ships sequentially: a finished ship of another repository or branch is archived, an active one refuses.
+		// One session ships sequentially: a merged ship is always archived (re-assessing it must not reopen the merged PR),
+		// a blocked ship of another repository or branch is archived, an active one elsewhere refuses.
 		const priorRepo = prRepo(pr);
 		const elsewhere = (priorRepo && signals.git.repo && priorRepo !== signals.git.repo) || pr.head !== signals.git.branch;
-		if (elsewhere) {
-			const { phase } = record.ship;
-			if (phase !== "merged" && phase !== "blocked") {
-				return {
-					ok: false,
-					done: false,
-					reason: `this session is still shipping ${pr.url} (phase ${phase}); finish or block that ship before assessing another repository or branch`,
-				};
+		const { phase } = record.ship;
+		if (elsewhere && phase !== "merged" && phase !== "blocked") {
+			return {
+				ok: false,
+				done: false,
+				reason: `this session is still shipping ${pr.url} (phase ${phase}); finish or block that ship before assessing another repository or branch`,
+			};
+		}
+		if (phase === "merged" || elsewhere) {
+			if (!archiveShip(statePath, deps.now())) {
+				return { ok: false, done: false, reason: `could not archive the finished ship ${pr.url}; state file not writable` };
 			}
-			archiveShip(statePath, deps.now());
 			pr = undefined;
 		}
 	}

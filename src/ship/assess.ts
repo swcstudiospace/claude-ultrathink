@@ -43,6 +43,8 @@ function ruleGaps(signals: ShipSignals): string[] {
 	if (gsd?.verification && gsd.verification.status !== "passed")
 		gaps.push(`latest GSD verification is ${gsd.verification.status}`);
 	if (gsd?.milestone) {
+		if (gsd.milestone.verifications.length === 0)
+			gaps.push(`archived milestone ${gsd.milestone.version} has no phase verifications`);
 		for (const v of gsd.milestone.verifications) {
 			if (v.status !== "passed")
 				gaps.push(`archived milestone ${gsd.milestone.version}: ${v.phase} verification is ${v.status}`);

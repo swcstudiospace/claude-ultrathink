@@ -79,7 +79,7 @@ When the repository has `.planning/ROADMAP.md`, these GSD rules also apply:
 - `gsd-tools.cjs` was not found, or `node` is not on `PATH` to run it (see [GSD tools](#gsd-tools));
 - the GSD roadmap (`gsd-tools.cjs query roadmap.analyze`) has incomplete phases;
 - the latest `.planning/phases/*/*-VERIFICATION.md` has a status other than `passed`;
-- when `.planning/phases` has no `*-VERIFICATION.md` (for example after `gsd-autonomous` archived the milestone), any `.planning/milestones/<version>-phases/*/*-VERIFICATION.md` of the latest archived milestone has a status other than `passed`. Each one is a gap `archived milestone <version>: <phase> verification is <status>`. The status and scores in `.planning/milestones/<version>-MILESTONE-AUDIT.md`, when present, go to the judge as evidence.
+- when `.planning/phases` has no `*-VERIFICATION.md` (for example after `gsd-autonomous` archived the milestone), any `.planning/milestones/<version>-phases/*/*-VERIFICATION.md` of the latest archived milestone has a status other than `passed`. Each one is a gap `archived milestone <version>: <phase> verification is <status>`. A phase directory without a readable verification status counts as `missing`, and a milestone with no phase verifications at all is the gap `archived milestone <version> has no phase verifications`. The status and scores in `.planning/milestones/<version>-MILESTONE-AUDIT.md`, when present, go to the judge as evidence.
 
 `assess --ignore-gsd` leaves all the GSD rules out. Use it only when you have decided the repository's `.planning/` roadmap is separate work from this change, for example planning that belongs to another effort. The judge still reads the request, the plan and the diff, and the PR body records `GSD roadmap: excluded by the operator`.
 
@@ -106,7 +106,7 @@ When the task is not done in gate mode, the skill hands the gaps back to you and
 
 ### Several PRs in one session
 
-One session can ship several PRs, one after another. `assess` in another repository or branch than the current ship archives the finished ship (`merged` or `blocked`) into `ship.history` (the last 10, oldest first) and starts a fresh one. While the previous ship is still active, `assess` in another repository or branch refuses: merge or block that ship first. `pr` records the PR's repository (`owner/repo`) as `pr.repo`.
+One session can ship several PRs, one after another. `assess` in another repository or branch than the current ship archives the finished ship (`merged` or `blocked`) into `ship.history` (the last 10, oldest first) and starts a fresh one. A `merged` ship is archived even on its own branch, so re-running `assess` never reopens a merged PR. While the previous ship is still active, `assess` in another repository or branch refuses: merge or block that ship first. `pr` records the PR's repository (`owner/repo`) as `pr.repo`.
 
 ## GSD tools
 

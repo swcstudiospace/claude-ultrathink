@@ -254,13 +254,23 @@ describe("runShip", () => {
 		expect(readFileSync(statePath, "utf8")).toBe(before);
 	});
 
-	test("assess on the ship's own branch and repository keeps the ship without archiving", async () => {
-		writeShip(statePath, { pr: { ...PR, repo: "o/r" }, phase: "merged", rounds: [PASSED] }, 5);
+	test("assess on the ship's own branch and repository keeps an active ship without archiving", async () => {
+		writeShip(statePath, { pr: { ...PR, repo: "o/r" }, phase: "needs-fixes", rounds: [PASSED] }, 5);
 		const out = await ship("assess", deps({ git: { repo: "o/r" } }));
 		expect(out.output).toMatchObject({ ok: true, done: true });
 		const state = readShip(statePath);
 		expect(state?.history).toBeUndefined();
 		expect(state).toMatchObject({ phase: "pr-open", pr: { ...PR, repo: "o/r" }, rounds: [PASSED] });
+	});
+
+	test("assess never reopens a merged ship on its own branch: it is archived", async () => {
+		writeShip(statePath, { pr: { ...PR, repo: "o/r" }, phase: "merged", rounds: [PASSED] }, 5);
+		const out = await ship("assess", deps({ git: { repo: "o/r" } }));
+		expect(out.output).toMatchObject({ ok: true, done: true });
+		const state = readShip(statePath);
+		expect(state).toMatchObject({ phase: "not-done", rounds: [] });
+		expect(state?.pr).toBeUndefined();
+		expect(state?.history?.[0]).toMatchObject({ phase: "merged", pr: { ...PR, repo: "o/r" } });
 	});
 
 	test("pr refuses when not assessed done", async () => {

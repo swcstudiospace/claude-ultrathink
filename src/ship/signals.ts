@@ -152,10 +152,10 @@ export function latestMilestone(cwd: string): MilestoneEvidence | undefined {
 			} catch {
 				continue;
 			}
+			// A phase without a readable, status-bearing verification counts as "missing", never as silently passed.
 			const file = files.filter((name) => name.endsWith("-VERIFICATION.md")).sort().at(-1);
-			if (!file) continue;
-			const status = frontmatterStatus(readFileSync(join(phasesDir, phase, file), "utf8"));
-			if (status) verifications.push({ phase, status });
+			const status = file ? frontmatterStatus(readFileSync(join(phasesDir, phase, file), "utf8")) : undefined;
+			verifications.push({ phase, status: status ?? "missing" });
 		}
 		const auditPath = join(milestonesDir, `${version}-MILESTONE-AUDIT.md`);
 		let audit: MilestoneEvidence["audit"];

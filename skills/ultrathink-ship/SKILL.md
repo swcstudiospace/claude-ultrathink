@@ -21,7 +21,7 @@ Advisory mode (`ship.judge: "advisory"`): `done` reflects the deterministic rule
 
 Exception, only on the user's explicit decision: when the user has said the repository's GSD roadmap is separate work (for example they chose not to run its phases for this change), run `bin/ultrathink-ship assess --state <stateFile> --ignore-gsd`. The roadmap and verification signals are left out, the judge still decides on the request, the plan and the diff, and the PR body records the exclusion. Never add the flag on your own initiative.
 
-Several ships: one session may ship several PRs, one at a time. Finish one ship (merged or blocked, then `ultrathink-sync`) before running `assess` in the next repository or branch; `assess` refuses while the previous ship is still active, and archives a finished one into `ship.history`.
+Several ships: one session may ship several PRs, one at a time. Finish one ship (merged or blocked, then `ultrathink-sync`) before running `assess` in the next repository or branch; `assess` refuses while the previous ship is still active, and archives a finished one into `ship.history` (a merged one even on the same branch).
 
 ## 1. Commit your own finished work
 
