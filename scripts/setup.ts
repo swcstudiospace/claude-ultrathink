@@ -246,7 +246,9 @@ export function apply(
 		writeFileSync(path, after);
 	}
 
-	writeSetupState({ notionAdded: notion.added, linearAdded: linear.added }, env);
+	// A re-run finds the servers it added earlier already present; keep them recorded so rollback still removes them.
+	const previous = readSetupState(env);
+	writeSetupState({ notionAdded: notion.added || previous.notionAdded, linearAdded: linear.added || previous.linearAdded }, env);
 
 	return { claude: { notion, linear, plugin, claudeMd: { path, changed: after !== before } }, grok };
 }

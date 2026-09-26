@@ -322,6 +322,28 @@ describe("apply / status / rollback", () => {
 		}
 	});
 
+	test("re-running apply keeps servers an earlier apply added recorded, so rollback still removes them", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			// The second run finds both servers present (added by the first run) and adds nothing.
+			const rerun = mcpRun("notion: https://mcp.notion.com/mcp (HTTP) - ✔ Connected\nlinear: https://mcp.linear.app/mcp (HTTP) - ✔ Connected\n");
+			const again = apply(repo, rerun, env);
+			expect(again.claude?.notion.added).toBe(false);
+			expect(again.claude?.linear.added).toBe(false);
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
+
+			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const result = rollback(env, rollbackRun);
+			expect(result.notion.removed).toBe(true);
+			expect(result.linear.removed).toBe(true);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("apply records added:false for a server that was already configured; rollback does not remove it", () => {
 		const { env, repo, cleanup } = tempSetup();
 		// `claude mcp list` shows both servers already configured, so ensureMcpServer skips both.

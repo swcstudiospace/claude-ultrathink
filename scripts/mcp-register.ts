@@ -20,7 +20,7 @@ in each host's user config. Every file it changes is backed up as <file>.bak-ult
   --providers  providers to register or remove (default: all)
   --replace    also overwrite same-named entries that are not ultrathink's (by default they are kept)
   --remove     delete ultrathink's entries (command ends with /bin/ultrathink-mcp); other entries are kept
-  --dry-run    print what would change without writing or running anything`;
+  --dry-run    print what would change without writing a file or changing a host (the hosts' read-only list/get commands still run)`;
 
 export interface Entry {
 	id: string;
@@ -510,7 +510,7 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		hermesConfig: () => (hermesFile === undefined ? undefined : readText(hermesFile)),
 	};
 	let failed = false;
-	if (dryRun) log("dry run: nothing will be written or executed");
+	if (dryRun) log("dry run: no file is written and no host is changed; read-only list/get commands still run");
 	if (mode !== "remove" && `${root}/`.includes("/plugins/cache/")) {
 		log(
 			`warning: ${root} is a plugin cache that the next plugin update replaces, which would break the registered commands; clone the repository to a stable directory and rerun mcp-register from there`,
