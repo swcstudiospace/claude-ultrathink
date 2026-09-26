@@ -38,6 +38,12 @@ export function buildPr(record: SessionRecord, assessment?: Assessment): { title
 		if (assessment.gaps.length > 0) {
 			lines.push("- Gaps:", ...assessment.gaps.map((gap) => `  - ${scrub(gap)}`));
 		}
+		if (assessment.mode === "advisory" && assessment.judge) {
+			const { judge } = assessment;
+			const error = judge.error ? `, error: ${scrub(judge.error)}` : "";
+			lines.push(`- Judge (advisory): done ${judge.done ? "yes" : "no"}, confidence ${judge.confidence}${error}`);
+			if (judge.gaps.length > 0) lines.push("- Judge notes:", ...judge.gaps.map((gap) => `  - ${scrub(gap)}`));
+		}
 		sections.push(`## Assessment\n\n${lines.join("\n")}`);
 	}
 

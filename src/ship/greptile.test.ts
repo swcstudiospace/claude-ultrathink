@@ -17,6 +17,7 @@ const repo = { name: "acme/app", remote: "github" as const, defaultBranch: "mast
 const config: ShipConfig = {
 	enabled: true,
 	autoMerge: true,
+	judge: "gate",
 	skills: ["gsd-"],
 	minScore: 5,
 	requireNoComments: true,

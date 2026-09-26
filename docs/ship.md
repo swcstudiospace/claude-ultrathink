@@ -78,7 +78,8 @@ When the repository has `.planning/ROADMAP.md`, these GSD rules also apply:
 - `.planning/ROADMAP.md` is not tracked by git and `.planning/` is not ignored (possibly stray planning written by another tool);
 - `gsd-tools.cjs` was not found, or `node` is not on `PATH` to run it (see [GSD tools](#gsd-tools));
 - the GSD roadmap (`gsd-tools.cjs query roadmap.analyze`) has incomplete phases;
-- the latest `.planning/phases/*/*-VERIFICATION.md` has a status other than `passed`.
+- the latest `.planning/phases/*/*-VERIFICATION.md` has a status other than `passed`;
+- when `.planning/phases` has no `*-VERIFICATION.md` (for example after `gsd-autonomous` archived the milestone), any `.planning/milestones/<version>-phases/*/*-VERIFICATION.md` of the latest archived milestone has a status other than `passed`. Each one is a gap `archived milestone <version>: <phase> verification is <status>`. The status and scores in `.planning/milestones/<version>-MILESTONE-AUDIT.md`, when present, go to the judge as evidence.
 
 `assess --ignore-gsd` leaves all the GSD rules out. Use it only when you have decided the repository's `.planning/` roadmap is separate work from this change, for example planning that belongs to another effort. The judge still reads the request, the plan and the diff, and the PR body records `GSD roadmap: excluded by the operator`.
 
@@ -90,14 +91,22 @@ When the rules pass, an LLM judge runs on the configured engine. It reads:
 - the diff stat and the commit log,
 - the patch itself, capped at 24,000 characters, with lockfiles left out.
 
-The task is done only when the judge says done with a confidence of at least 0.7. When unsure, the judge answers not done. If the judge fails or its reply cannot be parsed, the task is not done.
+`ship.judge` decides what the judge's verdict does. The rules above block the task in both modes.
+
+- `"gate"` (the default): the task is done only when the judge says done with a confidence of at least 0.7. When unsure, the judge answers not done. If the judge fails or its reply cannot be parsed, the task is not done.
+- `"advisory"`: the task is done whenever the rules pass. The judge still runs and its verdict (done, confidence, summary and gaps) is recorded under `judge` in the assessment and shown in the PR body, but it never blocks. A judge that fails or returns an unparseable reply is recorded with its error. The merge gate (see [Merge gate](#merge-gate)) is the same in both modes.
 
 If no engine is available (for example the Grok login is missing):
 
-- with `ship.autoMerge: true`, the task is not done ("no judge available");
-- with `ship.autoMerge: false`, the rules alone decide, with confidence 0.5.
+- in gate mode with `ship.autoMerge: true`, the task is not done ("no judge available");
+- in gate mode with `ship.autoMerge: false`, the rules alone decide, with confidence 0.5;
+- in advisory mode, the rules alone decide, with confidence 0.5, and the verdict is recorded as `no judge available`.
 
-When the task is not done, the skill hands the gaps back to you and opens no PR. The agent may finish work only when the gaps are clearly its own unfinished work from the same run.
+When the task is not done in gate mode, the skill hands the gaps back to you and opens no PR. The agent may finish work only when the gaps are clearly its own unfinished work from the same run. In advisory mode the agent fixes rule gaps itself, never asks you to open or merge a PR, and hands back only decisions it cannot make.
+
+### Several PRs in one session
+
+One session can ship several PRs, one after another. `assess` in another repository or branch than the current ship archives the finished ship (`merged` or `blocked`) into `ship.history` (the last 10, oldest first) and starts a fresh one. While the previous ship is still active, `assess` in another repository or branch refuses: merge or block that ship first. `pr` records the PR's repository (`owner/repo`) as `pr.repo`.
 
 ## GSD tools
 
@@ -262,14 +271,14 @@ Merge the PR on GitHub yourself. ultrathink does not watch it afterwards, and it
 
 | Subcommand | Does |
 |---|---|
-| `assess` | Collect the git, GSD and graph signals and judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out (see [Done assessment](#done-assessment)). |
+| `assess` | Collect the git, GSD and graph signals and judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out (see [Done assessment](#done-assessment)). In another repository or branch it archives a finished ship into `ship.history` and starts a fresh one (see [Several PRs in one session](#several-prs-in-one-session)). |
 | `pr` | Push the branch and open or reuse the PR into the default branch. |
 | `review` | Run one Greptile review round in PR or CLI mode. Returns `pending` within `waitMs` while Greptile is still working, or `blocked` when Greptile is not usable as configured. |
 | `merge` | Check the merge gate, merge, and (with `deleteBranch`) delete the branch, retrying transient failures within `waitMs` (see [Merge retries](#merge-retries)). Refuses with `autoMerge disabled` when `autoMerge` is off. |
 | `run` | `assess`, `pr`, `review` and `merge` in one call. It stops at the first step that is not ready, and before `merge` when `autoMerge` is off. When the review passed, it merges within what is left of its `waitMs`. Fixes stay with the agent. |
 | `status` | Print the stored ship state, including the attempt log. |
 
-Progress is stored under `ship` in the session record. It holds `phase`, `assessment`, `pr`, `rounds`, `pending`, `waiting`, `attempts`, `blockedReason`, `nudgedAt` and `mergedAt`. See [Configuration](configuration.md#state-directories) for where each host keeps the record.
+Progress is stored under `ship` in the session record. It holds `phase`, `assessment`, `pr`, `rounds`, `pending`, `waiting`, `attempts`, `blockedReason`, `nudgedAt`, `mergedAt` and `history`. See [Configuration](configuration.md#state-directories) for where each host keeps the record.
 
 ## Configuration
 
@@ -278,7 +287,8 @@ These keys go in the `ship` section of any [config file](configuration.md#config
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Add the ship instruction and nudges. |
-| `autoMerge` | `false` | Allow `merge`. When `true`, the assessment also requires the engine judge. |
+| `autoMerge` | `false` | Allow `merge`. When `true` and `judge` is `"gate"`, the assessment also requires the engine judge. |
+| `judge` | `"gate"` | `"gate"`: the LLM judge must say done with confidence >= 0.7. `"advisory"`: only the rules gate `done`; the judge verdict is recorded and shown in the PR body. The merge gate is unchanged in both modes (see [Done assessment](#done-assessment)). |
 | `deleteBranch` | `false` | Delete the remote and local branch after a confirmed merge. |
 | `skills` | `["gsd-"]` | Skill name prefixes that trigger ship. `[]` matches every planned prompt. |
 | `greptileOrganization` | `""` | Greptile organization id or handle sent with every Greptile API call. `""` lets Greptile pick, which works for single-organization accounts. |
@@ -314,6 +324,7 @@ Full auto-merge, with every other key at its default:
     "autoMerge": true,
     "deleteBranch": true,
     "skills": ["gsd-"],
+    "judge": "gate",
     "minScore": 5,
     "requireNoComments": true,
     "maxRounds": 5,

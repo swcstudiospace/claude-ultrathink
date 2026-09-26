@@ -23,7 +23,7 @@ import { mergeGate, reviewPasses } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
 import { defaultRun } from "./run.ts";
 import { collectSignals, gatherDiff } from "./signals.ts";
-import { appendAttempts, readShip, writeShip } from "./state.ts";
+import { appendAttempts, archiveShip, readShip, writeShip } from "./state.ts";
 import { GREPTILE_MAX_SCORE } from "./types.ts";
 import type { Assessment, PrRef, PrStatus, ReviewComment, ReviewResult, Run, ShipAttempt, ShipConfig, ShipState } from "./types.ts";
 
@@ -134,22 +134,47 @@ interface Ctx {
 	ignoreGsd: boolean;
 }
 
+/** owner/repo of a recorded PR: its own `repo`, else parsed from a `https://github.com/<owner>/<repo>/pull/<n>` url. */
+function prRepo(pr: PrRef): string | undefined {
+	if (pr.repo) return pr.repo;
+	const match = pr.url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+/);
+	return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
 async function stepAssess(ctx: Ctx): Promise<Output & { done: boolean }> {
 	const { deps, statePath, cwd } = ctx;
 	const record = readRecord(statePath);
 	if (!record) return { ok: false, done: false, reason: "state file missing or unreadable" };
 	const probed = deps.signals({ cwd, record, run: deps.run });
 	const signals = ctx.ignoreGsd ? { ...probed, gsd: undefined, gsdIgnored: true } : probed;
+	let pr = record.ship?.pr;
+	if (record.ship && pr) {
+		// One session ships sequentially: a finished ship of another repository or branch is archived, an active one refuses.
+		const priorRepo = prRepo(pr);
+		const elsewhere = (priorRepo && signals.git.repo && priorRepo !== signals.git.repo) || pr.head !== signals.git.branch;
+		if (elsewhere) {
+			const { phase } = record.ship;
+			if (phase !== "merged" && phase !== "blocked") {
+				return {
+					ok: false,
+					done: false,
+					reason: `this session is still shipping ${pr.url} (phase ${phase}); finish or block that ship before assessing another repository or branch`,
+				};
+			}
+			archiveShip(statePath, deps.now());
+			pr = undefined;
+		}
+	}
 	const diff = signals.git.base ? deps.diff({ cwd, base: signals.git.base, run: deps.run }) : { stat: "", log: "" };
 	const complete = await deps.engine();
-	let assessment: Assessment = await deps.assess({ record, signals, diff, complete, now: deps.now });
-	if (deps.config.autoMerge && assessment.source === "rules" && assessment.done) {
+	const mode = deps.config.judge;
+	let assessment: Assessment = await deps.assess({ record, signals, diff, complete, now: deps.now, mode });
+	if (mode === "gate" && deps.config.autoMerge && assessment.source === "rules" && assessment.done) {
 		assessment = { ...assessment, done: false, gaps: [...assessment.gaps, "no judge available"] };
 	}
-	const pr = record.ship?.pr;
 	writeShip(statePath, { assessment, phase: assessment.done && pr ? "pr-open" : "not-done" }, deps.now());
-	const { done, confidence, summary, gaps } = assessment;
-	return { ok: true, done, confidence, summary, gaps, signals };
+	const { done, confidence, summary, gaps, judge } = assessment;
+	return { ok: true, done, confidence, summary, gaps, mode: assessment.mode ?? mode, ...(judge ? { judge } : {}), signals };
 }
 
 async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
@@ -165,7 +190,8 @@ async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
 	if (git.onBase) return { ok: false, reason: `on base branch ${git.base ?? ""}; work must be on a feature branch` };
 	if (git.dirty.length > 0) return { ok: false, reason: `uncommitted tracked changes: ${git.dirty.join(", ")}` };
 	const github = deps.github(cwd);
-	const base = github.repo()?.defaultBranch ?? git.base;
+	const repo = github.repo();
+	const base = repo?.defaultBranch ?? git.base;
 	if (!base) return { ok: false, reason: "could not determine default branch" };
 	const pushed = github.push(git.branch);
 	if (!pushed.ok) return { ok: false, reason: `push failed: ${pushed.error ?? "unknown"}` };
@@ -176,7 +202,7 @@ async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
 		if ("error" in created) return { ok: false, reason: `create PR failed: ${created.error}` };
 		pr = created;
 	}
-	pr = { ...pr, head: git.branch };
+	pr = { ...pr, head: git.branch, ...(repo?.name ? { repo: repo.name } : {}) };
 	writeShip(statePath, { pr, phase: "pr-open" }, deps.now());
 	return { ok: true, pr, reused };
 }

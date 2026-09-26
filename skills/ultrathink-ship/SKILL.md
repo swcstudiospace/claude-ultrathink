@@ -15,9 +15,13 @@ Every step is idempotent: it reuses an open PR, reuses a review of the same head
 
 `bin/ultrathink-ship assess --state <stateFile>`
 
-If `done` is false, a GSD phase verification is `human_needed` or `gaps_found`, or the roadmap still has incomplete phases: never ship. Hand back to the user with the `gaps` (gsd-autonomous pause semantics) and do NOT open a PR. Only when the gaps are clearly your own unfinished work in this same run may you finish it and run `assess` again.
+Gate mode (`ship.judge: "gate"`, the default): if `done` is false, a GSD phase verification is `human_needed` or `gaps_found`, or the roadmap still has incomplete phases: never ship. Hand back to the user with the `gaps` (gsd-autonomous pause semantics) and do NOT open a PR. Only when the gaps are clearly your own unfinished work in this same run may you finish it and run `assess` again.
+
+Advisory mode (`ship.judge: "advisory"`): `done` reflects the deterministic rules only; the judge's verdict is in `judge`. If `done` is false, fix the rule `gaps` yourself, commit and run `assess` again; hand back to the user only a decision you cannot make. If `judge.gaps` names concrete missing work inside this task's scope, finish it, commit and run `assess` again; otherwise go to step 2. Never ask the user to open or merge a PR. The merge still needs a Greptile score of at least `ship.minScore` with no open threads and passing CI.
 
 Exception, only on the user's explicit decision: when the user has said the repository's GSD roadmap is separate work (for example they chose not to run its phases for this change), run `bin/ultrathink-ship assess --state <stateFile> --ignore-gsd`. The roadmap and verification signals are left out, the judge still decides on the request, the plan and the diff, and the PR body records the exclusion. Never add the flag on your own initiative.
+
+Several ships: one session may ship several PRs, one at a time. Finish one ship (merged or blocked, then `ultrathink-sync`) before running `assess` in the next repository or branch; `assess` refuses while the previous ship is still active, and archives a finished one into `ship.history`.
 
 ## 1. Commit your own finished work
 

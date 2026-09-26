@@ -24,7 +24,18 @@ export interface ShipConfig {
 	reviewRetries: number;
 	/** How long `merge` keeps retrying one reviewed head commit, from the first time it waited on it, before the ship blocks. */
 	mergeTimeoutMs: number;
+	/**
+	 * "gate": the LLM judge must say done with confidence >= 0.7 (today's behavior).
+	 * "advisory": only the deterministic rules gate `done`; the judge verdict is recorded and shown in the PR body,
+	 * and the merge gate (Greptile >= minScore, no open threads, CI) is unchanged.
+	 */
+	judge: JudgeMode;
 }
+
+/** How the pre-PR LLM done-judge takes part in `assess`; see ShipConfig.judge. */
+export type JudgeMode = "gate" | "advisory";
+
+export const JUDGE_MODES: readonly JudgeMode[] = ["gate", "advisory"];
 
 export const MERGE_METHODS: readonly ShipConfig["mergeMethod"][] = ["squash", "merge", "rebase"];
 
@@ -43,6 +54,7 @@ export const DEFAULT_SHIP_CONFIG: ShipConfig = {
 	waitMs: 100_000,
 	reviewRetries: 3,
 	mergeTimeoutMs: 3_600_000,
+	judge: "gate",
 };
 
 export interface GitSignals {
@@ -57,6 +69,16 @@ export interface GitSignals {
 	pushed: boolean;
 }
 
+/** Evidence of the latest archived GSD milestone (`gsd-autonomous` moves phases out of `.planning/phases`). */
+export interface MilestoneEvidence {
+	/** Archived milestone version, e.g. "v2.0" (from `.planning/milestones/<version>-phases/`). */
+	version: string;
+	/** One entry per archived phase dir that has a `*-VERIFICATION.md`, sorted by phase dir name; status = frontmatter `status:`. */
+	verifications: { phase: string; status: string }[];
+	/** From `.planning/milestones/<version>-MILESTONE-AUDIT.md` frontmatter, when present. */
+	audit?: { status: string; scores: Record<string, string> };
+}
+
 export interface GsdSignals {
 	phaseCount: number;
 	completedPhases: number;
@@ -69,6 +91,8 @@ export interface GsdSignals {
 	toolsMissing?: boolean;
 	/** gsd-tools.cjs resolved but `node` could not be spawned to run it (exit 127 / ENOENT). */
 	nodeMissing?: boolean;
+	/** Latest archived milestone; set only when no active phase under `.planning/phases/` has a `*-VERIFICATION.md`. */
+	milestone?: MilestoneEvidence;
 }
 
 export interface ShipSignals {
@@ -79,6 +103,14 @@ export interface ShipSignals {
 	graph?: { nodes: number; workflowUnits: number };
 }
 
+/** The LLM done-judge's parsed verdict. */
+export interface JudgeVerdict {
+	done: boolean;
+	confidence: number;
+	summary: string;
+	gaps: string[];
+}
+
 export interface Assessment {
 	done: boolean;
 	confidence: number;
@@ -86,6 +118,10 @@ export interface Assessment {
 	gaps: string[];
 	signals: ShipSignals;
 	source: "llm" | "rules";
+	/** Judge mode the assessment ran under. */
+	mode?: JudgeMode;
+	/** Advisory mode: the judge verdict, or `error` when the judge was unavailable or failed. */
+	judge?: JudgeVerdict & { error?: string };
 	at: number;
 }
 
@@ -120,6 +156,8 @@ export interface PrRef {
 	url: string;
 	head: string;
 	base: string;
+	/** owner/repo, recorded by `pr`. */
+	repo?: string;
 }
 
 export interface PrStatus {
@@ -157,6 +195,12 @@ export interface ShipAttempt {
 /** Most attempts kept; older ones are dropped. */
 export const MAX_ATTEMPTS = 50;
 
+/** A finished ship of this session, kept in ShipState.history. */
+export type ShipHistoryEntry = Omit<ShipState, "history">;
+
+/** Most finished ships kept per session; older ones are dropped. */
+export const MAX_SHIP_HISTORY = 10;
+
 export interface ShipState {
 	phase: ShipPhase;
 	assessment?: Assessment;
@@ -170,6 +214,8 @@ export interface ShipState {
 	attempts?: ShipAttempt[];
 	/** Since when `merge` has waited on this head commit. */
 	waiting?: { headSha: string; since: number };
+	/** Finished ships of this session, oldest first. */
+	history?: ShipHistoryEntry[];
 	updatedAt: number;
 }
 

@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { defaultRun } from "./run.ts";
-import type { GitSignals, GsdSignals, Run, ShipSignals } from "./types.ts";
+import type { GitSignals, GsdSignals, MilestoneEvidence, Run, ShipSignals } from "./types.ts";
 
 const DIFF_CAP = 8000;
 /** The judge reads the patch itself; larger diffs are truncated, never dropped. */
@@ -103,6 +103,73 @@ function latestVerification(cwd: string): GsdSignals["verification"] {
 	return undefined;
 }
 
+/** Frontmatter `scores:` map: the indented `key: value` lines directly under it, values trimmed of quotes. */
+function frontmatterScores(text: string): Record<string, string> {
+	const block = text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
+	const scores: Record<string, string> = {};
+	if (!block) return scores;
+	const lines = block.split(/\r?\n/);
+	const start = lines.findIndex((line) => /^scores:\s*$/.test(line));
+	if (start < 0) return scores;
+	for (const line of lines.slice(start + 1)) {
+		const entry = line.match(/^\s+([^:\s][^:]*?):\s*(.*?)\s*$/);
+		if (!entry?.[1]) break;
+		scores[entry[1]] = (entry[2] ?? "").replace(/^["']|["']$/g, "");
+	}
+	return scores;
+}
+
+/** Numeric per-component compare of `v1.10`-style versions; v1.10 > v1.9. */
+function compareVersions(a: string, b: string): number {
+	const pa = a.slice(1).split(".").map(Number);
+	const pb = b.slice(1).split(".").map(Number);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+/**
+ * The newest milestone archived under `.planning/milestones/` (what `gsd-autonomous` leaves behind once the active
+ * phases are gone): its phase verifications and audit. Fails open to undefined.
+ */
+export function latestMilestone(cwd: string): MilestoneEvidence | undefined {
+	try {
+		const milestonesDir = join(cwd, ".planning", "milestones");
+		const version = readdirSync(milestonesDir)
+			.map((name) => name.match(/^(v\d+(?:\.\d+)*)-phases$/)?.[1])
+			.filter((name): name is string => name !== undefined)
+			.sort(compareVersions)
+			.at(-1);
+		if (!version) return undefined;
+		const phasesDir = join(milestonesDir, `${version}-phases`);
+		const verifications: MilestoneEvidence["verifications"] = [];
+		for (const phase of readdirSync(phasesDir).sort()) {
+			let files: string[];
+			try {
+				files = readdirSync(join(phasesDir, phase));
+			} catch {
+				continue;
+			}
+			const file = files.filter((name) => name.endsWith("-VERIFICATION.md")).sort().at(-1);
+			if (!file) continue;
+			const status = frontmatterStatus(readFileSync(join(phasesDir, phase, file), "utf8"));
+			if (status) verifications.push({ phase, status });
+		}
+		const auditPath = join(milestonesDir, `${version}-MILESTONE-AUDIT.md`);
+		let audit: MilestoneEvidence["audit"];
+		if (existsSync(auditPath)) {
+			const text = readFileSync(auditPath, "utf8");
+			const status = frontmatterStatus(text);
+			if (status) audit = { status, scores: frontmatterScores(text) };
+		}
+		return { version, verifications, ...(audit ? { audit } : {}) };
+	} catch {
+		return undefined;
+	}
+}
+
 type Env = Record<string, string | undefined>;
 
 /** Where GSD installs gsd-tools.cjs, in lookup order: project-local installs (incl. legacy), then each host's config dir, then the legacy home path. */
@@ -153,10 +220,13 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	let phaseCount = 0;
 	let completedPhases = 0;
 	const verification = latestVerification(cwd);
-	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification, toolsMissing: true };
+	// Archived milestone evidence only stands in when no active phase has a verification.
+	const milestone = verification ? undefined : latestMilestone(cwd);
+	const archived = milestone ? { milestone } : {};
+	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification, ...archived, toolsMissing: true };
 	const analyzed = run(["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], { cwd });
 	if (analyzed.exitCode === 127 || /ENOENT/.test(analyzed.stderr)) {
-		return { phaseCount, completedPhases, trusted, state, verification, nodeMissing: true };
+		return { phaseCount, completedPhases, trusted, state, verification, ...archived, nodeMissing: true };
 	}
 	const text = analyzed.exitCode === 0 ? analyzed.stdout.trim() : "";
 	try {
@@ -166,7 +236,7 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	} catch {
 		phaseCount = 0;
 	}
-	return { phaseCount, completedPhases, trusted, state, verification };
+	return { phaseCount, completedPhases, trusted, state, verification, ...archived };
 }
 
 function collectGraph(record: SessionRecord): ShipSignals["graph"] {

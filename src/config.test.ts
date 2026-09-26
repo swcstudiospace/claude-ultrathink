@@ -277,6 +277,12 @@ describe("ship config", () => {
 	test("minScore above Greptile's 5/5 maximum falls back", () => {
 		expect(mergeConfig({ ship: { minScore: 6 } }, base).ship.minScore).toBe(5);
 	});
+	test("judge accepts gate and advisory; anything else falls back to gate", () => {
+		expect(base.ship.judge).toBe("gate");
+		expect(mergeConfig({ ship: { judge: "advisory" } }, base).ship.judge).toBe("advisory");
+		expect(mergeConfig({ ship: { judge: "gate" } }, { ...base, ship: { ...base.ship, judge: "advisory" } }).ship.judge).toBe("gate");
+		for (const judge of ["off", "ADVISORY", 1, null]) expect(mergeConfig({ ship: { judge } }, base).ship.judge).toBe("gate");
+	});
 });
 
 describe("substrate config", () => {

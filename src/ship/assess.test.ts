@@ -173,6 +173,72 @@ describe("collectSignals", () => {
 		expect(crashed.gsd?.nodeMissing).toBeUndefined();
 		expect(crashed.gsd?.toolsMissing).toBeUndefined();
 	});
+
+	/** A trusted repo with a roadmap, and archived milestones as `{ "<version>": { "<phase dir>": status | undefined } }`. */
+	function archivedRepo(milestones: Record<string, Record<string, string | undefined>>): string {
+		const cwd = tempDir();
+		mkdirSync(join(cwd, ".planning", "phases"), { recursive: true });
+		writeFileSync(join(cwd, ".planning", "ROADMAP.md"), "# r");
+		for (const [version, phases] of Object.entries(milestones)) {
+			for (const [phase, status] of Object.entries(phases)) {
+				const phaseDir = join(cwd, ".planning", "milestones", `${version}-phases`, phase);
+				mkdirSync(phaseDir, { recursive: true });
+				if (status) writeFileSync(join(phaseDir, `${phase.slice(0, 2)}-VERIFICATION.md`), `---\nstatus: ${status}\n---\n`);
+			}
+		}
+		return cwd;
+	}
+	const trustedRun = (cwd: string) =>
+		fakeRun({
+			...GIT,
+			"git ls-files --error-unmatch .planning/ROADMAP.md": ".planning/ROADMAP.md",
+			[`node g.cjs query roadmap.analyze --cwd ${cwd}`]: JSON.stringify({ phase_count: 0, completed_phases: 0 }),
+		});
+
+	test("with no active verification the archived milestone's phase verifications and audit are collected", () => {
+		const cwd = archivedRepo({ "v2.0": { "02-b": "gaps_found", "01-a": "passed", "03-c": undefined } });
+		writeFileSync(
+			join(cwd, ".planning", "milestones", "v2.0-MILESTONE-AUDIT.md"),
+			"---\nmilestone: v2.0\nstatus: tech_debt\nscores:\n  requirements: 12/12\n  phases: \"2/3\"\n  nyquist: '0.9'\ngaps: []\n---\n# Audit\n",
+		);
+		const milestone = {
+			version: "v2.0",
+			verifications: [
+				{ phase: "01-a", status: "passed" },
+				{ phase: "02-b", status: "gaps_found" },
+			],
+			audit: { status: "tech_debt", scores: { requirements: "12/12", phases: "2/3", nyquist: "0.9" } },
+		};
+		expect(collectSignals({ cwd, record: RECORD, run: trustedRun(cwd), gsdTools: "g.cjs" }).gsd?.milestone).toEqual(milestone);
+		// The tools-missing early return carries it too.
+		const missing = collectSignals({ cwd, record: RECORD, run: trustedRun(cwd), env: {}, home: tempDir() }).gsd;
+		expect(missing).toMatchObject({ toolsMissing: true, milestone });
+	});
+
+	test("the highest archived version wins by numeric compare (v1.10 over v1.9); no audit file means no audit", () => {
+		const cwd = archivedRepo({ "v1.9": { "01-a": "passed" }, "v1.10": { "01-x": "human_needed" }, "v1.2.3": { "01-z": "passed" } });
+		mkdirSync(join(cwd, ".planning", "milestones", "v9-notes"), { recursive: true });
+		expect(collectSignals({ cwd, record: RECORD, run: trustedRun(cwd), gsdTools: "g.cjs" }).gsd?.milestone).toEqual({
+			version: "v1.10",
+			verifications: [{ phase: "01-x", status: "human_needed" }],
+		});
+	});
+
+	test("no milestones dir fails open: no milestone key", () => {
+		const cwd = archivedRepo({});
+		const gsd = collectSignals({ cwd, record: RECORD, run: trustedRun(cwd), gsdTools: "g.cjs" }).gsd;
+		expect(gsd).toMatchObject({ phaseCount: 0, trusted: true });
+		expect(gsd && "milestone" in gsd).toBe(false);
+	});
+
+	test("an active phase verification takes precedence: the archived milestone is not collected", () => {
+		const cwd = archivedRepo({ "v1.0": { "01-a": "passed" } });
+		mkdirSync(join(cwd, ".planning", "phases", "04-d"), { recursive: true });
+		writeFileSync(join(cwd, ".planning", "phases", "04-d", "04-VERIFICATION.md"), "---\nstatus: gaps_found\n---\n");
+		const gsd = collectSignals({ cwd, record: RECORD, run: trustedRun(cwd), gsdTools: "g.cjs" }).gsd;
+		expect(gsd?.verification).toEqual({ phase: "04-d", status: "gaps_found" });
+		expect(gsd && "milestone" in gsd).toBe(false);
+	});
 });
 
 describe("resolveGsdTools", () => {
@@ -353,5 +419,143 @@ describe("assessDone judge", () => {
 		const a = await assessDone({ record: RECORD, signals: signals(), diff: DIFF, complete: async () => "yes!" });
 		expect(a.done).toBe(false);
 		expect(a.gaps[0]).toStartWith("assessment unavailable:");
+	});
+});
+
+describe("assessDone modes", () => {
+	const judge = (reply: object) => async () => JSON.stringify(reply);
+	const MILESTONE_GSD: ShipSignals["gsd"] = {
+		phaseCount: 0,
+		completedPhases: 0,
+		trusted: true,
+		milestone: {
+			version: "v2.0",
+			verifications: [
+				{ phase: "01-core", status: "passed" },
+				{ phase: "02-ui", status: "gaps_found" },
+			],
+		},
+	};
+
+	test("gate: done judge below 0.7 -> still not done", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals(),
+			diff: DIFF,
+			mode: "gate",
+			complete: judge({ done: true, confidence: 0.6, summary: "maybe", gaps: [] }),
+		});
+		expect(a).toMatchObject({ done: false, mode: "gate", source: "llm" });
+		expect(a.judge).toBeUndefined();
+	});
+
+	test("advisory: done judge below 0.7 -> done, verdict recorded", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals(),
+			diff: DIFF,
+			mode: "advisory",
+			complete: judge({ done: true, confidence: 0.6, summary: "maybe", gaps: [] }),
+		});
+		expect(a).toMatchObject({ done: true, confidence: 0.6, summary: "maybe", gaps: [], mode: "advisory", source: "llm" });
+		expect(a.judge).toEqual({ done: true, confidence: 0.6, summary: "maybe", gaps: [] });
+	});
+
+	test("advisory: judge says not done -> done, judge gaps kept out of gaps", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals(),
+			diff: DIFF,
+			mode: "advisory",
+			complete: judge({ done: false, confidence: 0.9, summary: "missing docs", gaps: ["docs", "tests"] }),
+		});
+		expect(a).toMatchObject({ done: true, gaps: [], mode: "advisory" });
+		expect(a.judge).toMatchObject({ done: false, gaps: ["docs", "tests"] });
+	});
+
+	test("advisory: judge throws -> done with judge error", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals(),
+			diff: DIFF,
+			mode: "advisory",
+			complete: async () => {
+				throw new Error("offline");
+			},
+		});
+		expect(a).toMatchObject({ done: true, confidence: 0, gaps: [], mode: "advisory" });
+		expect(a.judge).toEqual({ done: false, confidence: 0, summary: "", gaps: [], error: "offline" });
+	});
+
+	test("advisory: unparsable reply -> done with judge error", async () => {
+		const a = await assessDone({ record: RECORD, signals: signals(), diff: DIFF, mode: "advisory", complete: async () => "yes!" });
+		expect(a).toMatchObject({ done: true, gaps: [], mode: "advisory" });
+		expect(a.judge?.error).toBeDefined();
+	});
+
+	test("advisory without judge -> done at 0.5 from rules", async () => {
+		const a = await assessDone({ record: RECORD, signals: signals(), diff: DIFF, mode: "advisory" });
+		expect(a).toMatchObject({ done: true, confidence: 0.5, gaps: [], source: "rules", mode: "advisory" });
+		expect(a.judge?.error).toBeDefined();
+	});
+
+	test("advisory: rule gap still blocks without calling the judge", async () => {
+		let called = false;
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals({ onBase: true, branch: "master" }),
+			diff: DIFF,
+			mode: "advisory",
+			complete: async () => {
+				called = true;
+				return JSON.stringify({ done: true, confidence: 1, summary: "", gaps: [] });
+			},
+		});
+		expect(a).toMatchObject({ done: false, source: "rules", mode: "advisory" });
+		expect(called).toBe(false);
+	});
+
+	for (const mode of ["gate", "advisory"] as const) {
+		test(`${mode}: archived milestone with a non-passed verification is a rule gap`, async () => {
+			const a = await assessDone({
+				record: RECORD,
+				signals: signals({}, MILESTONE_GSD),
+				diff: DIFF,
+				mode,
+				complete: judge({ done: true, confidence: 1, summary: "", gaps: [] }),
+			});
+			expect(a).toMatchObject({ done: false, source: "rules" });
+			expect(a.gaps).toEqual(["archived milestone v2.0: 02-ui verification is gaps_found"]);
+		});
+	}
+
+	test("all-passed archived milestone is no gap; judge prompt carries the milestone line", async () => {
+		let prompt = "";
+		const gsd: ShipSignals["gsd"] = {
+			phaseCount: 0,
+			completedPhases: 0,
+			trusted: true,
+			milestone: {
+				version: "v2.0",
+				verifications: [
+					{ phase: "01-core", status: "passed" },
+					{ phase: "02-ui", status: "passed" },
+				],
+				audit: { status: "passed", scores: { requirements: "12/12", integration: "5/5" } },
+			},
+		};
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals({}, gsd),
+			diff: DIFF,
+			complete: async (_system, user) => {
+				prompt = user;
+				return JSON.stringify({ done: true, confidence: 0.9, summary: "ok", gaps: [] });
+			},
+		});
+		expect(a.done).toBe(true);
+		expect(prompt).toContain(
+			"latest milestone: v2.0 archived: 2/2 phase verifications passed; audit passed (requirements 12/12, integration 5/5)",
+		);
 	});
 });

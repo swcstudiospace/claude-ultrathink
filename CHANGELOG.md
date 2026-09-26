@@ -30,6 +30,8 @@ A fresh install now contacts only the services you configured, the installers wo
 - Ship: `ship.reviewRetries` config key (integer >= 0, default 3): a failed Greptile review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or one pending past `ship.reviewTimeoutMs` is re-triggered on the next `review` call, up to this many times per head commit; then the ship blocks with a PR comment.
 - Ship: `ship.mergeTimeoutMs` config key (integer >= 1 ms, default 3600000 = 60 min): how long `merge` keeps retrying one reviewed head commit before the ship blocks.
 - Ship: `ship.attempts` in the session record: every review result and merge outcome (newest 50), shown by `bin/ultrathink-ship status` and, as the last 10, in the `ultrathink-ship stopped` PR comment.
+- Ship: `ship.judge` config key, `"gate"` (default, unchanged behaviour) or `"advisory"`. In advisory mode only the deterministic rules decide whether the task is done, so the agent always opens the PR itself once they pass; the LLM judge's verdict (or its error) is recorded under `judge` in the assessment and shown in the PR body, and never blocks. The merge gate (Greptile score >= `ship.minScore` with no open threads, CI) is the same in both modes.
+- Ship: several PRs per session, one after another. `assess` in another repository or branch archives a finished (`merged` or `blocked`) ship into `ship.history` (last 10) and starts a fresh one, and refuses while the previous ship is still active. `pr` records the PR's `owner/repo` as `pr.repo`.
 
 ### Changed
 
@@ -76,6 +78,7 @@ A fresh install now contacts only the services you configured, the installers wo
 - `scripts/setup.ts rollback` never removes a Notion or Linear MCP server you replaced after `apply` added it (for example with the gateway through `mcp-register --replace`): it removes a server only while `claude mcp get` still shows setup's user-scope HTTP entry with the hosted URL, reports a replaced one as left in place and a missing one as already removed.
 - `scripts/mcp-register.ts` decides ownership from the user-scope entry only, the scope it adds to and removes from: a same-named project- or local-scope entry in Claude Code or Grok no longer blocks registration and is never touched.
 - The `/ultrathink-off`, `-on`, `-skip`, `-status` and `-track` command files work when `CLAUDE_PLUGIN_ROOT` is not set: the model asks you for the ultrathink directory and runs `bin/ultrathink` from there, instead of failing.
+- Ship: the done assessment is no longer blind after `gsd-autonomous` archives a milestone. When `.planning/phases` has no `*-VERIFICATION.md`, the latest `.planning/milestones/<version>-phases/*/*-VERIFICATION.md` statuses must all be `passed` (each other status is a gap), and the milestone's audit status and scores go to the judge as evidence, instead of the judge seeing "0/0 phases, verification none".
 
 ### Security
 
