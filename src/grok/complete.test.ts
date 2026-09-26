@@ -262,13 +262,13 @@ describe("grokComplete (http)", () => {
 	});
 });
 
-/** Anthropic Messages reply the shunt gateway returns for `grok-4.7-xhigh` (thinking block first). */
+/** Anthropic Messages reply the shunt gateway returns for `grok-shunt-route` (thinking block first). */
 function shuntReply(text: string, extra: Record<string, unknown>[] = []): Response {
 	return Response.json({
 		id: "msg_1",
 		type: "message",
 		role: "assistant",
-		model: "grok-4.7-xhigh",
+		model: "grok-shunt-route",
 		content: [{ type: "thinking", thinking: "hidden reasoning", signature: "sig" }, ...extra, { type: "text", text }],
 		stop_reason: "end_turn",
 		usage: { input_tokens: 1, output_tokens: 1 },
@@ -277,8 +277,8 @@ function shuntReply(text: string, extra: Record<string, unknown>[] = []): Respon
 
 describe("buildShuntBody", () => {
 	test("produces an Anthropic Messages payload without a thinking param", () => {
-		const body = buildShuntBody("SYS", "USER", "grok-4.7-xhigh", 4096);
-		expect(body).toEqual({ model: "grok-4.7-xhigh", max_tokens: 4096, system: "SYS", messages: [{ role: "user", content: "USER" }] });
+		const body = buildShuntBody("SYS", "USER", "grok-shunt-route", 4096);
+		expect(body).toEqual({ model: "grok-shunt-route", max_tokens: 4096, system: "SYS", messages: [{ role: "user", content: "USER" }] });
 		expect("thinking" in body).toBe(false);
 	});
 });
@@ -320,14 +320,14 @@ describe("parseShuntText", () => {
 });
 
 describe("grokComplete (shunt)", () => {
-	const shuntBaseUrl = "http://gateway.test:3001";
+	const shuntBaseUrl = "http://gateway.test:8080";
 
 	test("posts Anthropic Messages to {shuntBaseUrl}/v1/messages with no auth and returns the text", async () => {
 		const { fetch, calls } = fakeFetch(() => shuntReply("<UPLIFT/>"));
 		const text = await grokComplete("SYS", "USER", {
 			transport: "shunt",
-			shuntBaseUrl: "http://gateway.test:3001/",
-			shuntModel: "grok-4.7-xhigh",
+			shuntBaseUrl: "http://gateway.test:8080/",
+			shuntModel: "grok-shunt-route",
 			shuntMaxTokens: 2048,
 			model: "grok-4.7",
 			reasoningEffort: "xhigh",
@@ -336,7 +336,7 @@ describe("grokComplete (shunt)", () => {
 		expect(text).toBe("<UPLIFT/>");
 		expect(calls).toHaveLength(1);
 		const call = calls[0]!;
-		expect(call.url).toBe("http://gateway.test:3001/v1/messages");
+		expect(call.url).toBe("http://gateway.test:8080/v1/messages");
 		expect(call.init.method).toBe("POST");
 		const headers = new Headers(call.init.headers);
 		expect(headers.get("content-type")).toBe("application/json");
@@ -345,7 +345,7 @@ describe("grokComplete (shunt)", () => {
 		expect(headers.get("x-api-key")).toBeNull();
 		expect(headers.get("x-xai-token-auth")).toBeNull();
 		expect(JSON.parse(String(call.init.body))).toEqual({
-			model: "grok-4.7-xhigh",
+			model: "grok-shunt-route",
 			max_tokens: 2048,
 			system: "SYS",
 			messages: [{ role: "user", content: "USER" }],
@@ -371,7 +371,7 @@ describe("grokComplete (shunt)", () => {
 		dirs.push(home);
 		const complete = createGrokCompleter({ transport: "shunt", shuntBaseUrl, shuntModel: "", model: "grok-4.6", home, fetch });
 		expect(await complete("S", "U")).toBe("ok");
-		expect(calls[0]!.url).toBe("http://gateway.test:3001/v1/messages");
+		expect(calls[0]!.url).toBe("http://gateway.test:8080/v1/messages");
 		const body = JSON.parse(String(calls[0]!.init.body));
 		expect(body.model).toBe("grok-4.6");
 		expect(body.max_tokens).toBe(8192);

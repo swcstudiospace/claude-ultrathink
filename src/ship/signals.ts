@@ -148,11 +148,16 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	} catch {
 		state = undefined;
 	}
-	// Roadmap counts fail open to 0/0; trust and state still gate shipping. Tools that are not installed at all are a gap.
+	// Roadmap counts fail open to 0/0; trust and state still gate shipping. Tools or node that are not installed are a gap.
 	let phaseCount = 0;
 	let completedPhases = 0;
-	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification: latestVerification(cwd), toolsMissing: true };
-	const text = out(run, ["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], cwd);
+	const verification = latestVerification(cwd);
+	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification, toolsMissing: true };
+	const analyzed = run(["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], { cwd });
+	if (analyzed.exitCode === 127 || /ENOENT/.test(analyzed.stderr)) {
+		return { phaseCount, completedPhases, trusted, state, verification, nodeMissing: true };
+	}
+	const text = analyzed.exitCode === 0 ? analyzed.stdout.trim() : "";
 	try {
 		const parsed = text ? (JSON.parse(text) as { phase_count?: unknown; completed_phases?: unknown }) : {};
 		if (typeof parsed.phase_count === "number") phaseCount = parsed.phase_count;
@@ -160,7 +165,7 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	} catch {
 		phaseCount = 0;
 	}
-	return { phaseCount, completedPhases, trusted, state, verification: latestVerification(cwd) };
+	return { phaseCount, completedPhases, trusted, state, verification };
 }
 
 function collectGraph(record: SessionRecord): ShipSignals["graph"] {

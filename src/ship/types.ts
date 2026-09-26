@@ -58,6 +58,8 @@ export interface GsdSignals {
 	verification?: { phase: string; status: string };
 	/** A roadmap exists but gsd-tools.cjs was found neither via `GSD_TOOLS` nor in any standard GSD install location. */
 	toolsMissing?: boolean;
+	/** gsd-tools.cjs resolved but `node` could not be spawned to run it (exit 127 / ENOENT). */
+	nodeMissing?: boolean;
 }
 
 export interface ShipSignals {

@@ -14,7 +14,7 @@ describe("grokEngineLabel", () => {
 	});
 
 	test("shunt transport yields <shuntModel>@shunt", () => {
-		expect(grokEngineLabel({ ...DEFAULT_GROK_CONFIG, transport: "shunt", shuntModel: "grok-4.7-xhigh" })).toBe("grok-4.7-xhigh@shunt");
+		expect(grokEngineLabel({ ...DEFAULT_GROK_CONFIG, transport: "shunt", shuntModel: "grok-shunt-route" })).toBe("grok-shunt-route@shunt");
 		expect(grokEngineLabel({ ...DEFAULT_GROK_CONFIG, transport: "shunt", model: "grok-4.6", shuntModel: "grok-4.7" })).toBe("grok-4.7@shunt");
 	});
 

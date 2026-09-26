@@ -33,6 +33,10 @@ function ruleGaps(signals: ShipSignals): string[] {
 			".planning/ is neither tracked nor ignored (possibly stray planning written by another tool); commit or remove it before shipping",
 		);
 	if (gsd?.toolsMissing) gaps.push("GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd");
+	if (gsd?.nodeMissing)
+		gaps.push(
+			"GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd",
+		);
 	if (gsd && gsd.completedPhases < gsd.phaseCount)
 		gaps.push(`GSD roadmap incomplete: ${gsd.completedPhases}/${gsd.phaseCount} phases`);
 	if (gsd?.verification && gsd.verification.status !== "passed")

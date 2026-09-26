@@ -155,6 +155,24 @@ describe("collectSignals", () => {
 		expect(s.gsd).toMatchObject({ phaseCount: 2, completedPhases: 2 });
 		expect(s.gsd?.toolsMissing).toBeUndefined();
 	});
+
+	test("node that cannot be spawned is flagged node-missing; any other run failure still fails open to 0/0", () => {
+		const cwd = tempDir();
+		mkdirSync(join(cwd, ".planning"), { recursive: true });
+		writeFileSync(join(cwd, ".planning", "ROADMAP.md"), "# r");
+		const withNode = (reply: { exitCode: number; stderr: string }): Run => {
+			const git = fakeRun(GIT);
+			return (argv, opts) => (argv[0] === "node" ? { stdout: "", ...reply } : git(argv, opts));
+		};
+		for (const reply of [{ exitCode: 127, stderr: "" }, { exitCode: 1, stderr: "Executable not found in $PATH: \"node\" (ENOENT)" }]) {
+			const s = collectSignals({ cwd, record: RECORD, run: withNode(reply), gsdTools: "g.cjs" });
+			expect(s.gsd).toMatchObject({ phaseCount: 0, completedPhases: 0, nodeMissing: true });
+		}
+		const crashed = collectSignals({ cwd, record: RECORD, run: withNode({ exitCode: 1, stderr: "TypeError: boom" }), gsdTools: "g.cjs" });
+		expect(crashed.gsd).toMatchObject({ phaseCount: 0, completedPhases: 0 });
+		expect(crashed.gsd?.nodeMissing).toBeUndefined();
+		expect(crashed.gsd?.toolsMissing).toBeUndefined();
+	});
 });
 
 describe("resolveGsdTools", () => {
@@ -255,6 +273,11 @@ describe("assessDone rules", () => {
 			"gsd tools missing",
 			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true }),
 			"GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd",
+		],
+		[
+			"node missing",
+			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, nodeMissing: true }),
+			"GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd",
 		],
 		[
 			"verification",
