@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import type { ReviewThread, ReviewThreads } from "./github.ts";
 import { defaultRun } from "./run.ts";
-import type { ReviewComment, ReviewResult, Run, ShipConfig } from "./types.ts";
+import { GREPTILE_MAX_SCORE, type ReviewComment, type ReviewResult, type Run, type ShipConfig } from "./types.ts";
 
 export interface ToolCaller {
 	call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
@@ -27,7 +27,10 @@ const asNum = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
 const asArr = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
-const SCORE_PATTERN = /confidence\s+score(?:\s*:|\s+of)?\s*(?:<[^>]*>\s*)*(\d+)\s*\/\s*5\b/i;
+const SCORE_PATTERN = new RegExp(
+	String.raw`confidence\s+score(?:\s*:|\s+of)?\s*(?:<[^>]*>\s*)*(\d+)\s*\/\s*${GREPTILE_MAX_SCORE}\b`,
+	"i",
+);
 /** Greptile renders comment priority as a badge image: `<img alt="P1" ...>`. */
 const BADGE_PATTERN = /<img\b[^>]*\balt\s*=\s*["']?(P[0-3])\b/i;
 
@@ -35,7 +38,7 @@ export function parseScore(body: string): number | null {
 	const match = SCORE_PATTERN.exec(body.replace(/\*\*/g, ""));
 	if (!match) return null;
 	const n = Number(match[1]);
-	return n >= 0 && n <= 5 ? n : null;
+	return n >= 0 && n <= GREPTILE_MAX_SCORE ? n : null;
 }
 
 function repoArgs(repo: GreptileRepo): Obj {
@@ -155,6 +158,8 @@ export async function reviewPr(input: {
 	organization?: string;
 	/** The PR's review threads on GitHub; without them, or on failure, every unaddressed Greptile comment stays open. */
 	reviewThreads?: () => ReviewThreads;
+	/** Review ids already recorded as failed or timed out for headSha: ignored, so a fresh review is triggered. */
+	staleReviewIds?: string[];
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 }): Promise<ReviewResult> {
@@ -174,7 +179,7 @@ export async function reviewPr(input: {
 		const org = orgArgs(input.organization);
 		const tuple = { ...repoArgs(input.repo), ...org };
 		const deadline = now() + input.timeoutMs;
-		const stale = new Set<string>();
+		const stale = new Set<string>(input.staleReviewIds);
 		let triggered = false;
 		let delay = input.pollMs;
 		while (true) {
@@ -252,7 +257,7 @@ const parseJson = (text: string): Obj | undefined => {
 };
 const validScore = (value: unknown): number | undefined => {
 	const n = asNum(value);
-	return n !== undefined && n >= 0 && n <= 5 ? n : undefined;
+	return n !== undefined && n >= 0 && n <= GREPTILE_MAX_SCORE ? n : undefined;
 };
 const mapComments = (value: unknown): ReviewComment[] =>
 	asArr(value)
@@ -273,6 +278,8 @@ export async function reviewCli(input: {
 	headSha: string;
 	waitMs: number;
 	pollMs: number;
+	/** Run ids already recorded as failed or timed out for headSha: a status record naming one counts as no review. */
+	staleRunIds?: string[];
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 }): Promise<ReviewResult> {
@@ -306,6 +313,7 @@ export async function reviewCli(input: {
 	};
 	const deadline = now() + input.waitMs;
 	let delay = input.pollMs;
+	const staleRuns = new Set(input.staleRunIds);
 	while (true) {
 		const checked = run(["greptile", "review", "status", "--commit", input.headSha, "--json"], {
 			cwd,
@@ -319,9 +327,11 @@ export async function reviewCli(input: {
 				sha === input.headSha ||
 				(sha.length >= 7 && (input.headSha.startsWith(sha) || sha.startsWith(input.headSha))),
 		);
-		const inFlight = matches && (checked.exitCode === 3 || asStr(info?.status)?.toUpperCase() === "IN_FLIGHT");
+		const staleRun = staleRuns.has(asStr(info?.runId) ?? "");
+		const inFlight =
+			matches && !staleRun && (checked.exitCode === 3 || asStr(info?.status)?.toUpperCase() === "IN_FLIGHT");
 		if (!inFlight) {
-			if (info && matches && checked.exitCode === 0) return complete(info);
+			if (info && matches && !staleRun && checked.exitCode === 0) return complete(info);
 			break;
 		}
 		const remaining = deadline - now();
@@ -373,6 +383,8 @@ export async function runReview(input: {
 	prNumber: number;
 	headSha: string;
 	reviewThreads?: () => ReviewThreads;
+	/** reviewIds of rounds for headSha that failed or timed out; those reviews are re-triggered instead of reused. */
+	staleReviewIds?: string[];
 	now?: () => number;
 }): Promise<ReviewResult> {
 	const run = input.run ?? defaultRun;
@@ -406,6 +418,7 @@ export async function runReview(input: {
 				pollMs: input.config.pollMs,
 				organization,
 				...(input.reviewThreads ? { reviewThreads: input.reviewThreads } : {}),
+				...(input.staleReviewIds ? { staleReviewIds: input.staleReviewIds } : {}),
 			});
 		}
 	}
@@ -416,5 +429,6 @@ export async function runReview(input: {
 		headSha: input.headSha,
 		waitMs: input.config.waitMs,
 		pollMs: input.config.pollMs,
+		...(input.staleReviewIds ? { staleRunIds: input.staleReviewIds } : {}),
 	});
 }

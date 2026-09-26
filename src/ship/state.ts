@@ -2,7 +2,8 @@
 // Copyright (C) 2026 SWC Studio
 /** Read-modify-write of the `ship` section inside a session state file. Never throws. */
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { ShipState } from "./types.ts";
+import { MAX_ATTEMPTS } from "./types.ts";
+import type { ShipAttempt, ShipState } from "./types.ts";
 
 function readRecord(statePath: string): Record<string, unknown> | undefined {
 	try {
@@ -31,4 +32,18 @@ export function writeShip(statePath: string, patch: Partial<ShipState>, now: num
 	} catch {
 		return undefined;
 	}
+}
+
+/** Longest attempt detail kept in the log. */
+const MAX_DETAIL = 200;
+
+/** Appends attempts to the ship state's log, keeping the newest MAX_ATTEMPTS. Never throws. */
+export function appendAttempts(statePath: string, attempts: ShipAttempt[], now: number = Date.now()): ShipState | undefined {
+	const prior = readShip(statePath)?.attempts;
+	// Details are one line of at most MAX_DETAIL characters.
+	const added = attempts.map((attempt) =>
+		attempt.detail === undefined ? attempt : { ...attempt, detail: attempt.detail.replace(/\s+/g, " ").trim().slice(0, MAX_DETAIL) },
+	);
+	const log = [...(Array.isArray(prior) ? prior : []), ...added].slice(-MAX_ATTEMPTS);
+	return writeShip(statePath, { attempts: log }, now);
 }

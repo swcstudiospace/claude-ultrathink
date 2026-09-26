@@ -27,6 +27,8 @@ const config: ShipConfig = {
 	reviewTimeoutMs: 1000,
 	pollMs: 100,
 	waitMs: 1000,
+	reviewRetries: 3,
+	mergeTimeoutMs: 3_600_000,
 };
 
 function fakeClient(handlers: Record<string, (args: Record<string, unknown>, n: number) => unknown>) {
@@ -209,6 +211,26 @@ describe("reviewPr", () => {
 		expect(calls.filter((c) => c.name === "trigger_code_review").length).toBe(1);
 	});
 
+	test("an in-flight review listed as stale is not waited on: a fresh review is triggered", async () => {
+		const { client, calls } = fakeClient({
+			trigger_code_review: () => ({}),
+			list_code_reviews: (_args, n) => ({
+				codeReviews: [
+					{ id: "40", status: "REVIEWING_FILES", commitSha: "new", createdAt: "2026-01-02T00:00:00Z" },
+					...(n >= 2 ? [{ id: "41", status: "COMPLETED", commitSha: "new", createdAt: "2026-01-01T00:00:00Z" }] : []),
+				],
+			}),
+			get_code_review: () => ({ codeReview: { body: "Confidence Score: 5/5" } }),
+			list_merge_request_comments: () => ({ comments: [] }),
+		});
+		expect(await reviewPr({ client, ...base, staleReviewIds: ["40"], ...clock() })).toMatchObject({
+			status: "completed",
+			reviewId: "41",
+			score: 5,
+		});
+		expect(calls.filter((c) => c.name === "trigger_code_review").length).toBe(1);
+	});
+
 	test("completed review without a parseable score fails", async () => {
 		const { client } = fakeClient({
 			list_code_reviews: () => ({ codeReviews: [{ id: "8", status: "COMPLETED", commitSha: "new" }] }),
@@ -367,6 +389,26 @@ describe("reviewCli", () => {
 			return { exitCode: 1 };
 		});
 		expect(await review(run, time)).toMatchObject({ status: "pending", score: null, headSha: SHA });
+	});
+
+	test("a status record whose runId is stale counts as no review: a new run starts", async () => {
+		const { run, argvs } = fakeRun((argv) =>
+			argv[2] === "status" ? inFlight : { exitCode: 0, stdout: JSON.stringify({ runId: "run-2", confidence: 5, comments: [] }) },
+		);
+		const time = clock();
+		const result = await reviewCli({
+			run,
+			cwd: "/x",
+			base: "main",
+			headSha: SHA,
+			waitMs: 100_000,
+			pollMs: 20_000,
+			staleRunIds: ["run-1"],
+			...time,
+		});
+		expect(result).toMatchObject({ status: "completed", score: 5, reviewId: "run-2" });
+		expect(argvs).toEqual([STATUS, START]);
+		expect(time.sleeps).toEqual([]);
 	});
 
 	test("start exiting non-zero before the wait -> failed with truncated stderr", async () => {

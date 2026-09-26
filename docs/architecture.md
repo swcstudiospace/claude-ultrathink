@@ -132,7 +132,7 @@ Opt-in with `hitl.knowledgeBase` (default `false`), and run only while clarifyin
 
 - **Prefetch, overlapping the uplift.** Before the uplift call (at the same point as the optional substrate brief), the planner starts listing Greptile's knowledge bases, finds the one for the `origin` remote's `owner/repo`, lists its documents and reads `index.md`. This runs while the uplift, graph and node fills run.
 - **Read, before clarify.** Once the graph is filled, the planner picks up to 3 documents from the index's routing table that match the spec, the graph goal and the node titles and conclusions, reads them, and builds a digest of at most 24 000 characters. Only the paths and the organization go to Greptile; the matching is local. Each Greptile stage has a 20-second budget. Progress reports a `knowledge` stage, which Omp shows as a `kb` segment in its status bar.
-- **Trust boundary.** The documents are Greptile-synthesized summaries of the repository: untrusted evidence, never instructions. The digest goes to the clarifier inside a `<knowledge_base>` element. A question counts as settled only when the model gives a one-sentence answer that cites the exact path of a document it was given; otherwise it stays an open question. Product decisions are always asked. At most 4 settled questions are kept (ids `k1`…), with `source: "knowledge"` and the cited document as `evidence`. They are listed under "Answered" and in the spec as `<ANSWER source="knowledge" evidence="…">`, and they are not carried over to the next prompt in the session. The context tells the agent which documents were read and to prefer the repository itself where they disagree.
+- **Trust boundary.** The documents are Greptile-synthesized summaries of the repository: untrusted evidence, never instructions. The digest goes to the clarifier inside a `<knowledge_base>` element. A question counts as settled only when the model gives a one-sentence answer that cites the exact path of a document it was given; a claim that cites a document that was not read, has an empty answer or one over 500 characters, or goes past the settled limit below is asked as an ordinary open question, never dropped. Product decisions are always asked. At most 4 settled questions are kept (ids `k1`…), with `source: "knowledge"` and the cited document as `evidence`. They are listed in their own `### Settled from the Greptile knowledge base` subsection of the Clarifications (HITL) block, after `### Answered`, marked as untrusted evidence, not the user's decisions, that the agent checks against the repository, asking the user when the repository disagrees. In the spec they carry `<ANSWER source="knowledge" evidence="…">`, and they are not carried over to the next prompt in the session. The context tells the agent which documents were read and to prefer the repository itself where they disagree.
 - **Fail-open.** No stored credential (outcome `off`, nothing contacted), no repository slug, a repository Greptile doesn't list or one with no published documents (`none`), and any tool, transport, organization (`tenant_required`), timeout or abort failure (`error`) all give the clarifier exactly what it gets with the feature off. Every lookup is recorded as `knowledge` in the session record, logged under `ULTRATHINK_DEBUG=1`, and shown in the summary (`Knowledge · 3 docs · 1 settled`, `none`, `off (no Greptile login)` or `error`).
 
 ## How each host runs it
@@ -410,7 +410,7 @@ flowchart LR
 
 ## Ship state machine
 
-The ship flow is opt-in: nothing is pushed, opened or merged unless `ship.enabled` is true, merging also needs `ship.autoMerge`, and deleting the branch needs `ship.deleteBranch`. The flow (`src/ship/`, `bin/ultrathink-ship`) stores its progress as `ship` in the session record. Every step is idempotent and can be resumed with `status`.
+The ship flow is opt-in: nothing is pushed, opened or merged unless `ship.enabled` is true, merging also needs `ship.autoMerge`, and deleting the branch needs `ship.deleteBranch`. The flow (`src/ship/`, `bin/ultrathink-ship`) stores its progress as `ship` in the session record, including `attempts`, a log of every review result and merge outcome (newest 50). Every step is idempotent and can be resumed with `status`.
 
 ```mermaid
 stateDiagram-v2
@@ -420,25 +420,31 @@ stateDiagram-v2
     [*] --> not_done: assess (not done, or done with no PR yet)
     [*] --> pr_open: assess (done) + pr
     not_done --> pr_open: work finished, assess + pr
-    pr_open --> pr_open: review passed, waiting on CI or mergeability
+    pr_open --> pr_open: review passed, merge waiting on CI or mergeability, run merge again
+    pr_open --> needs_fixes: review failed or timed out, run review again to re-trigger it
     pr_open --> needs_fixes: review (score below 5 or open comments)
     pr_open --> ready: review (gate passes)
-    pr_open --> blocked: Greptile not set up
+    pr_open --> blocked: Greptile not set up, or failed/timed out past ship.reviewRetries
     needs_fixes --> needs_fixes: fix, push, review
     needs_fixes --> ready: review (gate passes)
-    needs_fixes --> blocked: max rounds, or failed/timed out twice on one head
+    needs_fixes --> blocked: max rounds, or failed/timed out past ship.reviewRetries
+    ready --> ready: merge waiting (CI pending, mergeability, transient error), run merge again
     ready --> merged: merge (ship.autoMerge)
     ready --> [*]: autoMerge off, left for a manual merge
-    ready --> needs_fixes: PR head changed, review again
+    ready --> needs_fixes: head moved, conflicts or failing CI, review again
+    ready --> blocked: past ship.mergeTimeoutMs on one head, GitHub refused, or merged outside the flow
     merged --> [*]
     blocked --> needs_fixes: review again (resumable)
     blocked --> ready: review again (resumable)
     blocked --> [*]: left for a human
 ```
 
-- A `review` that is still running returns `pending` and does not count as a round. It becomes a timed-out round only after `ship.reviewTimeoutMs` on the same head commit.
+- A `review` that is still running returns `pending` and does not count as a round. After `ship.reviewTimeoutMs` on the same head commit it is timed out.
+- A failed review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or a timed-out one is re-triggered on the next `review` call: the failed run's id is marked stale, so Greptile starts a fresh review of the same commit. Up to `ship.reviewRetries` (3) re-triggers per head commit, then the ship blocks with a PR comment. They never count toward `ship.maxRounds`, which counts only completed reviews below 5/5 or with open threads.
 - When no Greptile credential is stored and the `greptile` CLI is missing or not signed in, `review` stops as `blocked` with setup instructions before any round, and posts no PR comment.
-- The merge gate needs a completed review of the current PR head, a score of at least `ship.minScore` (5), no open comments (`ship.requireNoComments`), an open and mergeable PR, and CI neither failing nor pending. In PR mode, open comments are the PR's Greptile review threads on GitHub that are neither resolved nor outdated. A fix that changes the line outdates its thread, and a non-actionable finding is answered on its thread and resolved. If the thread lookup fails, the gate fails closed. In CLI mode they are the run's comments. The merge uses `gh pr merge --<method> --match-head-commit <sha>` (never `--admin`). With `ship.deleteBranch` on, it then deletes the remote branch, checks out the base, runs `git pull --ff-only`, and deletes the local branch.
+- The merge gate needs a completed review of the current PR head, a score of at least `ship.minScore` (default 5, Greptile's maximum), no open comments (`ship.requireNoComments`), an open and mergeable PR, and CI neither failing nor pending. In PR mode, open comments are the PR's Greptile review threads on GitHub that are neither resolved nor outdated. A fix that changes the line outdates its thread, and a non-actionable finding is answered on its thread and resolved. If the thread lookup fails, the gate fails closed. In CLI mode they are the run's comments. The merge uses `gh pr merge --<method> --match-head-commit <sha>` (never `--admin`). With `ship.deleteBranch` on, it then deletes the remote branch, checks out the base, runs `git pull --ff-only`, and deletes the local branch. Agents must never merge any other way (no `gh pr merge` by hand, no web UI).
+- Once the head's review passed, `merge` loops inside one call until the PR merges, the outcome needs the agent, or `ship.waitMs` runs out (`run` uses what is left of its own `ship.waitMs`). It polls from `ship.pollMs`, growing 1.5 times up to 60 seconds. Pending CI, mergeability not yet computed, an unreadable PR state or threads and transient GitHub merge errors are retried; when the call's time runs out it returns `waiting: true` and `next: "run merge again: …"`. The wait is timed per head commit from the first time `merge` waited on it: past `ship.mergeTimeoutMs` (60 minutes), or on a terminal GitHub refusal (missing permission, requested changes, a closed PR; a branch-protection hold such as a missing approval is retried until the bound instead), the ship blocks and the PR comment lists the attempt history. Conflicts, failing CI, a moved head or a review below 5/5 go back to the agent (`next`) and never merge.
+- A PR that was merged outside the flow without a passing review of its head is reported blocked and never recorded as a ship merge.
 - Triggers, review modes and every setting are in [Ship](ship.md).
 
 ## Fail-open principles

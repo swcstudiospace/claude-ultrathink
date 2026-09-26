@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import type { PrStatus, ReviewResult, ShipConfig } from "./types.ts";
+import { GREPTILE_MAX_SCORE, type PrStatus, type ReviewResult, type ShipConfig } from "./types.ts";
 
 /** The review side of the gate: a completed review at or above minScore with no open comments (when required). */
 export function reviewPasses(config: ShipConfig, review: ReviewResult): boolean {
@@ -18,7 +18,9 @@ export function mergeGate(input: { config: ShipConfig; status: PrStatus; latest?
 	if (latest.status !== "completed") return fail(`review ${latest.status}`);
 	if (latest.headSha && latest.headSha !== status.headSha) return fail("review is for an older commit");
 	if (latest.score === null) return fail("review has no score");
-	if (latest.score < config.minScore) return fail(`review score ${latest.score}/5 is below ${config.minScore}/5`);
+	if (latest.score < config.minScore) {
+		return fail(`review score ${latest.score}/${GREPTILE_MAX_SCORE} is below ${config.minScore}/${GREPTILE_MAX_SCORE}`);
+	}
 	if (config.requireNoComments && latest.comments.length > 0) {
 		return fail(`${latest.comments.length} open review comment(s)`);
 	}

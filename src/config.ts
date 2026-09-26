@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
-import { DEFAULT_SHIP_CONFIG, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
+import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
 import { MAX_NODES, MIN_NODES, type ThinkConfig } from "./think/types.ts";
 
 export interface ClaudeConfig {
@@ -288,7 +288,10 @@ function mergeShip(ship: Record<string, unknown> | undefined, defaults: ShipConf
 		autoMerge: typeof ship.autoMerge === "boolean" ? ship.autoMerge : defaults.autoMerge,
 		skills,
 		minScore:
-			typeof ship.minScore === "number" && Number.isFinite(ship.minScore) && ship.minScore >= 1 && ship.minScore <= 5
+			typeof ship.minScore === "number" &&
+			Number.isFinite(ship.minScore) &&
+			ship.minScore >= 1 &&
+			ship.minScore <= GREPTILE_MAX_SCORE
 				? ship.minScore
 				: defaults.minScore,
 		requireNoComments:
@@ -303,6 +306,11 @@ function mergeShip(ship: Record<string, unknown> | undefined, defaults: ShipConf
 		reviewTimeoutMs: positiveInt(ship.reviewTimeoutMs, defaults.reviewTimeoutMs),
 		pollMs: positiveInt(ship.pollMs, defaults.pollMs),
 		waitMs: positiveInt(ship.waitMs, defaults.waitMs),
+		reviewRetries:
+			typeof ship.reviewRetries === "number" && Number.isFinite(ship.reviewRetries) && ship.reviewRetries >= 0
+				? Math.floor(ship.reviewRetries)
+				: defaults.reviewRetries,
+		mergeTimeoutMs: positiveInt(ship.mergeTimeoutMs, defaults.mergeTimeoutMs),
 	};
 }
 

@@ -277,7 +277,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 	}
 	if (input.ship && input.statePath) {
 		const flow =
-			"It decides whether the task is really done, opens a PR into the repository's default branch and runs the Greptile review until 5/5 with no open comments. It merges only when ship.autoMerge is on (otherwise the PR is left for a manual merge) and deletes the branch only when ship.deleteBranch is on. Do not merge any other way.";
+			"It decides whether the task is really done, opens a PR into the repository's default branch and runs the Greptile review until 5/5 with no open comments. It merges only when ship.autoMerge is on (otherwise the PR is left for a manual merge), and then keeps retrying the merge until the 5/5-reviewed PR merges. It deletes the branch only when ship.deleteBranch is on. Do not merge any other way.";
 		tail.push(
 			[
 				"## Ship",

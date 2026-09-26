@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+/** Greptile's confidence scale: scores run 0..5 and 5 ("5/5") is the maximum. */
+export const GREPTILE_MAX_SCORE = 5;
+
 export interface ShipConfig {
 	/** Ship is opt-in: false means a skill run never pushes, opens a PR or merges. */
 	enabled: boolean;
@@ -17,6 +20,10 @@ export interface ShipConfig {
 	pollMs: number;
 	/** Longest a single `review` call blocks before returning "pending"; fits every host's default shell timeout. */
 	waitMs: number;
+	/** Re-triggers of a failed or timed-out Greptile review per head commit before the ship blocks (0 = none). */
+	reviewRetries: number;
+	/** How long `merge` keeps retrying one reviewed head commit, from the first time it waited on it, before the ship blocks. */
+	mergeTimeoutMs: number;
 }
 
 export const MERGE_METHODS: readonly ShipConfig["mergeMethod"][] = ["squash", "merge", "rebase"];
@@ -34,6 +41,8 @@ export const DEFAULT_SHIP_CONFIG: ShipConfig = {
 	reviewTimeoutMs: 1_200_000,
 	pollMs: 20_000,
 	waitMs: 100_000,
+	reviewRetries: 3,
+	mergeTimeoutMs: 3_600_000,
 };
 
 export interface GitSignals {
@@ -123,6 +132,31 @@ export interface PrStatus {
 
 export type ShipPhase = "not-done" | "pr-open" | "needs-fixes" | "ready" | "merged" | "blocked";
 
+export type ShipAttemptOutcome =
+	| "passed"
+	| "needs-fixes"
+	| "failed"
+	| "timeout"
+	| "waiting"
+	| "retry"
+	| "merged"
+	| "needs-agent"
+	| "blocked";
+
+/** One review result or merge outcome, kept in ShipState.attempts for the audit trail. */
+export interface ShipAttempt {
+	at: number;
+	step: "review" | "merge";
+	headSha: string;
+	outcome: ShipAttemptOutcome;
+	score?: number | null;
+	/** One line, at most 200 chars. */
+	detail?: string;
+}
+
+/** Most attempts kept; older ones are dropped. */
+export const MAX_ATTEMPTS = 50;
+
 export interface ShipState {
 	phase: ShipPhase;
 	assessment?: Assessment;
@@ -133,6 +167,9 @@ export interface ShipState {
 	nudgedAt?: number;
 	/** In-flight Greptile review for headSha; never counted as a round. */
 	pending?: { headSha: string; source: "pr" | "cli"; since: number; runId?: string };
+	attempts?: ShipAttempt[];
+	/** Since when `merge` has waited on this head commit. */
+	waiting?: { headSha: string; since: number };
 	updatedAt: number;
 }
 
