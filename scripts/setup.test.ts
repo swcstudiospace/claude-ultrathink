@@ -466,22 +466,84 @@ describe("apply / status / rollback", () => {
 		}
 	});
 
-	test("a same-named server at another URL or scope counts as changed", () => {
+	test("a user-scope server at another URL counts as changed", () => {
 		const { env, repo, cleanup } = tempSetup();
 		try {
 			apply(repo, mcpRun(""), env);
 			const otherUrl = setupEntry("notion");
 			otherUrl.stdout = otherUrl.stdout.replace("https://mcp.notion.com/mcp", "https://notion.example.com/mcp");
-			const localScope = setupEntry("linear");
-			localScope.stdout = localScope.stdout.replace("User config (available in all your projects)", "Local config (private to you in this project)");
-			const run = ownedRun((cmd) => (cmd[2] === "get" ? (cmd[3] === "notion" ? otherUrl : localScope) : undefined));
+			const run = ownedRun((cmd) => (cmd[2] === "get" && cmd[3] === "notion" ? otherUrl : undefined));
 			const result = rollback(env, run);
 			expect(result.notion.kept).toBe("changed");
-			expect(result.linear.kept).toBe("changed");
-			expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+			expect(run.calls).not.toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
 		} finally {
 			cleanup();
 		}
+	});
+
+	describe("a project entry shadowing the user-scope server", () => {
+		/** `claude mcp get` shows a project-scope entry with the same name, which wins over the user scope. */
+		const shadowed = (cmd: string[]): Reply | undefined =>
+			cmd[2] === "get"
+				? { stdout: `${cmd[3]}:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx other-mcp\n`, stderr: "", code: 0 }
+				: undefined;
+		const claudeJson = (env: Record<string, string>) => join(env.CLAUDE_CONFIG_DIR, ".claude.json");
+
+		test("setup's user-scope entry in ~/.claude.json is still removed at user scope", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(
+					claudeJson(env),
+					JSON.stringify({
+						mcpServers: {
+							notion: { type: "http", url: "https://mcp.notion.com/mcp" },
+							linear: { type: "http", url: "https://mcp.linear.app/mcp" },
+						},
+					}),
+				);
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion.removed).toBe(true);
+				expect(result.linear.removed).toBe(true);
+				expect(run.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+				expect(result.state.status).toBe("removed");
+			} finally {
+				cleanup();
+			}
+		});
+
+		test("with no user-scope entry, the server counts as already removed and the record is dropped", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(claudeJson(env), JSON.stringify({ mcpServers: {} }));
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion).toEqual({ removed: false, kept: "gone" });
+				expect(rollbackReport(result).join("\n")).toContain("Notion MCP: already removed");
+				expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+				expect(existsSync(setupStatePath(env))).toBe(false);
+			} finally {
+				cleanup();
+			}
+		});
+
+		test("when ~/.claude.json cannot be read, the record is kept for a retry", () => {
+			const { env, repo, cleanup } = tempSetup();
+			try {
+				apply(repo, mcpRun(""), env);
+				writeFileSync(claudeJson(env), "{ not json");
+				const run = ownedRun(shadowed);
+				const result = rollback(env, run);
+				expect(result.notion.error).toContain(claudeJson(env));
+				expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+				expect(result.state.status).toBe("kept");
+				expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
+			} finally {
+				cleanup();
+			}
+		});
 	});
 
 	test("without the claude CLI, rollback keeps both servers recorded so a later rollback can still check and remove them", () => {

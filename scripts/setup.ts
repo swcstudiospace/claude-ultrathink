@@ -315,25 +315,55 @@ function commandError(result: { stdout: string; stderr: string; code: number }):
 	return `exit ${result.code}: ${result.stderr.trim() || result.stdout.trim() || "no output"}`;
 }
 
+/** Claude Code's user-scope MCP servers live in the top-level `mcpServers` of this file (the path scripts/mcp-register.ts reads). */
+export function claudeJsonPath(env: Record<string, string | undefined> = process.env): string {
+	return join(env.CLAUDE_CONFIG_DIR?.trim() || homedir(), ".claude.json");
+}
+
+type UserEntry = { found: false } | { found: true; type?: string; url?: string } | { error: string };
+
 /**
- * Removes a server `apply` added, but only while `claude mcp get` still shows setup's own entry
- * (user scope, HTTP, the hosted URL) — a server the user replaced since (e.g. with the gateway) stays.
+ * The user-scope entry for `name`. `claude mcp get` prints the entry that wins by precedence (local > project > user);
+ * when another scope wins (or the output has no `Scope:` line to tell), the user entry comes from ~/.claude.json.
  */
-function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run: Run): McpRemoval {
-	if (!added) return { removed: false };
+function userScopeEntry(name: string, run: Run, claudeJson: string): UserEntry {
 	const current = run(["claude", "mcp", "get", name]);
 	if (current.code !== 0) {
-		if (current.code !== 127 && /No MCP server named/i.test(`${current.stdout}\n${current.stderr}`)) return { removed: false, kept: "gone" };
-		return { removed: false, error: commandError(current) };
+		if (current.code !== 127 && /No MCP server named/i.test(`${current.stdout}\n${current.stderr}`)) return { found: false };
+		return { error: commandError(current) };
 	}
-	// `claude mcp get` prints `  Scope: User config (…)`, `  Type: http`, `  URL: …`; the first occurrence of each key is the server's own.
+	// `  Scope: User config (…)`, `  Type: http`, `  URL: …`; the first occurrence of each key is the server's own.
 	const fields: Record<string, string> = {};
 	for (const line of current.stdout.split("\n")) {
 		const match = /^\s+([A-Za-z]+):\s*(.*)$/.exec(line);
 		if (match && !(match[1] in fields)) fields[match[1]] = match[2].trim();
 	}
-	const ours = /^user\b/i.test(fields.Scope ?? "") && fields.Type?.toLowerCase() === "http" && fields.URL === SETUP_MCP_URLS[name];
-	if (!ours) return { removed: false, kept: "changed" };
+	if (/^User config\b/i.test(fields.Scope ?? "")) return { found: true, type: fields.Type?.toLowerCase(), url: fields.URL };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(claudeJson, "utf8"));
+	} catch {
+		return { error: `could not read the user-scope entry from ${claudeJson}` };
+	}
+	if (typeof parsed !== "object" || parsed === null) return { error: `could not read the user-scope entry from ${claudeJson}` };
+	const servers = "mcpServers" in parsed ? parsed.mcpServers : undefined;
+	const entry = typeof servers === "object" && servers !== null && name in servers ? Reflect.get(servers, name) : undefined;
+	if (entry === undefined) return { found: false };
+	const type = typeof entry === "object" && entry !== null && "type" in entry ? entry.type : undefined;
+	const url = typeof entry === "object" && entry !== null && "url" in entry ? entry.url : undefined;
+	return { found: true, type: typeof type === "string" ? type.toLowerCase() : undefined, url: typeof url === "string" ? url : undefined };
+}
+
+/**
+ * Removes a server `apply` added, but only while the user-scope entry is still setup's own (HTTP, the hosted URL) —
+ * a server the user replaced since (e.g. with the gateway) stays, and a same-named local/project entry is never judged.
+ */
+function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run: Run, claudeJson: string): McpRemoval {
+	if (!added) return { removed: false };
+	const entry = userScopeEntry(name, run, claudeJson);
+	if ("error" in entry) return { removed: false, error: entry.error };
+	if (!entry.found) return { removed: false, kept: "gone" };
+	if (entry.type !== "http" || entry.url !== SETUP_MCP_URLS[name]) return { removed: false, kept: "changed" };
 	const result = run(["claude", "mcp", "remove", "--scope", "user", name]);
 	return result.code === 0 ? { removed: true } : { removed: false, error: commandError(result) };
 }
@@ -341,8 +371,9 @@ function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run:
 export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): RollbackResult {
 	const claudeMdChanged = removeBlock(claudeMdPath(env), false);
 	const state = readSetupState(env);
-	const notion = removeMcpServer("notion", state.notionAdded, run);
-	const linear = removeMcpServer("linear", state.linearAdded, run);
+	const claudeJson = claudeJsonPath(env);
+	const notion = removeMcpServer("notion", state.notionAdded, run, claudeJson);
+	const linear = removeMcpServer("linear", state.linearAdded, run, claudeJson);
 	const statePath = setupStatePath(env);
 	const left: SetupState = { notionAdded: notion.error !== undefined, linearAdded: linear.error !== undefined };
 	let stateStatus: RollbackResult["state"]["status"] = existsSync(statePath) ? "removed" : "absent";
