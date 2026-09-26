@@ -17,13 +17,13 @@ ultrathink plans every non-trivial prompt by default. The commands on this page 
 | `/ultrathink-off` | Planning off for this host until you turn it back on. |
 | `/ultrathink-on` | Planning back on for this host. |
 | `/ultrathink-track off` | Planning continues, but no Linear/Notion rows are created. |
-| `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. |
-| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, and the state directory. |
+| `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. `on` and `off` are per-host settings that beat `track.enabled` in the config until you change them again. |
+| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate and ship state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
 
 Some details:
 
 - Nothing changes unless you use a command. Planning stays on by default.
-- The state is per host. Each host has its own state directory (see [Architecture](architecture.md#state)), so `/ultrathink-off` in Omp leaves Claude Code planning. Within a host the setting applies to every session and project on the machine.
+- The state is per host. Each host has its own state directory (see [State directories](configuration.md#state-directories)), so `/ultrathink-off` in Omp leaves Claude Code planning. Within a host the setting applies to every session and project on the machine.
 - `/ultrathink-skip` sets a one-shot flag. The next message that reaches the planner uses it up, even a trivial one such as `ok` or a skill invocation. Built-in slash commands and `raw:` messages do not use it up. `/ultrathink-status` shows `(skipping next prompt)` while it is armed.
 - `/ultrathink-track off` stops every row: the planner creates none, and `ultrathink-kickoff` and `bin/ultrathink-mcp track complete` create none either. If neither `notion.dataSourceUrl` nor `linear.team` is configured, no rows are created whatever this setting says. See [Tracking](tracking.md).
 - Commands are case-insensitive, and unknown verbs are not treated as commands.
@@ -42,7 +42,7 @@ Every command except `quick` is answered by the prompt hook before any model tur
 
 In every case no model turn runs, and the command takes effect even when nothing is printed. From scripts, call [`bin/ultrathink`](#binultrathink) directly.
 
-On Claude Code, Grok and Muse, each command also ships as a command file in `commands/`. If the hook did not run, for example because hooks are not approved or not installed, the host expands that file instead. The file tells the model to run `bin/ultrathink <verb>` with its shell tool and reply with the output, so the command still works, just with a model turn.
+On Claude Code, Grok and Muse, each command also ships as a command file in `commands/`. If the hook did not run, for example because hooks are not approved or not installed, the host expands that file instead. The file tells the model to run `"${CLAUDE_PLUGIN_ROOT}/bin/ultrathink" <verb>` with its shell tool and reply with the output, so the command still works, just with a model turn. When `CLAUDE_PLUGIN_ROOT` is not set in that shell, the file gives the model a `find` command that looks under `$HOME` for the directory holding both `hooks/hooks.json` and `bin/ultrathink`; if that finds nothing, the model asks you where the plugin is.
 
 `/ultrathink-quick` works differently. The hook recognizes it and plans nothing, and no plan is written. The host's command template (`commands/ultrathink-quick.md`) or host adapter then delivers your message to the agent as typed.
 
@@ -57,7 +57,7 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 
 ### Grok Build
 
-- Grok does not dispatch plugin hooks, so the commands only get a no-model-turn answer after `bun scripts/setup.ts apply` has installed the global hook file `~/.grok/hooks/ultrathink.json` (see [Install](install.md)). Without that file, Grok still loads the command files from the plugin directory, and the model runs `bin/ultrathink` itself.
+- Grok does not dispatch plugin hooks, so the commands only get a no-model-turn answer after `bun scripts/setup.ts apply` has installed the global hook file `~/.grok/hooks/ultrathink.json` (`$GROK_HOME/hooks/ultrathink.json` when `GROK_HOME` is set; see [Install](install.md) and [`scripts/setup.ts`](#scriptssetupts)). Without that file, Grok still loads the command files from the plugin directory, and the model runs `bin/ultrathink` itself.
 - With the hook file installed, the hook returns a block decision for a control command. Grok blocks the prompt and shows the reply in the interactive UI. `grok -p` prints nothing for a blocked command.
 - `/ultrathink-quick` and the control commands delete the plan carrier `last-plan.json`, as every prompt that isn't planned does, so the model never picks up the previous prompt's plan for them.
 - Grok wraps what you typed in a `<user_query>` element before hooks see it. Commands are parsed inside that wrapper.
@@ -108,17 +108,19 @@ Set these in the environment of the host process. They override config and the c
 | Variable | Effect |
 |---|---|
 | `ULTRATHINK_UPLIFT=0` | No planning at all for this process. Useful for automation and `claude -p` runners. |
-| `ULTRATHINK_TRACK=0` | The planner creates no Linear/Notion rows. Planning continues, and `ultrathink-kickoff` creates the rows in the agent's turn instead. With a tracker configured, `/ultrathink-status` shows `Tracking: kickoff`. `track.enabled: false` in config does the same. |
-| `ULTRATHINK_SHIP=0` | No ship nudge and no `## Ship` section in the plan. See [Ship](ship.md). |
+| `ULTRATHINK_TRACK=0` | The planner creates no Linear/Notion rows. Planning continues, and `ultrathink-kickoff` creates the rows in the agent's turn instead. With a tracker configured, `/ultrathink-status` shows `Tracking: kickoff`. `track.enabled: false` in config does the same, unless `/ultrathink-track on` was run on that host (the per-host setting beats `track.enabled`; this variable beats both). |
+| `ULTRATHINK_SHIP=0` | No ship nudge and no `## Ship` section in the plan, even with `ship.enabled: true`. See [Ship](ship.md). |
 | `ULTRATHINK_DEBUG=1` | `hooks/uplift.ts` (Claude Code, Grok, Muse) logs every skip reason and failure to stderr as `[ultrathink] …`. |
 | `ULTRATHINK_HOST` | Forces the host id: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. This selects the state directory, which matters for `bin/ultrathink` run from a plain terminal. |
-| `ULTRATHINK_STATE_DIR` | Overrides the state directory. It is ignored if it points into a `.planning/` directory. |
+| `ULTRATHINK_STATE_DIR` | Overrides the state directory. Use an absolute path (a relative one resolves differently per host; see [Configuration](configuration.md#environment-variables)). It is ignored if it points into a `.planning/` directory. |
 
-The credential store, OAuth, Hermes timeout and substrate variables are listed in [Configuration](configuration.md).
+The other variables (credential store, OAuth callback and Tailscale opt-in, Hermes timeout, Agent Substrate, GSD tools, Bun) are listed in [Configuration: Environment variables](configuration.md#environment-variables).
 
 ## CLI reference
 
-All three CLIs are POSIX shell wrappers that follow symlinks to the checkout and run through `bin/run-bun`, which finds `bun` even when it is not on `PATH`.
+The three CLIs `bin/ultrathink`, `bin/ultrathink-mcp` and `bin/ultrathink-ship` are POSIX shell wrappers that follow symlinks to the checkout and run through `bin/run-bun`, which finds `bun` even when it is not on `PATH` (see [Finding Bun](configuration.md#finding-bun)). Without Bun they print `ultrathink: bun not found. Install Bun 1.2 or later (https://bun.sh) or set BUN=/path/to/bun` and exit 127.
+
+The two setup scripts, [`scripts/setup.ts`](#scriptssetupts) and [`scripts/mcp-register.ts`](#scriptsmcp-registerts), are run with `bun` from the checkout.
 
 ### `bin/ultrathink`
 
@@ -138,7 +140,7 @@ Usage: ultrathink <command>
 
 | Verb | Effect |
 |---|---|
-| `status` (also the default with no verb) | Full state, one line per item. |
+| `status` (also the default with no verb) | Full state, one line per item. See the example below. |
 | `off`, `on`, `skip` | As the slash commands. |
 | `track on`, `track off`, `track status` | As `/ultrathink-track`. |
 | `last` | Root element and source (`llm` or `fallback`) of the last uplift, then its XML. |
@@ -156,18 +158,52 @@ ULTRATHINK_HOST=omp <clone>/bin/ultrathink off
 ULTRATHINK_HOST=grok-build <clone>/bin/ultrathink status
 ```
 
-`bun hooks/uplift.ts --ctl <verb> [args]` is the older spelling of the same commands.
+`bun hooks/uplift.ts --ctl <verb> [args]` is the older spelling of the same commands. An unknown verb prints the usage text.
+
+Example `status` output on a fresh install (the state path is shortened):
+
+```text
+Prompt Uplift on
+Engine: claude:sonnet
+Grok: grok-4.7 @ xhigh · transport http
+SuperGrok OAuth: not logged in (run grok login)
+Graph of Thought on
+HITL clarifications on · max 4
+Tracking: on (not configured: set notion.dataSourceUrl / linear.team)
+Notion: not configured
+Linear team: not configured
+Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
+Ship: off (opt-in: set ship.enabled)
+Model: sonnet · concurrency 3
+State: ~/.claude/ultrathink
+```
+
+What the lines can say:
+
+| Line | Values |
+|---|---|
+| `Prompt Uplift` | `on` or `off`, plus `(skipping next prompt)` while a `/ultrathink-skip` is armed. |
+| `Engine` | `claude:<model>` (`claude:session default` when `claude.model` is `""`), or the Grok engine label when `think.engine` is `grok`. |
+| `Grok` | Model, effort and transport. With `transport: "shunt"` it adds `<shuntBaseUrl>/v1/messages`, or `shunt gateway not configured (set grok.shuntBaseUrl)`, then the wire model and `max_tokens`. |
+| `SuperGrok OAuth` | The `grok login` state: the account and expiry, `not logged in (run grok login)`, `expired (run grok login)`, or `not used (shunt gateway owns upstream auth)`. |
+| `Tracking` | `on (Linear/Notion rows)`, `off (Linear/Notion rows)` after `/ultrathink-track off`, `on (not configured: …)` when neither tracker is set, or `kickoff (…)` when only the planner's own row creation is off. |
+| `Notion`, `Linear team` | The configured value or `not configured`. |
+| `Substrate` | `off (optional: set substrate.url or SUBSTRATE_URL)`, `off (SUBSTRATE_DISABLED=1)`, or `<url> (SUBSTRATE_URL)` / `<url> (config)` showing where the URL came from. |
+| `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
+| `Model` | `claude.model` and `claude.concurrency`. |
+| `State` | The state directory in use. |
+| `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
 
 ### `bin/ultrathink-mcp`
 
-The shared MCP gateway for Notion, Linear and Greptile. See [Tracking](tracking.md) and [Architecture](architecture.md#mcp-gateway).
+The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md).
 
 ```text
 usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
-  ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--no-listen]
+  ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
   ultrathink-mcp track complete --state <sessions/<id>.json>
@@ -177,17 +213,29 @@ usage:
 
 | Command | Effect |
 |---|---|
-| `serve <provider>` | Stdio MCP server that relays to the hosted provider and adds credentials from the store. Hosts run this; `bun scripts/mcp-register.ts` registers it. `ULTRATHINK_MCP_DEBUG=1` logs relay events to stderr. |
+| `serve <provider>` | Stdio MCP server that relays to the hosted provider and adds credentials from the store. Hosts run this; `bun scripts/mcp-register.ts` registers it. `ULTRATHINK_MCP_DEBUG=1` logs relay events to stderr. When a credential is missing, the error says how to add one: for Notion `ultrathink-mcp auth login notion`; for Linear and Greptile either `auth login <provider>` (OAuth) or `auth set-key <provider> --stdin` (an API key from that account's settings). |
 | `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. |
-| `auth set-key <provider>` | Stores an API key for `linear` or `greptile`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. |
-| `auth login <provider>` | OAuth login (Notion needs it). Prints an authorization URL, listens on `127.0.0.1:<port>` (default 8765) for the callback, and also accepts the redirected URL pasted on stdin. `--no-listen` only accepts the pasted URL. `--redirect <url>` sets the callback URL. For remote and SSH sessions, see [Troubleshooting](troubleshooting.md#notion-oauth-over-ssh). |
+| `auth set-key <provider>` | Stores an API key for `linear` or `greptile`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. Notion has no API-key route. |
+| `auth login <provider>` | OAuth login (Notion needs it; Linear and Greptile can use it instead of a key). See [OAuth login options](#oauth-login-options). |
 | `auth logout <provider>` | Removes that provider's credentials. |
 | `check [provider...]` | Runs `initialize` and `tools/list` against each provider (all three by default) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
-| `track complete --state <file>` | Creates the rows still missing for a planned session, rewrites its spec and state file, and prints the linked TODO lines. `ultrathink-kickoff` runs this. Does nothing when `/ultrathink-track off` is set or no tracker is configured. |
+| `track complete --state <file>` | Creates the rows still missing for a planned session, rewrites its spec and state file, and prints the linked TODO lines. `ultrathink-kickoff` runs this. Run it from the project directory: it reads the config files, including `<project>/.claude/ultrathink.json`, from the current directory. Does nothing (exit 0) when `/ultrathink-track off` is set or no tracker is configured. Exits 1 when the record cannot be read, has no plan, there are no tracker credentials, or tracking failed. |
 | `session mark --state <file> <kicked-off\|synced>` | Sets `kickedOff` or `synced` to `true` in the session record and prints nothing. `ultrathink-kickoff` runs it with `kicked-off` as its last step. The marks describe the plan now in the record: the session's next planned prompt writes a new graph with both back at `false`. A missing or unreadable record exits 1 and is left untouched. |
-| `notion init --parent <page>` | Creates the Agent Task Graph database under a Notion page. `--title` sets its name. `--write-config` saves `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`. |
+| `notion init --parent <page>` | Creates the Agent Task Graph database under a Notion page. `--title` sets its name. `--write-config` saves `notion.dataSourceUrl` to `~/.config/ultrathink/config.json` (under `$XDG_CONFIG_HOME` when set). Exits 1 when Notion is not logged in, or when the database was created but its `Parent Item` self-relation could not be added. |
 
-Exit codes: 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr).
+#### OAuth login options
+
+`auth login <provider>` prints an authorization URL. Open it in any browser and approve. The login finishes when the browser is sent back to the callback URL, or when you paste the URL of the page you were sent back to (it may fail to load) into the terminal and press Enter.
+
+| Option | Effect |
+|---|---|
+| (none) | Callback `http://127.0.0.1:8765/callback`, served by a listener on `127.0.0.1`. On a remote session (`SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY` set), the output tells you to forward the port first (it prints an `ssh -L 8765:127.0.0.1:8765 <user>@<host>` line when it can) or to paste the redirected URL. |
+| `--port <n>` | Listener port, 1 to 65535. Default `8765`. |
+| `--no-listen` | Start no listener; only the pasted URL is accepted. |
+| `--redirect <url>` | Use this callback URL instead. It must be https, or http on `127.0.0.1`, `localhost` or `[::1]`, and it must reach the listener on `127.0.0.1:<port>`. `ULTRATHINK_OAUTH_REDIRECT` does the same; the flag wins. It also wins over `--tailscale`. |
+| `--tailscale` | Opt-in, for remote sessions on a machine in a [Tailscale](https://tailscale.com) network. ultrathink reads the machine's tailnet name from `tailscale status --json`, runs `tailscale serve --bg --https=443 --set-path=/ultrathink-oauth http://127.0.0.1:<port>` and uses `https://<tailnet name>/ultrathink-oauth/callback` as the callback, so a browser on another device in the same tailnet finishes the login by itself. The route is removed when the login ends. When Tailscale is not running or has no HTTPS certificate for that name, the default callback is used; when `tailscale serve` fails, the login falls back to the default callback and says so. `ULTRATHINK_OAUTH_TAILSCALE=1` does the same as the flag. Without either, ultrathink never runs `tailscale`. On a local (non-SSH) session the option has no effect. |
+
+See [Logging in from a remote machine](tracking.md#logging-in-from-a-remote-machine) for a walk-through, and [Troubleshooting](troubleshooting.md) for failed logins.
 
 ### `bin/ultrathink-ship`
 
@@ -199,11 +247,80 @@ usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.
 
 | Subcommand | Effect |
 |---|---|
-| `assess` | Collects git, GSD and diff signals and asks the engine to judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out; use it only when that roadmap is separate work ([ship.md](ship.md#done-assessment)). |
+| `assess` | Collects git, GSD and diff signals and asks the engine to judge whether the task is done. A GSD roadmap whose `gsd-tools.cjs` cannot be found is reported as a gap (see [GSD tools lookup](configuration.md#gsd-tools-lookup)). `--ignore-gsd` leaves the GSD roadmap out; use it only when that roadmap is separate work (see [Ship](ship.md)). |
 | `pr` | Pushes the branch and opens a PR into the repository's default branch, or reuses the open one. |
-| `review` | One Greptile review round. Returns `status: "pending"` within `ship.waitMs` while Greptile is still working, and running it again resumes the same review. |
-| `merge` | Checks the merge gate, merges, and cleans up the branch. |
+| `review` | One Greptile review round. Returns `status: "pending"` within `ship.waitMs` while Greptile is still working, and running it again resumes the same review. Returns `status: "blocked"` without counting a round when Greptile is not set up (no stored Greptile credential and no signed-in `greptile` CLI) or when your Greptile account needs `ship.greptileOrganization`; the reason says what to do. |
+| `merge` | Checks the merge gate and merges. Refuses with `autoMerge disabled` unless `ship.autoMerge` is `true`. Deletes the remote and local branch and fast-forwards the base branch only when `ship.deleteBranch` is `true`. |
 | `run` | `assess`, `pr`, `review` and `merge` in one go. Fixing findings stays with the agent. |
 | `status` | Prints the stored ship state. |
 
-`--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. It exits 0 even when a step refuses (`ok: false` with a `reason`) and 2 only on a usage error.
+`--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it.
+
+### `scripts/setup.ts`
+
+Installs the Claude Code and Grok Build parts. Run it from the checkout:
+
+```sh
+bun scripts/setup.ts apply     # install or update
+bun scripts/setup.ts status    # report what is installed (also the default, and what any other verb does)
+bun scripts/setup.ts rollback  # undo what apply did
+```
+
+`apply` does the following. Re-running it updates in place.
+
+1. Grok Build, always: merges the ultrathink rule into `~/.grok/rules/ultrathink.md` (between marker comments, so your own text in that file stays) and writes the hook file `~/.grok/hooks/ultrathink.json`. Both are under `$GROK_HOME` when it is set. Re-run `apply` after updating ultrathink so both files match the new version. It does not enable the Grok plugin itself; run `grok plugin enable ultrathink` for that (see [Install](install.md)).
+2. Claude Code, only when the `claude` CLI is installed:
+   - adds the Notion and Linear hosted MCP servers at user scope (`claude mcp add --transport http --scope user notion https://mcp.notion.com/mcp`, and the same for `linear` with `https://mcp.linear.app/mcp`), unless a server with exactly that name already exists;
+   - adds the checkout as a plugin marketplace and runs `claude plugin install ultrathink@ultrathink`;
+   - merges a short "Ultrathink task tracking" block between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->` into `~/.claude/CLAUDE.md` (`$CLAUDE_CONFIG_DIR/CLAUDE.md` when set). The block says the plugin *can* track work and applies only when tracking is configured;
+   - records which MCP servers it added in `ultrathink-setup-state.json` next to that `CLAUDE.md`. A re-run keeps servers recorded by earlier runs, so `rollback` still removes them.
+3. Prints the remaining steps for the other hosts: the Hermes symlink into `$HERMES_HOME/plugins/ultrathink` (`~/.hermes` when unset) and the `hermes config set plugins.hook_callback_timeout 600` command (see [Install](install.md)), `muse plugins install <clone> --scope user && muse plugins approve ultrathink`, and `omp plugin link <clone>`. It does not run them.
+
+`apply` never changes `~/.claude/settings.json` or any Hermes setting.
+
+`status` prints one line each for the Notion MCP server, the Linear MCP server and the `CLAUDE.md` block (or `Claude Code: claude CLI not found`), then the Grok rule and hook file, with the command that fixes anything missing.
+
+`rollback` removes the `CLAUDE.md` block, removes only the MCP servers that `apply` recorded as added, deletes the setup state file, removes the Grok rule block (and the file, if nothing else is left in it) and the Grok hook file. When removing a recorded MCP server fails, it prints the error and the manual `claude mcp remove --scope user <name>` command, and keeps the setup state file so a second `rollback` retries. It prints, but does not run, the plugin uninstall: `claude plugin uninstall ultrathink@ultrathink && claude plugin marketplace remove ultrathink`.
+
+### `scripts/mcp-register.ts`
+
+Registers the MCP gateway (`<clone>/bin/ultrathink-mcp serve <provider>`) as the `notion`, `linear` and `greptile` MCP servers in each host's user config.
+
+```text
+Usage: bun scripts/mcp-register.ts [--hosts claude,grok,hermes,muse,omp] [--providers notion,linear,greptile] [--replace | --remove] [--dry-run]
+```
+
+| Flag | Effect |
+|---|---|
+| `--hosts <list>` | Comma-separated hosts to change: `claude`, `grok`, `hermes`, `muse`, `omp`. Default: all. |
+| `--providers <list>` | Comma-separated providers to register or remove: `notion`, `linear`, `greptile`. Default: all. |
+| `--replace` | Also overwrite same-named entries that are not ultrathink's. Without it they are kept. |
+| `--remove` | Delete ultrathink's entries (command ending in `/bin/ultrathink-mcp`) and keep all others. Cannot be combined with `--replace`. |
+| `--dry-run` | Print what would change without writing a file or changing a host. The hosts' read-only list and get commands (`claude mcp get`, `grok mcp list --json`, `hermes mcp list`) still run to see what is registered. |
+| `--help`, `-h` | Print the usage text. |
+
+Where each host keeps the entries:
+
+| Host | How it is changed |
+|---|---|
+| `claude` | `claude mcp add\|remove --scope user`. The file backed up is `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set). |
+| `grok` | `grok mcp add\|remove --scope user`. The file backed up is `~/.grok/config.toml` (`$GROK_HOME/config.toml` when set). |
+| `hermes` | `hermes mcp add\|remove`. The file backed up is the `config.yaml` of the active Hermes profile: `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml` when set), or `<Hermes home>/profiles/<name>/config.yaml` when a profile other than `default` is active or `HERMES_HOME` points at a profile directory. When the active profile cannot be resolved, nothing is backed up and a line says so (check `hermes profile list`). |
+| `muse` | Written directly to `~/.config/muse/settings.json` (`$XDG_CONFIG_HOME/muse/settings.json` when set). |
+| `omp` | Written directly to `~/.omp/agent/mcp.json` (`$PI_CODING_AGENT_DIR/mcp.json` when set). |
+
+A host whose CLI (`claude`, `grok` or `hermes`) is not on `PATH` is skipped. Every file it changes is first backed up as `<file>.bak-ultrathink-mcp-<timestamp>`. An entry counts as ultrathink's when its command ends with `/bin/ultrathink-mcp`, from any clone.
+
+It prints one line per host and provider, `<host>: <provider> <action>`, where the action is one of `added`, `replaced` (an ultrathink entry from another clone, or any entry with `--replace`), `re-enabled`, `unchanged`, `kept` (someone else's entry, left in place; rerun with `--replace` to overwrite it), `removed`, `not registered`, `saved disabled` (Hermes saved the entry but reports it not authenticated yet) or `FAILED` (with the host command's error). When the checkout path contains `/plugins/cache/`, it warns that the next plugin update will replace that directory and asks you to register from a stable clone instead.
+
+## Exit codes
+
+| Program | Exit codes |
+|---|---|
+| `bin/ultrathink` | 0, including for unknown verbs (which print the usage text). |
+| `bin/ultrathink-mcp` | 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr). During an `auth login` that set up a Tailscale route, Ctrl-C removes the route and exits 130 (143 on `SIGTERM`). |
+| `bin/ultrathink-ship` | 0, even when a step refuses (`ok: false` with a `reason`); 2 on a usage error. |
+| All three CLIs above | 127 when Bun is not found. When Bun is found but cannot start, the shell's own status (for example 126). |
+| Hooks (`hooks/*`, run by the hosts) | 0 when Bun is missing, so a prompt is never blocked by ultrathink. |
+| `scripts/setup.ts` | 0; 1 on an unexpected error. |
+| `scripts/mcp-register.ts` | 0 on success, 1 when any host change `FAILED`, 2 on an argument error (unknown host or provider, `--replace` with `--remove`). |

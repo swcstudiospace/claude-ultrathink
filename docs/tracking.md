@@ -2,6 +2,8 @@
 
 ultrathink can record every plan as rows in Linear, in Notion, or in both. Tracking is off until you configure a provider: with `notion.dataSourceUrl` and `linear.team` both unset (the default), no rows are created and neither service is contacted.
 
+Step-by-step setup lives in the task guides: [Set up Notion](how-to/set-up-notion.md), [Set up Linear](how-to/set-up-linear.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md). This page is the reference for what they set up.
+
 - [What gets created](#what-gets-created)
 - [When rows are created](#when-rows-are-created)
 - [The MCP gateway and credential store](#the-mcp-gateway-and-credential-store)
@@ -30,10 +32,10 @@ Each description ends with a footer, `ultrathink graph <graph id> · node <node 
 | `Level` | Count | Main properties | `Parent Item` |
 |---|---|---|---|
 | `Task` | one per plan | `Item`, `Description`, `Uplifted Prompt` (cut to 1900 characters), `Agent` (the host), `Status` = `Planning`, `Linear State` = `Todo`, `Repo`, `Branch`, `Graph ID` | none |
-| `Issue` | one per graph node | `Item`, `Thought`, `Graph ID`, and `Linear URL` / `Issue ID` when Linear is also configured | the Task |
-| `Sub-Issue` | one per rationale step | `Item`, `Step`, `Thought`, `Graph ID`, `Linear URL` / `Issue ID` | the node's Issue |
+| `Issue` | one per graph node | `Item`, `Thought`, `Graph ID`, `Agent`, `Status`, `Linear State`, and `Linear URL` / `Issue ID` when Linear is also configured | the Task |
+| `Sub-Issue` | one per rationale step | `Item`, `Step`, `Thought`, `Graph ID`, `Agent`, `Status`, `Linear State`, `Linear URL` / `Issue ID` | the node's Issue |
 
-ultrathink fetches the database schema first and writes only the properties the database has, so a database with fewer columns still works. A re-run finds existing rows by `Graph ID`.
+ultrathink fetches the database schema first and writes only the properties the database has, so a database with fewer columns still works. If the fetched schema does not show `Item`, `Level` and `Graph ID`, it sends every property instead, and a create that names a missing column fails. A re-run finds existing rows by `Graph ID`.
 
 That adoption by Graph ID happens only when `track complete` re-runs on a session record that already has `tracking` refs. The first run on a record (always the case on Hermes, where the hook creates no rows) creates every row without looking for existing ones, so a first run interrupted before it records its refs leaves rows that a retry creates again. Delete the duplicates by `Graph ID` if that happens.
 
@@ -56,6 +58,8 @@ Kickoff fails open. When `track complete` reports that Notion or Linear is down,
 
 Sync looks rows up by Graph ID only: the Notion Task by the session record's `tracking.notion.taskUrl` or its `Graph ID`, the Linear issues by the session record's `tracking` refs or the `ultrathink graph <id>` footer. It never matches by branch, PR title or repo, never creates a row, and never clears or overwrites `PR URL` or `PR #` in a turn that has no pull request. It fails open like kickoff: when Notion or Linear is down, unreachable, rate-limited or unauthorised, it doesn't retry, says in one line which tracker it couldn't update, and the turn carries on, including the turn that opened the PR.
 
+A tool call counts as opening a pull request, and nudges the agent to run `ultrathink-sync`, when it is either `gh pr create` run through a shell tool (`Bash`, `bash`, `shell`, `exec`, `terminal` or `run_terminal_command`), or a tool whose name ends in `create_pull_request`, `pull_request_create` or `createPullRequest`, compared case-insensitively (for example `mcp__github__create_pull_request`). The name must end there, so PR-review tools such as `create_pull_request_review` do not count. The `gh pr create` check is a plain text match, so a command that only quotes it, such as a commit message, can nudge too.
+
 On Hermes the plugin nudges sync when a tool call opens a pull request and, through Hermes' `pre_verify` hook, once per plan (per session and Graph ID) when a coding turn is about to finish with rows created but `synced` not yet set. Recording `synced` stops that end-of-turn nudge.
 
 No rows are created when:
@@ -65,11 +69,14 @@ No rows are created when:
 - the message references an existing ultrathink graph as `graph ut-<id>-<8 hex>` (as dispatched workers and the Linear issue footers do), so it isn't planned again; prefix it with `uplift:` to plan it anyway,
 - tracking is turned off (see [Turning tracking off](#turning-tracking-off)).
 
-You can run `track complete` yourself at any time. It is safe to repeat:
+You can run `track complete` yourself at any time. It is safe to repeat. Run it from the project directory: it reads the config files for the current directory, so `<project>/.claude/ultrathink.json` applies only there.
 
 ```sh
+cd <project>
 <clone>/bin/ultrathink-mcp track complete --state <state dir>/sessions/<session-id>.json
 ```
+
+It uses the `notion.dataSourceUrl` and `linear.team` configured now, not the ones in effect when the plan was made, so rows still missing after you change them go to the new database or team.
 
 See [Configuration](configuration.md#state-directories) for where each host keeps its session records.
 
@@ -83,7 +90,7 @@ See [Configuration](configuration.md#state-directories) for where each host keep
 | `linear` | `https://mcp.linear.app/mcp` | API key, or OAuth |
 | `greptile` | `https://api.greptile.com/mcp` | API key, or OAuth |
 
-The planner, `track complete` and the ship flow call these servers directly with the credentials in the store. `bin/ultrathink-mcp serve <provider>` exposes the same connection as a stdio MCP server, so your agents use the same login (see [Registering the gateway](#registering-the-gateway-in-your-hosts)).
+The planner, `track complete` and the ship flow call these servers directly with the credentials in the store. `bin/ultrathink-mcp serve <provider>` exposes the same connection as a stdio MCP server, so your agents use the same login (see [Registering the gateway](#registering-the-gateway-in-your-hosts)). Each provider holds one credential: a later `set-key` or `login` replaces the earlier one.
 
 Commands:
 
@@ -91,7 +98,7 @@ Commands:
 bin/ultrathink-mcp auth status                     # which providers are ready; never prints a secret
 bin/ultrathink-mcp auth set-key <linear|greptile> --stdin
 bin/ultrathink-mcp auth set-key <linear|greptile> --env-file <path> --var <NAME>
-bin/ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--no-listen]
+bin/ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
 bin/ultrathink-mcp auth logout <provider>          # removes the local entry only
 bin/ultrathink-mcp check [provider...]             # initialize + tools/list against each provider
 ```
@@ -110,36 +117,31 @@ See [SECURITY.md](../SECURITY.md) for how to report a vulnerability.
 
 ## Setting up Notion
 
-### 1. Log in
+The full walkthrough is [Set up Notion](how-to/set-up-notion.md). In short:
 
 ```sh
-<clone>/bin/ultrathink-mcp auth login notion
+<clone>/bin/ultrathink-mcp auth login notion                                            # OAuth only
+<clone>/bin/ultrathink-mcp notion init --parent <notion page url or id> --write-config   # create the database
 ```
 
-The command prints an authorization URL and waits. Open the URL in a browser, approve access, and the browser returns to a local callback listener on `127.0.0.1:8765` (change the port with `--port`). If the page fails to load, copy the full URL from the address bar and paste it into the terminal. That works too. With `--no-listen` the command only waits for a pasted URL.
+`auth login` prints an authorization URL and waits. Open it in a browser, approve access, and the browser returns to a local listener on `http://127.0.0.1:8765/callback` (change the port with `--port`). If the page fails to load, copy the full URL from the address bar and paste it into the terminal. With `--no-listen` the command only waits for a pasted URL.
+
+`notion init` creates a database titled `Agent Task Graph` (change it with `--title`) under a page your Notion login can edit, adds the two-way `Parent Item` / `Sub-Items` self-relation, and prints the new `collection://<data source id>` data source. `--write-config` saves it as `notion.dataSourceUrl` in the user config (`~/.config/ultrathink/config.json`, or under `$XDG_CONFIG_HOME`) and keeps the other keys; without it, the command prints the JSON line for you to add yourself. It never creates rows. It exits 1 when the relation could not be added, and its create call waits up to 120 seconds, so check Notion before you rerun after a timeout.
+
+To use an existing database instead, set `notion.dataSourceUrl` to its `collection://<data source id>` data source. It needs at least `Item` (title), `Level` (select) and `Graph ID` (text); see [Or use an existing database](how-to/set-up-notion.md#or-use-an-existing-database).
 
 ### Logging in from a remote machine
 
-Over SSH, the browser runs on your own computer, where `127.0.0.1` is not the server. The command detects an SSH session (`SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY`) and picks one of these routes:
+Over SSH, the browser runs on your own computer, where `127.0.0.1` is not the server. The command detects an SSH session (`SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY`) and prints hints for these routes:
 
 | Route | When | How it works |
 |---|---|---|
-| Tailscale | Tailscale is running on the server and its tailnet name has HTTPS certificates | The callback URL is `https://<server tailnet name>/ultrathink-oauth/callback`. For the length of the login, the command adds `tailscale serve --bg --https=443 --set-path=/ultrathink-oauth` pointing at the local listener, and removes it afterwards. Open the URL on any device in the same tailnet and the login finishes by itself. If the route cannot be added, the command falls back to the port forward route. |
-| Port forward | No usable Tailscale | Forward the callback port before you open the URL: `ssh -L 8765:127.0.0.1:8765 <user>@<server>`, or a local port forward in your SSH client (for example Termius: bind `127.0.0.1:8765` locally to `127.0.0.1:8765` through the SSH host). |
+| Port forward | Default | Forward the callback port before you open the URL: `ssh -L 8765:127.0.0.1:8765 <user>@<server>`, or a local port forward in your SSH client (for example Termius: bind `127.0.0.1:8765` on your computer to `127.0.0.1:8765` through the SSH host). |
 | Paste | Always | Approve in the browser, then paste the redirected URL into the terminal, even if the page did not load. |
-| Override | `--redirect <url>` or `ULTRATHINK_OAUTH_REDIRECT` | Use your own callback URL. It must be https, or http on `127.0.0.1`, `localhost` or `[::1]`, and it must reach the listener on `127.0.0.1:<port>` with the same path. |
+| Tailscale | Opt-in: `--tailscale` or `ULTRATHINK_OAUTH_TAILSCALE=1`, in an SSH session, with Tailscale running and HTTPS certificates for the server's tailnet name | The callback URL is `https://<server tailnet name>/ultrathink-oauth/callback`. For the length of the login, the command adds `tailscale serve --bg --https=443 --set-path=/ultrathink-oauth` pointing at the local listener, and removes it afterwards. Open the URL on any device in the same tailnet and the login finishes by itself. If the handler cannot be added, the command falls back to the loopback callback, so the port forward and paste routes still work. Without the opt-in, ultrathink never runs `tailscale`. |
+| Override | `--redirect <url>` or `ULTRATHINK_OAUTH_REDIRECT` (the flag wins); takes precedence over Tailscale | Use your own callback URL. It must be https, or http on `127.0.0.1`, `localhost` or `[::1]`, and it must reach the listener on `127.0.0.1:<port>` with the same path. |
 
-### 2. Create the tracking database
-
-```sh
-<clone>/bin/ultrathink-mcp notion init --parent <notion page url or id> --write-config
-```
-
-This creates a database titled `Agent Task Graph` (change it with `--title`) under the parent page. The page must be one your Notion login can edit. The command then adds the two-way `Parent Item` / `Sub-Items` relation on the database itself and prints the new `collection://…` data source. `--write-config` saves it as `notion.dataSourceUrl` in `~/.config/ultrathink/config.json` and keeps the other keys. Without `--write-config`, it prints the JSON snippet for you to add yourself.
-
-It never creates rows. If the database is created but the relation fails, the command exits with status 1 and says so. Rows then stay flat until you add a two-way relation named `Parent Item` (synced as `Sub-Items`) from the database to itself in Notion. The create call waits up to 120 seconds. If it times out, check Notion before you run it again, because the database may exist already.
-
-To use an existing database instead, set `notion.dataSourceUrl` to its `collection://<id>` data source by hand.
+Details and expected output: [Logging in over SSH](how-to/set-up-notion.md#logging-in-over-ssh).
 
 ### Database schema
 
@@ -173,21 +175,25 @@ These are the columns `notion init` creates (`TASK_GRAPH_COLUMNS` in `src/mcp/no
 
 ## Setting up Linear
 
-1. Store a Linear API key. `--stdin` reads it from standard input (paste it, then press Ctrl-D):
+The full walkthrough is [Set up Linear](how-to/set-up-linear.md). In short:
+
+1. Store a credential: a personal API key from Linear's **Settings → Account → Security & access**, read from standard input (paste it, press Enter, then Ctrl-D):
 
    ```sh
    <clone>/bin/ultrathink-mcp auth set-key linear --stdin
    ```
 
-   Or read it from an env file: `auth set-key linear --env-file <path> --var LINEAR_API_KEY`. `auth login linear` (OAuth) also works.
+   Or read it from an env file: `auth set-key linear --env-file <path> --var LINEAR_API_KEY`. `auth login linear` (OAuth) works too.
 
 2. Set the team the issues go into, in any [config file](configuration.md#config-files):
 
    ```json
-   { "linear": { "team": "<your team name>" } }
+   { "linear": { "team": "<your Linear team>" } }
    ```
 
-The key must belong to the Linear workspace that has this team.
+   The value is passed unchanged as the `team` argument of the Linear MCP `save_issue` call, which Linear's server documents as a team name or ID. ultrathink does not check it first; a wrong value fails each create with Linear's error.
+
+The credential must belong to the Linear workspace that has this team.
 
 ## Greptile key
 
@@ -201,23 +207,29 @@ Greptile is not used for tracking. The ship flow uses it for code review (see [S
 
 ## Registering the gateway in your hosts
 
-The planner and `track complete` read the store directly and need no registration. Register the gateway so that the agents themselves (the kickoff and sync skills, or you asking the agent) can use the Notion, Linear and Greptile tools with the same login:
+The planner, `track complete` and the ship flow read the store directly and need no registration. Register the gateway so that the agents themselves (the kickoff and sync skills, or you asking the agent) can use the Notion, Linear and Greptile tools with the same login. The full guide, including when you can skip it, is [Register the MCP gateway](how-to/register-mcp-gateway.md).
 
 ```sh
-bun scripts/mcp-register.ts [--hosts claude,grok,hermes,muse,omp] [--providers notion,linear,greptile] [--dry-run]
+bun scripts/mcp-register.ts [--hosts claude,grok,hermes,muse,omp] [--providers notion,linear,greptile] [--replace | --remove] [--dry-run]
 ```
 
 For each provider it adds a server named `notion`, `linear` or `greptile` that runs `<clone>/bin/ultrathink-mcp serve <provider>`:
 
 | Host | How | File backed up first |
 |---|---|---|
-| Claude Code | `claude mcp add --scope user` | `~/.claude.json` |
-| Grok Build | `grok mcp add --scope user` | `~/.grok/config.toml` |
-| Hermes Agent | `hermes mcp add` | `$HERMES_HOME/config.yaml` |
-| Muse Code | writes `mcpServers` in `~/.config/muse/settings.json` | the same file |
-| Omp | writes `~/.omp/agent/mcp.json` | the same file |
+| Claude Code | `claude mcp add --scope user` | `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set) |
+| Grok Build | `grok mcp add --scope user` | `~/.grok/config.toml` (`$GROK_HOME/config.toml` when set) |
+| Hermes Agent | `hermes mcp add` | the active Hermes profile's `config.yaml`: `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml` when set), or `<Hermes root>/profiles/<name>/config.yaml` when `HERMES_HOME` is a profile directory or the root's `active_profile` names a non-default profile. If the profile cannot be resolved, nothing is backed up and the script says so. |
+| Muse Code | writes `mcpServers` in `~/.config/muse/settings.json` (under `$XDG_CONFIG_HOME` when set) | the same file |
+| Omp | writes `mcpServers` in `~/.omp/agent/mcp.json` (`$PI_CODING_AGENT_DIR/mcp.json` when set) | the same file |
 
-It writes user-level config only, replaces entries with the same name, and backs up each file it changes as `<file>.bak-ultrathink-mcp-<timestamp>`. A host whose CLI is not on `PATH` is skipped. `--dry-run` prints the changes without writing anything. Claude Code keeps any claude.ai Notion or Linear connectors next to these. Disable them in `/mcp` if you want only one.
+- It writes user-level config only, and backs up each file it changes as `<file>.bak-ultrathink-mcp-<timestamp>`.
+- It changes only ultrathink's entries: those whose command ends with `/bin/ultrathink-mcp`, from any clone. A same-named entry that is not ultrathink's, such as the hosted `notion` or `linear` HTTP server that `scripts/setup.ts apply` adds to Claude Code, is kept and reported as `kept`. `--replace` overwrites it.
+- `--remove` deletes ultrathink's entries and keeps every other one.
+- `--dry-run` prints the changes without writing a file or changing a host.
+- A host whose CLI is not on `PATH` (Claude Code, Grok Build, Hermes Agent) is skipped. Muse and Omp files are written whether or not the host is installed; use `--hosts` to leave them out.
+- Run from a path that contains `/plugins/cache/`, it warns that the next plugin update replaces that directory and would break the registered commands. Register from a stable clone.
+- It exits 1 when any registration failed and 2 on a usage error.
 
 ## Turning tracking off
 
@@ -226,7 +238,7 @@ It writes user-level config only, replaces entries with the same name, and backs
 | No rows at all on this host | `/ultrathink-track off` in the agent, or `bin/ultrathink track off`. The planner, `track complete` and the kickoff skill then create nothing. Planning continues. `/ultrathink-track on` turns it back on. |
 | No rows anywhere | Leave `notion.dataSourceUrl` and `linear.team` unset. This is the default. |
 | No rows for one message | `/ultrathink-quick <message>`, or the `raw:` prefix. |
-| Planner creates no rows, kickoff creates them | `"track": { "enabled": false }` in config, or `ULTRATHINK_TRACK=0` in the environment. |
+| Planner creates no rows, kickoff creates them | `ULTRATHINK_TRACK=0` in the environment, or `"track": { "enabled": false }` in config. The config key has no effect on a host where `/ultrathink-track on` or `off` (or `bin/ultrathink track on`/`off`) has been used: that per-host control setting beats `track.enabled` and stays until you delete `trackEnabled` from `<state dir>/control.json`. `ULTRATHINK_TRACK=0` still works there. |
 
 `bin/ultrathink track status` shows which case applies:
 

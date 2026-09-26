@@ -5,6 +5,8 @@ ultrathink is a planner plugin for coding agents. Before the agent sees a non-tr
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 [![CI](https://github.com/swcstudiospace/claude-ultrathink/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/swcstudiospace/claude-ultrathink/actions/workflows/ci.yml)
 
+**New here?** Follow [Getting started](docs/getting-started.md) to install ultrathink and plan your first prompt. Everything else is in the [documentation index](docs/README.md).
+
 ## Why
 
 A coding agent starts on the prompt exactly as typed. For anything larger than a one-line fix, the scope, the order of the work and the questions worth settling first are left for the agent to work out as it goes, and whatever plan it forms stays inside that one session. ultrathink adds one planning pass in front of the agent: a written spec, a dependency graph whose independent parts can run in parallel, the blocking questions asked once up front, and, if you want them, tracker rows for every part of the plan. One engine and one config serve all five hosts.
@@ -41,7 +43,7 @@ The agent-side half is four skills, shared by every host:
 | `ultrathink-kickoff` | First, when tracking is on | Finishes missing tracker rows, resolves blocking questions, hands back the full spec and the linked TODO lines |
 | `ultrathink-plan` | On a host that drops hook output (Grok Build) | Reads the plan from `last-plan.json`, then runs kickoff |
 | `ultrathink-sync` | After a pull request opens, or at a stopping point | Puts the PR link, checks and status on the tracked rows; never creates rows |
-| `ultrathink-ship` | After a planned GSD skill run | Done check, pull request, Greptile review to 5/5, squash-merge, branch cleanup (see [Ship](#ship)) |
+| `ultrathink-ship` | After a planned GSD skill run, only when ship is turned on | Done check, pull request, Greptile review to 5/5; merge and branch cleanup only when you enable them (see [Ship](#ship)) |
 
 ## Supported hosts
 
@@ -50,18 +52,51 @@ Each host was tested live with the version shown, including planning and the `/u
 | Host | Tested | How ultrathink loads | How the plan reaches the agent |
 |---|---|---|---|
 | Claude Code | 2.1.278 | `.claude-plugin/` marketplace; hooks in `hooks/hooks.json` | `UserPromptSubmit` hook context |
-| Grok Build | 1.0.41 | The plugin directory supplies the skills and commands. Grok does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs the global hook file `~/.grok/hooks/ultrathink.json` | Grok discards hook output, so the plan is written to `last-plan.json` and a rule file (`~/.grok/rules/ultrathink.md`) tells the model to read it |
-| Hermes Agent | v0.21.4 | Python plugin `hosts/hermes`, symlinked into `~/.hermes/plugins/ultrathink` | `pre_llm_call` returns the plan from `hooks/engine.ts` |
+| Grok Build | 1.0.41 | The plugin directory supplies the skills and commands. Grok does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs the global hook file `~/.grok/hooks/ultrathink.json` (under `$GROK_HOME` when set) | Grok discards hook output, so the plan is written to `last-plan.json` and a rule file (`~/.grok/rules/ultrathink.md`) tells the model to read it |
+| Hermes Agent | v0.21.4 | Python plugin `hosts/hermes` (Python 3.10 or later), symlinked into `${HERMES_HOME:-~/.hermes}/plugins/ultrathink` | `pre_llm_call` gets the plan from `hooks/engine.ts` and hands the agent a short handoff: the spec path, the state file and the Graph ID |
 | Muse Code | 1.4.0 | `.muse-plugin/plugin.json` | `UserPromptSubmit` hook context, same entry as Claude Code |
 | Omp | 18.3.1 | `package.json` `omp.extensions` → `src/host/omp.ts` | `before_agent_start`; the TUI shows a live status bar and plan cards. Omp caps a handler at 30 s, so the extension waits up to 25 s and a slower plan arrives later as an aside |
 
+### Platforms
+
+ultrathink runs on **Linux** and **macOS**. On Windows, use it inside **WSL**; native Windows is not supported. CI runs on Linux and macOS.
+
 Requirements:
 
-- **Bun 1.2 or newer** (tested with 1.4.0). `bin/run-bun` finds Bun even when a host's PATH does not include it.
-- **An engine:** the default Claude engine runs the `claude` CLI on every host, so it must be installed and logged in. The optional Grok engine needs `grok login` instead.
-- **For ship:** `gh`, authenticated, and Greptile: the gateway's Greptile key when Greptile indexes the repository, otherwise the Greptile CLI (tested with 3.4.1) after `greptile login`.
+- **Bun 1.2 or newer** (tested with 1.4.0). `bin/run-bun` finds Bun even when a host's PATH does not include it. Without Bun the hooks exit quietly and prompts go through unplanned; the `bin/` CLIs print `ultrathink: bun not found` and exit with status 127.
+- **An engine:** the default Claude engine runs the `claude` CLI (Claude Code 2.1.278 or later) on every host, so it must be installed and logged in. It passes `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`; an older CLI rejects these and every plan falls back to the minimal spec. The optional Grok engine needs `grok login` instead.
+- **Hermes Agent only:** Python 3.10 or newer.
+- **For ship (optional):** `gh`, authenticated, and Greptile: a Greptile key in the gateway, or the Greptile CLI (tested with 3.4.1) after `greptile login`.
 
 State is kept per host: `~/.claude/ultrathink`, `~/.grok/plugin-data/ultrathink`, `$HERMES_HOME/ultrathink` (default `~/.hermes/ultrathink`), `~/.config/muse/ultrathink` and `~/.omp/agent/ultrathink`. Planning never writes `.planning/` into your working directory.
+
+## Cost and latency
+
+Planning is not free. For each prompt it plans, the engine makes one model call to write the spec, one to build the Graph of Thought, one per node to fill it in (5 to 8 nodes by default) and one for the clarifying questions: **8 to 11 headless model calls** on the configured engine. With the default Claude engine they run through your `claude` login, with model `sonnet` unless you set `claude.model`. Node fills run up to `claude.concurrency` (default 3) at a time within a dependency level; the other calls run one after another, and creating tracker rows can add up to `track.budgetMs` (60 s by default). The agent starts only when the plan is ready (on Omp, after 25 s at most; a slower plan arrives as an aside).
+
+To spend less: send small messages with `/ultrathink-quick` or a `raw:` prefix, lower `think.maxNodes`, turn clarifying questions off with `hitl.enabled: false`, or turn the graph off with `think.enabled: false`. Short replies such as `ok` are not planned. See [Reduce cost and latency](docs/how-to/reduce-cost-and-latency.md).
+
+## What leaves your machine
+
+- **Always, for a planned prompt:** your message and the recent conversation go to the planning engine: Anthropic through the `claude` CLI by default, or xAI when you choose the Grok engine (or a gateway you run, with the Grok `shunt` transport).
+- **Only when you configure them:** plan contents (the uplifted prompt, node titles and reasoning, repository name and branch) go to Notion and Linear through their hosted MCP servers; ship pushes to GitHub with `gh` and sends the pull request to Greptile; the Agent Substrate brief request sends the repository, branch and host name to the URL you set.
+- Credentials for Notion, Linear and Greptile stay in one local file, `~/.config/ultrathink/mcp-credentials.json` (mode 0600). ultrathink has no telemetry of its own.
+
+Details for every service: [What leaves your machine](docs/privacy.md).
+
+## Optional integrations (off by default)
+
+A fresh install plans prompts and contacts nothing but the engine. Each of these stays off until you turn it on:
+
+| Integration | Turn it on with | What it does |
+|---|---|---|
+| Notion and Linear tracking | `notion.dataSourceUrl`, `linear.team` | Creates rows for each plan (see [Getting started](docs/getting-started.md#6-optional-track-plans-in-notion-or-linear)) |
+| Ship | `ship.enabled: true`; merging also needs `ship.autoMerge: true`, branch deletion `ship.deleteBranch: true` | Opens a pull request after a GSD skill run and reviews it with Greptile (see [Ship](#ship)) |
+| Agent Substrate brief | `substrate.url` or `SUBSTRATE_URL` | Fetches a cross-agent brief for the repository and branch before the graph is built |
+| Tailscale OAuth callback | `bin/ultrathink-mcp auth login <provider> --tailscale` or `ULTRATHINK_OAUTH_TAILSCALE=1` | Receives the OAuth callback over `tailscale serve` for logins on a remote machine |
+| Grok `shunt` transport | `grok.transport: "shunt"` plus `grok.shuntBaseUrl` | Sends Grok engine calls to an Anthropic-compatible gateway you run; there is no built-in one |
+
+`bin/ultrathink status` shows tracking, Substrate, Ship and the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
 
 ## Quickstart
 
@@ -78,13 +113,17 @@ Then run the lines for each host you use:
 claude plugin marketplace add <clone>
 claude plugin install ultrathink@ultrathink
 
-# Grok Build: the plugin directory, then the global hook file and rule file
+# Grok Build: the plugin directory, enable it, then the global hook file and rule file
 mkdir -p ~/.grok/plugins && ln -sfn <clone> ~/.grok/plugins/ultrathink
+grok plugin enable ultrathink
+grok plugin list                 # ultrathink should be listed as enabled
 bun <clone>/scripts/setup.ts apply
 
-# Hermes Agent
-mkdir -p ~/.hermes/plugins && ln -sfn <clone>/hosts/hermes ~/.hermes/plugins/ultrathink
+# Hermes Agent: the plugin, then the hook cap (required, see below)
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins"
+ln -sfn <clone>/hosts/hermes "${HERMES_HOME:-$HOME/.hermes}/plugins/ultrathink"
 hermes plugins enable ultrathink
+hermes config set plugins.hook_callback_timeout 600
 
 # Muse Code
 muse plugins install <clone> --scope user
@@ -94,34 +133,25 @@ muse plugins approve ultrathink
 omp plugin link <clone>
 ```
 
+- **Hermes hook cap.** Hermes stops waiting for a plugin hook after `plugins.hook_callback_timeout` seconds, 30 by default, and a plan takes longer than that. ultrathink plans only when the cap is at least 105 s; 600 (Hermes' maximum) is recommended. It is a global Hermes setting that applies to every plugin, and ultrathink never changes it for you. Below 105 s, every prompt goes through unplanned and the Hermes log gets one warning naming the command above.
 - `setup.ts apply` installs the Grok hook file and rule first. If the `claude` CLI is on PATH, it also sets up Claude Code: it installs the plugin, adds the hosted Notion and Linear MCP servers and adds a marked block to `~/.claude/CLAUDE.md`. Without `claude`, it skips those steps and says so.
-- Muse refuses a plugin directory that contains symlinks, and `bun install` can create some under `node_modules/.bin`, so install from a clone where you have not run it (or delete `node_modules` first). The `multiple-manifests` warning is expected: Muse uses `.muse-plugin/plugin.json` and ignores the Claude manifest. Planning starts only after `approve`.
+- Muse refuses a plugin directory that contains symlinks, and `bun install` can create some under `node_modules/.bin`, so install from a clone where you have not run it (or delete `node_modules` first). Planning starts only after `approve`.
 - Check the result with `<clone>/bin/ultrathink status`, then send a request. In Claude Code a `Prompt Uplift · …` line appears before the agent starts.
 
-Per-host details: [Claude Code](docs/install.md#claude-code) (including the GitHub marketplace, no clone needed), [Grok Build](docs/install.md#grok-build), [Hermes Agent](docs/install.md#hermes-agent), [Muse Code](docs/install.md#muse-code), [Omp](docs/install.md#omp).
+Per-host details, updating and removing: [docs/install.md](docs/install.md).
 
 ### Optional: track plans in Linear and Notion
 
-Tracking stays off until you configure a provider, and rows are created only for the providers you set up. The Notion, Linear and Greptile credentials live in one store that every host shares (`~/.config/ultrathink/mcp-credentials.json`, mode 0600).
+Tracking stays off until you configure a provider, and rows are created only for the providers you set up. The short version, from `<clone>`:
 
 ```bash
-cd <clone>
-
-# Linear: store an API key (paste it, then Ctrl-D), then set linear.team (see Configuration)
-bin/ultrathink-mcp auth set-key linear --stdin
-
-# Notion: OAuth, then create the tracking database and save it to your config
+bin/ultrathink-mcp auth login linear      # or: bin/ultrathink-mcp auth set-key linear --stdin
 bin/ultrathink-mcp auth login notion
 bin/ultrathink-mcp notion init --parent <notion page url or id> --write-config
-
-# Greptile, used by ship
-bin/ultrathink-mcp auth set-key greptile --stdin
-
-bin/ultrathink-mcp auth status   # which providers are ready
-bun scripts/mcp-register.ts      # register the gateway in each host (--hosts to choose, --dry-run to preview)
+bun scripts/mcp-register.ts               # give each host's agent the tracker tools
 ```
 
-`mcp-register` gives each host's agent the Notion, Linear and Greptile tools that the kickoff and sync skills use; the planner itself reads the credential store directly. For a Notion login on a remote machine over SSH, see [docs/tracking.md](docs/tracking.md#logging-in-from-a-remote-machine).
+Then set `linear.team` to `<your Linear team name>` in `~/.config/ultrathink/config.json`. The walkthrough, with what each step prints: [Getting started](docs/getting-started.md#6-optional-track-plans-in-notion-or-linear). Guides: [Set up Notion](docs/how-to/set-up-notion.md), [Set up Linear](docs/how-to/set-up-linear.md), [Register the MCP gateway](docs/how-to/register-mcp-gateway.md).
 
 ## Skip ultrathink for quick messages
 
@@ -135,17 +165,11 @@ The same commands work on every host. Nothing changes unless you use one.
 | `/ultrathink-track off`, `/ultrathink-track on` | Keep planning, but stop or start creating Linear/Notion rows |
 | `/ultrathink-status` | Show the planning, tracking and engine state |
 
-- The prompt hook answers every command except `quick` before any model turn. Claude Code, Grok Build and Muse Code block the prompt and show the reply; Omp shows a notification; Hermes replies inline.
-- Claude Code also lists them as `/ultrathink:ultrathink-<verb>`, and still accepts the older `/ultrathink:<verb>`.
-- In a Hermes gateway, `/ultrathink-quick` needs `plugins.entries.ultrathink.allow_gateway_injection: true`; without it, the command skips your next message instead. Telegram menus list the commands with underscores, such as `ultrathink_status`.
-- Start a message with `raw:` to send it without planning, or with `uplift:` to plan it even while planning is off.
-- From a shell, `<clone>/bin/ultrathink status`, `off`, `on`, `skip` and `track off|on` do the same. `ULTRATHINK_HOST` (`claude-code`, `grok-build`, `hermes`, `muse`, `omp`) picks the host whose state they change.
-
-Per-host behavior and environment variables: [docs/commands.md](docs/commands.md).
+Start a message with `raw:` to send it without planning, or with `uplift:` to plan it even while planning is off. From a shell, `<clone>/bin/ultrathink status`, `off`, `on`, `skip` and `track off|on` do the same. Per-host behavior, Claude Code's plugin-qualified names and environment variables: [docs/commands.md](docs/commands.md).
 
 ## Ship
 
-When a planned run of a GSD skill (by default, a skill whose name starts with `gsd-`) ends with committed work on a feature branch, ultrathink tells the agent to run the `ultrathink-ship` skill. The skill first checks that the task is really done, from the git state, the GSD roadmap and verification status and a judge over the diff, and hands back to you if it is not. Otherwise it pushes the branch, opens a pull request into the default branch that GitHub reports, and runs Greptile reviews, fixing the findings between rounds, until the score is 5/5 with zero open comments. It merges (squash by default) only while the reviewed commit is still the PR head, the PR is mergeable and CI is neither failing nor pending, then deletes the branch and runs `ultrathink-sync`. After 5 review rounds (the default) without a pass, it stops, comments on the PR and leaves it open for a person. Turn it off with `"ship": { "enabled": false }` or `ULTRATHINK_SHIP=0`. The full flow and every setting: [docs/ship.md](docs/ship.md).
+Ship is off until you set `"ship": { "enabled": true }`. Then, when a planned run of a GSD skill (GSD, "Get Shit Done", is a family of `gsd-*` agent skills; any skill whose name starts with `gsd-` by default) ends with committed work on a feature branch, ultrathink tells the agent to run the `ultrathink-ship` skill. It checks that the task is really done, pushes the branch, opens a pull request into the default branch and runs Greptile reviews, fixing the findings between rounds, until the score is 5/5 with no open comments. It merges only with `ship.autoMerge: true` (otherwise it leaves the pull request for you) and deletes the branch only with `ship.deleteBranch: true`. `ULTRATHINK_SHIP=0` turns it off for one shell. Setup: [Ship with Greptile](docs/how-to/ship-with-greptile.md). The full flow and every setting: [docs/ship.md](docs/ship.md).
 
 ## Configuration
 
@@ -155,36 +179,11 @@ ultrathink runs with no config file. Every host reads the same JSON files, and l
 2. `~/.claude/ultrathink.json` (`$CLAUDE_CONFIG_DIR/ultrathink.json` when that is set)
 3. `<project>/.claude/ultrathink.json`
 
-A minimal file that turns on tracking for both providers:
-
-```json
-{
-  "linear": { "team": "<your Linear team name>" },
-  "notion": { "dataSourceUrl": "collection://<data source id>" }
-}
-```
-
-Neither provider is configured by default. To plan with Grok instead of Claude, add `"think": { "engine": "grok" }` and run `grok login`. Without a Grok login, planning is skipped instead of silently switching to Claude, unless you set `"grok": { "fallbackToClaude": true }`.
-
-| Variable | Effect |
-|---|---|
-| `ULTRATHINK_UPLIFT=0` | No planning in this process, for scripts and headless runs |
-| `ULTRATHINK_TRACK=0` | The planner creates no rows; `ultrathink-kickoff` still creates them. `/ultrathink-track off` stops both |
-| `ULTRATHINK_SHIP=0` | No ship flow |
-
-Every key and its default: [docs/configuration.md](docs/configuration.md).
+To plan with Grok instead of Claude, add `"think": { "engine": "grok" }` and run `grok login` (see [Choose the engine](docs/how-to/choose-engine.md)). `ULTRATHINK_UPLIFT=0` turns planning off in one process, for scripts and headless runs. Every key, its default and every environment variable: [docs/configuration.md](docs/configuration.md).
 
 ## Documentation
 
-| Document | Covers |
-|---|---|
-| [docs/install.md](docs/install.md) | Installing, checking, updating and removing ultrathink on each host; the shared MCP gateway; choosing the engine |
-| [docs/commands.md](docs/commands.md) | The `/ultrathink-*` commands on each host, the `raw:` and `uplift:` prefixes, `bin/ultrathink`, environment variables |
-| [docs/configuration.md](docs/configuration.md) | Config files, every key and its default |
-| [docs/tracking.md](docs/tracking.md) | Linear and Notion setup and the rows ultrathink creates |
-| [docs/ship.md](docs/ship.md) | The done check, pull request, Greptile review loop and merge gate |
-| [docs/architecture.md](docs/architecture.md) | How the engine, host entries, skills and gateway fit together |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and how to diagnose them |
+Start with [Getting started](docs/getting-started.md). The [documentation index](docs/README.md) lists every guide and reference page: install per host, the how-to guides, configuration, commands, tracking, ship, architecture, privacy and troubleshooting.
 
 ## Contributing, security and conduct
 
