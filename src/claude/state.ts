@@ -13,6 +13,7 @@ import type { UpliftResult } from "../types.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { resolveStateDir } from "../host/paths.ts";
 import type { ShipState } from "../ship/types.ts";
+import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 
 export interface ControlState {
 	enabled?: boolean;
@@ -48,6 +49,8 @@ export interface SessionRecord {
 	skill?: { name: string; summary?: string; source: SkillInvocation["source"] };
 	/** Ship lifecycle (assess -> PR -> review -> merge) after a GSD skill run. */
 	ship?: ShipState;
+	/** Greptile knowledge-base lookup the planner ran before the HITL clarify step. */
+	knowledge?: KnowledgeLookup;
 }
 
 export function defaultStateDir(env: Record<string, string | undefined> = process.env): string {

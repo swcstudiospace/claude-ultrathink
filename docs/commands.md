@@ -18,7 +18,7 @@ ultrathink plans every non-trivial prompt by default. The commands on this page 
 | `/ultrathink-on` | Planning back on for this host. |
 | `/ultrathink-track off` | Planning continues, but no Linear/Notion rows are created. |
 | `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. `on` and `off` are per-host settings that beat `track.enabled` in the config until you change them again. |
-| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate and ship state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
+| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship and knowledge-base state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
 
 Some details:
 
@@ -174,6 +174,7 @@ Notion: not configured
 Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
+Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -190,6 +191,7 @@ What the lines can say:
 | `Notion`, `Linear team` | The configured value or `not configured`. |
 | `Substrate` | `off (optional: set substrate.url or SUBSTRATE_URL)`, `off (SUBSTRATE_DISABLED=1)`, or `<url> (SUBSTRATE_URL)` / `<url> (config)` showing where the URL came from. |
 | `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
+| `Knowledge base` | The Greptile knowledge-base read before the clarifying questions (see [`hitl.knowledgeBase`](configuration.md#hitl-clarifying-questions)): `off (opt-in: set hitl.knowledgeBase)`; `on · not read while HITL is off`; `on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)`; or `on · Greptile` (`on · Greptile · organization <org>` when `ship.greptileOrganization` is set). |
 | `Model` | `claude.model` and `claude.concurrency`. |
 | `State` | The state directory in use. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |

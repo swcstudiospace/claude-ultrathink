@@ -11,6 +11,8 @@ import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
 import { resolveStateDir } from "../host/paths.ts";
+import { hasUsableCredential } from "../mcp/client.ts";
+import { storePath } from "../mcp/store.ts";
 import { resolveSubstrate } from "../substrate/brief.ts";
 import { graphSketch } from "../think/graph.ts";
 import { grokUserQuery, parseSlashCommand } from "./skill.ts";
@@ -120,6 +122,17 @@ function shipLine(config: UltrathinkConfig, env: Record<string, string | undefin
 	return `Ship: on · auto-merge ${ship.autoMerge ? "on" : "off"} · delete branch ${ship.deleteBranch ? "on" : "off"}`;
 }
 
+/** The knowledge-base prefetch is opt-in and runs only with HITL on and a stored Greptile credential. */
+function knowledgeLine(config: UltrathinkConfig, state: ControlState, env: Record<string, string | undefined>): string {
+	if (!config.hitl.knowledgeBase) return "Knowledge base: off (opt-in: set hitl.knowledgeBase)";
+	if (!(state.hitlEnabled ?? config.hitl.enabled)) return "Knowledge base: on · not read while HITL is off";
+	if (!hasUsableCredential("greptile", storePath(env))) {
+		return "Knowledge base: on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)";
+	}
+	const org = config.ship.greptileOrganization;
+	return `Knowledge base: on · Greptile${org ? ` · organization ${org}` : ""}`;
+}
+
 async function grokOauthLine(config: UltrathinkConfig): Promise<string> {
 	if (config.grok.transport === "shunt") return "SuperGrok OAuth: not used (shunt gateway owns upstream auth)";
 	const auth = await grokAuthStatusFresh({ home: config.grok.home || undefined, bin: config.grok.bin });
@@ -140,6 +153,7 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		...trackingLines(config, state),
 		substrateLine(config, process.env),
 		shipLine(config, process.env),
+		knowledgeLine(config, state, process.env),
 		`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
 		`State: ${stateDir}`,
 	];

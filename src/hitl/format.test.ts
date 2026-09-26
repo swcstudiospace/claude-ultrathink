@@ -26,6 +26,18 @@ const soft: Clarification = {
 
 const answered: Clarification = { ...soft, id: "q3", question: "Which color?", answer: "blue", source: "user", answeredAt: 1 };
 
+const settled: Clarification = {
+	id: "k1",
+	question: "Where are records stored?",
+	header: "Storage",
+	why: "",
+	options: [],
+	blocking: false,
+	answer: "In SQLite.",
+	source: "knowledge",
+	evidence: 'docs/a&b "store".md',
+};
+
 describe("clarificationsToXml", () => {
 	test("escapes text, marks only the default as recommended, and emits ANSWER only when answered", () => {
 		const xml = clarificationsToXml([open, answered]);
@@ -39,6 +51,12 @@ describe("clarificationsToXml", () => {
 		expect(xml).toContain('<ANSWER source="user">blue</ANSWER>');
 		expect(xml.match(/<ANSWER/g)).toHaveLength(1);
 		expect(clarificationsToXml([])).toBe("");
+	});
+
+	test("a knowledge answer carries its escaped evidence document; other answers do not", () => {
+		const xml = clarificationsToXml([settled, answered]);
+		expect(xml).toContain('<ANSWER source="knowledge" evidence="docs/a&amp;b &quot;store&quot;.md">In SQLite.</ANSWER>');
+		expect(xml).toContain('<ANSWER source="user">blue</ANSWER>');
 	});
 });
 
@@ -102,6 +120,13 @@ describe("formatHitlAddendum", () => {
 		// Only steps 2 and 5 differ; the open/answered lists are the same.
 		expect(out.slice(out.indexOf("### Open (blocking)"))).toBe(claude.slice(claude.indexOf("### Open (blocking)")));
 	});
+
+	test("knowledge answers are listed as answered with their document", () => {
+		const out = formatHitlAddendum([soft, settled, answered]);
+		expect(out).toContain('- [k1] Where are records stored? → In SQLite. (Greptile knowledge base: docs/a&b "store".md)');
+		expect(out).toContain("- [q3] Which color? → blue\n");
+		expect(out).not.toContain("- [k1] Where are records stored? — options");
+	});
 });
 
 describe("formatHitlEcho", () => {
@@ -111,5 +136,11 @@ describe("formatHitlEcho", () => {
 		expect(out).toContain('q1 [blocking] Database: Use <Postgres> or "SQLite"?\n   options: Postgres | SQLite (default: Postgres)');
 		expect(out).toContain("q3 Tests: Which color?\n   options: Yes | No (default: Yes)\n   answer: blue");
 		expect(out.match(/answer:/g)).toHaveLength(1);
+	});
+
+	test("marks assumed and knowledge-base answers", () => {
+		const out = formatHitlEcho([settled, { ...answered, source: "assumed" }]);
+		expect(out).toContain('   answer: In SQLite. (knowledge base: docs/a&b "store".md)');
+		expect(out).toContain("   answer: blue (assumed)");
 	});
 });

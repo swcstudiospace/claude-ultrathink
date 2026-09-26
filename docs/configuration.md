@@ -1,6 +1,6 @@
 # Configuration
 
-ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, and never pushes, opens a pull request or merges.
+ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, and never pushes, opens a pull request or merges.
 
 Terms used on this page:
 
@@ -72,6 +72,16 @@ Each node gets 4 to 8 numbered rationale steps. That range is fixed in code, not
 |---|---|---|---|
 | `enabled` | boolean | `true` | Generate clarifying questions. `bin/ultrathink hitl on\|off` overrides this per host. |
 | `maxQuestions` | integer, 1 to 4 | `4` | Most questions per prompt. |
+| `knowledgeBase` | boolean | `false` | Opt-in. Before the clarifying questions, read the repository's Greptile knowledge base and let the clarifier settle questions it answers instead of asking them. Needs HITL on and a stored Greptile credential (`bin/ultrathink-mcp auth login greptile`, or `bin/ultrathink-mcp auth set-key greptile --stdin`). When `ship.greptileOrganization` is set, it is sent as the organization; an account in several organizations needs it. |
+
+How the knowledge-base read works when `knowledgeBase` is `true` (see [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md) for a walk-through):
+
+- While the prompt is uplifted, ultrathink finds the repository's knowledge base on Greptile by the git remote's `owner/repo`, lists its documents and reads `index.md`.
+- After the Graph of Thought, it picks up to 3 documents from the routing table in `index.md` that match the request and reads them. At most 24,000 characters go to the clarifier, marked as untrusted evidence, not instructions.
+- Each stage has a 20-second budget. Any failure (no credential, no knowledge base for the repository, a Greptile error, a timeout) fails open: you get exactly the questions you would get with the key off.
+- Only list and read calls go to Greptile's hosted MCP (`https://api.greptile.com/mcp`): the organization, the knowledge-base namespace id and document paths. Nothing from your prompt or your code is sent to Greptile. The documents read go to the planning engine inside the clarify call.
+- Questions the knowledge base settled are not asked. They appear under "Answered" as `(Greptile knowledge base: <document>)` and in the spec's `CLARIFICATIONS` block as `<ANSWER source="knowledge" evidence="…">`, and they are not carried to the next prompt. Product decisions are still asked.
+- Each lookup is shown in the summary (`Knowledge · 3 docs · 1 settled`, `Knowledge · none`, `Knowledge · off (no Greptile login)` or `Knowledge · error`), in the session record's `knowledge` field, in a `## Greptile knowledge base` section of the plan context when documents were used, in the `ULTRATHINK_DEBUG=1` log as `greptile knowledge base: …`, and as a `kb` segment in the Omp status bar. `bin/ultrathink status` shows the `Knowledge base:` line. See [Troubleshooting](troubleshooting.md#greptile-knowledge-base) when it does not read what you expect.
 
 ### `claude`: the Claude engine
 
@@ -166,13 +176,13 @@ All keys are optional; write only the ones you change. This file shows every key
 
 - `notion.dataSourceUrl` and `linear.team` hold placeholders. Replace them with your own values, or leave them `""` to keep tracking unconfigured.
 - `grok.shuntBaseUrl`, `grok.shuntModel` and `substrate.url` are `""`, which is the default and means off. Set them only if you run those services.
-- `ship.enabled`, `ship.autoMerge` and `ship.deleteBranch` are `false`, the opt-in defaults.
+- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch` and `hitl.knowledgeBase` are `false`, the opt-in defaults.
 
 ```json
 {
   "uplift": { "enabled": true, "skipTrivial": true, "maxChars": 20000, "echo": true },
   "think": { "enabled": true, "minNodes": 5, "maxNodes": 8, "engine": "claude" },
-  "hitl": { "enabled": true, "maxQuestions": 4 },
+  "hitl": { "enabled": true, "maxQuestions": 4, "knowledgeBase": false },
   "claude": {
     "bin": "claude",
     "model": "sonnet",
@@ -239,6 +249,12 @@ Ask an Agent Substrate server for a brief before each plan:
 
 ```json
 { "substrate": { "url": "https://<your substrate host>" } }
+```
+
+Read the repository's Greptile knowledge base before the clarifying questions. Store a Greptile credential first with `bin/ultrathink-mcp auth login greptile` (or `bin/ultrathink-mcp auth set-key greptile --stdin`); set `ship.greptileOrganization` only if your Greptile account is in several organizations:
+
+```json
+{ "hitl": { "knowledgeBase": true }, "ship": { "greptileOrganization": "<your Greptile organization>" } }
 ```
 
 ## Environment variables

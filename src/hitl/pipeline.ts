@@ -9,6 +9,7 @@ import {
 	type ClarificationOption,
 	MAX_HEADER_CHARS,
 	MAX_QUESTIONS,
+	MAX_SETTLED,
 } from "./types.ts";
 
 /** Same shape as `Completer` in src/grok/complete.ts and `ClaudeCompleter` in src/claude/complete.ts. */
@@ -23,10 +24,13 @@ export interface RunClarifyOptions {
 	signal?: AbortSignal;
 	maxQuestions?: number;
 	onProgress?: (message: string) => void;
+	/** Greptile knowledge-base digest (untrusted evidence) and the document paths it holds; questions it settles are recorded, not asked. */
+	knowledge?: { digest: string; docs: string[] };
 }
 
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 4;
+const MAX_KNOWLEDGE_ANSWER_CHARS = 500;
 
 function isAbortError(error: unknown): boolean {
 	if (error instanceof Error) return error.name === "AbortError";
@@ -80,12 +84,17 @@ function normalizeHeader(raw: unknown, fallback: string): string {
 	return header || fallback;
 }
 
+function normalizeQuestionText(raw: unknown): string {
+	const question = asString(raw).replace(/\s+/g, " ");
+	if (!question) return "";
+	return /[?]$/.test(question) ? question : `${question.replace(/[.!:;,]+$/, "")}?`;
+}
+
 function normalizeItem(raw: unknown, index: number): Clarification | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const obj = raw as Record<string, unknown>;
-	let question = asString(obj.question).replace(/\s+/g, " ");
+	const question = normalizeQuestionText(obj.question);
 	if (!question) return undefined;
-	if (!/[?]$/.test(question)) question = `${question.replace(/[.!:;,]+$/, "")}?`;
 
 	const options = normalizeOptions(obj.options);
 	if (options.length < MIN_OPTIONS) return undefined;
@@ -105,26 +114,73 @@ function normalizeItem(raw: unknown, index: number): Clarification | undefined {
 	};
 }
 
-export function normalizeClarifications(raw: unknown, maxQuestions: number): Clarification[] {
+/** The verified `{answer, source}` of an item's knowledge object, or undefined when missing, invalid, or citing a document not read. */
+function knowledgeClaim(raw: unknown, docs: ReadonlySet<string>): { answer: string; source: string } | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const obj = raw as Record<string, unknown>;
+	const answer = asString(obj.answer).replace(/\s+/g, " ");
+	if (!answer || answer.length > MAX_KNOWLEDGE_ANSWER_CHARS) return undefined;
+	const source = asString(obj.source);
+	if (!source || !docs.has(source)) return undefined;
+	return { answer, source };
+}
+
+function normalizeSettledItem(raw: unknown, index: number, docs: ReadonlySet<string>): Clarification | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const obj = raw as Record<string, unknown>;
+	const claim = knowledgeClaim(obj.knowledge, docs);
+	if (!claim) return undefined;
+	const question = normalizeQuestionText(obj.question);
+	if (!question) return undefined;
+
+	const options = normalizeOptions(obj.options);
+	const wanted = asString(obj.default).toLowerCase();
+	const match = wanted ? options.find((option) => option.label.toLowerCase() === wanted) : undefined;
+
+	const settled: Clarification = {
+		id: `k${index + 1}`,
+		question,
+		header: normalizeHeader(obj.header, "KB"),
+		why: asString(obj.why).replace(/\s+/g, " "),
+		options,
+		blocking: false,
+		answer: claim.answer,
+		source: "knowledge",
+		evidence: claim.source,
+	};
+	if (match) settled.default = match.label;
+	return settled;
+}
+
+/**
+ * Validate the clarifier's JSON: open questions (ids q1.., at most `maxQuestions`) followed by questions a
+ * knowledge-base document settled (ids k1.., at most MAX_SETTLED). An item is settled only when its `knowledge`
+ * object has a non-empty answer and cites one of `knowledgeDocs`; otherwise it is an ordinary open question.
+ */
+export function normalizeClarifications(raw: unknown, maxQuestions: number, knowledgeDocs?: string[]): Clarification[] {
 	const max = Math.max(0, Math.floor(Number.isFinite(maxQuestions) ? maxQuestions : MAX_QUESTIONS));
 	let items: unknown[] = [];
 	if (Array.isArray(raw)) items = raw;
 	else if (raw && typeof raw === "object" && "questions" in raw && Array.isArray(raw.questions)) {
 		items = raw.questions;
 	}
+	const docs = new Set((knowledgeDocs ?? []).map((path) => path.trim()).filter(Boolean));
 
 	const seen = new Set<string>();
-	const list: Clarification[] = [];
+	const open: Clarification[] = [];
+	const settled: Clarification[] = [];
 	for (const item of items) {
-		if (list.length >= max) break;
-		const clarification = normalizeItem(item, list.length);
+		if (open.length >= max && (docs.size === 0 || settled.length >= MAX_SETTLED)) break;
+		const known = docs.size > 0 ? normalizeSettledItem(item, settled.length, docs) : undefined;
+		if (known && settled.length >= MAX_SETTLED) continue;
+		const clarification = known ?? (open.length < max ? normalizeItem(item, open.length) : undefined);
 		if (!clarification) continue;
 		const key = normalizeQuestion(clarification.question);
 		if (!key || seen.has(key)) continue;
 		seen.add(key);
-		list.push(clarification);
+		(known ? settled : open).push(clarification);
 	}
-	return list;
+	return [...open, ...settled];
 }
 
 function graphConclusions(graph: ThoughtGraph): string {
@@ -134,11 +190,20 @@ function graphConclusions(graph: ThoughtGraph): string {
 		.join("\n\n");
 }
 
+/** The knowledge to use: only when a non-empty digest is given. */
+function activeKnowledge(opts: RunClarifyOptions): { digest: string; docs: string[] } | undefined {
+	const digest = opts.knowledge?.digest.trim() ?? "";
+	return digest ? { digest, docs: opts.knowledge!.docs } : undefined;
+}
+
 export function clarifyUserPayload(opts: RunClarifyOptions, maxQuestions: number): string {
 	const parts = ["<spec>", opts.uplift.xml.trim(), "</spec>"];
 
 	const conclusions = opts.graph ? graphConclusions(opts.graph) : "";
 	if (conclusions) parts.push("", "<graph_conclusions>", conclusions, "</graph_conclusions>");
+
+	const knowledge = activeKnowledge(opts);
+	if (knowledge) parts.push("", "<knowledge_base>", knowledge.digest, "</knowledge_base>");
 
 	const conversation = opts.conversation?.trim() ?? "";
 	if (conversation) parts.push("", "<conversation>", conversation, "</conversation>");
@@ -161,13 +226,17 @@ export function clarifyUserPayload(opts: RunClarifyOptions, maxQuestions: number
 export async function runClarify(opts: RunClarifyOptions): Promise<Clarification[]> {
 	const max = Math.max(0, Math.floor(opts.maxQuestions ?? MAX_QUESTIONS));
 	if (max === 0) return [];
+	const knowledge = activeKnowledge(opts);
 	try {
 		opts.onProgress?.("Clarifications…");
-		const text = await opts.complete(clarifySystemPrompt(max), clarifyUserPayload(opts, max), opts.signal);
+		const system = clarifySystemPrompt(max, knowledge ? { knowledge: true } : {});
+		const text = await opts.complete(system, clarifyUserPayload(opts, max), opts.signal);
 		const parsed = extractJsonObject(text);
 		if (!parsed || typeof parsed !== "object") throw new Error("unparsable JSON");
-		const list = normalizeClarifications(parsed, max);
-		opts.onProgress?.(`Clarifications → ${list.length}`);
+		const list = normalizeClarifications(parsed, max, knowledge?.docs);
+		const settled = list.filter((item) => item.source === "knowledge").length;
+		const settledBit = settled > 0 ? ` (+${settled} settled)` : "";
+		opts.onProgress?.(`Clarifications → ${list.length - settled}${settledBit}`);
 		return list;
 	} catch (error) {
 		if (isAbortError(error)) throw error;

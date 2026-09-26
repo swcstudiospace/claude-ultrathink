@@ -11,9 +11,9 @@ import type { SessionRecord } from "../claude/state.ts";
 import { readControl } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { selectEngine } from "../host/engine.ts";
-import { createMcpClient } from "../mcp/client.ts";
+import { createMcpClientIfCredentialed } from "../mcp/client.ts";
 import type { McpClient } from "../mcp/client.ts";
-import { readStore, storePath } from "../mcp/store.ts";
+import { storePath } from "../mcp/store.ts";
 import { assessDone } from "./assess.ts";
 import { createGithub } from "./github.ts";
 import type { Github } from "./github.ts";
@@ -377,13 +377,7 @@ async function main(): Promise<number> {
 		},
 		greptile: () => {
 			// No stored Greptile credential means no MCP mode; review then needs a signed-in greptile CLI.
-			const credential = readStore(storePath()).providers.greptile;
-			if (!credential || (credential.kind === "oauth" && (credential.needsLogin || !credential.tokens))) return undefined;
-			try {
-				client ??= createMcpClient("greptile", { storePath: storePath() });
-			} catch {
-				return undefined;
-			}
+			client ??= createMcpClientIfCredentialed("greptile", { storePath: storePath() });
 			return client;
 		},
 	};

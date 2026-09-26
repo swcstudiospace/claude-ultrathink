@@ -79,7 +79,7 @@ To spend less: send small messages with `/ultrathink-quick` or a `raw:` prefix, 
 ## What leaves your machine
 
 - **Always, for a planned prompt:** your message and the recent conversation go to the planning engine: Anthropic through the `claude` CLI by default, or xAI when you choose the Grok engine (or a gateway you run, with the Grok `shunt` transport).
-- **Only when you configure them:** plan contents (the uplifted prompt, node titles and reasoning, repository name and branch) go to Notion and Linear through their hosted MCP servers; ship pushes to GitHub with `gh` and sends the pull request to Greptile; the Agent Substrate brief request sends the repository, branch and host name to the URL you set.
+- **Only when you configure them:** plan contents (the uplifted prompt, node titles and reasoning, repository name and branch) go to Notion and Linear through their hosted MCP servers; ship pushes to GitHub with `gh` and sends the pull request to Greptile; the Greptile knowledge-base read sends only list and read calls to Greptile (never your prompt or code) and passes the documents it reads to the engine; the Agent Substrate brief request sends the repository, branch and host name to the URL you set.
 - Credentials for Notion, Linear and Greptile stay in one local file, `~/.config/ultrathink/mcp-credentials.json` (mode 0600). ultrathink has no telemetry of its own.
 
 Details for every service: [What leaves your machine](docs/privacy.md).
@@ -92,11 +92,12 @@ A fresh install plans prompts and contacts nothing but the engine. Each of these
 |---|---|---|
 | Notion and Linear tracking | `notion.dataSourceUrl`, `linear.team` | Creates rows for each plan (see [Getting started](docs/getting-started.md#6-optional-track-plans-in-notion-or-linear)) |
 | Ship | `ship.enabled: true`; merging also needs `ship.autoMerge: true`, branch deletion `ship.deleteBranch: true` | Opens a pull request after a GSD skill run and reviews it with Greptile (see [Ship](#ship)) |
+| Greptile knowledge base | `hitl.knowledgeBase: true` and a stored Greptile credential | Reads the repository's Greptile knowledge base before the clarifying questions and settles the ones it answers (see [Use the Greptile knowledge base](docs/how-to/use-greptile-knowledge-base.md)) |
 | Agent Substrate brief | `substrate.url` or `SUBSTRATE_URL` | Fetches a cross-agent brief for the repository and branch before the graph is built |
 | Tailscale OAuth callback | `bin/ultrathink-mcp auth login <provider> --tailscale` or `ULTRATHINK_OAUTH_TAILSCALE=1` | Receives the OAuth callback over `tailscale serve` for logins on a remote machine |
 | Grok `shunt` transport | `grok.transport: "shunt"` plus `grok.shuntBaseUrl` | Sends Grok engine calls to an Anthropic-compatible gateway you run; there is no built-in one |
 
-`bin/ultrathink status` shows tracking, Substrate, Ship and the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
+`bin/ultrathink status` shows tracking, Substrate, Ship, the knowledge base and the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
 
 ## Quickstart
 

@@ -125,6 +125,16 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ hitl: { maxQuestions: 2 } }, base).hitl.maxQuestions).toBe(2);
 	});
 
+	test("hitl knowledgeBase is opt-in and accepts only a boolean", () => {
+		const base = defaultConfig();
+		expect(base.hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: true } }, base).hitl.knowledgeBase).toBe(true);
+		expect(mergeConfig({ hitl: { knowledgeBase: false } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: "true" } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: 1 } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { maxQuestions: 2 } }, base).hitl.knowledgeBase).toBe(false);
+	});
+
 	test("notion dataSourceUrl and linear team accept a non-empty override, reject an empty string", () => {
 		const base = mergeConfig({ notion: { dataSourceUrl: "collection://mine" }, linear: { team: "Mine" } }, defaultConfig());
 		expect(base.notion.dataSourceUrl).toBe("collection://mine");

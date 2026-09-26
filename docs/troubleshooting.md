@@ -5,7 +5,7 @@ ultrathink fails open. When something is wrong, your prompt still goes through, 
 In the commands below, `<clone>` is the absolute path of your checkout. Paths written as `${NAME:-default}` use the environment variable when you set it, and the default otherwise.
 
 - [First checks](#first-checks)
-- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked)
+- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked) · [Greptile knowledge base](#greptile-knowledge-base)
 - By host: [Claude Code](#claude-code) · [Grok Build](#grok-build) · [Muse Code](#muse-code) · [Hermes Agent](#hermes-agent) · [Omp](#omp)
 - [Uninstalling](#uninstalling)
 
@@ -25,6 +25,7 @@ Notion: not configured
 Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
+Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -40,6 +41,7 @@ What the less obvious lines mean:
 | `Tracking: …`, `Notion: …`, `Linear team: …` | See [Tracking rows don't appear](#tracking-rows-dont-appear). |
 | `Substrate: …` | The optional Agent Substrate brief. It is off unless you set `substrate.url` or `SUBSTRATE_URL`; `SUBSTRATE_DISABLED=1` turns it off again. |
 | `Ship: …` | The PR, review and merge loop. Off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` turns it off for that shell. When on, it shows whether `autoMerge` and `deleteBranch` are on. |
+| `Knowledge base: …` | The Greptile knowledge-base read before the clarifying questions. Off unless you set `hitl.knowledgeBase`. See [Greptile knowledge base](#greptile-knowledge-base). |
 
 After each planned prompt, hosts that show the summary (`claude.echo`, on by default) print one line such as `Prompt Uplift · UPLIFTED_PROMPT · llm · claude:sonnet · Graph of Thought · 6 nodes · Tracking · 6 issues · 18 sub-issues linked · 41.2s`. A `fallback` source means the engine call failed, and an `Engine error · …` segment shows the first error.
 
@@ -240,6 +242,20 @@ Ship is opt-in: it does nothing until you set `ship.enabled: true`. `bin/ultrath
 | `merge` | `PR closed without merge` | The ship is marked blocked. |
 
 Resume at any time with `bin/ultrathink-ship status --state <stateFile>`. Every step is idempotent.
+
+## Greptile knowledge base
+
+With `hitl.knowledgeBase: true` (see [Configuration](configuration.md#hitl-clarifying-questions) and [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md)), the planner reads the repository's Greptile knowledge base before the clarifying questions. It fails open: whatever goes wrong, you get the same questions as with the key off. The summary after each plan shows what happened, and `bin/ultrathink status` shows the `Knowledge base:` line.
+
+With `ULTRATHINK_DEBUG=1` (Claude Code, Grok Build and Muse), the prompt hook writes one line per lookup to stderr: `greptile knowledge base: <outcome>`, then the documents read or the reason, then the elapsed time, for example `[ultrathink] greptile knowledge base: error · timed out after 20000ms · 20004ms`.
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| No `Knowledge` segment in the summary | The key is off, HITL is off (`Knowledge base: on · not read while HITL is off`), or the prompt was not clarified. | Set `hitl.knowledgeBase: true` and turn HITL on (`bin/ultrathink hitl on`). |
+| `Knowledge · off (no Greptile login)` | No usable Greptile credential is stored, so Greptile was not contacted. `bin/ultrathink status` shows `Knowledge base: on · no Greptile credential (…)`. | Store one: `bin/ultrathink-mcp auth login greptile`, or `bin/ultrathink-mcp auth set-key greptile --stdin`. `bin/ultrathink-mcp auth status` shows whether it is ready. |
+| `Knowledge · none` | Nothing to read: the git remote gives no `owner/repo`, Greptile has no knowledge base for that `owner/repo`, or the knowledge base has no published documents yet. The debug line gives the reason. | Check `git remote get-url origin` names the repository Greptile indexes (for example `acme/widgets`). A new repository needs Greptile to publish its knowledge base first. |
+| `Knowledge · error` | A Greptile call failed, the account needs an organization, or a stage ran past its 20-second budget. The debug line reads `greptile knowledge base: error · <reason> · <ms>ms`. | For `Greptile account has several organizations; set ship.greptileOrganization …` (Greptile answered `tenant_required`), set `ship.greptileOrganization` to one of the listed ids or handles. A timeout needs no action: the questions were composed without the knowledge base. For other errors, check the credential with `bin/ultrathink-mcp auth status`. |
+| A question you expected was not asked | The knowledge base settled it. Settled questions are listed under "Answered" as `- [k1] <question> → <answer> (Greptile knowledge base: <document>)`, and in the spec as `<ANSWER source="knowledge" evidence="<document>">`. Product decisions are still asked. | If the answer is wrong, say so in your next prompt; settled answers are not carried over to it. To stop settling questions this way, set `hitl.knowledgeBase: false`. |
 
 ## Claude Code
 

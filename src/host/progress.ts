@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { writeSync } from "node:fs";
 
-export type StageName = "brief" | "uplift" | "think" | "clarify" | "plan" | "track" | "state";
+export type StageName = "brief" | "uplift" | "think" | "knowledge" | "clarify" | "plan" | "track" | "state";
 
 export type ProgressEvent =
 	/** `track`: planner-side tracking will run this turn. */

@@ -244,6 +244,7 @@ function mergeHitl(hitl: Record<string, unknown> | undefined, defaults: HitlConf
 			hitl.maxQuestions <= 4
 				? hitl.maxQuestions
 				: defaults.maxQuestions,
+		knowledgeBase: typeof hitl.knowledgeBase === "boolean" ? hitl.knowledgeBase : defaults.knowledgeBase,
 	};
 }
 

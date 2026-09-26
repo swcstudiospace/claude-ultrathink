@@ -22,7 +22,8 @@ function clarificationXml(item: Clarification): string {
 		"		</OPTIONS>",
 	];
 	if (item.answer !== undefined) {
-		lines.push(`		<ANSWER source="${item.source ?? "user"}">${escapeXml(item.answer)}</ANSWER>`);
+		const evidence = item.evidence !== undefined ? ` evidence="${escapeXml(item.evidence)}"` : "";
+		lines.push(`		<ANSWER source="${item.source ?? "user"}"${evidence}>${escapeXml(item.answer)}</ANSWER>`);
 	}
 	lines.push("	</CLARIFICATION>");
 	return lines.join("\n");
@@ -56,6 +57,10 @@ function optionsLine(item: Clarification): string {
 	const labels = item.options.map((option) => option.label).join(" | ");
 	const recommended = item.default ? ` (recommended: ${item.default})` : "";
 	return `${labels}${recommended}`;
+}
+
+function knowledgeSuffix(item: Clarification, label: string): string {
+	return item.source === "knowledge" && item.evidence ? ` (${label}: ${item.evidence})` : "";
 }
 
 export interface HitlAddendumOptions {
@@ -103,7 +108,7 @@ export function formatHitlAddendum(list: Clarification[], options: HitlAddendumO
 	}
 	if (answered.length > 0) {
 		lines.push("", "### Answered", "");
-		for (const item of answered) lines.push(`- [${item.id}] ${item.question} → ${item.answer}`);
+		for (const item of answered) lines.push(`- [${item.id}] ${item.question} → ${item.answer}${knowledgeSuffix(item, "Greptile knowledge base")}`);
 	}
 	lines.push("");
 	return lines.join("\n");
@@ -118,7 +123,7 @@ export function formatHitlEcho(list: Clarification[]): string {
 			const defaultBit = item.default ? ` (default: ${item.default})` : "";
 			const lines = [`${item.id}${flag} ${item.header}: ${item.question}`, `   options: ${options}${defaultBit}`];
 			if (item.answer !== undefined) {
-				const source = item.source === "assumed" ? " (assumed)" : "";
+				const source = item.source === "assumed" ? " (assumed)" : knowledgeSuffix(item, "knowledge base");
 				lines.push(`   answer: ${item.answer}${source}`);
 			}
 			return lines.join("\n");
