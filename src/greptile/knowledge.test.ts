@@ -188,6 +188,22 @@ describe("createKnowledgeReader", () => {
 		expect(lookup.docs[0]).toBe("index.md");
 	});
 
+	test("listed paths with whitespace or control characters are never read", async () => {
+		const fake = fakeClient(
+			happyHandlers({
+				list_knowledge_base_documents: () => ({
+					documentPaths: ["docs/billing plan.md", "docs/billing\n.md", "docs/billing\u001b[31m.md", "docs/billing.md"],
+				}),
+			}),
+		);
+		const { lookup } = await createKnowledgeReader({ client: () => fake.client }).start({ repo: "acme/widgets" }).read("billing");
+		expect(lookup.outcome).toBe("used");
+		expect(lookup.docs).toEqual(["docs/billing.md"]);
+		expect(fake.calls.filter((call) => call.name === "get_knowledge_base_document").map((call) => call.args.path)).toEqual([
+			"docs/billing.md",
+		]);
+	});
+
 	test("tenant_required is an error naming ship.greptileOrganization", async () => {
 		const fake = fakeClient({
 			list_knowledge_bases: () => {
@@ -263,6 +279,18 @@ describe("selectDocuments", () => {
 	test("without a routing table, matches the listed paths' words", () => {
 		expect(selectDocuments({ paths: PATHS, topic: "rotate the auth credential", maxDocs: 3 })).toEqual(["docs/auth.md"]);
 		expect(selectDocuments({ paths: PATHS, topic: "unrelated words entirely", maxDocs: 3 })).toEqual([]);
+	});
+
+	test("markup-free request text does not route to an entry about graphs, prompts and workflows", () => {
+		const index = [
+			"- the graph of thought, build prompt nodes, kind, workflow waves and parallel planning -> [`docs/planner.md`](docs/planner.md)",
+			"- invoice billing and failed payment retries -> [`docs/billing.md`](docs/billing.md)",
+		].join("\n");
+		const paths = ["index.md", "docs/planner.md", "docs/billing.md"];
+		const topic = "Retry failed invoice payments\nRetry billing: resend the invoice after a failed payment";
+		expect(selectDocuments({ index, paths, topic, maxDocs: 3 })).toEqual(["docs/billing.md"]);
+		const markup = `<BUILD_PROMPT><GRAPH_OF_THOUGHT><NODE kind="generate">${topic}</NODE></GRAPH_OF_THOUGHT><WORKFLOW><WAVE parallel="true"/></WORKFLOW></BUILD_PROMPT>`;
+		expect(selectDocuments({ index, paths, topic: markup, maxDocs: 3 })).toContain("docs/planner.md");
 	});
 });
 

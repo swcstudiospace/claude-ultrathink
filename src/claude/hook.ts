@@ -88,9 +88,13 @@ function specFile(stateDir: string, sessionId: string): string {
 	return sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml");
 }
 
-/** What the knowledge base should be matched against: the uplifted spec plus the graph's goal and node conclusions. */
+/**
+ * What the knowledge base should be matched against: the uplifted spec's text plus the graph's goal and node titles and
+ * conclusions. Tags are stripped: their names and attributes (GRAPH_OF_THOUGHT, NODE, kind, …) would otherwise score
+ * unrelated routing entries on every request.
+ */
 function knowledgeTopic(result: UpliftResult, graph: ThoughtGraph | undefined): string {
-	const parts = [result.xml];
+	const parts = [result.xml.replace(/<[^>]*>/g, " ")];
 	if (graph) {
 		parts.push(graph.goal);
 		for (const node of graph.nodes) parts.push(node.conclusion ? `${node.title}: ${node.conclusion}` : node.title);

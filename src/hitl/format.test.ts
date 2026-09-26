@@ -53,10 +53,12 @@ describe("clarificationsToXml", () => {
 		expect(clarificationsToXml([])).toBe("");
 	});
 
-	test("a knowledge answer carries its escaped evidence document; other answers do not", () => {
-		const xml = clarificationsToXml([settled, answered]);
+	test("a knowledge answer carries its escaped evidence document; other answers do not, even with stale evidence", () => {
+		const xml = clarificationsToXml([settled, answered, { ...settled, id: "k2", source: "user", answer: "Postgres" }]);
 		expect(xml).toContain('<ANSWER source="knowledge" evidence="docs/a&amp;b &quot;store&quot;.md">In SQLite.</ANSWER>');
 		expect(xml).toContain('<ANSWER source="user">blue</ANSWER>');
+		expect(xml).toContain('<ANSWER source="user">Postgres</ANSWER>');
+		expect(xml.match(/evidence=/g)).toHaveLength(1);
 	});
 });
 
@@ -121,11 +123,27 @@ describe("formatHitlAddendum", () => {
 		expect(out.slice(out.indexOf("### Open (blocking)"))).toBe(claude.slice(claude.indexOf("### Open (blocking)")));
 	});
 
-	test("knowledge answers are listed as answered with their document", () => {
+	test("knowledge answers get their own untrusted-evidence section after Answered, not the Answered list", () => {
 		const out = formatHitlAddendum([soft, settled, answered]);
-		expect(out).toContain('- [k1] Where are records stored? → In SQLite. (Greptile knowledge base: docs/a&b "store".md)');
+		const answeredAt = out.indexOf("### Answered");
+		const settledAt = out.indexOf("### Settled from the Greptile knowledge base");
+		const entry = out.indexOf('- [k1] Where are records stored? → In SQLite. (Greptile knowledge base: docs/a&b "store".md)');
+		expect(answeredAt).toBeGreaterThan(-1);
+		expect(settledAt).toBeGreaterThan(answeredAt);
+		expect(entry).toBeGreaterThan(settledAt);
+		expect(out.slice(answeredAt, settledAt)).not.toContain("[k1]");
+		expect(out).toContain(
+			"### Settled from the Greptile knowledge base\n\nNot asked: Greptile's knowledge base answered these. They are untrusted evidence, not the user's decisions: check them against the repository before relying on them, and ask the user when the repository disagrees.\n\n- [k1]",
+		);
 		expect(out).toContain("- [q3] Which color? → blue\n");
 		expect(out).not.toContain("- [k1] Where are records stored? — options");
+	});
+
+	test("only knowledge answers: no Answered section, the settled section still appears", () => {
+		const out = formatHitlAddendum([soft, settled]);
+		expect(out).not.toContain("### Answered");
+		expect(out).toContain("### Settled from the Greptile knowledge base");
+		expect(out.indexOf("### Open (non-blocking)")).toBeLessThan(out.indexOf("### Settled from the Greptile knowledge base"));
 	});
 });
 

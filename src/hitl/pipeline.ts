@@ -31,6 +31,8 @@ export interface RunClarifyOptions {
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 4;
 const MAX_KNOWLEDGE_ANSWER_CHARS = 500;
+/** Longest claimed answer shown as the "As stated" option description of a rejected knowledge claim. */
+const MAX_CLAIMED_DESCRIPTION_CHARS = 200;
 
 function isAbortError(error: unknown): boolean {
 	if (error instanceof Error) return error.name === "AbortError";
@@ -90,16 +92,34 @@ function normalizeQuestionText(raw: unknown): string {
 	return /[?]$/.test(question) ? question : `${question.replace(/[.!:;,]+$/, "")}?`;
 }
 
-function normalizeItem(raw: unknown, index: number): Clarification | undefined {
+/**
+ * Options for a question whose knowledge claim was rejected and that came without two options of its own:
+ * accept the claimed answer ("As stated") or give another. An empty claim offers the default instead.
+ */
+function claimedOptions(claimed: string): ClarificationOption[] {
+	const first: ClarificationOption = claimed ? { label: "As stated", description: claimed } : { label: "Proceed with the default" };
+	return [first, { label: "Something else" }];
+}
+
+/**
+ * An open question (id `q{index+1}`), or undefined when it has no question text or fewer than two options.
+ * `claimed` is the collapsed answer of a rejected knowledge claim: when given, an item short of two options
+ * is asked with {@link claimedOptions} instead of being dropped.
+ */
+function normalizeItem(raw: unknown, index: number, claimed?: string): Clarification | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const obj = raw as Record<string, unknown>;
 	const question = normalizeQuestionText(obj.question);
 	if (!question) return undefined;
 
-	const options = normalizeOptions(obj.options);
-	if (options.length < MIN_OPTIONS) return undefined;
+	let options = normalizeOptions(obj.options);
+	let wanted = asString(obj.default).toLowerCase();
+	if (options.length < MIN_OPTIONS) {
+		if (claimed === undefined) return undefined;
+		options = claimedOptions(claimed);
+		wanted = "";
+	}
 
-	const wanted = asString(obj.default).toLowerCase();
 	const match = wanted ? options.find((option) => option.label.toLowerCase() === wanted) : undefined;
 	const fallbackDefault = options[0]!.label;
 
@@ -114,34 +134,28 @@ function normalizeItem(raw: unknown, index: number): Clarification | undefined {
 	};
 }
 
-/** The verified `{answer, source}` of an item's knowledge object, or undefined when missing, invalid, or citing a document not read. */
-function knowledgeClaim(raw: unknown, docs: ReadonlySet<string>): { answer: string; source: string } | undefined {
-	if (!raw || typeof raw !== "object") return undefined;
-	const obj = raw as Record<string, unknown>;
-	const answer = asString(obj.answer).replace(/\s+/g, " ");
+/** The verified `{answer, source}` of an item's knowledge object, or undefined when invalid or citing a document not read. */
+function knowledgeClaim(knowledge: Record<string, unknown>, docs: ReadonlySet<string>): { answer: string; source: string } | undefined {
+	const answer = asString(knowledge.answer).replace(/\s+/g, " ");
 	if (!answer || answer.length > MAX_KNOWLEDGE_ANSWER_CHARS) return undefined;
-	const source = asString(obj.source);
+	const source = asString(knowledge.source);
 	if (!source || !docs.has(source)) return undefined;
 	return { answer, source };
 }
 
-function normalizeSettledItem(raw: unknown, index: number, docs: ReadonlySet<string>): Clarification | undefined {
-	if (!raw || typeof raw !== "object") return undefined;
-	const obj = raw as Record<string, unknown>;
-	const claim = knowledgeClaim(obj.knowledge, docs);
-	if (!claim) return undefined;
-	const question = normalizeQuestionText(obj.question);
+function normalizeSettledItem(raw: Record<string, unknown>, index: number, claim: { answer: string; source: string }): Clarification | undefined {
+	const question = normalizeQuestionText(raw.question);
 	if (!question) return undefined;
 
-	const options = normalizeOptions(obj.options);
-	const wanted = asString(obj.default).toLowerCase();
+	const options = normalizeOptions(raw.options);
+	const wanted = asString(raw.default).toLowerCase();
 	const match = wanted ? options.find((option) => option.label.toLowerCase() === wanted) : undefined;
 
 	const settled: Clarification = {
 		id: `k${index + 1}`,
 		question,
-		header: normalizeHeader(obj.header, "KB"),
-		why: asString(obj.why).replace(/\s+/g, " "),
+		header: normalizeHeader(raw.header, "KB"),
+		why: asString(raw.why).replace(/\s+/g, " "),
 		options,
 		blocking: false,
 		answer: claim.answer,
@@ -154,8 +168,11 @@ function normalizeSettledItem(raw: unknown, index: number, docs: ReadonlySet<str
 
 /**
  * Validate the clarifier's JSON: open questions (ids q1.., at most `maxQuestions`) followed by questions a
- * knowledge-base document settled (ids k1.., at most MAX_SETTLED). An item is settled only when its `knowledge`
- * object has a non-empty answer and cites one of `knowledgeDocs`; otherwise it is an ordinary open question.
+ * knowledge-base document settled (ids k1.., at most MAX_SETTLED). With `knowledgeDocs`, an item is settled only
+ * when its `knowledge` object has a non-empty answer of at most 500 chars citing one of `knowledgeDocs` and fewer
+ * than MAX_SETTLED items are settled. A rejected claim is never dropped: it becomes an open question (subject to
+ * `maxQuestions`) with its own options, or, short of two, "As stated" (the claimed answer) / "Something else".
+ * Items without a knowledge object, and every item without `knowledgeDocs`, need two options or are dropped.
  */
 export function normalizeClarifications(raw: unknown, maxQuestions: number, knowledgeDocs?: string[]): Clarification[] {
 	const max = Math.max(0, Math.floor(Number.isFinite(maxQuestions) ? maxQuestions : MAX_QUESTIONS));
@@ -171,14 +188,20 @@ export function normalizeClarifications(raw: unknown, maxQuestions: number, know
 	const settled: Clarification[] = [];
 	for (const item of items) {
 		if (open.length >= max && (docs.size === 0 || settled.length >= MAX_SETTLED)) break;
-		const known = docs.size > 0 ? normalizeSettledItem(item, settled.length, docs) : undefined;
-		if (known && settled.length >= MAX_SETTLED) continue;
-		const clarification = known ?? (open.length < max ? normalizeItem(item, open.length) : undefined);
+		const obj = docs.size > 0 && item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
+		const knowledge = obj?.knowledge && typeof obj.knowledge === "object" ? (obj.knowledge as Record<string, unknown>) : undefined;
+		const claim = knowledge && settled.length < MAX_SETTLED ? knowledgeClaim(knowledge, docs) : undefined;
+		let clarification: Clarification | undefined;
+		if (obj && claim) clarification = normalizeSettledItem(obj, settled.length, claim);
+		else if (open.length < max) {
+			const claimed = knowledge ? asString(knowledge.answer).replace(/\s+/g, " ").slice(0, MAX_CLAIMED_DESCRIPTION_CHARS).trim() : undefined;
+			clarification = normalizeItem(item, open.length, claimed);
+		}
 		if (!clarification) continue;
 		const key = normalizeQuestion(clarification.question);
 		if (!key || seen.has(key)) continue;
 		seen.add(key);
-		(known ? settled : open).push(clarification);
+		(claim ? settled : open).push(clarification);
 	}
 	return [...open, ...settled];
 }

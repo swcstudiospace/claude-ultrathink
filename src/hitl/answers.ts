@@ -83,6 +83,7 @@ export function applyAnswers(
 		target.answer = answer;
 		target.answeredAt = now;
 		target.source = "user";
+		delete target.evidence;
 		if (!matched.includes(target)) matched.push(target);
 	};
 

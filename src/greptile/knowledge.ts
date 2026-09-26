@@ -65,6 +65,8 @@ const NAMESPACE_PAGES = 20;
 const DOCUMENT_PAGES = 5;
 const PAGE_LIMIT = 100;
 const MAX_PATH = 200;
+/** Listed document paths accepted for reading, citing and printing: no whitespace or control characters. */
+const DOC_PATH = /^[\w./-]+\.md$/;
 const MAX_ID = 200;
 const MAX_REASON = 200;
 const INDEX_MAX_CHARS = 8_000;
@@ -282,7 +284,7 @@ export function createKnowledgeReader(opts: {
 					const listed = asArr(result?.documentPaths);
 					for (const entry of listed) {
 						const path = asStr(entry)?.trim();
-						if (path?.endsWith(".md") && !path.includes("..") && path.length <= MAX_PATH && !paths.includes(path)) {
+						if (path && DOC_PATH.test(path) && !path.includes("..") && path.length <= MAX_PATH && !paths.includes(path)) {
 							paths.push(path);
 						}
 					}

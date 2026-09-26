@@ -125,9 +125,9 @@ describe("normalizeClarifications with knowledge-base answers", () => {
 		expect(list[1]?.default).toBeUndefined();
 	});
 
-	test("a knowledge claim is ignored without knowledgeDocs, with an unread source, or with an empty answer", () => {
+	test("a rejected knowledge claim with its own options is asked with them", () => {
 		const item = { ...settledItem("Which db?"), options: twoOptions, blocking: true };
-		const asOpen = { id: "q1", question: "Which db?", blocking: true, default: "Postgres" };
+		const asOpen = { id: "q1", question: "Which db?", blocking: true, default: "Postgres", options: twoOptions };
 		expect(normalizeClarifications([item], 4)[0]).toMatchObject(asOpen);
 		expect(normalizeClarifications([{ ...item, knowledge: { answer: "x", source: "docs/other.md" } }], 4, docs)[0]).toMatchObject(asOpen);
 		expect(normalizeClarifications([{ ...item, knowledge: { answer: "  ", source: "index.md" } }], 4, docs)[0]).toMatchObject(asOpen);
@@ -135,20 +135,50 @@ describe("normalizeClarifications with knowledge-base answers", () => {
 		for (const list of [normalizeClarifications([item], 4), normalizeClarifications([{ ...item, knowledge: "yes" }], 4, docs)]) {
 			expect(list[0]?.answer).toBeUndefined();
 			expect(list[0]?.source).toBeUndefined();
+			expect(list[0]?.evidence).toBeUndefined();
 		}
-		// An unverifiable claim without two options is dropped like any other open question.
-		expect(normalizeClarifications([settledItem("Which db?", "docs/other.md")], 4, docs)).toEqual([]);
 	});
 
-	test("settled answers are capped at four and do not count toward maxQuestions", () => {
+	test("a rejected knowledge claim without two options is asked with As stated / Something else, never dropped", () => {
+		const [unread] = normalizeClarifications([settledItem("Which db?", "docs/other.md")], 4, docs);
+		expect(unread).toEqual({
+			id: "q1",
+			question: "Which db?",
+			header: "Storage",
+			why: "picks the adapter",
+			options: [{ label: "As stated", description: "Records live in SQLite." }, { label: "Something else" }],
+			default: "As stated",
+			blocking: false,
+		});
+
+		const long = `${"word ".repeat(120)}end`;
+		const [tooLong] = normalizeClarifications([{ ...settledItem("Which db?"), knowledge: { answer: long, source: "index.md" }, default: "Something else" }], 4, docs);
+		expect(tooLong?.options[0]?.description).toBe("word ".repeat(40).trim());
+		expect(tooLong?.default).toBe("As stated");
+
+		const [empty] = normalizeClarifications([{ ...settledItem("Which db?"), knowledge: { answer: "   ", source: "index.md" } }], 4, docs);
+		expect(empty?.options).toEqual([{ label: "Proceed with the default" }, { label: "Something else" }]);
+		expect(empty?.default).toBe("Proceed with the default");
+
+		// Without knowledgeDocs the feature is off: such an item is dropped like any other short of two options.
+		expect(normalizeClarifications([settledItem("Which db?", "docs/other.md")], 4)).toEqual([]);
+	});
+
+	test("settled answers are capped at four; claims beyond the cap are asked, within maxQuestions", () => {
 		const questions = [
 			...Array.from({ length: 6 }, (_, i) => settledItem(`Settled ${i}?`)),
 			{ question: "Open A?", options: twoOptions },
 			{ question: "Open B?", options: twoOptions },
 		];
-		const list = normalizeClarifications({ questions }, 1, docs);
-		expect(list.map((item) => item.id)).toEqual(["q1", "k1", "k2", "k3", "k4"]);
-		expect(list[0]?.question).toBe("Open A?");
+		const list = normalizeClarifications({ questions }, 2, docs);
+		expect(list.map((item) => item.id)).toEqual(["q1", "q2", "k1", "k2", "k3", "k4"]);
+		expect(list.map((item) => item.question)).toEqual(["Settled 4?", "Settled 5?", "Settled 0?", "Settled 1?", "Settled 2?", "Settled 3?"]);
+		expect(list[0]).toMatchObject({ default: "As stated", options: [{ label: "As stated", description: "Records live in SQLite." }, { label: "Something else" }] });
+		expect(list[0]?.answer).toBeUndefined();
+
+		const capped = normalizeClarifications({ questions }, 1, docs);
+		expect(capped.map((item) => item.question)).toEqual(["Settled 4?", "Settled 0?", "Settled 1?", "Settled 2?", "Settled 3?"]);
+		expect(normalizeClarifications({ questions }, 0, docs).map((item) => item.id)).toEqual(["k1", "k2", "k3", "k4"]);
 	});
 
 	test("dedupes open and settled questions together", () => {

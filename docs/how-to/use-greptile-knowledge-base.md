@@ -88,11 +88,11 @@ Every host also records the lookup as `knowledge` in the session record (`<state
 1. While the uplift runs, the planner finds the repository's knowledge base by the `origin` remote's `owner/repo`, lists its documents and reads `index.md`.
 2. After the Graph of Thought, it picks up to 3 documents from the index's routing table that match the request and reads them.
 3. At most 24 000 characters of those documents go to the clarifier, marked as untrusted evidence. Each Greptile stage has a 20-second budget.
-4. The clarifier may mark a question as settled only by citing one of the documents it was given. A settled question is not asked. Product decisions (what you want, as opposed to how the repository works) are still asked.
+4. The clarifier may mark a question as settled only by citing one of the documents it was given, with a one-sentence answer. A settled question is not asked. A claim that cites a document that was not read, has an empty or overlong answer, or goes past the limit of 4 settled questions is asked as an ordinary question, never dropped. Product decisions (what you want, as opposed to how the repository works) are still asked.
 
 Settled questions show up:
 
-- in the plan's clarifications under **Answered**, as `- [k1] <question> → <answer> (Greptile knowledge base: docs/shipping-workflow.md)`;
+- in the plan's clarifications in their own **Settled from the Greptile knowledge base** subsection, after **Answered**, as `- [k1] <question> → <answer> (Greptile knowledge base: docs/shipping-workflow.md)`. The subsection marks them as untrusted evidence, not your decisions: the agent checks them against the repository and asks you when the repository disagrees. **Answered** lists only your answers and assumed defaults;
 - in the spec's `CLARIFICATIONS` block as `<ANSWER source="knowledge" evidence="docs/shipping-workflow.md">…</ANSWER>`;
 - in a `## Greptile knowledge base` section of the context the agent sees, which names the documents read and says they are Greptile-synthesized summaries to check against the repository itself.
 

@@ -737,6 +737,32 @@ describe("Greptile knowledge base before clarify", () => {
 		}
 	});
 
+	test("the lookup topic is the request text, goal and node conclusions, without the spec's XML markup", async () => {
+		const topics: string[] = [];
+		const reader: KnowledgeReader = {
+			start: () => ({
+				read: async (topic) => {
+					topics.push(topic);
+					return { lookup: { outcome: "none", docs: [], chars: 0, ms: 1 }, digest: "" };
+				},
+				close: () => {},
+			}),
+		};
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), knowledge: reader, clarify: async () => [] });
+		try {
+			await runPromptSubmit(input, deps);
+			expect(topics).toHaveLength(1);
+			const topic = topics[0] ?? "";
+			expect(topic).toContain("add a widget");
+			expect(topic).toContain("Ship it");
+			expect(topic).toContain("T1: c n1");
+			expect(topic).not.toContain("<");
+			for (const tag of ["BUILD_PROMPT", "GRAPH_OF_THOUGHT", "ORIGINAL", "NODE"]) expect(topic).not.toContain(tag);
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("knowledge-settled answers are not carried to the next prompt; user answers are", async () => {
 		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [] });
 		try {
