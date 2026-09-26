@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionRecord } from "../claude/state.ts";
 import type { TrackPlan } from "../track/types.ts";
+import { shellArg } from "../track/gateway.ts";
 import { SHIP_CLI, shipNudge } from "./nudge.ts";
 import { DEFAULT_SHIP_CONFIG } from "./types.ts";
 
@@ -20,7 +21,7 @@ describe("shipNudge", () => {
 	test("blocks with everything the agent needs to run the skill", () => {
 		const nudge = shipNudge(base);
 		expect(nudge?.decision).toBe("block");
-		for (const part of ["gsd-execute-phase", "feat/x", "master", "stateFile=/s/s1.json", `CLI: ${SHIP_CLI}`, "ultrathink-ship"]) {
+		for (const part of ["gsd-execute-phase", "feat/x", "master", "stateFile=/s/s1.json", `CLI: ${shellArg(SHIP_CLI)}`, "ultrathink-ship"]) {
 			expect(nudge?.reason).toContain(part);
 		}
 		expect(SHIP_CLI.endsWith("/bin/ultrathink-ship")).toBe(true);

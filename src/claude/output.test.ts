@@ -250,6 +250,12 @@ describe("tracking", () => {
 		expect(without).not.toContain("## Linked issues");
 	});
 
+	test("a state file path with a space is single-quoted in the track command", () => {
+		const statePath = "/Users/Jane Doe/.claude/ultrathink/sessions/x.json";
+		const out = formatPromptContext({ result, plan, tracking: partial, statePath, trackCommand: "/r/bin/ultrathink-mcp track complete" });
+		expect(out).toContain(`\`/r/bin/ultrathink-mcp track complete --state '${statePath}'\``);
+	});
+
 	test("skill hints: a host that does not list plugin skills gets each skill's load call and an existing SKILL.md path", () => {
 		const out = formatPromptContext({ result, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", ship: true, skillHints: true });
 		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {

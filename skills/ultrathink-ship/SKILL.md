@@ -5,7 +5,7 @@ description: Invoked with a stateFile after a GSD skill run finishes (or when th
 
 # ultrathink-ship
 
-You have a `stateFile` (the session's `<state dir>/sessions/<id>.json`) from the nudge or the plan's `## Ship` section. Every step uses the plugin's CLI, `bin/ultrathink-ship <subcommand> --state <stateFile> [--cwd <repo dir>]`, which prints one JSON object. `bin/ultrathink-ship` below means the absolute path given as `CLI:` in the nudge or the Ship section (in Claude Code also `${CLAUDE_PLUGIN_ROOT}/bin/ultrathink-ship`); run it from the project's working tree, or pass `--cwd`. Run the steps in order and never skip the gates.
+You have a `stateFile` (the session's `<state dir>/sessions/<id>.json`) from the nudge or the plan's `## Ship` section. Every step uses the plugin's CLI, `bin/ultrathink-ship <subcommand> --state <stateFile> [--cwd <repo dir>]`, which prints one JSON object. `bin/ultrathink-ship` below means the absolute path given as `CLI:` in the nudge or the Ship section (in Claude Code also `${CLAUDE_PLUGIN_ROOT}/bin/ultrathink-ship` (quote it if the path contains spaces)); run it from the project's working tree, or pass `--cwd`. Run the steps in order and never skip the gates.
 
 Ship is opt-in: Ultrathink only asks for this skill when `ship.enabled` is true in the ultrathink config (`~/.config/ultrathink/config.json`). Merging additionally needs `ship.autoMerge`, and deleting the branch after the merge needs `ship.deleteBranch`; both are off by default.
 

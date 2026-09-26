@@ -50,7 +50,7 @@ export interface HookDeps {
 	config: UltrathinkConfig;
 	control: ControlState;
 	complete: ClaudeCompleter;
-	/** Thinking engine label recorded and echoed, e.g. "grok-4.7@xhigh", "grok-4.7-xhigh@shunt" or "claude:sonnet". */
+	/** Thinking engine label recorded and echoed, e.g. "grok-4.7@xhigh", "<shuntModel or model>@shunt" or "claude:sonnet". */
 	engine: string;
 	stateDir: string;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;

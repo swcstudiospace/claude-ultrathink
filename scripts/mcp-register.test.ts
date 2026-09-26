@@ -532,6 +532,36 @@ describe("main", () => {
 		}
 	});
 
+	test("blank CLAUDE_CONFIG_DIR and GROK_HOME count as unset and padded values are trimmed", () => {
+		const servers: Record<CliHost, Record<string, string>> = { claude: {}, grok: {}, hermes: {} };
+		const dir = mkdtempSync(join(tmpdir(), "mcp-register-trim-"));
+		const fake = fakeHosts(servers, join(dir, "config.yaml"));
+		try {
+			sandbox(({ home, env, lines, deps }) => {
+				const claudeFile = join(home, ".claude.json");
+				const grokFile = join(home, ".grok", "config.toml");
+				mkdirSync(join(home, ".grok"));
+				writeFileSync(claudeFile, "{}\n");
+				writeFileSync(grokFile, "");
+				const backups = () => lines.filter((l) => l.trimStart().startsWith("backup "));
+				env.CLAUDE_CONFIG_DIR = "   ";
+				env.GROK_HOME = " ";
+				expect(main(["--hosts", "claude,grok", "--providers", "linear", "--dry-run"], deps())).toBe(0);
+				expect(backups()).toEqual([
+					`  backup ${claudeFile} -> ${claudeFile}${STAMP}`,
+					`  backup ${grokFile} -> ${grokFile}${STAMP}`,
+				]);
+				lines.length = 0;
+				env.CLAUDE_CONFIG_DIR = ` ${home}\n`;
+				env.GROK_HOME = `  ${join(home, ".grok")} `;
+				expect(main(["--hosts", "claude,grok", "--providers", "linear", "--dry-run"], deps())).toBe(0);
+				expect(backups()).toHaveLength(2);
+			}, fake.run);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("warns to rerun from a stable clone only when run from a plugin cache", () => {
 		sandbox(({ lines, deps }) => {
 			main(["--hosts", "omp", "--dry-run"], deps("/home/u/.claude/plugins/cache/ultrathink/ultrathink/1.1.0"));

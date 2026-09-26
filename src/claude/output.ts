@@ -17,6 +17,7 @@ import { THINK_ADDENDUM, THINK_ADDENDUM_UNTRACKED } from "../think/prompts.ts";
 import type { ThoughtGraph } from "../think/types.ts";
 import { stepKey } from "../track/create.ts";
 import { formatTrackingTodos } from "../track/render.ts";
+import { shellArg } from "../track/gateway.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
 
@@ -235,7 +236,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 	else if (input.statePath) {
 		const complete = input.tracking?.status === "complete";
 		const finish = input.trackCommand
-			? `, which first runs \`${input.trackCommand} --state ${input.statePath}\` to finish the missing Notion/Linear rows`
+			? `, which first runs \`${input.trackCommand} --state ${shellArg(input.statePath)}\` to finish the missing Notion/Linear rows`
 			: ", which first finishes the missing Notion/Linear rows";
 		const where = [...(providers.notion ? ["Notion"] : []), ...(providers.linear ? ["Linear"] : [])].join(" and ") || "the tracker";
 		const kickoff = skillReference("ultrathink-kickoff", hints);
@@ -252,8 +253,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 				"## Ship",
 				"",
 				hints
-					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${SHIP_CLI}). ${flow}`
-					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${SHIP_CLI}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). ${flow}`,
+					? `When this ${input.skill ?? "GSD"} run is finished, invoke ${skillReference("ultrathink-ship", true)} with stateFile=${input.statePath} (CLI: ${shellArg(SHIP_CLI)}). ${flow}`
+					: `When this ${input.skill ?? "GSD"} run is finished, invoke the ultrathink-ship skill with stateFile=${input.statePath} (CLI: ${shellArg(SHIP_CLI)}; if your host does not list that skill, read ${SHIP_SKILL_FILE} and follow it). ${flow}`,
 			].join("\n"),
 		);
 	}

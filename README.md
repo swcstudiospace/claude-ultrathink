@@ -52,7 +52,7 @@ Each host was tested live with the version shown, including planning and the `/u
 | Host | Tested | How ultrathink loads | How the plan reaches the agent |
 |---|---|---|---|
 | Claude Code | 2.1.278 | `.claude-plugin/` marketplace; hooks in `hooks/hooks.json` | `UserPromptSubmit` hook context |
-| Grok Build | 1.0.41 | The plugin directory supplies the skills and commands. Grok does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs the global hook file `~/.grok/hooks/ultrathink.json` (under `$GROK_HOME` when set) | Grok discards hook output, so the plan is written to `last-plan.json` and a rule file (`~/.grok/rules/ultrathink.md`) tells the model to read it |
+| Grok Build | 1.0.41 | The plugin directory supplies the skills and commands. Grok does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs the global hook file `${GROK_HOME:-~/.grok}/hooks/ultrathink.json` | Grok discards hook output, so the plan is written to `last-plan.json` and a rule file (`${GROK_HOME:-~/.grok}/rules/ultrathink.md`) tells the model to read it |
 | Hermes Agent | v0.21.4 | Python plugin `hosts/hermes` (Python 3.10 or later), symlinked into `${HERMES_HOME:-~/.hermes}/plugins/ultrathink` | `pre_llm_call` gets the plan from `hooks/engine.ts` and hands the agent a short handoff: the spec path, the state file and the Graph ID |
 | Muse Code | 1.4.0 | `.muse-plugin/plugin.json` | `UserPromptSubmit` hook context, same entry as Claude Code |
 | Omp | 18.3.1 | `package.json` `omp.extensions` → `src/host/omp.ts` | `before_agent_start`; the TUI shows a live status bar and plan cards. Omp caps a handler at 30 s, so the extension waits up to 25 s and a slower plan arrives later as an aside |
@@ -68,7 +68,7 @@ Requirements:
 - **Hermes Agent only:** Python 3.10 or newer.
 - **For ship (optional):** `gh`, authenticated, and Greptile: a Greptile key in the gateway, or the Greptile CLI (tested with 3.4.1) after `greptile login`.
 
-State is kept per host: `~/.claude/ultrathink`, `~/.grok/plugin-data/ultrathink`, `$HERMES_HOME/ultrathink` (default `~/.hermes/ultrathink`), `~/.config/muse/ultrathink` and `~/.omp/agent/ultrathink`. Planning never writes `.planning/` into your working directory.
+State is kept per host: `~/.claude/ultrathink`, `$GROK_PLUGIN_DATA/ultrathink` if set (otherwise `${GROK_HOME:-~/.grok}/plugin-data/ultrathink`), `$HERMES_HOME/ultrathink` (default `~/.hermes/ultrathink`), `~/.config/muse/ultrathink` and `~/.omp/agent/ultrathink`. Planning never writes `.planning/` into your working directory.
 
 ## Cost and latency
 
@@ -114,7 +114,7 @@ claude plugin marketplace add <clone>
 claude plugin install ultrathink@ultrathink
 
 # Grok Build: the plugin directory, enable it, then the global hook file and rule file
-mkdir -p ~/.grok/plugins && ln -sfn <clone> ~/.grok/plugins/ultrathink
+mkdir -p ${GROK_HOME:-~/.grok}/plugins && ln -sfn <clone> ${GROK_HOME:-~/.grok}/plugins/ultrathink
 grok plugin enable ultrathink
 grok plugin list                 # ultrathink should be listed as enabled
 bun <clone>/scripts/setup.ts apply

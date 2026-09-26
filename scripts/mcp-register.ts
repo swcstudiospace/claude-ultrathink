@@ -501,8 +501,8 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	const command = join(root, "bin", "ultrathink-mcp");
 	const entries: Entry[] = providers.map((id) => ({ id, command, args: ["serve", id] }));
 	const stamp = backupSuffix((deps.now ?? (() => new Date()))());
-	const home = env.HOME || homedir();
-	const config = env.XDG_CONFIG_HOME || join(home, ".config");
+	const home = env.HOME?.trim() || homedir();
+	const config = env.XDG_CONFIG_HOME?.trim() || join(home, ".config");
 	const hermesFile = hermesConfigFile(env, home);
 	const options: ApplyOptions = {
 		mode,
@@ -522,7 +522,7 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		if (host === "omp" || host === "muse") {
 			const file =
 				host === "omp"
-					? join(env.PI_CODING_AGENT_DIR || join(home, ".omp", "agent"), "mcp.json")
+					? join(env.PI_CODING_AGENT_DIR?.trim() || join(home, ".omp", "agent"), "mcp.json")
 					: join(config, "muse", "settings.json");
 			const current = readJson(file);
 			const merged = host === "omp" ? mergeOmpMcp(current, entries, mode) : mergeMuseSettings(current, entries, mode);
@@ -544,9 +544,9 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		if (!plan.commands.length) continue;
 		const configFile =
 			host === "claude"
-				? join(env.CLAUDE_CONFIG_DIR || home, ".claude.json")
+				? join(env.CLAUDE_CONFIG_DIR?.trim() || home, ".claude.json")
 				: host === "grok"
-					? join(env.GROK_HOME || join(home, ".grok"), "config.toml")
+					? join(env.GROK_HOME?.trim() || join(home, ".grok"), "config.toml")
 					: hermesFile;
 		if (configFile === undefined) {
 			log("  hermes: the active Hermes profile could not be resolved (check `hermes profile list`); config.yaml not backed up");

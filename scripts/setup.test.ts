@@ -454,7 +454,9 @@ describe("any checkout path", () => {
 describe("hermesHint", () => {
 	test("links into HERMES_HOME when set, else ~/.hermes, and states the global hook cap", () => {
 		const hint = hermesHint("/src/ultrathink", { HERMES_HOME: "/opt/hermes home" });
-		expect(hint).toContain(`ln -s '/src/ultrathink/hosts/hermes' '/opt/hermes home/plugins/ultrathink'`);
+		expect(hint).toContain(
+			`mkdir -p '/opt/hermes home/plugins' && ln -sfn '/src/ultrathink/hosts/hermes' '/opt/hermes home/plugins/ultrathink' && hermes plugins enable ultrathink`,
+		);
 		expect(hint).toContain("hermes config set plugins.hook_callback_timeout 600");
 		expect(hint).toContain("at least 105 s");
 		expect(hint).toContain("global Hermes setting");

@@ -109,7 +109,7 @@ Every file the script changed, now or when you registered, has a backup next to 
 |---|---|
 | Claude Code | `${CLAUDE_CONFIG_DIR:-~}/.claude.json` |
 | Grok Build | `${GROK_HOME:-~/.grok}/config.toml` |
-| Hermes Agent | `${HERMES_HOME:-~/.hermes}/config.yaml` |
+| Hermes Agent | `${HERMES_HOME:-~/.hermes}/config.yaml`, or with an active Hermes profile `${HERMES_HOME:-~/.hermes}/profiles/<name>/config.yaml` |
 | Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json` |
 | Omp | `${PI_CODING_AGENT_DIR:-~/.omp/agent}/mcp.json` |
 
@@ -149,7 +149,7 @@ Each host keeps its own state directory: control state, planned sessions, specs 
 |---|---|
 | Claude Code | `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink` |
 | Grok Build | `$GROK_PLUGIN_DATA/ultrathink` if set, otherwise `${GROK_HOME:-~/.grok}/plugin-data/ultrathink` |
-| Hermes Agent | `${HERMES_HOME:-~/.hermes}/ultrathink` |
+| Hermes Agent | `${HERMES_HOME:-~/.hermes}/ultrathink`, and `ultrathink` in each Hermes profile directory you used it in (`${HERMES_HOME:-~/.hermes}/profiles/<name>`) |
 | Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/ultrathink` |
 | Omp | `${PI_CODING_AGENT_DIR:-~/.omp/agent}/ultrathink` |
 

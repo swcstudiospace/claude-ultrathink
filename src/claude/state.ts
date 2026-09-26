@@ -27,7 +27,7 @@ export interface ControlState {
 export interface SessionRecord {
 	sessionId: string;
 	at: number;
-	/** Thinking engine label, e.g. "grok-4.7@xhigh", "grok-4.7-xhigh@shunt" or "claude:sonnet". */
+	/** Thinking engine label, e.g. "grok-4.7@xhigh", "<shuntModel or model>@shunt" or "claude:sonnet". */
 	engine?: string;
 	/** Host that planned this prompt. Absent on records written before multi-host support. */
 	host?: string;

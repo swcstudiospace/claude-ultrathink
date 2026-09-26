@@ -63,7 +63,7 @@ PR_URL_RE = re.compile(rf"https://github\.com/[^{JS_SPACE}/]+/[^{JS_SPACE}/]+/pu
 PR_TOOL_RE = re.compile(
 	r"(?:create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|createPullRequest)\Z", re.ASCII | re.IGNORECASE
 )
-SHELL_TOOLS = frozenset({"Bash", "bash", "run_terminal_command", "shell", "exec", "terminal"})
+SHELL_TOOLS = frozenset({"Bash", "bash", "run_terminal_command", "run_terminal_cmd", "shell", "exec", "terminal"})
 
 # Port of src/uplift/detect.ts isAlreadyUplifted: ROOT_TAGS (src/types.ts) plus "uplifted"
 # and "ultrathink", case-insensitive. JavaScript's \w is ASCII.

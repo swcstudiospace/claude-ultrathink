@@ -356,7 +356,9 @@ function shellQuote(value: string): string {
 }
 
 export function hermesHint(repoRoot: string, env: Record<string, string | undefined> = process.env): string {
-	const link = `ln -s ${shellQuote(join(repoRoot, "hosts", "hermes"))} ${shellQuote(join(hermesHome(env), "plugins", "ultrathink"))}`;
+	const pluginsDir = join(hermesHome(env), "plugins");
+	// -n replaces an existing link instead of nesting a new one inside the linked directory on a re-paste; Hermes plugins are opt-in, hence enable.
+	const link = `mkdir -p ${shellQuote(pluginsDir)} && ln -sfn ${shellQuote(join(repoRoot, "hosts", "hermes"))} ${shellQuote(join(pluginsDir, "ultrathink"))} && hermes plugins enable ultrathink`;
 	return `Hermes: ${link}; then hermes config set plugins.hook_callback_timeout 600 — the hook cap must be at least 105 s, 600 recommended (Hermes drops slower hooks after 30 s by default; this is a global Hermes setting that applies to every plugin); then disable any other prompt-planning plugin so two planners do not plan the same turn.`;
 }
 

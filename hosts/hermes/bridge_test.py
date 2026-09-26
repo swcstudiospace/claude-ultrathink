@@ -495,6 +495,9 @@ def test_deadline_kills_bun_and_everything_it_spawned():
 def test_pr_creation_tool_mirrors_pr_detect():
 	for command in ("gh pr create --fill", "cd x && gh pr create", "  gh   pr   create"):
 		assert is_pr_creation_tool("terminal", command), command
+	for tool in ("run_terminal_cmd", "run_terminal_command"):
+		assert is_pr_creation_tool(tool, "gh pr create --fill"), tool
+		assert not is_pr_creation_tool(tool, "gh pr list"), tool
 	# Substring rule, as in pr-detect.ts: a mere mention counts (a spare nudge, never a missed one).
 	assert is_pr_creation_tool("terminal", "echo gh pr create")
 	for command in ("gh pr list", "gh pr view 5", "gh issue create", "xgh pr create", "gh pr created", ""):

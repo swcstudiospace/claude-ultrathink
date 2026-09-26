@@ -76,7 +76,14 @@ export function createGatewayTracker(
 	};
 }
 
-export function trackCommand(): string {
-	const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-	return `${resolve(repoRoot, "bin", "ultrathink-mcp")} track complete`;
+/**
+ * One shell word for a command line printed into the agent's context: plain paths stay as they are, anything else
+ * (spaces, quotes, `$`…) is POSIX single-quoted so the line can be run as-is.
+ */
+export function shellArg(value: string): string {
+	return /^[A-Za-z0-9_./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+export function trackCommand(repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..")): string {
+	return `${shellArg(resolve(repoRoot, "bin", "ultrathink-mcp"))} track complete`;
 }

@@ -13,6 +13,7 @@ const PR_TOOL_RE = /(?:create[_-]?pull[_-]?request|pull[_-]?request[_-]?create|c
 const SHELL_TOOLS: Record<string, true> = {
 	Bash: true,
 	bash: true,
+	run_terminal_cmd: true,
 	run_terminal_command: true,
 	shell: true,
 	exec: true,
