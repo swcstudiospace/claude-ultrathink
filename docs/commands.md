@@ -18,7 +18,7 @@ ultrathink plans every non-trivial prompt by default. The commands on this page 
 | `/ultrathink-on` | Planning back on for this host. |
 | `/ultrathink-track off` | Planning continues, but no Linear/Notion rows are created. |
 | `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. `on` and `off` are per-host settings that beat `track.enabled` in the config until you change them again. |
-| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate and ship state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
+| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship and knowledge-base state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
 
 Some details:
 
@@ -174,6 +174,7 @@ Notion: not configured
 Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
+Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -190,6 +191,7 @@ What the lines can say:
 | `Notion`, `Linear team` | The configured value or `not configured`. |
 | `Substrate` | `off (optional: set substrate.url or SUBSTRATE_URL)`, `off (SUBSTRATE_DISABLED=1)`, or `<url> (SUBSTRATE_URL)` / `<url> (config)` showing where the URL came from. |
 | `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
+| `Knowledge base` | The Greptile knowledge-base read before the clarifying questions (see [`hitl.knowledgeBase`](configuration.md#hitl-clarifying-questions)): `off (opt-in: set hitl.knowledgeBase)`; `on · not read while HITL is off`; `on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)`; or `on · Greptile` (`on · Greptile · organization <org>` when `ship.greptileOrganization` is set). |
 | `Model` | `claude.model` and `claude.concurrency`. |
 | `State` | The state directory in use. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
@@ -249,12 +251,12 @@ usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.
 |---|---|
 | `assess` | Collects git, GSD and diff signals and asks the engine to judge whether the task is done. A GSD roadmap whose `gsd-tools.cjs` cannot be found is reported as a gap (see [GSD tools lookup](configuration.md#gsd-tools-lookup)). `--ignore-gsd` leaves the GSD roadmap out; use it only when that roadmap is separate work (see [Ship](ship.md)). |
 | `pr` | Pushes the branch and opens a PR into the repository's default branch, or reuses the open one. |
-| `review` | One Greptile review round. Returns `status: "pending"` within `ship.waitMs` while Greptile is still working, and running it again resumes the same review. Returns `status: "blocked"` without counting a round when Greptile is not set up (no stored Greptile credential and no signed-in `greptile` CLI) or when your Greptile account needs `ship.greptileOrganization`; the reason says what to do. |
-| `merge` | Checks the merge gate and merges. Refuses with `autoMerge disabled` unless `ship.autoMerge` is `true`. Deletes the remote and local branch and fast-forwards the base branch only when `ship.deleteBranch` is `true`. |
-| `run` | `assess`, `pr`, `review` and `merge` in one go. Fixing findings stays with the agent. |
-| `status` | Prints the stored ship state. |
+| `review` | One Greptile review round. Returns `status: "pending"` within `ship.waitMs` while Greptile is still working, and running it again resumes the same review. A failed review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or one pending past `ship.reviewTimeoutMs` is re-triggered on the next `review` call, up to `ship.reviewRetries` (3) times per head commit, then the ship blocks with a PR comment; these never count toward `ship.maxRounds`, which counts only completed reviews below 5/5 or with open threads. The output's `passed` says whether this review of the head passed the gate. Returns `status: "blocked"` without counting a round when Greptile is not set up (no stored Greptile credential and no signed-in `greptile` CLI) or when your Greptile account needs `ship.greptileOrganization`; the reason says what to do. |
+| `merge` | Checks the merge gate and merges. Refuses with `autoMerge disabled` unless `ship.autoMerge` is `true`. After the head's review passed, it keeps retrying within the call, up to `ship.waitMs`, through pending CI, mergeability not computed, unreadable PR state or threads and transient GitHub errors; when the call's time runs out it returns `waiting: true` and `next: "run merge again: …"`, and the agent runs `merge` again. Past `ship.mergeTimeoutMs` (60 minutes) on one head commit, or on a terminal GitHub refusal (missing permission, requested changes, a closed PR; a branch-protection hold such as a missing approval is retried until the bound instead), the ship blocks and the PR comment lists the attempt history. Conflicts, failing CI, a moved head or a review below 5/5 go back to the agent (`next`), never merge. Deletes the remote and local branch and fast-forwards the base branch only when `ship.deleteBranch` is `true`. |
+| `run` | `assess`, `pr`, `review` and `merge` in one go. When the review passed and `ship.autoMerge` is on, it merges within its own `ship.waitMs` budget, and `next` is the merge's `next` (`run merge again: …` while waiting). Fixing findings stays with the agent. |
+| `status` | Prints the stored ship state, including `attempts`: every review result and merge outcome (newest 50). |
 
-`--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it.
+`--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it. `merge` is the only way the ship flow merges: agents must never merge any other way (no `gh pr merge`, no web UI), and a PR merged outside the flow without a passing review of its head is reported blocked, never recorded as a ship merge.
 
 ### `scripts/setup.ts`
 

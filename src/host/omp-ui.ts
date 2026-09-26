@@ -250,6 +250,7 @@ function planningSegments(state: BarState, p: Paint, now: number): string[] {
 		? `graph ${state.graph.done}/${state.graph.total}${state.graph.current ? ` · ${state.graph.current}` : ""}`
 		: "graph";
 	push(state.stages.think === "running", `${graph} ${stageGlyph(p, state.stages.think, now)}`);
+	if (state.stages.knowledge) push(state.stages.knowledge === "running", `kb ${stageGlyph(p, state.stages.knowledge, now)}`);
 	push(state.stages.clarify === "running", `clarify ${stageGlyph(p, state.stages.clarify, now)}`);
 	if (state.tracking !== false) {
 		let track = "track";

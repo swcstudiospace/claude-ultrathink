@@ -8,8 +8,8 @@ import type { Github, ReviewThreads } from "./github.ts";
 import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
-import { readShip, writeShip } from "./state.ts";
-import type { Assessment, GitSignals, PrRef, PrStatus, ReviewResult, ShipConfig, ShipSignals } from "./types.ts";
+import { appendAttempts, readShip, writeShip } from "./state.ts";
+import type { Assessment, GitSignals, PrRef, PrStatus, ReviewResult, ShipAttempt, ShipConfig, ShipSignals } from "./types.ts";
 
 const CONFIG: ShipConfig = {
 	enabled: true,
@@ -24,19 +24,29 @@ const CONFIG: ShipConfig = {
 	reviewTimeoutMs: 1000,
 	pollMs: 10,
 	waitMs: 100,
+	reviewRetries: 3,
+	mergeTimeoutMs: 10_000,
 };
 const PR: PrRef = { number: 7, url: "https://github.com/o/r/pull/7", head: "feat", base: "master" };
+const PASSED: ReviewResult = { source: "cli", status: "completed", score: 5, comments: [], headSha: "abc", at: 1 };
 
 let dir: string;
 let statePath: string;
 let calls: string[];
 let comments: string[];
+/** Fake clock: `now` reads it, the fake `sleep` advances it, so nothing really waits. */
+let clock: number;
+let sleeps: number[];
+let reviewInputs: Parameters<ShipDeps["review"]>[0][];
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ship-cli-"));
 	statePath = join(dir, "s.json");
 	calls = [];
 	comments = [];
+	clock = 1000;
+	sleeps = [];
+	reviewInputs = [];
 	writeFileSync(statePath, JSON.stringify({ sessionId: "s", at: 1, result: { original: "ship it", uplifted: "ship it" }, kickedOff: true }));
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -47,27 +57,38 @@ interface FakeOpts {
 	source?: Assessment["source"];
 	existingPr?: PrRef;
 	status?: Partial<PrStatus>;
+	/** PR status per prStatus call, each over `status` (null = unreadable); once used up, `status` answers. */
+	statuses?: (Partial<PrStatus> | null)[];
 	review?: Partial<ReviewResult>;
 	config?: Partial<ShipConfig>;
 	methods?: ShipConfig["mergeMethod"][];
+	/** GitHub merge result per merge call; once used up, merges succeed. */
+	merges?: { ok: boolean; error?: string }[];
 	/** Local `git rev-parse HEAD`; defaults to the PR head sha. */
 	head?: string;
+	/** Sets the fake clock when the deps are built. */
 	now?: number;
 	/** GitHub review threads; defaults to a failed lookup. */
 	threads?: ReviewThreads;
 }
 
 function deps(o: FakeOpts = {}): ShipDeps {
+	if (o.now !== undefined) clock = o.now;
 	const git: GitSignals = { branch: "feat", base: "master", onBase: false, ahead: 1, dirty: [], untracked: 0, pushed: true, ...o.git };
 	const signals: ShipSignals = { git };
 	const status: PrStatus = { state: "OPEN", headSha: "abc", mergeable: "MERGEABLE", checks: "passing", url: PR.url, ...o.status };
+	const statuses = [...(o.statuses ?? [])];
+	const merges = [...(o.merges ?? [])];
 	const github: Github = {
 		repo: () => ({ name: "o/r", defaultBranch: "master" }),
 		push: (b) => (calls.push(`push:${b}`), { ok: true }),
 		findOpenPr: () => o.existingPr,
 		createPr: (i) => (calls.push(`create:${i.base}<-${i.head}`), PR),
-		prStatus: () => status,
-		merge: (i) => (calls.push(`merge:${i.method}:${i.headSha}`), { ok: true }),
+		prStatus: () => {
+			const next = statuses.shift();
+			return next === null ? undefined : { ...status, ...next };
+		},
+		merge: (i) => (calls.push(`merge:${i.method}:${i.headSha}`), merges.shift() ?? { ok: true }),
 		mergeMethods: () => o.methods ?? [],
 		deleteRemoteBranch: (b) => (calls.push(`delete:${b}`), { ok: true }),
 		comment: (n, body) => (calls.push(`comment:${n}`), comments.push(body), { ok: true }),
@@ -77,10 +98,11 @@ function deps(o: FakeOpts = {}): ShipDeps {
 	return {
 		config: { ...CONFIG, ...o.config },
 		run: (argv) => ({ exitCode: 0, stdout: argv.join(" ") === "git rev-parse HEAD" ? `${o.head ?? status.headSha}\n` : "", stderr: "" }),
-		now: () => o.now ?? 1000,
+		now: () => clock,
 		github: () => github,
 		review: async (i) => (
 			calls.push(`review:${i.prNumber}:${i.headSha}`),
+			reviewInputs.push(i),
 			{ source: "cli", status: "completed", score: 5, comments: [], headSha: i.headSha, at: 1, ...o.review }
 		),
 		assess: async (i) => ({
@@ -96,6 +118,10 @@ function deps(o: FakeOpts = {}): ShipDeps {
 		diff: () => ({ stat: "", log: "" }),
 		engine: async () => async () => "{}",
 		greptile: () => undefined,
+		sleep: async (ms) => {
+			sleeps.push(ms);
+			clock += ms;
+		},
 	};
 }
 
@@ -113,6 +139,19 @@ describe("state", () => {
 	test("missing state file yields undefined", () => {
 		expect(writeShip(join(dir, "nope.json"), { phase: "ready" })).toBeUndefined();
 		expect(readShip(join(dir, "nope.json"))).toBeUndefined();
+	});
+	test("appendAttempts keeps the newest 50 attempts, each detail one line of at most 200 characters", () => {
+		writeShip(statePath, { pr: PR });
+		const attempt = (at: number): ShipAttempt => ({ at, step: "merge", headSha: "abc", outcome: "waiting", detail: `CI checks\npending ${at}` });
+		for (let at = 0; at < 45; at++) appendAttempts(statePath, [attempt(at)], 5);
+		const state = appendAttempts(statePath, [attempt(45), { ...attempt(46), detail: "x".repeat(300) }, attempt(47)], 6);
+		expect(state?.attempts).toHaveLength(48);
+		const full = appendAttempts(statePath, Array.from({ length: 12 }, (_, i) => attempt(48 + i)), 7);
+		expect(full?.attempts).toHaveLength(50);
+		expect(full?.attempts?.[0]?.at).toBe(10);
+		expect(full?.attempts?.at(-1)).toEqual({ at: 59, step: "merge", headSha: "abc", outcome: "waiting", detail: "CI checks pending 59" });
+		expect(full?.attempts?.find((a) => a.at === 46)?.detail).toHaveLength(200);
+		expect(readShip(statePath)).toMatchObject({ pr: PR, updatedAt: 7 });
 	});
 });
 
@@ -463,26 +502,124 @@ describe("runShip", () => {
 		expect(readShip(statePath)?.blockedReason).toContain("max rounds");
 	});
 
-	test("review failing twice on the same head blocks", async () => {
+	test("review failing more than reviewRetries times on the same head blocks", async () => {
 		writeShip(statePath, { pr: PR, rounds: [{ source: "cli", status: "failed", score: null, comments: [], headSha: "abc", at: 1 }] });
-		const out = await ship("review", deps({ config: { maxRounds: 9 }, review: { status: "timeout", score: null } }));
-		expect(String(out.output.next)).toStartWith("stop:");
+		const out = await ship("review", deps({ config: { maxRounds: 9, reviewRetries: 1 }, review: { status: "timeout", score: null } }));
+		expect(String(out.output.next)).toBe("stop: Greptile review timed out 2 times on abc (ship.reviewRetries 1)");
 		expect(readShip(statePath)?.phase).toBe("blocked");
 		expect(comments).toHaveLength(1);
 	});
 
-	test("merge on already-merged PR skips merge but cleans up", async () => {
-		writeShip(statePath, { pr: PR });
+	describe("failed Greptile review", () => {
+		const failed: Partial<ReviewResult> = { status: "failed", score: null, reviewId: "run-1", error: "Greptile review FAILED" };
+
+		test("is re-triggered with the failed review marked stale and never counts toward maxRounds", async () => {
+			writeShip(statePath, { pr: PR, phase: "pr-open" });
+			const first = await ship("review", deps({ review: failed }));
+			expect(first.output).toMatchObject({
+				ok: true,
+				ready: false,
+				passed: false,
+				blocked: false,
+				failedRounds: 0,
+				next: "Greptile review failed: Greptile review FAILED; run review again to re-trigger it (retry 1 of 3)",
+			});
+			expect(reviewInputs[0]?.staleReviewIds).toEqual([]);
+			const second = await ship("review", deps({ review: { ...failed, reviewId: "run-2" } }));
+			expect(second.output).toMatchObject({ blocked: false, failedRounds: 0, round: 2 });
+			expect(String(second.output.next)).toEndWith("run review again to re-trigger it (retry 2 of 3)");
+			expect(reviewInputs[1]?.staleReviewIds).toEqual(["run-1"]);
+			expect(readShip(statePath)?.phase).toBe("needs-fixes");
+			expect(comments).toEqual([]);
+			const passed = await ship("review", deps());
+			expect(reviewInputs[2]?.staleReviewIds).toEqual(["run-1", "run-2"]);
+			expect(passed.output).toMatchObject({ ready: true, passed: true, failedRounds: 0, round: 3 });
+			expect(readShip(statePath)?.attempts?.map((a) => a.outcome)).toEqual(["failed", "failed", "passed"]);
+		});
+
+		test("blocks with one comment once the failures on one head exceed reviewRetries", async () => {
+			writeShip(statePath, { pr: PR, phase: "pr-open" });
+			const retryOnce = deps({ config: { reviewRetries: 1 }, review: failed });
+			expect((await ship("review", retryOnce)).output).toMatchObject({ blocked: false });
+			expect(comments).toEqual([]);
+			const second = await ship("review", retryOnce);
+			const reason = "Greptile review failed 2 times on abc (ship.reviewRetries 1): Greptile review FAILED";
+			expect(second.output).toMatchObject({ blocked: true, failedRounds: 0, next: `stop: ${reason}` });
+			expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: reason });
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toContain("Attempts:");
+			expect(comments[0]).toContain("review abc failed — Greptile review FAILED");
+		});
+	});
+
+	test("merge on an already-merged PR whose head passed review skips merge but cleans up", async () => {
+		writeShip(statePath, { pr: PR, rounds: [PASSED] });
 		const out = await ship("merge", deps({ status: { state: "MERGED" } }));
 		expect(out.output).toMatchObject({ ok: true, alreadyMerged: true });
 		expect(calls).toEqual(["delete:feat", "sync:master"]);
+		expect(readShip(statePath)?.phase).toBe("merged");
 	});
 
-	test("merge on closed PR blocks without deleting", async () => {
-		writeShip(statePath, { pr: PR });
-		expect((await ship("merge", deps({ status: { state: "CLOSED" } }))).output.ok).toBe(false);
-		expect(readShip(statePath)?.phase).toBe("blocked");
+	test("merge on a PR merged outside the flow without a passing review of its head blocks without cleanup", async () => {
+		const reason = "PR was merged outside the ship flow before its review passed";
+		for (const rounds of [[], [{ ...PASSED, score: 4 }], [{ ...PASSED, headSha: "old" }]]) {
+			writeShip(statePath, { pr: PR, rounds, phase: "pr-open", blockedReason: undefined });
+			const out = await ship("merge", deps({ status: { state: "MERGED" } }));
+			expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason });
+			expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: reason });
+		}
 		expect(calls).toEqual([]);
+		expect(comments).toEqual([]);
+	});
+
+	test("merge without a passing stored review goes back to the agent and never waits, even when the PR is unreadable", async () => {
+		const cases: [ReviewResult[], string][] = [
+			[[], "no review has run; run review again"],
+			[[{ ...PASSED, score: 3 }], "review score 3/5 is below 5/5; run review again"],
+		];
+		for (const [rounds, next] of cases) {
+			for (const statuses of [[null], []]) {
+				writeShip(statePath, { pr: PR, rounds, phase: "needs-fixes" });
+				const out = await ship("merge", deps({ statuses }));
+				expect(out.output).toMatchObject({ ok: false, merged: false, next });
+				expect(out.output.waiting).toBeUndefined();
+				expect(readShip(statePath)?.phase).toBe("needs-fixes");
+				expect(readShip(statePath)?.waiting).toBeUndefined();
+			}
+		}
+		expect(sleeps).toEqual([]);
+		expect(calls).toEqual([]);
+		expect(comments).toEqual([]);
+	});
+
+	test("merge on closed PR blocks without deleting, with or without a review", async () => {
+		for (const rounds of [[], [PASSED]]) {
+			writeShip(statePath, { pr: PR, rounds, phase: "pr-open", blockedReason: undefined });
+			const out = await ship("merge", deps({ status: { state: "CLOSED" } }));
+			expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason: "PR closed without merge" });
+			expect(readShip(statePath)?.phase).toBe("blocked");
+		}
+		expect(calls).toEqual([]);
+		expect(comments).toEqual([]);
+	});
+
+	describe("review restart for a failed round without a review id", () => {
+		const idless: ReviewResult = { source: "cli", status: "failed", score: null, comments: [], headSha: "abc", error: "no score", at: 1 };
+
+		test("the next review restarts; once its fresh review is pending it is resumed, not restarted", async () => {
+			writeShip(statePath, { pr: PR, rounds: [idless], phase: "needs-fixes" });
+			await ship("review", deps({ review: { status: "pending", score: null } }));
+			expect(reviewInputs[0]?.restart).toBe(true);
+			await ship("review", deps());
+			expect(reviewInputs[1]?.restart).toBeUndefined();
+		});
+
+		test("rounds with ids only mark those ids stale, without restart", async () => {
+			writeShip(statePath, { pr: PR, rounds: [{ ...idless, reviewId: "run-1" }] });
+			await ship("review", deps());
+			expect(reviewInputs[0]).toMatchObject({ staleReviewIds: ["run-1"] });
+			expect(reviewInputs[0]?.restart).toBeUndefined();
+		});
 	});
 
 	test("merge substitutes an allowed method", async () => {
@@ -490,5 +627,175 @@ describe("runShip", () => {
 		const out = await ship("merge", deps({ methods: ["rebase"], config: { deleteBranch: false } }));
 		expect(out.output.method).toBe("rebase");
 		expect(calls).toEqual(["merge:rebase:abc"]);
+	});
+
+	describe("merge retry loop", () => {
+		const outcomes = () => readShip(statePath)?.attempts?.map((a) => a.outcome);
+		beforeEach(() => {
+			writeShip(statePath, { pr: PR, phase: "pr-open", rounds: [PASSED] });
+		});
+
+		test("CI pending on the first polls, then passing: merges within one call", async () => {
+			const out = await ship("merge", deps({ statuses: [{ checks: "pending" }, { checks: "pending" }] }));
+			expect(out.output).toMatchObject({ ok: true, merged: true, next: "run ultrathink-sync" });
+			expect(sleeps).toEqual([10, 15]);
+			expect(calls).toEqual(["merge:squash:abc", "delete:feat", "sync:master"]);
+			expect(outcomes()).toEqual(["merged"]);
+			expect(readShip(statePath)?.waiting).toBeUndefined();
+		});
+
+		test("a call that runs out of time waits without blocking; past mergeTimeoutMs on the head it blocks with one comment", async () => {
+			const pending = deps({ status: { checks: "pending" } });
+			const first = await ship("merge", pending);
+			expect(first.output).toMatchObject({ ok: false, merged: false, waiting: true, reason: "CI checks pending", polls: 6, waitedMs: 100 });
+			expect(String(first.output.next)).toStartWith("run merge again: CI checks pending (waited ");
+			expect(first.output.blocked).toBeUndefined();
+			expect(readShip(statePath)).toMatchObject({ phase: "pr-open", waiting: { headSha: "abc", since: 1000 } });
+			expect(readShip(statePath)?.blockedReason).toBeUndefined();
+			expect(outcomes()).toEqual(["waiting"]);
+			expect(comments).toEqual([]);
+
+			clock += CONFIG.mergeTimeoutMs;
+			const late = await ship("merge", pending);
+			expect(late.output).toMatchObject({ ok: false, merged: false, blocked: true, commented: true });
+			expect(String(late.output.reason)).toStartWith("merge still not possible after ");
+			expect(String(late.output.reason)).toEndWith(" min on abc: CI checks pending");
+			expect(readShip(statePath)?.phase).toBe("blocked");
+			expect(outcomes()).toEqual(["waiting", "blocked"]);
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toContain("merge still not possible");
+			expect(comments[0]).toContain("Attempts:");
+			expect(comments[0]).toContain("merge abc waiting — CI checks pending (6 poll(s))");
+			await ship("merge", pending);
+			expect(comments).toHaveLength(1);
+			expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+		});
+
+		test("a transient GitHub merge error is retried and merges in the same call", async () => {
+			const out = await ship("merge", deps({ merges: [{ ok: false, error: "GraphQL: something went wrong" }] }));
+			expect(out.output).toMatchObject({ ok: true, merged: true });
+			expect(calls.filter((c) => c.startsWith("merge:"))).toEqual(["merge:squash:abc", "merge:squash:abc"]);
+			expect(sleeps).toEqual([10]);
+			expect(readShip(statePath)?.attempts).toMatchObject([
+				{ step: "merge", outcome: "retry", detail: "merge failed: GraphQL: something went wrong" },
+				{ step: "merge", outcome: "merged", score: 5 },
+			]);
+		});
+
+		test("an access denial blocks with one comment", async () => {
+			const error = "GraphQL: Resource not accessible by integration (mergePullRequest)";
+			const out = await ship("merge", deps({ merges: [{ ok: false, error }] }));
+			expect(out.output).toMatchObject({ blocked: true, reason: `merge refused by GitHub: ${error}`, commented: true });
+			expect(comments).toHaveLength(1);
+			expect(sleeps).toEqual([]);
+		});
+
+		test("a GitHub refusal only a human can clear blocks with one comment", async () => {
+			const error = "At least 1 approving review is required by reviewers with write access.";
+			const out = await ship("merge", deps({ merges: [{ ok: false, error }] }));
+			const reason = `merge refused by GitHub: ${error}`;
+			expect(out.output).toMatchObject({ ok: false, merged: false, blocked: true, reason, next: `stop: ${reason}` });
+			expect(readShip(statePath)).toMatchObject({ phase: "blocked", blockedReason: reason });
+			expect(comments).toHaveLength(1);
+			expect(comments[0]).toContain(`**ultrathink-ship stopped:** ${reason}`);
+			expect(sleeps).toEqual([]);
+		});
+
+		test("a GitHub merge conflict goes back to the agent without blocking", async () => {
+			const error = "Pull Request has merge conflicts";
+			const out = await ship("merge", deps({ merges: [{ ok: false, error }] }));
+			expect(out.output).toMatchObject({ ok: false, merged: false, reason: error, next: `${error}; run review again` });
+			expect(out.output.blocked).toBeUndefined();
+			expect(readShip(statePath)?.phase).toBe("pr-open");
+			expect(outcomes()).toEqual(["needs-agent"]);
+			expect(comments).toEqual([]);
+		});
+
+		test("merge conflicts and failing CI go back to the agent without merging", async () => {
+			const cases: [Partial<PrStatus>, string][] = [
+				[{ mergeable: "CONFLICTING" }, "merge conflicts: resolve them against the base, push, then run review again"],
+				[{ checks: "failing" }, "CI checks failing: fix CI, commit, push, then run review again"],
+			];
+			for (const [status, next] of cases) {
+				const out = await ship("merge", deps({ status }));
+				expect(out.output).toMatchObject({ ok: false, merged: false, next });
+				expect(readShip(statePath)?.phase).toBe("pr-open");
+			}
+			expect(calls).toEqual([]);
+			expect(comments).toEqual([]);
+			expect(sleeps).toEqual([]);
+		});
+
+		test("a base branch policy refusal is retried until mergeTimeoutMs, then blocks with one comment", async () => {
+			const error = "X Pull request #7 is not mergeable: the base branch policy prohibits the merge.";
+			const refused = deps({ merges: Array.from({ length: 20 }, () => ({ ok: false, error })) });
+			const first = await ship("merge", refused);
+			expect(first.output).toMatchObject({ ok: false, merged: false, waiting: true, reason: `merge failed: ${error}` });
+			expect(readShip(statePath)?.phase).toBe("pr-open");
+			expect(comments).toEqual([]);
+			clock += CONFIG.mergeTimeoutMs;
+			const late = await ship("merge", refused);
+			expect(late.output).toMatchObject({ blocked: true, commented: true });
+			expect(String(late.output.reason)).toStartWith("merge still not possible after ");
+			expect(String(late.output.reason)).toEndWith("the base branch policy prohibits the merge.");
+			expect(comments).toHaveLength(1);
+		});
+
+		test("network and rate-limit errors are retried, not blocked", async () => {
+			for (const error of [
+				'Post "https://api.github.com/graphql": http2: server sent GOAWAY and closed the connection',
+				"use of closed network connection",
+				"HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+			]) {
+				calls = [];
+				writeShip(statePath, { phase: "pr-open", blockedReason: undefined });
+				const out = await ship("merge", deps({ merges: [{ ok: false, error }] }));
+				expect(out.output).toMatchObject({ ok: true, merged: true });
+				expect(calls.filter((c) => c.startsWith("merge:"))).toHaveLength(2);
+			}
+			expect(comments).toEqual([]);
+		});
+
+		test("an unreadable PR status never counts against a stale waiting head", async () => {
+			writeShip(statePath, { waiting: { headSha: "old", since: 0 } });
+			clock = 10 * CONFIG.mergeTimeoutMs;
+			const out = await ship("merge", deps({ statuses: [null] }));
+			expect(out.output).toMatchObject({ ok: true, merged: true });
+			expect(comments).toEqual([]);
+		});
+
+		test("after a timeout block, a new review and merge start a fresh bound instead of blocking again", async () => {
+			const pending = deps({ status: { checks: "pending" } });
+			await ship("merge", pending);
+			clock += CONFIG.mergeTimeoutMs;
+			expect((await ship("merge", pending)).output).toMatchObject({ blocked: true });
+			expect(readShip(statePath)?.waiting).toBeUndefined();
+			expect((await ship("review", pending)).output).toMatchObject({ passed: true, blocked: false });
+			expect(readShip(statePath)?.phase).toBe("pr-open");
+			const again = await ship("merge", pending);
+			expect(again.output).toMatchObject({ ok: false, waiting: true });
+			expect(again.output.blocked).toBeUndefined();
+			expect(comments).toHaveLength(1);
+		});
+
+		test("merge without any review round goes back to the agent", async () => {
+			writeShip(statePath, { rounds: [] });
+			const out = await ship("merge", deps());
+			expect(out.output).toMatchObject({ ok: false, merged: false, reason: "no review has run", next: "no review has run; run review again" });
+			expect(calls).toEqual([]);
+		});
+
+		test("run merges once CI passes when the review passed while CI was pending", async () => {
+			writeShip(statePath, { pr: undefined, rounds: [], phase: "not-done" });
+			const out = await ship("run", deps({ statuses: [{ checks: "pending" }, { checks: "pending" }] }));
+			expect(out.output).toMatchObject({
+				ok: true,
+				review: { passed: true, ready: false },
+				merge: { ok: true, merged: true },
+				next: "run ultrathink-sync",
+			});
+			expect(sleeps).toEqual([10]);
+			expect(calls).toEqual(["push:feat", "create:master<-feat", "review:7:abc", "merge:squash:abc", "delete:feat", "sync:master"]);
+		});
 	});
 });

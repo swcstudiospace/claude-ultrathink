@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { Clarification } from "../hitl/types.ts";
+import type { KnowledgeReader, KnowledgeResult } from "../greptile/knowledge.ts";
+import type { RunClarifyOptions } from "../hitl/pipeline.ts";
 import type { ProgressEvent } from "../host/progress.ts";
 import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import { runPromptSubmit, type HookDeps, type PromptSubmitInput } from "./hook.ts";
@@ -597,6 +599,182 @@ describe("skill invocations", () => {
 		try {
 			const gsd = await runPromptSubmit(skillInput, deps);
 			expect(gsd.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("Greptile knowledge base before clarify", () => {
+	/** A reader whose read() resolves `result`; records start() inputs and close() calls. */
+	function fakeReader(result: KnowledgeResult): { reader: KnowledgeReader; starts: Array<{ repo?: string }>; closed: () => number } {
+		const starts: Array<{ repo?: string }> = [];
+		let closes = 0;
+		const reader: KnowledgeReader = {
+			start(input) {
+				starts.push({ repo: input.repo });
+				return {
+					read: async () => result,
+					close: () => {
+						closes++;
+					},
+				};
+			},
+		};
+		return { reader, starts, closed: () => closes };
+	}
+
+	const open: Clarification = {
+		id: "q1",
+		question: "Which queue backend?",
+		header: "Queue",
+		why: "w",
+		options: [{ label: "Redis" }, { label: "SQS" }],
+		default: "Redis",
+		blocking: true,
+	};
+	const settled: Clarification = {
+		id: "k1",
+		question: "Where do widgets persist?",
+		header: "Storage",
+		why: "w",
+		options: [],
+		default: "",
+		blocking: false,
+		answer: "In the widgets table",
+		source: "knowledge",
+		evidence: "docs/storage.md",
+	};
+
+	test("a used lookup reaches clarify, is recorded with its settled count, and adds the context section", async () => {
+		const { reader, starts, closed } = fakeReader({
+			lookup: { outcome: "used", repo: "acme/widgets", namespaceId: "ns1", docs: ["index.md", "docs/storage.md"], chars: 42, ms: 5 },
+			digest: "## index.md\nwidgets persist in the widgets table",
+		});
+		let seen: RunClarifyOptions | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			knowledge: reader,
+			clarify: async (opts) => {
+				seen = opts;
+				return [open, settled];
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(starts).toEqual([{ repo: "acme/widgets" }]);
+			expect(seen?.knowledge).toEqual({ digest: "## index.md\nwidgets persist in the widgets table", docs: ["index.md", "docs/storage.md"] });
+			expect(result.record?.knowledge).toMatchObject({ outcome: "used", docs: ["index.md", "docs/storage.md"], settled: 1 });
+			expect(readSession(deps.stateDir, "s1")?.knowledge).toMatchObject({ outcome: "used", settled: 1 });
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Greptile knowledge base");
+			expect(ctx).toContain("for acme/widgets: index.md, docs/storage.md.");
+			expect(result.output?.systemMessage).toContain("Knowledge · 2 docs · 1 settled");
+			expect(closed()).toBe(1);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("an error lookup fails open: clarify runs without knowledge, the record says error, no context section", async () => {
+		const { reader } = fakeReader({
+			lookup: { outcome: "error", repo: "acme/widgets", docs: [], chars: 0, ms: 20_000, reason: "timed out after 20000ms" },
+			digest: "",
+		});
+		let seen: RunClarifyOptions | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			knowledge: reader,
+			clarify: async (opts) => {
+				seen = opts;
+				return [open];
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(seen).toBeDefined();
+			expect(seen?.knowledge).toBeUndefined();
+			expect(result.record?.knowledge).toMatchObject({ outcome: "error", settled: 0 });
+			expect(result.record?.clarifications).toEqual([open]);
+			expect(result.output?.hookSpecificOutput.additionalContext ?? "").not.toContain("## Greptile knowledge base");
+			expect(result.output?.systemMessage).toContain("Knowledge · error");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a lookup is still recorded when clarify throws", async () => {
+		const { reader } = fakeReader({
+			lookup: { outcome: "none", repo: "acme/widgets", docs: [], chars: 0, ms: 3, reason: "repository not listed" },
+			digest: "",
+		});
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			knowledge: reader,
+			clarify: async () => {
+				throw new Error("clarify down");
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.knowledge).toMatchObject({ outcome: "none", settled: 0 });
+			expect(result.record?.clarifications).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("HITL off: the knowledge base is never read", async () => {
+		const { reader, starts } = fakeReader({ lookup: { outcome: "used", docs: ["index.md"], chars: 1, ms: 1 }, digest: "x" });
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), knowledge: reader, control: { hitlEnabled: false } });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(starts).toEqual([]);
+			expect(result.record?.knowledge).toBeUndefined();
+			expect(result.output?.systemMessage).not.toContain("Knowledge");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the lookup topic is the request text, goal and node conclusions, without the spec's XML markup", async () => {
+		const topics: string[] = [];
+		const reader: KnowledgeReader = {
+			start: () => ({
+				read: async (topic) => {
+					topics.push(topic);
+					return { lookup: { outcome: "none", docs: [], chars: 0, ms: 1 }, digest: "" };
+				},
+				close: () => {},
+			}),
+		};
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), knowledge: reader, clarify: async () => [] });
+		try {
+			await runPromptSubmit(input, deps);
+			expect(topics).toHaveLength(1);
+			const topic = topics[0] ?? "";
+			expect(topic).toContain("add a widget");
+			expect(topic).toContain("Ship it");
+			expect(topic).toContain("T1: c n1");
+			expect(topic).not.toContain("<");
+			for (const tag of ["BUILD_PROMPT", "GRAPH_OF_THOUGHT", "ORIGINAL", "NODE"]) expect(topic).not.toContain(tag);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("knowledge-settled answers are not carried to the next prompt; user answers are", async () => {
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [] });
+		try {
+			const userAnswer: Clarification = { ...open, answer: "Redis", answeredAt: 1, source: "user" };
+			writeSession(deps.stateDir, {
+				sessionId: "s1",
+				at: 0,
+				result: { xml: "<X/>", original: "x", root: "X", source: "llm" },
+				clarifications: [userAnswer, settled],
+			});
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.clarifications).toEqual([userAnswer]);
 		} finally {
 			cleanup();
 		}

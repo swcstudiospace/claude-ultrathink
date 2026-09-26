@@ -31,10 +31,11 @@ describe("shipNudge", () => {
 	test("promises a merge only when ship.autoMerge is on", () => {
 		const manual = shipNudge(base);
 		expect(manual?.reason).toContain("leaves the PR for a manual merge (ship.autoMerge is off)");
-		expect(manual?.reason).not.toContain("and merges");
+		expect(manual?.reason).not.toContain("keeps retrying the merge");
 		expect(manual?.systemMessage).toContain("manual merge");
 		const auto = shipNudge({ ...base, config: { ...base.config, autoMerge: true } });
-		expect(auto?.reason).toEndWith("runs the Greptile review until 5/5 and merges.");
+		expect(auto?.reason).toContain("keeps retrying the merge until the 5/5-reviewed PR merges");
+		expect(auto?.reason).not.toContain("manual merge");
 		expect(auto?.systemMessage).toEndWith("Greptile review, merge).");
 	});
 

@@ -5,7 +5,7 @@ Ship is opt-in. With `ship.enabled` on, when a planned skill run finishes (a GSD
 1. It checks that the task is really done.
 2. It opens a PR into the repository's default branch.
 3. It runs Greptile review rounds until the score is 5/5 with zero open comments.
-4. With `ship.autoMerge` on, it merges the PR (squash by default). With `ship.deleteBranch` on, it then deletes the branch. Both are off by default, so the PR is left for you to merge.
+4. With `ship.autoMerge` on, it merges the PR (squash by default), retrying until the 5/5-reviewed PR merges. With `ship.deleteBranch` on, it then deletes the branch. Both are off by default, so the PR is left for you to merge.
 5. It runs `ultrathink-sync`, so the tracked Linear and Notion rows get the PR link and status.
 
 The skill drives `bin/ultrathink-ship`. Each gate is enforced by that CLI, not left to the agent. For a step-by-step setup, see [Ship with Greptile](how-to/ship-with-greptile.md).
@@ -20,6 +20,7 @@ The skill drives `bin/ultrathink-ship`. Each gate is enforced by that CLI, not l
 - [Pending reviews and resume](#pending-reviews-and-resume)
 - [Fix loop and blocking](#fix-loop-and-blocking)
 - [Merge gate](#merge-gate)
+- [Merge retries](#merge-retries)
 - [Merge and branch cleanup](#merge-and-branch-cleanup)
 - [Manual merge](#manual-merge)
 - [bin/ultrathink-ship](#binultrathink-ship)
@@ -51,7 +52,7 @@ When they hold, the agent is told in these ways:
 
 | Where | Hosts | What happens |
 |---|---|---|
-| The plan | every host, Hermes included | The injected plan ends with a `## Ship` section: when the run is finished, invoke `ultrathink-ship` with `stateFile=<session record>`. It gives the absolute CLI path and the skill file to read if the host does not list the skill, and says the PR is merged only when `ship.autoMerge` is on and left for a manual merge otherwise. |
+| The plan | every host, Hermes included | The injected plan ends with a `## Ship` section: when the run is finished, invoke `ultrathink-ship` with `stateFile=<session record>`. It gives the absolute CLI path and the skill file to read if the host does not list the skill, and says the PR is merged only when `ship.autoMerge` is on, with the merge retried until the 5/5-reviewed PR merges, and left for a manual merge otherwise. |
 | Stop hook | Claude Code, Grok Build (through the global hook file), Muse Code | When the agent tries to stop, the hook blocks the stop once and asks it to invoke `ultrathink-ship`. |
 | `agent_end` | Omp | The extension sends one `ultrathink-ship` aside card. |
 
@@ -141,11 +142,13 @@ Every Greptile API call carries `ship.greptileOrganization` as the organization 
 | | PR mode | CLI mode |
 |---|---|---|
 | Used when | A Greptile credential is stored, and the Greptile API lists the repository with reviews not disabled for it | No Greptile credential is stored; or the account does not list the repository, lists it with reviews disabled, or the repository lookup fails for any reason other than the organization choice (see [Blocked before review](#blocked-before-review)) |
-| Finds a review | Reuses Greptile's review of the PR head commit. Greptile reviews pushes to indexed repositories on its own. It triggers a review only when none exists for that commit or the last one failed. | `greptile review status --commit <head> --json` finds a finished or running review for the head commit. Only when none exists does it start `greptile review --json -b <base>`. |
+| Finds a review | Reuses Greptile's review of the PR head commit. Greptile reviews pushes to indexed repositories on its own. It triggers a review only when none exists for that commit or the last one failed or timed out; a review already recorded as a failed or timed-out round is ignored, so a fresh one starts. | `greptile review status --commit <head> --json` finds a finished or running review for the head commit. Only when none exists, or the run it finds was already recorded as a failed or timed-out round, does it start `greptile review --json -b <base>`. |
 | Score | `Confidence Score: N/5` in the review body | `confidence` in the CLI's JSON |
 | Open comments | The PR's Greptile review threads that are neither resolved nor outdated on GitHub (`gh api graphql`). Greptile reviews incrementally and does not repeat an unfixed finding, and it does not mark fixed ones addressed, so the thread state decides. A thread goes outdated when a commit changes its line. If the thread lookup fails, every unaddressed Greptile comment on the PR stays open. | The run's `comments` (fetched with `greptile review show <runId> --json` when needed) |
 
-A review that finishes gives a completed round with its score and comments. A failed review, or one with no score, gives a failed round. When a credential is stored but CLI mode is used anyway and the Greptile CLI is not installed, the round fails.
+A review that finishes gives a completed round with its score and comments. A failed review (Greptile `FAILED`/`ERROR`/`SKIPPED`, no score, or a CLI failure) gives a failed round. When a credential is stored but CLI mode is used anyway and the Greptile CLI is not installed, the round fails.
+
+A failed round, or one pending past `ship.reviewTimeoutMs`, is not a verdict on the code. The next `review` call re-triggers the review of the same head commit, up to `ship.reviewRetries` times (default 3) per head commit; its `next` says `run review again to re-trigger it (retry <k> of <n>)`. When the review of that head still fails or times out after that many re-triggers, the ship blocks with a PR comment. These rounds never count toward `ship.maxRounds`.
 
 ## Blocked before review
 
@@ -166,9 +169,9 @@ If the review is still running when the wait ends, `review` returns `status: "pe
 
 A review of one head commit that stays pending longer than `ship.reviewTimeoutMs` (20 minutes) is recorded as a timed-out round.
 
-In PR mode, a Greptile tool or network error while polling (for example a transient `Repository not found`) is also reported as `pending`, with the message in `error`, rather than as a failed review: the next `review` call retries and resumes the same run. If the error persists past `ship.reviewTimeoutMs`, the round is recorded as timed out and its error keeps the last tool error. Every recorded round whose review did not pass counts toward `ship.maxRounds`: a Greptile `FAILED`/`ERROR` status, a timeout, a completed review with no parseable score, a score below `ship.minScore`, or open comments when `ship.requireNoComments` is enabled.
+In PR mode, a Greptile tool or network error while polling (for example a transient `Repository not found`) is also reported as `pending`, with the message in `error`, rather than as a failed review: the next `review` call retries and resumes the same run. If the error persists past `ship.reviewTimeoutMs`, the round is recorded as timed out and its error keeps the last tool error, and the next `review` call re-triggers the review (see [Review: PR mode and CLI mode](#review-pr-mode-and-cli-mode)). Only completed reviews that do not pass count toward `ship.maxRounds`: a score below `ship.minScore`, or open comments when `ship.requireNoComments` is enabled. Failed and timed-out reviews count toward `ship.reviewRetries` instead.
 
-Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review, and `merge` itself, re-read the review threads, so a thread resolved since then no longer counts as open and a finding posted since then does. If the threads cannot be read, `review` reports not ready and `merge` refuses; neither falls back to the stored comments. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
+Every step can be repeated safely. `pr` reuses the open PR, `review` reuses a completed review of the same head commit, and `merge` notices a PR that is already merged. In PR mode a reused review, and `merge` itself, re-read the review threads, so a thread resolved since then no longer counts as open and a finding posted since then does. If the threads cannot be read, `review` reports not ready and `merge` retries (see [Merge retries](#merge-retries)); neither falls back to the stored comments. After an interruption, `bin/ultrathink-ship status` prints the stored state, and the skill continues from its `phase`.
 
 ## Fix loop and blocking
 
@@ -177,9 +180,9 @@ After each round the phase is one of:
 | Phase | Meaning | Next |
 |---|---|---|
 | `ready` | The merge gate passes | run `merge` (with `ship.autoMerge`), else [merge by hand](#manual-merge) |
-| `needs-fixes` | The gate fails and rounds remain | The agent fixes the findings (security issues first, then P0, P1, P2), commits only the files it edited, pushes and runs `review` again. It never suppresses lint rules, weakens tests or skips checks to satisfy the reviewer. |
-| `pr-open` | The review passed (5/5, no open comments) but the PR is still waiting: CI pending or failing, mergeability not computed, or merge conflicts | Not a failed round: it never counts toward `maxRounds` or blocks the ship. Wait and run `merge` again; fix failing CI or conflicts, push, and run `review` again. |
-| `blocked` | Greptile is not usable as configured ([Blocked before review](#blocked-before-review)), `ship.maxRounds` failed reviews reached (rounds whose review passed and only waited do not count), two failed or timed-out reviews on the same head commit, the PR was closed without merging, or it was merged outside the ship flow before its review passed | For an open PR blocked by failed reviews, the CLI posts a comment with the reason, the score and up to 20 remaining findings, and leaves the PR for a human. `run` reports `ok: false`. A PR merged outside the flow after a passing review is `ready`: `merge` skips the merge and finishes the branch cleanup. |
+| `needs-fixes` | The gate fails and rounds remain, or a failed or timed-out review will be re-triggered | The agent fixes the findings (security issues first, then P0, P1, P2), commits only the files it edited, pushes and runs `review` again. It never suppresses lint rules, weakens tests or skips checks to satisfy the reviewer. After a failed or timed-out review there is nothing to fix: the agent runs `review` again to re-trigger it. |
+| `pr-open` | The review passed (5/5, no open comments) but the PR is still waiting: CI pending or failing, mergeability not computed, or merge conflicts | Not a failed round: it never counts toward `maxRounds` or blocks the ship. Run `merge`: it keeps retrying through pending CI and mergeability not computed (see [Merge retries](#merge-retries)). For failing CI or conflicts, fix them, push, and run `review` again. |
+| `blocked` | Greptile is not usable as configured ([Blocked before review](#blocked-before-review)), `ship.maxRounds` completed reviews below 5/5 or with open threads (rounds whose review passed and only waited do not count), the review of one head commit still failing or timing out after `ship.reviewRetries` re-triggers, `merge` still not possible after `ship.mergeTimeoutMs` on one head commit, a terminal GitHub merge refusal, the PR was closed without merging, or it was merged outside the ship flow before its review passed | For an open PR, the CLI posts one comment with the reason, the score, up to 20 remaining findings and the last 10 attempts, and leaves the PR for a human. `run` reports `ok: false`. A PR merged outside the flow after a passing review of its exact head is `ready`: `merge` skips the merge and finishes the branch cleanup. |
 
 The skill also stops and reports when two rounds in a row return the same findings.
 
@@ -194,19 +197,37 @@ The agent never resolves a finding just to pass the gate.
 
 ## Merge gate
 
-`merge` refuses with `autoMerge disabled` before doing anything else unless `ship.autoMerge` is `true`: it does not merge, delete branches or change the phase (see [Manual merge](#manual-merge)). With `ship.autoMerge` on, it checks the gate again and refuses unless every condition holds:
+`merge` refuses with `autoMerge disabled` before doing anything else unless `ship.autoMerge` is `true`: it does not merge, delete branches or change the phase (see [Manual merge](#manual-merge)). With `ship.autoMerge` on, it checks the gate again and merges only when every condition holds. The gate never weakens: retries only wait for it to pass.
 
-| Check | Fails with |
-|---|---|
-| A review round exists and it completed | `no review has run`, `review failed`, `review timeout` |
-| The reviewed commit is the current PR head | `review is for an older commit` or `PR head changed since last review` |
-| The review has a score of at least `ship.minScore` (5) | `review has no score`, `review score N/5 is below 5/5` |
-| No open comments, when `ship.requireNoComments` is `true`. In PR mode these are the unresolved, non-outdated Greptile review threads; in CLI mode, the run's comments. | `N open review comment(s)` |
-| The PR is open | `PR closed without merge` (the phase becomes `blocked`) |
-| GitHub reports the PR mergeable | `merge conflicts`, or `GitHub has not computed mergeability yet` |
-| CI checks are neither failing nor pending | `CI checks failing`, `CI checks pending` |
+| Check | Fails with | Then |
+|---|---|---|
+| A review round exists and it completed | `no review has run`, `review failed`, `review timeout` | back to the agent: run `review` again |
+| The reviewed commit is the current PR head | `PR head changed since last review` | back to the agent: run `review` again |
+| The review has a score of at least `ship.minScore` (default 5, Greptile's maximum) | `review has no score`, `review score N/5 is below M/5` | back to the agent: run `review` again |
+| No open comments, when `ship.requireNoComments` is `true`. In PR mode these are the unresolved, non-outdated Greptile review threads; in CLI mode, the run's comments. | `N open review comment(s)` | back to the agent: run `review` again |
+| The PR is open | `PR closed without merge` | the phase becomes `blocked` |
+| GitHub reports the PR mergeable | `merge conflicts`, or `GitHub has not computed mergeability yet` | conflicts go back to the agent; uncomputed mergeability is retried |
+| CI checks are neither failing nor pending | `CI checks failing`, `CI checks pending` | failing CI goes back to the agent; pending CI is retried |
 
 The skill never merges any other way, with no `gh pr merge` by hand and no web UI.
+
+## Merge retries
+
+Once the latest review of the exact PR head has passed, `merge` keeps retrying within one call until the PR merges, the outcome needs the agent or blocks, or the call's `ship.waitMs` runs out. It polls starting at `ship.pollMs`, growing to at most 60 seconds.
+
+| Outcome | Causes | What happens |
+|---|---|---|
+| Retried | CI checks pending, mergeability not computed yet, unreadable PR state or review threads, GitHub's `the base branch policy prohibits the merge` (for example a required approval not given yet), a transient GitHub merge error (network or rate limit) | `merge` waits and tries again. When the call's time runs out it returns `ok: false`, `waiting: true` and `next: "run merge again: <reason> (waited <m> of <limit> min on this commit; it keeps retrying until the PR merges)"`. The agent runs `merge` again. |
+| Back to the agent | no review has run, merge conflicts, failing CI, a PR head moved since the review, a latest review that does not pass (below 5/5, open threads, failed or timed out), a GitHub error saying the branch is out of date or not mergeable (other than the base branch policy) | `merge` returns `ok: false` with `next`: fix, commit, push, then run `review` again. It never merges and never blocks. |
+| Blocked | `merge still not possible after <minutes> min on <sha7>: <reason>` past `ship.mergeTimeoutMs`; `merge refused by GitHub: <error>` for a terminal refusal (required approving review, missing permission, closed PR) | The phase becomes `blocked` and the CLI posts one PR comment with the reason and the attempt history. |
+
+When branch protection holds the merge (`the base branch policy prohibits the merge`, for example until a required approval is given), `merge` retries it until `ship.mergeTimeoutMs`, so a human can approve in the meantime and the next retry merges; past that bound the ship blocks with the PR comment.
+
+The bound is per head commit: `ship.mergeTimeoutMs` (60 minutes by default) counts from the first time `merge` waited on that commit, across calls, and is stored as `ship.waiting`. A new head commit needs a new passing review and starts a new bound.
+
+`run` merges within its own `ship.waitMs` budget when the review passed, and returns the same `waiting` result when that budget runs out.
+
+Every review result and merge outcome is recorded in `ship.attempts` (newest 50) with its time, step, head commit, outcome, score and detail. `bin/ultrathink-ship status` shows them.
 
 ## Merge and branch cleanup
 
@@ -216,6 +237,8 @@ With `ship.autoMerge` on, when the gate passes, `merge`:
 2. reads the PR back and counts the merge as done only when GitHub reports it `MERGED`.
 3. with `ship.autoMerge` on and `ship.deleteBranch: true`, deletes the remote branch (`git push origin --delete <branch>`) after the merge is confirmed. It then checks out the base branch, fast-forwards it from `origin`, and deletes the local branch with `git branch -D`. With the default `false`, both branches stay and your checkout is not touched.
 
+A PR already merged on GitHub counts as a ship merge only when the ship already recorded it, or when the latest review passed on the exact commit GitHub merged; then `merge` finishes the cleanup. Otherwise the phase becomes `blocked` with `PR was merged outside the ship flow before its review passed`, and nothing is cleaned up.
+
 The phase becomes `merged`. The skill then runs `ultrathink-sync` with the PR URL, and reports the PR URL, the number of review rounds, the final score, and whether it merged or exactly why not.
 
 ## Manual merge
@@ -224,7 +247,7 @@ With `ship.autoMerge: false`, the default:
 
 - the nudge and the `## Ship` section say the PR is left for a manual merge;
 - the done assessment does not require the engine judge (see [Done assessment](#done-assessment));
-- `run` stops after a passing review with `next: "autoMerge disabled: merge manually"`, and `merge` refuses with `autoMerge disabled`;
+- `run` stops after a passing review with `next: "autoMerge disabled: merge manually"`, and `merge` refuses with `autoMerge disabled`, so nothing retries a merge;
 - the skill tells you the PR is ready to merge, runs `ultrathink-sync` with the current PR status, and reports.
 
 Merge the PR on GitHub yourself. ultrathink does not watch it afterwards, and it deletes no branch. Only `merge` records the `merged` phase, so the stored ship state stays at its last phase: `bin/ultrathink-ship status` prints it, and `review` still re-reads the PR from GitHub. To record the merge in Linear and Notion, invoke `ultrathink-sync` again with the PR URL.
@@ -242,11 +265,11 @@ Merge the PR on GitHub yourself. ultrathink does not watch it afterwards, and it
 | `assess` | Collect the git, GSD and graph signals and judge whether the task is done. `--ignore-gsd` leaves the GSD roadmap out (see [Done assessment](#done-assessment)). |
 | `pr` | Push the branch and open or reuse the PR into the default branch. |
 | `review` | Run one Greptile review round in PR or CLI mode. Returns `pending` within `waitMs` while Greptile is still working, or `blocked` when Greptile is not usable as configured. |
-| `merge` | Check the merge gate, merge, and (with `deleteBranch`) delete the branch. Refuses with `autoMerge disabled` when `autoMerge` is off. |
-| `run` | `assess`, `pr`, `review` and `merge` in one call. It stops at the first step that is not ready, and before `merge` when `autoMerge` is off. Fixes stay with the agent. |
-| `status` | Print the stored ship state. |
+| `merge` | Check the merge gate, merge, and (with `deleteBranch`) delete the branch, retrying transient failures within `waitMs` (see [Merge retries](#merge-retries)). Refuses with `autoMerge disabled` when `autoMerge` is off. |
+| `run` | `assess`, `pr`, `review` and `merge` in one call. It stops at the first step that is not ready, and before `merge` when `autoMerge` is off. When the review passed, it merges within what is left of its `waitMs`. Fixes stay with the agent. |
+| `status` | Print the stored ship state, including the attempt log. |
 
-Progress is stored under `ship` in the session record. It holds `phase`, `assessment`, `pr`, `rounds`, `pending`, `blockedReason`, `nudgedAt` and `mergedAt`. See [Configuration](configuration.md#state-directories) for where each host keeps the record.
+Progress is stored under `ship` in the session record. It holds `phase`, `assessment`, `pr`, `rounds`, `pending`, `waiting`, `attempts`, `blockedReason`, `nudgedAt` and `mergedAt`. See [Configuration](configuration.md#state-directories) for where each host keeps the record.
 
 ## Configuration
 
@@ -261,11 +284,13 @@ These keys go in the `ship` section of any [config file](configuration.md#config
 | `greptileOrganization` | `""` | Greptile organization id or handle sent with every Greptile API call. `""` lets Greptile pick, which works for single-organization accounts. |
 | `minScore` | `5` | Lowest Greptile score that may merge (1 to 5). |
 | `requireNoComments` | `true` | Refuse to merge with open review comments. |
-| `maxRounds` | `5` | Failed review rounds before the ship is blocked. |
+| `maxRounds` | `5` | Completed reviews below 5/5 or with open threads before the ship is blocked. Failed and timed-out reviews do not count. |
+| `reviewRetries` | `3` | Re-triggers of a failed Greptile review (Greptile `FAILED`/`ERROR`/`SKIPPED`, no score, CLI failure) or one pending past `reviewTimeoutMs`, per head commit, before the ship blocks with a PR comment. Integer >= 0; `0` blocks on the first failure. |
 | `mergeMethod` | `"squash"` | `"squash"`, `"merge"` or `"rebase"`. |
 | `reviewTimeoutMs` | `1200000` | Pending time for one head commit before it counts as a timed-out round. |
-| `pollMs` | `20000` | First interval between review status checks. |
-| `waitMs` | `100000` | Longest one `review` call blocks. |
+| `mergeTimeoutMs` | `3600000` | How long `merge` keeps retrying one reviewed head commit (60 minutes), from the first time it waited on it, before the ship blocks. Integer >= 1 ms. |
+| `pollMs` | `20000` | First interval between review and merge status checks. |
+| `waitMs` | `100000` | Longest one `review`, `merge` or `run` call blocks. |
 
 A typical opt-in that keeps the merge with you:
 
@@ -292,8 +317,10 @@ Full auto-merge, with every other key at its default:
     "minScore": 5,
     "requireNoComments": true,
     "maxRounds": 5,
+    "reviewRetries": 3,
     "mergeMethod": "squash",
     "reviewTimeoutMs": 1200000,
+    "mergeTimeoutMs": 3600000,
     "pollMs": 20000,
     "waitMs": 100000
   }

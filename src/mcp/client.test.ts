@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMcpClient, loginHint } from "./client.ts";
+import { createMcpClient, hasUsableCredential, loginHint } from "./client.ts";
 import { writeStore } from "./store.ts";
 
 interface Rpc {
@@ -198,5 +198,43 @@ describe("createMcpClient", () => {
 		await expect(pending).rejects.toThrow("client closed");
 		await expect(client.call("again", {})).rejects.toThrow("client closed");
 		never.resolve();
+	});
+});
+
+describe("hasUsableCredential", () => {
+	const oauthClient = {
+		clientId: "c",
+		redirectUri: "http://127.0.0.1/callback",
+		issuer: "https://issuer.example",
+		authorizationEndpoint: "https://issuer.example/authorize",
+		tokenEndpoint: "https://issuer.example/token",
+		registeredAt: 0,
+	};
+
+	function storeWith(providers: Parameters<typeof writeStore>[1]["providers"]): string {
+		const dir = mkdtempSync(join(tmpdir(), "mcp-cred-"));
+		dirs.push(dir);
+		const path = join(dir, "creds.json");
+		writeStore(path, { version: 1, providers });
+		return path;
+	}
+
+	test("an API key is usable", () => {
+		const path = storeWith({ greptile: { kind: "api_key", apiKey: "k", updatedAt: 0 } });
+		expect(hasUsableCredential("greptile", path)).toBe(true);
+	});
+
+	test("OAuth tokens are usable until a new login is needed", () => {
+		const tokens = { accessToken: "a" };
+		expect(hasUsableCredential("greptile", storeWith({ greptile: { kind: "oauth", client: oauthClient, tokens, updatedAt: 0 } }))).toBe(true);
+		const stale = storeWith({ greptile: { kind: "oauth", client: oauthClient, tokens, needsLogin: "refresh rejected", updatedAt: 0 } });
+		expect(hasUsableCredential("greptile", stale)).toBe(false);
+		expect(hasUsableCredential("greptile", storeWith({ greptile: { kind: "oauth", client: oauthClient, updatedAt: 0 } }))).toBe(false);
+	});
+
+	test("a provider without a stored credential, or no store at all, is not usable", () => {
+		const path = storeWith({ linear: { kind: "api_key", apiKey: "k", updatedAt: 0 } });
+		expect(hasUsableCredential("greptile", path)).toBe(false);
+		expect(hasUsableCredential("greptile", join(path, "..", "missing.json"))).toBe(false);
 	});
 });

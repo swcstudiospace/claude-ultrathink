@@ -125,6 +125,16 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ hitl: { maxQuestions: 2 } }, base).hitl.maxQuestions).toBe(2);
 	});
 
+	test("hitl knowledgeBase is opt-in and accepts only a boolean", () => {
+		const base = defaultConfig();
+		expect(base.hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: true } }, base).hitl.knowledgeBase).toBe(true);
+		expect(mergeConfig({ hitl: { knowledgeBase: false } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: "true" } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { knowledgeBase: 1 } }, base).hitl.knowledgeBase).toBe(false);
+		expect(mergeConfig({ hitl: { maxQuestions: 2 } }, base).hitl.knowledgeBase).toBe(false);
+	});
+
 	test("notion dataSourceUrl and linear team accept a non-empty override, reject an empty string", () => {
 		const base = mergeConfig({ notion: { dataSourceUrl: "collection://mine" }, linear: { team: "Mine" } }, defaultConfig());
 		expect(base.notion.dataSourceUrl).toBe("collection://mine");
@@ -209,7 +219,18 @@ describe("loadConfig", () => {
 describe("ship config", () => {
 	const base = defaultConfig();
 	test("defaults gate gsd- skills with strict review, but ship stays off until enabled", () => {
-		expect(base.ship).toMatchObject({ enabled: false, autoMerge: false, deleteBranch: false, skills: ["gsd-"], minScore: 5, mergeMethod: "squash", maxRounds: 5, waitMs: 100_000 });
+		expect(base.ship).toMatchObject({
+			enabled: false,
+			autoMerge: false,
+			deleteBranch: false,
+			skills: ["gsd-"],
+			minScore: 5,
+			mergeMethod: "squash",
+			maxRounds: 5,
+			waitMs: 100_000,
+			reviewRetries: 3,
+			mergeTimeoutMs: 3_600_000,
+		});
 	});
 	test("opting in restores auto-merge and branch deletion; greptileOrganization is trimmed", () => {
 		const ship = mergeConfig({ ship: { enabled: true, autoMerge: true, deleteBranch: true, greptileOrganization: " acme " } }, base).ship;
@@ -225,10 +246,36 @@ describe("ship config", () => {
 	});
 	test("invalid values fall back to defaults", () => {
 		const ship = mergeConfig(
-			{ ship: { enabled: "yes", skills: ["gsd-", ""], mergeMethod: "force", maxRounds: 0, minScore: 9, pollMs: -1, waitMs: 0 } },
+			{
+				ship: {
+					enabled: "yes",
+					skills: ["gsd-", ""],
+					mergeMethod: "force",
+					maxRounds: 0,
+					minScore: 9,
+					pollMs: -1,
+					waitMs: 0,
+					reviewRetries: -1,
+					mergeTimeoutMs: 0,
+				},
+			},
 			base,
 		).ship;
 		expect(ship).toEqual(base.ship);
+	});
+	test("reviewRetries accepts 0 and floors fractions; strings and negatives fall back", () => {
+		expect(mergeConfig({ ship: { reviewRetries: 0 } }, base).ship.reviewRetries).toBe(0);
+		expect(mergeConfig({ ship: { reviewRetries: 2.7 } }, base).ship.reviewRetries).toBe(2);
+		expect(mergeConfig({ ship: { reviewRetries: -1 } }, base).ship.reviewRetries).toBe(3);
+		expect(mergeConfig({ ship: { reviewRetries: "3" } }, base).ship.reviewRetries).toBe(3);
+	});
+	test("mergeTimeoutMs must be at least 1 ms", () => {
+		expect(mergeConfig({ ship: { mergeTimeoutMs: 600_000 } }, base).ship.mergeTimeoutMs).toBe(600_000);
+		expect(mergeConfig({ ship: { mergeTimeoutMs: 0 } }, base).ship.mergeTimeoutMs).toBe(3_600_000);
+		expect(mergeConfig({ ship: { mergeTimeoutMs: -5 } }, base).ship.mergeTimeoutMs).toBe(3_600_000);
+	});
+	test("minScore above Greptile's 5/5 maximum falls back", () => {
+		expect(mergeConfig({ ship: { minScore: 6 } }, base).ship.minScore).toBe(5);
 	});
 });
 

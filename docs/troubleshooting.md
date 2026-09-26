@@ -5,7 +5,7 @@ ultrathink fails open. When something is wrong, your prompt still goes through, 
 In the commands below, `<clone>` is the absolute path of your checkout. Paths written as `${NAME:-default}` use the environment variable when you set it, and the default otherwise.
 
 - [First checks](#first-checks)
-- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked)
+- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked) · [Greptile knowledge base](#greptile-knowledge-base)
 - By host: [Claude Code](#claude-code) · [Grok Build](#grok-build) · [Muse Code](#muse-code) · [Hermes Agent](#hermes-agent) · [Omp](#omp)
 - [Uninstalling](#uninstalling)
 
@@ -25,6 +25,7 @@ Notion: not configured
 Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
+Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -40,6 +41,7 @@ What the less obvious lines mean:
 | `Tracking: …`, `Notion: …`, `Linear team: …` | See [Tracking rows don't appear](#tracking-rows-dont-appear). |
 | `Substrate: …` | The optional Agent Substrate brief. It is off unless you set `substrate.url` or `SUBSTRATE_URL`; `SUBSTRATE_DISABLED=1` turns it off again. |
 | `Ship: …` | The PR, review and merge loop. Off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` turns it off for that shell. When on, it shows whether `autoMerge` and `deleteBranch` are on. |
+| `Knowledge base: …` | The Greptile knowledge-base read before the clarifying questions. Off unless you set `hitl.knowledgeBase`. See [Greptile knowledge base](#greptile-knowledge-base). |
 
 After each planned prompt, hosts that show the summary (`claude.echo`, on by default) print one line such as `Prompt Uplift · UPLIFTED_PROMPT · llm · claude:sonnet · Graph of Thought · 6 nodes · Tracking · 6 issues · 18 sub-issues linked · 41.2s`. A `fallback` source means the engine call failed, and an `Engine error · …` segment shows the first error.
 
@@ -212,7 +214,7 @@ If `auth status` later shows Notion as not ready, the grant was revoked or expir
 
 ## Ship is blocked
 
-Ship is opt-in: it does nothing until you set `ship.enabled: true`. `bin/ultrathink-ship` returns `ok: false` with a `reason`. A blocked review returns `blocked: true` and `next: "stop: <reason>"`, plus `status: "blocked"` when Greptile is unusable as configured; after a failed review loop it also posts a PR comment `ultrathink-ship stopped: <reason>`. `bin/ultrathink-ship status --state <stateFile>` then shows `phase: "blocked"` and the `blockedReason`. A blocked PR is left open for a human, and the skill doesn't retry. See [Ship](ship.md) for the flow and [Ship with Greptile](how-to/ship-with-greptile.md) for setup.
+Ship is opt-in: it does nothing until you set `ship.enabled: true`. `bin/ultrathink-ship` returns `ok: false` with a `reason`. A blocked review returns `blocked: true` and `next: "stop: <reason>"`, plus `status: "blocked"` when Greptile is unusable as configured; when a review or merge loop gives up it also posts a PR comment `ultrathink-ship stopped: <reason>` that lists the last attempts. `bin/ultrathink-ship status --state <stateFile>` then shows `phase: "blocked"`, the `blockedReason` and `attempts`, the log of every review result and merge outcome (newest 50). A blocked PR is left open for a human, and the skill doesn't retry. See [Ship](ship.md) for the flow and [Ship with Greptile](how-to/ship-with-greptile.md) for setup.
 
 | Step | Reason | What to do |
 |---|---|---|
@@ -229,17 +231,36 @@ Ship is opt-in: it does nothing until you set `ship.enabled: true`. `bin/ultrath
 | `review` | `status: "blocked"`, `Greptile account has several organizations; set ship.greptileOrganization in ~/.config/ultrathink/config.json (one of: …)` | Greptile answered `tenant_required`: your account belongs to several organizations and none was chosen. Set `ship.greptileOrganization` to one of the listed ids or handles, then run `review` again. |
 | `review` | `local HEAD <sha> differs from PR head <sha>; push your commits (or pull) first` | `git push`, then run `review` again. |
 | `review` | `status: "pending"` | Not an error. Run `review` again; it resumes the same Greptile run. |
-| `review` | `max rounds reached: …` | `ship.maxRounds` (5) rounds without passing. A human takes over. |
-| `review` | `review failed twice for <sha>: …`, `review timeout twice for <sha>: …` | Greptile failed or timed out twice on the same commit. Check `greptile login` (CLI mode) or the Greptile credential (`bin/ultrathink-mcp auth status`). |
+| `review` | `max rounds reached: …` | `ship.maxRounds` (5) completed reviews below 5/5 or with open threads. Failed and timed-out reviews don't count. A human takes over. |
+| `review` | `Greptile review failed: <error>; run review again to re-trigger it (retry k of N)`, `Greptile review timed out; run review again to re-trigger it (retry k of N)` | Not a block. Greptile returned FAILED, ERROR or SKIPPED, no score, the CLI failed, or the review stayed pending past `ship.reviewTimeoutMs`. Run `review` again: it starts a fresh review of the same commit. Up to `ship.reviewRetries` (3) re-triggers per head commit. |
+| `review` | `Greptile review failed N times on <sha> (ship.reviewRetries N): <error>`, `Greptile review timed out N times on <sha> (ship.reviewRetries N)` | Greptile failed or timed out more than `ship.reviewRetries` times on the same commit, so the ship is blocked and the PR comment lists the attempts. Check `greptile login` (CLI mode) or the Greptile credential (`bin/ultrathink-mcp auth status`), then run `review` again. |
 | `merge` | `autoMerge disabled` | Expected by default: `ship.autoMerge` is off, so ship stops at a passing review and `run` reports `autoMerge disabled: merge manually`. Merge by hand, or set `ship.autoMerge: true`. |
 | `merge` | `PR head changed since last review; run review again` | Run `review`. |
-| `merge` | `review score N/5 is below 5/5`, `no review has run` | Continue the review loop. |
+| `merge` | `review score N/5 is below 5/5; run review again` | Continue the review loop. |
 | `review` or `merge` | `N open review comment(s)` | In PR mode these are the PR's Greptile review threads on GitHub that are neither resolved nor outdated. A fix that changes the flagged line makes its thread outdated. For a finding that isn't actionable (factually wrong, or describing intended behavior), reply on its thread with the reason and resolve it; the `review` output gives each finding's `threadId`, and [Ship](ship.md#fix-loop-and-blocking) has the commands. Never resolve a finding just to pass the gate. If the thread lookup fails (a `gh` error, or more than 100 threads), the gate fails closed and counts every unaddressed Greptile comment on the PR. Fix `gh auth status` and run `review` again. In CLI mode the count is the run's comments. |
-| `review` or `merge` | `could not read review threads: <error>` | The PR's review threads couldn't be read from GitHub, so nothing is recorded and the merge is refused. Check `gh auth status`, then run `review` again. |
-| `merge` | `merge conflicts`, `GitHub has not computed mergeability yet`, `CI checks failing`, `CI checks pending` | Resolve on GitHub, or wait and retry. |
+| `review` or `merge` | `could not read review threads: <error>` | The PR's review threads couldn't be read from GitHub, so nothing is recorded and the merge is refused. `merge` keeps retrying this within its time (see `run merge again` below). Check `gh auth status`, then run `review` or `merge` again. |
+| `merge` | `waiting: true`, `run merge again: <reason> (waited N of 60 min on this commit; it keeps retrying until the PR merges)` | Not an error. The review passed, but CI is pending, GitHub has not computed mergeability, the PR state or threads couldn't be read, GitHub returned a transient error, or branch protection refused with `the base branch policy prohibits the merge` (for example a required approval not given yet), and this call's `ship.waitMs` ran out. Run `merge` again; it keeps retrying the same commit for up to `ship.mergeTimeoutMs` (60 min), so a human can approve in the meantime. Past that it blocks with a PR comment. |
+| `merge` | `merge conflicts: resolve them against the base, push, then run review again`, `CI checks failing: fix CI, commit, push, then run review again` | Back to the agent, never merged. Fix the cause, push, then run `review` again. |
+| `merge` | `merge still not possible after N min on <sha>: <reason>` | The ship is blocked: the same reviewed commit could not merge within `ship.mergeTimeoutMs`. The PR comment lists the attempts. Fix the cause (for example stuck CI), then run `review` or `merge` again. |
+| `merge` | `merge refused by GitHub: <error>` | The ship is blocked: GitHub refused for a reason retrying can't fix, such as missing permission, requested changes or a closed PR. A human acts (grant rights, resolve the requested changes or reopen), then runs `merge` again. |
 | `merge` | `PR closed without merge` | The ship is marked blocked. |
+| `merge` | `PR was merged outside the ship flow before its review passed` | The ship is blocked and not recorded as a ship merge: the PR was merged (by hand, web UI or another tool) without a passing Greptile review of its head. Review the merged change yourself. Agents must never merge any other way than `bin/ultrathink-ship merge`. |
 
 Resume at any time with `bin/ultrathink-ship status --state <stateFile>`. Every step is idempotent.
+
+## Greptile knowledge base
+
+With `hitl.knowledgeBase: true` (see [Configuration](configuration.md#hitl-clarifying-questions) and [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md)), the planner reads the repository's Greptile knowledge base before the clarifying questions. It fails open: whatever goes wrong, you get the same questions as with the key off. The summary after each plan shows what happened, and `bin/ultrathink status` shows the `Knowledge base:` line.
+
+With `ULTRATHINK_DEBUG=1` (Claude Code, Grok Build and Muse), the prompt hook writes one line per lookup to stderr: `greptile knowledge base: <outcome>`, then the documents read or the reason, then the elapsed time, for example `[ultrathink] greptile knowledge base: error · timed out after 20000ms · 20004ms`.
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| No `Knowledge` segment in the summary | The key is off, HITL is off (`Knowledge base: on · not read while HITL is off`), or the prompt was not clarified. | Set `hitl.knowledgeBase: true` and turn HITL on (`bin/ultrathink hitl on`). |
+| `Knowledge · off (no Greptile login)` | No usable Greptile credential is stored, so Greptile was not contacted. `bin/ultrathink status` shows `Knowledge base: on · no Greptile credential (…)`. | Store one: `bin/ultrathink-mcp auth login greptile`, or `bin/ultrathink-mcp auth set-key greptile --stdin`. `bin/ultrathink-mcp auth status` shows whether it is ready. |
+| `Knowledge · none` | Nothing to read: the git remote gives no `owner/repo`, Greptile has no knowledge base for that `owner/repo`, or the knowledge base has no published documents yet. The debug line gives the reason. | Check `git remote get-url origin` names the repository Greptile indexes (for example `acme/widgets`). A new repository needs Greptile to publish its knowledge base first. |
+| `Knowledge · error` | A Greptile call failed, the account needs an organization, or a stage ran past its 20-second budget. One selected document that fails to read or times out is enough: the lookup is then `error` as a whole, never used with only some documents. The debug line reads `greptile knowledge base: error · <reason> · <ms>ms`. | For `Greptile account has several organizations; set ship.greptileOrganization …` (Greptile answered `tenant_required`), set `ship.greptileOrganization` to one of the listed ids or handles. A timeout or a failed document read needs no action: the questions were composed exactly as with the feature off. For other errors, check the credential with `bin/ultrathink-mcp auth status`. |
+| A question you expected was not asked | The knowledge base settled it. Settled questions are listed in their own `### Settled from the Greptile knowledge base` subsection of the Clarifications (HITL) block as `- [k1] <question> → <answer> (Greptile knowledge base: <document>)`, marked as untrusted evidence the agent checks against the repository (asking you when the repository disagrees), not as your decisions. In the spec they appear as `<ANSWER source="knowledge" evidence="<document>">`. A claim that cites a document that was not read, or is otherwise invalid, is asked as an ordinary question. Product decisions and questions the clarifier marks blocking are always asked, never settled. | If the answer is wrong, say so in your next prompt; settled answers are not carried over to it. To stop settling questions this way, set `hitl.knowledgeBase: false`. |
 
 ## Claude Code
 

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { applyAnswers } from "./answers.ts";
+import { clarificationsToXml } from "./format.ts";
 import type { Clarification } from "./types.ts";
 
 function item(id: string, question: string, extra: Partial<Clarification> = {}): Clarification {
@@ -101,5 +102,15 @@ describe("applyAnswers", () => {
 		expect(applyAnswers(base, undefined, undefined, 1).matched).toEqual([]);
 		expect(applyAnswers(base, undefined, { answers: { "Add tests?": "   " } }, 1).matched).toEqual([]);
 		expect(applyAnswers(base, undefined, "  ", 1).list).toHaveLength(2);
+	});
+
+	test("a user answer to a knowledge-settled item makes it the user's and drops the evidence", () => {
+		const settled = item("k1", "Where are records stored?", { answer: "In SQLite.", source: "knowledge", evidence: "docs/storage.md" });
+		const { list } = applyAnswers([settled], undefined, { answers: { "Where are records stored?": "In Postgres" } }, 7);
+		expect(list[0]).toMatchObject({ id: "k1", answer: "In Postgres", source: "user", answeredAt: 7 });
+		expect(list[0]?.evidence).toBeUndefined();
+		const xml = clarificationsToXml(list);
+		expect(xml).toContain('<ANSWER source="user">In Postgres</ANSWER>');
+		expect(xml).not.toContain("evidence=");
 	});
 });

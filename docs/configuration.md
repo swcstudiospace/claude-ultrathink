@@ -1,6 +1,6 @@
 # Configuration
 
-ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, and never pushes, opens a pull request or merges.
+ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, and never pushes, opens a pull request or merges.
 
 Terms used on this page:
 
@@ -72,6 +72,16 @@ Each node gets 4 to 8 numbered rationale steps. That range is fixed in code, not
 |---|---|---|---|
 | `enabled` | boolean | `true` | Generate clarifying questions. `bin/ultrathink hitl on\|off` overrides this per host. |
 | `maxQuestions` | integer, 1 to 4 | `4` | Most questions per prompt. |
+| `knowledgeBase` | boolean | `false` | Opt-in. Before the clarifying questions, read the repository's Greptile knowledge base and let the clarifier settle questions it answers instead of asking them. Needs HITL on and a stored Greptile credential (`bin/ultrathink-mcp auth login greptile`, or `bin/ultrathink-mcp auth set-key greptile --stdin`). When `ship.greptileOrganization` is set, it is sent as the organization; an account in several organizations needs it. |
+
+How the knowledge-base read works when `knowledgeBase` is `true` (see [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md) for a walk-through):
+
+- While the prompt is uplifted, ultrathink finds the repository's knowledge base on Greptile by the git remote's `owner/repo`, lists its documents and reads `index.md`.
+- After the Graph of Thought, it picks up to 3 documents from the routing table in `index.md` that match the request and reads them. At most 24,000 characters go to the clarifier, marked as untrusted evidence, not instructions.
+- Each stage has a 20-second budget. Any failure (no credential, no knowledge base for the repository, a Greptile error, a timeout) fails open: you get exactly the questions you would get with the key off.
+- Only list and read calls go to Greptile's hosted MCP (`https://api.greptile.com/mcp`): the organization, the knowledge-base namespace id and document paths. Nothing from your prompt or your code is sent to Greptile. The documents read go to the planning engine inside the clarify call.
+- Questions the knowledge base settled are not asked. They appear in their own `### Settled from the Greptile knowledge base` subsection of the Clarifications (HITL) block as `(Greptile knowledge base: <document>)`, marked as untrusted evidence the agent checks against the repository (asking you when the repository disagrees), not as your decisions, and in the spec's `CLARIFICATIONS` block as `<ANSWER source="knowledge" evidence="…">`. They are not carried to the next prompt. A claim that cites a document that was not read, or is otherwise invalid, is asked as an ordinary question. Product decisions are still asked.
+- Each lookup is shown in the summary (`Knowledge · 3 docs · 1 settled`, `Knowledge · none`, `Knowledge · off (no Greptile login)` or `Knowledge · error`), in the session record's `knowledge` field, in a `## Greptile knowledge base` section of the plan context when documents were used, in the `ULTRATHINK_DEBUG=1` log as `greptile knowledge base: …`, and as a `kb` segment in the Omp status bar. `bin/ultrathink status` shows the `Knowledge base:` line. See [Troubleshooting](troubleshooting.md#greptile-knowledge-base) when it does not read what you expect.
 
 ### `claude`: the Claude engine
 
@@ -138,17 +148,21 @@ Ship is opt-in. With the defaults, no skill run ever pushes a branch, opens a pu
 | `enabled` | boolean | `false` | Tell the agent to run `ultrathink-ship` after a matching skill run: the plan gets a Ship section and the end-of-run nudge fires. `bin/ultrathink-ship` still works when you run it by hand with this off. |
 | `autoMerge` | boolean | `false` | Allow `bin/ultrathink-ship merge`. When `false`, `merge` refuses (`autoMerge disabled`) and `run` stops once the PR is ready, with `next: "autoMerge disabled: merge manually"`. When `true`, the done assessment also requires an engine judge. |
 | `skills` | array of non-empty strings | `["gsd-"]` | Skill name prefixes that trigger ship. `[]` matches every skill run, and every planned prompt gets the ship instruction. |
-| `minScore` | number, 1 to 5 | `5` | Lowest Greptile confidence score that may merge. |
+| `minScore` | number, 1 to 5 | `5` | Lowest Greptile confidence score that may merge. 5 is Greptile's maximum ("5/5"). |
 | `requireNoComments` | boolean | `true` | Refuse to merge while the head review has open comments. |
-| `maxRounds` | number, >= 1 | `5` | Review rounds before the ship is blocked. Rounded down. |
+| `maxRounds` | number, >= 1 | `5` | Completed Greptile reviews below `minScore` or with open threads before the ship is blocked. Failed and timed-out reviews don't count (see `reviewRetries`). Rounded down. |
 | `mergeMethod` | `"squash"`, `"merge"` or `"rebase"` | `"squash"` | Merge method. When the repository does not allow it, the first allowed method is used and the output says so. |
 | `deleteBranch` | boolean | `false` | After the merge, delete the remote branch, check out and fast-forward the base branch, then delete the local branch. When `false`, branches are left alone. |
 | `greptileOrganization` | string | `""` | Greptile organization id or handle, passed as `organization` on every Greptile MCP call. `""` lets Greptile pick, which works for accounts in one organization. An account in several organizations needs it: without it, the review is `blocked` with a reason that names this key and the candidates. |
-| `reviewTimeoutMs` | number, >= 1 | `1200000` | How long a review of one head commit may stay pending before it counts as a timed-out round (20 minutes). Rounded down. |
-| `pollMs` | number, >= 1 | `20000` | First interval between review status checks. It grows by 1.5 times per check, up to 60 seconds. Rounded down. |
-| `waitMs` | number, >= 1 | `100000` | Longest one `review` call blocks before it returns `pending` (100 seconds). Rounded down. |
+| `reviewTimeoutMs` | number, >= 1 | `1200000` | How long a review of one head commit may stay pending before it counts as timed out (20 minutes). A timed-out review is re-triggered like a failed one (see `reviewRetries`). Rounded down. |
+| `reviewRetries` | integer, >= 0 | `3` | A failed Greptile review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or one pending past `reviewTimeoutMs` is re-triggered on the next `review` call, up to this many times per head commit; then the ship blocks with a PR comment. These never count toward `maxRounds`. `0` blocks on the first failure. Rounded down. |
+| `pollMs` | number, >= 1 | `20000` | First interval between review and merge status checks. It grows by 1.5 times per check, up to 60 seconds. Rounded down. |
+| `waitMs` | number, >= 1 | `100000` | Longest one `review` or `merge` call blocks before it returns `pending` or `waiting: true` (100 seconds). `run` merges within what is left of its own `waitMs` after the review. Rounded down. |
+| `mergeTimeoutMs` | integer, >= 1 (ms) | `3600000` | After the head's review passed, `merge` keeps retrying (pending CI, mergeability not computed, unreadable PR state or threads, transient GitHub errors) within each call up to `waitMs`, returning `waiting: true` and `next: "run merge again: …"` when the call's time runs out; the agent runs `merge` again. Past `mergeTimeoutMs` (60 minutes) on one head commit, or on a terminal GitHub refusal (missing permission, requested changes, a closed PR; a branch-protection hold such as a missing approval is retried until the bound instead), the ship blocks and the PR comment lists the attempt history. Conflicts, failing CI, a moved head or a review below 5/5 go back to the agent (`next`), never merge. Rounded down. |
 
 `ULTRATHINK_SHIP=0` turns the ship instruction and nudge off for one process whatever `ship.enabled` says.
+
+The merge gate never weakens: a completed Greptile review of the exact PR head with a score of at least `minScore` (default 5, Greptile's maximum) and no open threads, an open mergeable PR, and CI neither pending nor failing. A PR merged outside the flow without such a review is reported blocked, never recorded as a ship merge; agents must never merge any other way (no `gh pr merge`, no web UI). Every review result and merge outcome is recorded in `ship.attempts` in the session record (newest 50), shown by `bin/ultrathink-ship status`.
 
 ### `substrate`: Agent Substrate brief
 
@@ -166,13 +180,13 @@ All keys are optional; write only the ones you change. This file shows every key
 
 - `notion.dataSourceUrl` and `linear.team` hold placeholders. Replace them with your own values, or leave them `""` to keep tracking unconfigured.
 - `grok.shuntBaseUrl`, `grok.shuntModel` and `substrate.url` are `""`, which is the default and means off. Set them only if you run those services.
-- `ship.enabled`, `ship.autoMerge` and `ship.deleteBranch` are `false`, the opt-in defaults.
+- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch` and `hitl.knowledgeBase` are `false`, the opt-in defaults.
 
 ```json
 {
   "uplift": { "enabled": true, "skipTrivial": true, "maxChars": 20000, "echo": true },
   "think": { "enabled": true, "minNodes": 5, "maxNodes": 8, "engine": "claude" },
-  "hitl": { "enabled": true, "maxQuestions": 4 },
+  "hitl": { "enabled": true, "maxQuestions": 4, "knowledgeBase": false },
   "claude": {
     "bin": "claude",
     "model": "sonnet",
@@ -211,8 +225,10 @@ All keys are optional; write only the ones you change. This file shows every key
     "deleteBranch": false,
     "greptileOrganization": "",
     "reviewTimeoutMs": 1200000,
+    "reviewRetries": 3,
     "pollMs": 20000,
-    "waitMs": 100000
+    "waitMs": 100000,
+    "mergeTimeoutMs": 3600000
   },
   "substrate": { "url": "" }
 }
@@ -239,6 +255,12 @@ Ask an Agent Substrate server for a brief before each plan:
 
 ```json
 { "substrate": { "url": "https://<your substrate host>" } }
+```
+
+Read the repository's Greptile knowledge base before the clarifying questions. Store a Greptile credential first with `bin/ultrathink-mcp auth login greptile` (or `bin/ultrathink-mcp auth set-key greptile --stdin`); set `ship.greptileOrganization` only if your Greptile account is in several organizations:
+
+```json
+{ "hitl": { "knowledgeBase": true }, "ship": { "greptileOrganization": "<your Greptile organization>" } }
 ```
 
 ## Environment variables

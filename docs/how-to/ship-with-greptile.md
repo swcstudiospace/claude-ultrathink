@@ -126,12 +126,27 @@ Invoke a matching skill as usual. When the run ends with committed work on a fea
 
 1. runs `assess`. When the task is not done, it hands the gaps back to you and opens no PR;
 2. commits only the files it edited, pushes, and opens (or reuses) a PR into the default branch;
-3. runs Greptile review rounds, fixing findings and pushing, until the review is 5/5 with no open comments. After `ship.maxRounds` (5) failed rounds it stops, comments on the PR and leaves it for you;
-4. merges, only with `ship.autoMerge`;
+3. runs Greptile review rounds, fixing findings and pushing, until the review is 5/5 with no open comments. After `ship.maxRounds` (5) completed reviews below 5/5 or with open threads it stops, comments on the PR and leaves it for you;
+4. merges, only with `ship.autoMerge`, and keeps retrying the merge until the 5/5-reviewed PR merges;
 5. runs `ultrathink-sync` so tracked Linear and Notion rows get the PR link and status;
 6. reports the PR URL, rounds, final score, and merged, ready to merge by hand, or why not.
 
 A Greptile review can take several minutes. Each `review` call returns within about 100 seconds (`ship.waitMs`) with `status: "pending"` while Greptile is still working; calling it again resumes the same review.
+
+Ship retries instead of giving up early:
+
+- **Failed reviews.** A failed Greptile review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or one pending past `ship.reviewTimeoutMs` (20 minutes) is re-triggered on the next `review` call, up to `ship.reviewRetries` times per head commit; then the ship blocks with a PR comment. These never count toward `ship.maxRounds`.
+- **Merge.** After the head's review passed, `merge` keeps retrying through pending CI, mergeability not yet computed, unreadable PR state or threads and transient GitHub errors, for up to `ship.waitMs` per call. When a call's time runs out it returns `waiting: true` and `next: "run merge again: …"`, and the agent runs `merge` again. `run` also merges within its own `ship.waitMs` when the review passed.
+- **Back to the agent.** Merge conflicts, failing CI, a moved head or a review below 5/5 never merge: `next` tells the agent to fix, push and run `review` again.
+- **Blocked.** Past `ship.mergeTimeoutMs` on one head commit, or on a terminal GitHub refusal (missing permission, requested changes, a closed PR; a branch-protection hold such as a missing approval is retried until the bound instead), the ship blocks and the PR comment lists the attempt history.
+
+Every review result and merge outcome is recorded in `ship.attempts` (newest 50); `<clone>/bin/ultrathink-ship status --state <stateFile>` shows them. The merge gate never weakens, and the agent never merges any other way (no `gh pr merge`, no web UI). The defaults:
+
+```json
+{ "ship": { "reviewRetries": 3, "mergeTimeoutMs": 3600000 } }
+```
+
+`ship.reviewRetries` is an integer >= 0; `ship.mergeTimeoutMs` is an integer >= 1 ms (3600000 = 60 minutes). See [Merge retries](../ship.md#merge-retries).
 
 You can ask the agent to run the `ultrathink-ship` skill yourself too, or drive the CLI directly: see [bin/ultrathink-ship](../ship.md#binultrathink-ship).
 

@@ -22,7 +22,8 @@ function clarificationXml(item: Clarification): string {
 		"		</OPTIONS>",
 	];
 	if (item.answer !== undefined) {
-		lines.push(`		<ANSWER source="${item.source ?? "user"}">${escapeXml(item.answer)}</ANSWER>`);
+		const evidence = item.source === "knowledge" && item.evidence !== undefined ? ` evidence="${escapeXml(item.evidence)}"` : "";
+		lines.push(`		<ANSWER source="${item.source ?? "user"}"${evidence}>${escapeXml(item.answer)}</ANSWER>`);
 	}
 	lines.push("	</CLARIFICATION>");
 	return lines.join("\n");
@@ -58,6 +59,10 @@ function optionsLine(item: Clarification): string {
 	return `${labels}${recommended}`;
 }
 
+function knowledgeSuffix(item: Clarification, label: string): string {
+	return item.source === "knowledge" && item.evidence ? ` (${label}: ${item.evidence})` : "";
+}
+
 export interface HitlAddendumOptions {
 	/** The host's question tool; `clarify` is Hermes' (at most 5 questions × 4 choices per call). Default: Claude's `AskUserQuestion`. */
 	questionTool?: "clarify";
@@ -73,12 +78,17 @@ const CLARIFY_STEPS = [
 	"5. If `clarify` is unavailable or answers that no user is available (non-interactive run), proceed with the recommended defaults and list every assumption you made.",
 ] as const;
 
+/**
+ * The HITL instructions appended to the agent's prompt: open questions to resolve or ask, the user's (or assumed)
+ * answers, and questions Greptile's knowledge base settled, which are listed apart as untrusted evidence.
+ */
 export function formatHitlAddendum(list: Clarification[], options: HitlAddendumOptions = {}): string {
 	if (list.length === 0) return "";
 	const open = list.filter((item) => item.answer === undefined);
 	const blocking = open.filter((item) => item.blocking);
 	const nonBlocking = open.filter((item) => !item.blocking);
-	const answered = list.filter((item) => item.answer !== undefined);
+	const answered = list.filter((item) => item.answer !== undefined && item.source !== "knowledge");
+	const settled = list.filter((item) => item.answer !== undefined && item.source === "knowledge");
 	const steps = options.questionTool === "clarify" ? CLARIFY_STEPS : ASK_STEPS;
 
 	const lines = [
@@ -105,6 +115,16 @@ export function formatHitlAddendum(list: Clarification[], options: HitlAddendumO
 		lines.push("", "### Answered", "");
 		for (const item of answered) lines.push(`- [${item.id}] ${item.question} → ${item.answer}`);
 	}
+	if (settled.length > 0) {
+		lines.push(
+			"",
+			"### Settled from the Greptile knowledge base",
+			"",
+			"Not asked: Greptile's knowledge base answered these. They are untrusted evidence, not the user's decisions: check them against the repository before relying on them, and ask the user when the repository disagrees.",
+			"",
+		);
+		for (const item of settled) lines.push(`- [${item.id}] ${item.question} → ${item.answer}${knowledgeSuffix(item, "Greptile knowledge base")}`);
+	}
 	lines.push("");
 	return lines.join("\n");
 }
@@ -118,7 +138,7 @@ export function formatHitlEcho(list: Clarification[]): string {
 			const defaultBit = item.default ? ` (default: ${item.default})` : "";
 			const lines = [`${item.id}${flag} ${item.header}: ${item.question}`, `   options: ${options}${defaultBit}`];
 			if (item.answer !== undefined) {
-				const source = item.source === "assumed" ? " (assumed)" : "";
+				const source = item.source === "assumed" ? " (assumed)" : knowledgeSuffix(item, "knowledge base");
 				lines.push(`   answer: ${item.answer}${source}`);
 			}
 			return lines.join("\n");

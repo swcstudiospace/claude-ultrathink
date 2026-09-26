@@ -18,7 +18,7 @@ This page explains how the pieces fit together. To install it, start with [Getti
 | Tracker | Notion or Linear, where the plan can be recorded as rows and issues. Both are optional. |
 | MCP gateway | `bin/ultrathink-mcp`, a small local program that talks to the hosted Notion, Linear and Greptile [MCP](https://modelcontextprotocol.io) servers with credentials kept on your machine. |
 | GSD | "Get Shit Done", a family of agent skills (`gsd-*`) whose runs the ship flow can pick up. |
-| Greptile | A hosted AI code reviewer. The optional ship flow uses it to review a pull request before merging. |
+| Greptile | A hosted AI code reviewer. The optional ship flow uses it to review a pull request before merging, and the optional knowledge-base read (`hitl.knowledgeBase`) gives the clarify step Greptile's summaries of the repository. |
 | State directory | The per-host directory where ultrathink keeps its session records and toggles. It is never inside your repository. |
 
 ## Contents
@@ -59,6 +59,7 @@ flowchart LR
     engine -. "think.engine: grok" .-> grok --> xai["xAI Grok<br/>(your grok login)"]
     engine -. "grok.transport: shunt" .-> shunt["Your Anthropic-compatible gateway<br/>(grok.shuntBaseUrl)"]
     engine -- "tracking configured" --> gw
+    engine -. "hitl.knowledgeBase" .-> gw
     gw --> store
     gw --> notion["Notion MCP<br/>mcp.notion.com"]
     gw --> linear["Linear MCP<br/>mcp.linear.app"]
@@ -79,7 +80,7 @@ flowchart LR
 The boundaries that matter:
 
 - **Engine calls** leave through CLIs and logins you already have. ultrathink stores no Anthropic or xAI key of its own. The engine gets your prompt, text derived from it and, when you invoke a skill, the skill's name and up to 600 characters from its `SKILL.md` or command file. It never reads your source files, except in the ship flow's done check, which sends a capped diff.
-- **Tracker and review calls** go only to providers that are configured and logged in. The gateway holds their tokens in one local file. Separately, `bun scripts/setup.ts apply` adds `notion` and `linear` entries for the hosted MCP servers to Claude Code's user config when they are missing; Claude Code then talks to those servers itself, with its own login, and `setup.ts rollback` removes the entries it added.
+- **Tracker and review calls** go only to providers that are configured and logged in. The gateway holds their tokens in one local file. The optional Greptile knowledge-base read (`hitl.knowledgeBase`) uses the same client and store, and sends only list and read calls, never the prompt or code. Separately, `bun scripts/setup.ts apply` adds `notion` and `linear` entries for the hosted MCP servers to Claude Code's user config when they are missing; Claude Code then talks to those servers itself, with its own login, and `setup.ts rollback` removes the entries it added.
 - **GitHub** is reached through your `gh` login and plain `git` with your credentials for `origin`, and only by the ship flow: when you turn it on (`ship.enabled`) or run `bin/ultrathink-ship` yourself.
 - **Agent Substrate** and the **Tailscale** OAuth callback are off unless you set them. The brief needs `substrate.url` or `SUBSTRATE_URL`; kickoff registers the graph only when you connect an MCP server named `substrate`. A fresh install never contacts either service.
 - **Nothing else.** There is no telemetry, analytics or update check.
@@ -101,7 +102,8 @@ flowchart TD
     E --> F["Uplift: prompt to XML spec"]
     F --> G["Graph of Thought: nodes and WORKFLOW waves"]
     G --> H["Node fills: rationale and conclusion per node"]
-    H --> I["HITL clarifications"]
+    H --> KB["Greptile knowledge base (hitl.knowledgeBase)<br/>prefetched during the uplift, read before clarify"]
+    KB --> I["HITL clarifications"]
     I --> J["TrackPlan"]
     J --> K["Gateway rows: Linear issues and sub-issues, Notion rows<br/>(when tracking is configured; not on Hermes)"]
     K --> L["Persist sessions/id.json and .xml"]
@@ -116,13 +118,22 @@ flowchart TD
 6. **Substrate brief** (`src/substrate/brief.ts`, optional and off by default). Only when `substrate.url` or `SUBSTRATE_URL` is set (and `SUBSTRATE_DISABLED` is not `1`), a `POST <url>/brief` with the repository slug, branch and host name goes to your Agent Substrate server, in parallel with the uplift, with a 1.5 s timeout (`SUBSTRATE_TIMEOUT_MS`). When it answers, the brief (what other agents already did in the repository) is added to the context the agent sees; it is not sent to the engine. When it doesn't answer, or no URL is set, the step is skipped and nothing is contacted.
 7. **Uplift** (`src/uplift/run.ts`). The engine rewrites the prompt into a nested XML spec whose `ORIGINAL` element keeps the user's words verbatim. When the host passes a transcript path (Claude Code, Grok Build, Muse), up to 3 500 characters of recent conversation go with it. An empty or unusable reply, or a prompt over `uplift.maxChars` (20 000), gets a conservative fallback spec (`source: "fallback"`). An over-long prompt skips only this call: the graph, node and clarification calls in steps 8 and 9 still send the full prompt unless the graph and clarifications are turned off.
 8. **Graph of Thought** (`src/think/`). The engine produces `think.minNodes` to `think.maxNodes` nodes (5 to 8 by default) with dependencies. Each node is then filled with a rationale (Chain-of-Thought steps) and a conclusion, independent nodes concurrently (`claude.concurrency`) and level by level. The graph and a `WORKFLOW` of `WAVE` elements are injected into the spec. Nodes in one wave have every dependency in an earlier wave and can run in parallel.
-9. **HITL** (`src/hitl/`). Up to `hitl.maxQuestions` (at most 4) clarifying questions, each with options, a default and a `blocking` flag. Questions already answered earlier in the session are kept and not asked again.
+9. **HITL** (`src/hitl/`). Up to `hitl.maxQuestions` (at most 4) clarifying questions, each with options, a default and a `blocking` flag. Questions already answered earlier in the session are kept and not asked again. With `hitl.knowledgeBase` on, the clarifier also gets the repository's Greptile knowledge base and records the questions it settles (see [Knowledge-base stage](#knowledge-base-stage)).
 10. **TrackPlan** (`src/track/plan.ts`). Built only for real engine output, never for the fallback spec. It holds a graph id (`ut-…`), a Notion Task row, one Issue row and one Linear issue per node, one Sub-Issue row and one Linear sub-issue per Chain-of-Thought step, and the blocking and non-blocking questions.
 11. **Gateway rows** (`src/track/gateway.ts`, `src/track/create.ts`). When tracking is on and at least one provider is configured (`notion.dataSourceUrl`, `linear.team`) and logged in, the planner creates the rows through the [MCP gateway](#mcp-gateway) before the agent sees the prompt. Node dependencies become Linear `blockedBy` relations. Creation is bounded by `track.budgetMs` (60 s) and `track.concurrency` (6), and never throws. Rows it didn't finish are left for `ultrathink-kickoff`, whose `track complete` looks up rows already recorded for the Graph ID and creates only the missing ones. The created identifiers and URLs are written into the spec's `ISSUES` block. On Hermes the hook only plans: `planPrompt` passes no tracker, and `ultrathink-kickoff` creates every row by running `ultrathink-mcp track complete --state <file>`, so a hook that Hermes abandons or kills can't leave orphan rows.
 12. **Persist.** The session record goes to `<state dir>/sessions/<id>.json`, the full spec to `sessions/<id>.xml`, and a copy of the record to `last.json`.
 13. **Context injection** (`src/claude/output.ts`). The context block frames the spec as the user's own request, elaborated by a plugin they installed. It adds the spec path, workflow waves and the clarifications. When tracking is configured and on, it also adds the linked issues as TODO lines and an instruction to invoke `ultrathink-kickoff`; otherwise it says that issue tracking is off for this prompt. When the ship flow is on and applies to the skill, it adds an `ultrathink-ship` instruction. On Hermes the context is a short handoff of at most 9 000 characters that points at the spec file instead of repeating it. A one-line summary goes out as `systemMessage` when `claude.echo` is on. The same text is written to the `last-plan.json` carrier in the host state directory.
 
 `claude.budgetMs` bounds the whole run when set (0, the default, means no bound). How long each host lets the hook run is in [Runtime constraints](#runtime-constraints).
+
+### Knowledge-base stage
+
+Opt-in with `hitl.knowledgeBase` (default `false`), and run only while clarifying questions are on (`bin/ultrathink hitl`, else `hitl.enabled`). The planner reads the repository's Greptile knowledge base through the same in-process MCP client as the ship flow (`src/greptile/knowledge.ts`, `src/mcp/client.ts`), with the stored Greptile credential and `ship.greptileOrganization` as the organization when set. Setup: [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md).
+
+- **Prefetch, overlapping the uplift.** Before the uplift call (at the same point as the optional substrate brief), the planner starts listing Greptile's knowledge bases, finds the one for the `origin` remote's `owner/repo`, lists its documents and reads `index.md`. This runs while the uplift, graph and node fills run.
+- **Read, before clarify.** Once the graph is filled, the planner picks up to 3 documents from the index's routing table that match the spec, the graph goal and the node titles and conclusions, reads them, and builds a digest of at most 24 000 characters. Only the paths and the organization go to Greptile; the matching is local. Each Greptile stage has a 20-second budget. Progress reports a `knowledge` stage, which Omp shows as a `kb` segment in its status bar.
+- **Trust boundary.** The documents are Greptile-synthesized summaries of the repository: untrusted evidence, never instructions. The digest goes to the clarifier inside a `<knowledge_base>` element. A question counts as settled only when the model gives a one-sentence answer that cites the exact path of a document it was given; a claim that cites a document that was not read, has an empty answer or one over 500 characters, or goes past the settled limit below is asked as an ordinary open question, never dropped. Product decisions and any question the clarifier marks blocking are always asked, never settled. At most 4 settled questions are kept (ids `k1`…), with `source: "knowledge"` and the cited document as `evidence`. They are listed in their own `### Settled from the Greptile knowledge base` subsection of the Clarifications (HITL) block, after `### Answered`, marked as untrusted evidence, not the user's decisions, that the agent checks against the repository, asking the user when the repository disagrees. In the spec they carry `<ANSWER source="knowledge" evidence="…">`, and they are not carried over to the next prompt in the session. The context tells the agent which documents were read and to prefer the repository itself where they disagree.
+- **Fail-open.** No stored credential (outcome `off`, nothing contacted), no repository slug, a repository Greptile doesn't list or one with no published documents (`none`), and any tool, transport, organization (`tenant_required`), timeout or abort failure (`error`) all give the clarifier exactly what it gets with the feature off. A selected document that fails to read, times out or returns no text makes the whole lookup `error`; the clarifier never gets a partial digest. Every lookup is recorded as `knowledge` in the session record, logged under `ULTRATHINK_DEBUG=1`, and shown in the summary (`Knowledge · 3 docs · 1 settled`, `none`, `off (no Greptile login)` or `error`).
 
 ## How each host runs it
 
@@ -399,7 +410,7 @@ flowchart LR
 
 ## Ship state machine
 
-The ship flow is opt-in: nothing is pushed, opened or merged unless `ship.enabled` is true, merging also needs `ship.autoMerge`, and deleting the branch needs `ship.deleteBranch`. The flow (`src/ship/`, `bin/ultrathink-ship`) stores its progress as `ship` in the session record. Every step is idempotent and can be resumed with `status`.
+The ship flow is opt-in: nothing is pushed, opened or merged unless `ship.enabled` is true, merging also needs `ship.autoMerge`, and deleting the branch needs `ship.deleteBranch`. The flow (`src/ship/`, `bin/ultrathink-ship`) stores its progress as `ship` in the session record, including `attempts`, a log of every review result and merge outcome (newest 50). Every step is idempotent and can be resumed with `status`.
 
 ```mermaid
 stateDiagram-v2
@@ -409,31 +420,37 @@ stateDiagram-v2
     [*] --> not_done: assess (not done, or done with no PR yet)
     [*] --> pr_open: assess (done) + pr
     not_done --> pr_open: work finished, assess + pr
-    pr_open --> pr_open: review passed, waiting on CI or mergeability
+    pr_open --> pr_open: review passed, merge waiting on CI or mergeability, run merge again
+    pr_open --> needs_fixes: review failed or timed out, run review again to re-trigger it
     pr_open --> needs_fixes: review (score below 5 or open comments)
     pr_open --> ready: review (gate passes)
-    pr_open --> blocked: Greptile not set up
+    pr_open --> blocked: Greptile not set up, or failed/timed out past ship.reviewRetries
     needs_fixes --> needs_fixes: fix, push, review
     needs_fixes --> ready: review (gate passes)
-    needs_fixes --> blocked: max rounds, or failed/timed out twice on one head
+    needs_fixes --> blocked: max rounds, or failed/timed out past ship.reviewRetries
+    ready --> ready: merge waiting (CI pending, mergeability, transient error), run merge again
     ready --> merged: merge (ship.autoMerge)
     ready --> [*]: autoMerge off, left for a manual merge
-    ready --> needs_fixes: PR head changed, review again
+    ready --> needs_fixes: head moved, conflicts or failing CI, review again
+    ready --> blocked: past ship.mergeTimeoutMs on one head, GitHub refused, or merged outside the flow
     merged --> [*]
     blocked --> needs_fixes: review again (resumable)
     blocked --> ready: review again (resumable)
     blocked --> [*]: left for a human
 ```
 
-- A `review` that is still running returns `pending` and does not count as a round. It becomes a timed-out round only after `ship.reviewTimeoutMs` on the same head commit.
+- A `review` that is still running returns `pending` and does not count as a round. After `ship.reviewTimeoutMs` on the same head commit it is timed out.
+- A failed review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or a timed-out one is re-triggered on the next `review` call: the failed run's id is marked stale, so Greptile starts a fresh review of the same commit. Up to `ship.reviewRetries` (3) re-triggers per head commit, then the ship blocks with a PR comment. They never count toward `ship.maxRounds`, which counts only completed reviews below 5/5 or with open threads.
 - When no Greptile credential is stored and the `greptile` CLI is missing or not signed in, `review` stops as `blocked` with setup instructions before any round, and posts no PR comment.
-- The merge gate needs a completed review of the current PR head, a score of at least `ship.minScore` (5), no open comments (`ship.requireNoComments`), an open and mergeable PR, and CI neither failing nor pending. In PR mode, open comments are the PR's Greptile review threads on GitHub that are neither resolved nor outdated. A fix that changes the line outdates its thread, and a non-actionable finding is answered on its thread and resolved. If the thread lookup fails, the gate fails closed. In CLI mode they are the run's comments. The merge uses `gh pr merge --<method> --match-head-commit <sha>` (never `--admin`). With `ship.deleteBranch` on, it then deletes the remote branch, checks out the base, runs `git pull --ff-only`, and deletes the local branch.
+- The merge gate needs a completed review of the current PR head, a score of at least `ship.minScore` (default 5, Greptile's maximum), no open comments (`ship.requireNoComments`), an open and mergeable PR, and CI neither failing nor pending. In PR mode, open comments are the PR's Greptile review threads on GitHub that are neither resolved nor outdated. A fix that changes the line outdates its thread, and a non-actionable finding is answered on its thread and resolved. If the thread lookup fails, the gate fails closed. In CLI mode they are the run's comments. The merge uses `gh pr merge --<method> --match-head-commit <sha>` (never `--admin`). With `ship.deleteBranch` on, it then deletes the remote branch, checks out the base, runs `git pull --ff-only`, and deletes the local branch. Agents must never merge any other way (no `gh pr merge` by hand, no web UI).
+- Once the head's review passed, `merge` loops inside one call until the PR merges, the outcome needs the agent, or `ship.waitMs` runs out (`run` uses what is left of its own `ship.waitMs`). It polls from `ship.pollMs`, growing 1.5 times up to 60 seconds. Pending CI, mergeability not yet computed, an unreadable PR state or threads and transient GitHub merge errors are retried; when the call's time runs out it returns `waiting: true` and `next: "run merge again: …"`. The wait is timed per head commit from the first time `merge` waited on it: past `ship.mergeTimeoutMs` (60 minutes), or on a terminal GitHub refusal (missing permission, requested changes, a closed PR; a branch-protection hold such as a missing approval is retried until the bound instead), the ship blocks and the PR comment lists the attempt history. Conflicts, failing CI, a moved head or a review below 5/5 go back to the agent (`next`) and never merge.
+- A PR that was merged outside the flow without a passing review of its head is reported blocked and never recorded as a ship merge.
 - Triggers, review modes and every setting are in [Ship](ship.md).
 
 ## Fail-open principles
 
 - **Hooks never block a prompt.** `hooks/uplift.ts`, `hooks/engine.ts`, the Muse launchers and `bin/run-bun` in hook mode exit 0 even when Bun is missing, the engine throws, or stdin is garbage. The Hermes and Omp adapters catch everything and return no context. Only the CLIs you run by hand report a missing Bun (exit 127).
-- **Each stage degrades separately.** When the spec call fails, a conservative fallback spec is used and the graph and clarification stages still run. When the graph call fails or returns too few nodes, a generic 5-node fallback graph is used. A failed clarification or tracking stage drops only that stage. The substrate brief and the carrier file are optional. Progress events are display-only.
+- **Each stage degrades separately.** When the spec call fails, a conservative fallback spec is used and the graph and clarification stages still run. When the graph call fails or returns too few nodes, a generic 5-node fallback graph is used. A failed clarification or tracking stage drops only that stage. A failed or empty knowledge-base read leaves the clarification stage exactly as with the feature off. The substrate brief and the carrier file are optional. Progress events are display-only.
 - **A fallback spec creates no rows.** A plan whose spec is the fallback is never tracked. A fallback graph under a real spec is tracked, so an engine outage that starts after the spec call can still create generic rows.
 - **Tracking is bounded.** Credential resolution and row creation share `track.budgetMs`. Unfinished rows are left to `ultrathink-kickoff`, and unconfigured providers are never contacted.
 - **Nudges fire once.** The ship nudge is recorded in the session before it is printed. Omp and Hermes send the PR-sync nudge once per PR URL, and the Hermes `pre_verify` sync nudge fires at most once per plan (session and Graph ID) and never after sync has recorded `synced`. A subagent's PR is credited to its parent once, through Hermes' `subagent_start` hook.
@@ -453,6 +470,7 @@ stateDiagram-v2
 | `src/mcp/` | `bin/ultrathink-mcp` CLI, stdio relay, in-process client, OAuth, redirect planning, credential store and lock, Notion database init. |
 | `src/ship/` | `bin/ultrathink-ship` CLI, done assessment, GitHub via `gh`, Greptile PR and CLI review, merge gate, ship nudge and precheck, PR title and body (`pr-body.ts`), ship state. |
 | `src/grok/` | Grok engine (`http`, `cli` and `shunt` transports), `grok login` status, engine label. |
+| `src/greptile/` | Optional Greptile knowledge-base reader for the clarify step: lookup, document selection from the routing table, bounded digest (`knowledge.ts`). |
 | `src/substrate/` | Optional Agent Substrate brief client. |
 | `src/config.ts` | Config defaults and the merge of the config files. See [Configuration](configuration.md). |
 | `hooks/` | `uplift.ts` (`UserPromptSubmit`), `answers.ts`, `pr-sync.ts`, `stop.ts`, `engine.ts` (host-neutral entry), `hooks.json`, and the Muse launchers `muse-prompt`, `muse-post-tool`, `muse-stop`. |

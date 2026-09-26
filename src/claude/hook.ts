@@ -10,6 +10,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
+import { createGreptileKnowledge, type KnowledgeLookup, type KnowledgeReader, type KnowledgeResult, type KnowledgeSession } from "../greptile/knowledge.ts";
 import { injectClarificationsXml } from "../hitl/format.ts";
 import { normalizeQuestion, type RunClarifyOptions, runClarify } from "../hitl/pipeline.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -73,6 +74,8 @@ export interface HookDeps {
 	trackingOff?: boolean;
 	/** Structured live progress (Omp status bar); a throwing sink never breaks planning. */
 	progress?: ProgressSink;
+	/** Test seam for the Greptile knowledge-base prefetch; defaults to `createGreptileKnowledge(config)` (undefined unless opted in). */
+	knowledge?: KnowledgeReader;
 }
 
 export interface PromptSubmitResult {
@@ -83,6 +86,30 @@ export interface PromptSubmitResult {
 
 function specFile(stateDir: string, sessionId: string): string {
 	return sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml");
+}
+
+/**
+ * What the knowledge base should be matched against: the uplifted spec's text plus the graph's goal and node titles and
+ * conclusions. Tags are stripped: their names and attributes (GRAPH_OF_THOUGHT, NODE, kind, …) would otherwise score
+ * unrelated routing entries on every request.
+ */
+function knowledgeTopic(result: UpliftResult, graph: ThoughtGraph | undefined): string {
+	const parts = [result.xml.replace(/<[^>]*>/g, " ")];
+	if (graph) {
+		parts.push(graph.goal);
+		for (const node of graph.nodes) parts.push(node.conclusion ? `${node.title}: ${node.conclusion}` : node.title);
+	}
+	return parts.filter(Boolean).join("\n");
+}
+
+/** Awaits a knowledge read; a session that breaks its never-rejects contract still fails open as an error lookup. */
+async function readKnowledge(session: KnowledgeSession, topic: string): Promise<KnowledgeResult> {
+	try {
+		return await session.read(topic);
+	} catch (error) {
+		const reason = (error instanceof Error ? error.message : String(error)).split("\n")[0]?.slice(0, 200) ?? "error";
+		return { lookup: { outcome: "error", docs: [], chars: 0, ms: 0, reason }, digest: "" };
+	}
 }
 
 export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps): Promise<PromptSubmitResult> {
@@ -128,6 +155,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	let outcomeDetail: string | undefined;
 
 	const controller = new AbortController();
+	let session: KnowledgeSession | undefined;
 	const budget =
 		deps.config.claude.budgetMs > 0 ? setTimeout(() => controller.abort(), deps.config.claude.budgetMs) : undefined;
 	try {
@@ -147,6 +175,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			}
 		})();
 
+		// Decided before the brief: the knowledge-base prefetch only runs when clarify will.
+		const hitlOn = deps.control.hitlEnabled ?? deps.config.hitl.enabled;
+
 		// Started now, awaited before the Graph of Thought: the graph is then
 		// planned knowing what other agents already did, and the round trip
 		// overlaps the uplift call instead of adding to it.
@@ -157,6 +188,18 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			branch: git.branch,
 			surface: deps.surface ?? "claude-code",
 		}).catch(() => "");
+
+		// The knowledge-base prefetch (find the repo, list documents, read index.md) overlaps the uplift and the
+		// Graph of Thought; the topic-specific documents are read right before clarify.
+		const reader = hitlOn ? (deps.knowledge ?? createGreptileKnowledge(deps.config)) : undefined;
+		if (reader) {
+			try {
+				session = reader.start({ repo: git.repo, signal: controller.signal });
+				stage("knowledge", "start");
+			} catch (error) {
+				log(`greptile knowledge base: start failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 
 		let result: UpliftResult;
 		stage("uplift", "start");
@@ -207,9 +250,22 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 
 		/** Answered clarifications from an earlier turn of this session survive; stale open ones are dropped. */
 		let clarifications: Clarification[] = (readSession(deps.stateDir, sessionId)?.clarifications ?? []).filter(
-			(c) => c.answer,
+			(c) => c.answer && c.source !== "knowledge",
 		);
-		const hitlOn = deps.control.hitlEnabled ?? deps.config.hitl.enabled;
+
+		// Always awaited once started (it honours the abort signal and never rejects) so the record says what happened.
+		let knowledge: KnowledgeLookup | undefined;
+		let knowledgeInput: { digest: string; docs: string[] } | undefined;
+		if (session) {
+			const read = await readKnowledge(session, knowledgeTopic(result, graph));
+			const lookup = read.lookup;
+			log(
+				`greptile knowledge base: ${lookup.outcome}${lookup.docs.length > 0 ? ` · ${lookup.docs.join(", ")}` : ""}${lookup.reason ? ` · ${lookup.reason}` : ""} · ${lookup.ms}ms`,
+			);
+			stage("knowledge", "end", lookup.outcome !== "error", lookup.outcome === "used" ? `${lookup.docs.length} docs` : lookup.outcome);
+			knowledge = { ...lookup, settled: 0 };
+			if (lookup.outcome === "used") knowledgeInput = { digest: read.digest, docs: lookup.docs };
+		}
 		if (hitlOn && !controller.signal.aborted) {
 			stage("clarify", "start");
 			try {
@@ -222,9 +278,12 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					signal: controller.signal,
 					maxQuestions: deps.config.hitl.maxQuestions,
 					onProgress: log,
+					...(knowledgeInput ? { knowledge: knowledgeInput } : {}),
 				});
 				const seen = new Set(clarifications.map((c) => normalizeQuestion(c.question)));
-				clarifications = [...clarifications, ...fresh.filter((c) => !seen.has(normalizeQuestion(c.question)))];
+				const kept = fresh.filter((c) => !seen.has(normalizeQuestion(c.question)));
+				clarifications = [...clarifications, ...kept];
+				if (knowledge) knowledge = { ...knowledge, settled: kept.filter((c) => c.source === "knowledge").length };
 				stage("clarify", "end", true, `${clarifications.length} question${clarifications.length === 1 ? "" : "s"}`);
 			} catch (error) {
 				log(`clarify failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -287,6 +346,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			...(skill ? { skill: { name: skill.name, ...(skill.summary ? { summary: skill.summary } : {}), source: skill.source } } : {}),
 			kickedOff: false,
 			synced: false,
+			...(knowledge ? { knowledge } : {}),
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
@@ -323,6 +383,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					ship: shipApplies(deps.config.ship, skill?.name),
 					trackingOff: deps.trackingOff,
 					providers,
+					knowledge,
 					skillHints: deps.surface === "hermes",
 					// No spec file (the write failed) means nothing to point at: fall back to the inline spec.
 					handoff: deps.surface === "hermes" && specPath !== undefined,
@@ -342,6 +403,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				...(skill ? { skill: skill.name } : {}),
 				trackingOff: deps.trackingOff,
 				providers,
+				knowledge,
 				engineError: deps.engineError?.(),
 				elapsedMs: now() - started,
 			});
@@ -352,6 +414,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		outcomeDetail = error instanceof Error ? error.name : "error";
 		throw error;
 	} finally {
+		session?.close();
 		clearTimeout(budget);
 		emit({ type: "end", at: now(), outcome, ...(outcomeDetail ? { detail: outcomeDetail } : {}) });
 	}

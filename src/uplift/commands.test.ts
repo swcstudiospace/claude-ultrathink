@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import { readControl } from "../claude/state.ts";
+import { writeStore } from "../mcp/store.ts";
 import {
 	parseUltrathinkCommand,
 	runControl,
@@ -115,6 +116,7 @@ describe("runControl", () => {
 		"ULTRATHINK_SHIP",
 		"SUBSTRATE_URL",
 		"SUBSTRATE_DISABLED",
+		"ULTRATHINK_MCP_STORE",
 	] as const;
 	const saved: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
 	let dir: string;
@@ -134,6 +136,8 @@ describe("runControl", () => {
 		process.env.XDG_CONFIG_HOME = join(dir, "xdg");
 		process.env.CLAUDE_CONFIG_DIR = join(dir, "claude");
 		for (const key of ["ULTRATHINK_TRACK", "ULTRATHINK_SHIP", "SUBSTRATE_URL", "SUBSTRATE_DISABLED"] as const) delete process.env[key];
+		// The credential store must never be the real one.
+		process.env.ULTRATHINK_MCP_STORE = join(dir, "mcp-credentials.json");
 		projectConfig({});
 	});
 
@@ -210,6 +214,26 @@ describe("runControl", () => {
 		expect(await statusLine("Ship:")).toBe("Ship: on · auto-merge on · delete branch on");
 		process.env.ULTRATHINK_SHIP = "0";
 		expect(await statusLine("Ship:")).toBe("Ship: off (ULTRATHINK_SHIP=0)");
+	});
+
+	test("status shows the knowledge base as opt-in, idle while HITL is off, missing a credential, then ready with its organization", async () => {
+		expect(await statusLine("Knowledge base:")).toBe("Knowledge base: off (opt-in: set hitl.knowledgeBase)");
+		projectConfig({ hitl: { knowledgeBase: true } });
+		expect(await statusLine("Knowledge base:")).toBe(
+			"Knowledge base: on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)",
+		);
+		writeStore(process.env.ULTRATHINK_MCP_STORE as string, {
+			version: 1,
+			providers: { greptile: { kind: "api_key", apiKey: "test-key", updatedAt: 1 } },
+		});
+		expect(await statusLine("Knowledge base:")).toBe("Knowledge base: on · Greptile");
+		projectConfig({ hitl: { knowledgeBase: true }, ship: { greptileOrganization: "acme" } });
+		expect(await statusLine("Knowledge base:")).toBe("Knowledge base: on · Greptile · organization acme");
+		await runControl(["hitl", "off"], io);
+		expect(await statusLine("Knowledge base:")).toBe("Knowledge base: on · not read while HITL is off");
+		projectConfig({ hitl: { enabled: false, knowledgeBase: true }, ship: { greptileOrganization: "acme" } });
+		await runControl(["hitl", "on"], io);
+		expect(await statusLine("Knowledge base:")).toBe("Knowledge base: on · Greptile · organization acme");
 	});
 
 	test("the shunt status names the missing gateway setting and the model actually sent", async () => {

@@ -4,6 +4,7 @@ import { recoverUnauthorized, resolveAuthHeader } from "./oauth.ts";
 import { PROVIDERS, USER_AGENT } from "./providers.ts";
 import type { ProviderId } from "./providers.ts";
 import { createRelay } from "./relay.ts";
+import { readStore } from "./store.ts";
 import type { ToolCaller } from "../track/create.ts";
 
 export interface McpClient extends ToolCaller {
@@ -171,4 +172,20 @@ export function createMcpClient(provider: ProviderId, deps: McpClientDeps): McpC
 			}
 		},
 	};
+}
+
+/** True when `provider` has a usable stored credential: an API key, or OAuth tokens that do not need a new login. */
+export function hasUsableCredential(provider: ProviderId, storePath: string): boolean {
+	const credential = readStore(storePath).providers[provider];
+	if (!credential) return false;
+	return credential.kind === "api_key" || (!credential.needsLogin && Boolean(credential.tokens));
+}
+
+/** A client for `provider` when hasUsableCredential is true; otherwise undefined. Never throws. */
+export function createMcpClientIfCredentialed(provider: ProviderId, deps: McpClientDeps): McpClient | undefined {
+	try {
+		return hasUsableCredential(provider, deps.storePath) ? createMcpClient(provider, deps) : undefined;
+	} catch {
+		return undefined;
+	}
 }
