@@ -4,7 +4,7 @@ Thanks for helping. Bugs and feature requests go through the [issue forms](https
 
 ## Development setup
 
-You need [Bun](https://bun.sh) 1.2 or newer, Python 3.10 or newer and git, on Linux or macOS (Windows through WSL).
+You need [Bun](https://bun.sh) 1.2 or newer, Python 3.10 or newer and git, on Linux or macOS (Windows through WSL). ultrathink itself runs on Bun 1.2, but `bun install` needs a Bun that reads the current `bun.lock` format (the latest Bun does; Bun 1.2 does not).
 
 ```bash
 git clone https://github.com/swcstudiospace/claude-ultrathink.git
@@ -15,7 +15,7 @@ bun test
 python3 hosts/hermes/bridge_test.py    # Hermes bridge tests; prints "ok"
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10.
+CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10. The Bun 1.2.x jobs run the tests and the Hermes bridge tests without `bun install` and the type check, because they cannot read `bun.lock` and ultrathink has no runtime dependencies.
 
 To try a change in a host, install it from your checkout as [docs/install.md](docs/install.md) shows. For Claude Code, `claude --plugin-dir <checkout>` loads the checkout for one session; disable an installed copy first (`claude plugin disable ultrathink@ultrathink`) so the prompt is not planned twice. TypeScript changes under `hooks/` and `src/` take effect on the next prompt, with these exceptions:
 

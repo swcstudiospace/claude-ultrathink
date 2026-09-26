@@ -30,10 +30,14 @@ jobs:
         with:
           python-version: "3.10"
 
+      # ultrathink has no runtime dependencies; `bun install` only fetches type definitions for the type check.
+      # bun.lock uses a lockfile format Bun 1.2 cannot read, so the minimum-Bun leg runs the tests without it.
       - name: Install dependencies
+        if: matrix.bun == 'latest'
         run: bun install --frozen-lockfile
 
       - name: Type check
+        if: matrix.bun == 'latest'
         run: bun run check
 
       # The runner has no git identity and git refuses to commit without one; set it in case a test shells out to git.
