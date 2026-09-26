@@ -234,8 +234,8 @@ export function apply(
 	};
 	if (!claudeAvailable(run)) return { grok };
 
-	const notion = ensureMcpServer("notion", "https://mcp.notion.com/mcp", run);
-	const linear = ensureMcpServer("linear", "https://mcp.linear.app/mcp", run);
+	const notion = ensureMcpServer("notion", SETUP_MCP_URLS.notion, run);
+	const linear = ensureMcpServer("linear", SETUP_MCP_URLS.linear, run);
 	const plugin = ensurePluginInstalled(repoRoot, run);
 
 	const path = claudeMdPath(env);
@@ -268,8 +268,8 @@ export function status(env: Record<string, string | undefined> = process.env, ru
 	const notionOk = mcpServerConfigured("notion", run);
 	const linearOk = mcpServerConfigured("linear", run);
 	return [
-		`Notion MCP: ${notionOk ? "configured" : "missing — run: claude mcp add --transport http --scope user notion https://mcp.notion.com/mcp"}`,
-		`Linear MCP: ${linearOk ? "configured" : "missing — run: claude mcp add --transport http --scope user linear https://mcp.linear.app/mcp"}`,
+		`Notion MCP: ${notionOk ? "configured" : `missing — run: claude mcp add --transport http --scope user notion ${SETUP_MCP_URLS.notion}`}`,
+		`Linear MCP: ${linearOk ? "configured" : `missing — run: claude mcp add --transport http --scope user linear ${SETUP_MCP_URLS.linear}`}`,
 		`CLAUDE.md contract: ${claudeMdOk ? `present at ${path}` : `missing at ${path} — run: bun scripts/setup.ts apply`}`,
 		...grok,
 	].join("\n");
@@ -286,10 +286,17 @@ function removeBlock(path: string, deleteEmpty: boolean): boolean {
 	return true;
 }
 
-/** `error` is set when the removal ran and failed; the server stays recorded so a later rollback retries it. */
+/** The hosted servers `apply` adds at user scope. */
+export const SETUP_MCP_URLS = { notion: "https://mcp.notion.com/mcp", linear: "https://mcp.linear.app/mcp" } as const;
+
+/**
+ * `error`: the check or removal failed; the server stays recorded so a later rollback retries it.
+ * `kept`: nothing to undo any more — `changed` (the user replaced setup's entry) or `gone` (no server by that name).
+ */
 export interface McpRemoval {
 	removed: boolean;
 	error?: string;
+	kept?: "changed" | "gone";
 }
 
 export interface RollbackResult {
@@ -304,12 +311,31 @@ export interface RollbackResult {
 /** Plugin removal is left to the user: uninstalling from a running Claude Code session is theirs to decide. */
 export const PLUGIN_UNINSTALL_COMMANDS = ["claude plugin uninstall ultrathink@ultrathink", "claude plugin marketplace remove ultrathink"] as const;
 
-/** Removes a server `apply` added; `apply` adds at user scope, so a same-named local/project server is never touched. */
-function removeMcpServer(name: string, added: boolean, run: Run): McpRemoval {
+function commandError(result: { stdout: string; stderr: string; code: number }): string {
+	return `exit ${result.code}: ${result.stderr.trim() || result.stdout.trim() || "no output"}`;
+}
+
+/**
+ * Removes a server `apply` added, but only while `claude mcp get` still shows setup's own entry
+ * (user scope, HTTP, the hosted URL) — a server the user replaced since (e.g. with the gateway) stays.
+ */
+function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run: Run): McpRemoval {
 	if (!added) return { removed: false };
+	const current = run(["claude", "mcp", "get", name]);
+	if (current.code !== 0) {
+		if (current.code !== 127 && /No MCP server named/i.test(`${current.stdout}\n${current.stderr}`)) return { removed: false, kept: "gone" };
+		return { removed: false, error: commandError(current) };
+	}
+	// `claude mcp get` prints `  Scope: User config (…)`, `  Type: http`, `  URL: …`; the first occurrence of each key is the server's own.
+	const fields: Record<string, string> = {};
+	for (const line of current.stdout.split("\n")) {
+		const match = /^\s+([A-Za-z]+):\s*(.*)$/.exec(line);
+		if (match && !(match[1] in fields)) fields[match[1]] = match[2].trim();
+	}
+	const ours = /^user\b/i.test(fields.Scope ?? "") && fields.Type?.toLowerCase() === "http" && fields.URL === SETUP_MCP_URLS[name];
+	if (!ours) return { removed: false, kept: "changed" };
 	const result = run(["claude", "mcp", "remove", "--scope", "user", name]);
-	if (result.code === 0) return { removed: true };
-	return { removed: false, error: `exit ${result.code}: ${result.stderr.trim() || result.stdout.trim() || "no output"}` };
+	return result.code === 0 ? { removed: true } : { removed: false, error: commandError(result) };
 }
 
 export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): RollbackResult {
@@ -386,6 +412,8 @@ export function applyReport(repoRoot: string, result: ApplyResult, env: Record<s
 
 function mcpRemovalLine(label: string, name: string, removal: McpRemoval): string {
 	if (removal.removed) return `${label}: removed`;
+	if (removal.kept === "changed") return `${label}: left in place: ${name} was changed since setup added it`;
+	if (removal.kept === "gone") return `${label}: already removed`;
 	if (removal.error === undefined) return `${label}: left in place (setup did not add it)`;
 	return `${label}: removal failed (${removal.error}) — fix that, then re-run rollback or run: claude mcp remove --scope user ${name}`;
 }

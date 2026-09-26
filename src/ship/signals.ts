@@ -105,13 +105,14 @@ function latestVerification(cwd: string): GsdSignals["verification"] {
 
 type Env = Record<string, string | undefined>;
 
-/** Where GSD installs gsd-tools.cjs, in lookup order: project-local installs, then each host's config dir, then the legacy path. */
+/** Where GSD installs gsd-tools.cjs, in lookup order: project-local installs (incl. legacy), then each host's config dir, then the legacy home path. */
 export function gsdToolsCandidates(cwd: string, env: Env, home: string): string[] {
 	const tool = (dir: string): string => join(dir, "gsd-core", "bin", "gsd-tools.cjs");
 	return [
 		tool(cwd),
 		tool(join(cwd, ".claude")),
 		tool(join(cwd, ".codex")),
+		join(cwd, ".claude", "get-shit-done", "bin", "gsd-tools.cjs"),
 		...(env.CLAUDE_CONFIG_DIR ? [tool(env.CLAUDE_CONFIG_DIR)] : []),
 		tool(join(home, ".claude")),
 		tool(join(home, ".agents")),

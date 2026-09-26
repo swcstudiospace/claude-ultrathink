@@ -94,6 +94,20 @@ const LOOKALIKES = [
 	"my-linear: npx linear-mcp - ✔ Connected",
 ].join("\n");
 
+type Reply = { stdout: string; stderr: string; code: number };
+
+/** `claude mcp get` output for the hosted entry `apply` adds (user scope, HTTP, setup's URL). */
+function setupEntry(name: string): Reply {
+	const url = name === "notion" ? "https://mcp.notion.com/mcp" : "https://mcp.linear.app/mcp";
+	const stdout = `${name}:\n  Scope: User config (available in all your projects)\n  Status: ✔ Connected\n  Type: http\n  URL: ${url}\n\nTo remove this server, run: claude mcp remove ${name} -s user\n`;
+	return { stdout, stderr: "", code: 0 };
+}
+
+/** Rollback-time claude: `get` shows setup's own entry and every other call succeeds, unless `script` answers first. */
+function ownedRun(script: (cmd: string[]) => Reply | undefined = () => undefined): Run & { calls: string[][] } {
+	return fakeRun((cmd) => script(cmd) ?? (cmd[2] === "get" ? setupEntry(cmd[3]) : { stdout: "", stderr: "", code: 0 }));
+}
+
 describe("claudeMdPath", () => {
 	test("uses CLAUDE_CONFIG_DIR when set, else ~/.claude", () => {
 		expect(claudeMdPath({ CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join("/cfg", "CLAUDE.md"));
@@ -311,7 +325,7 @@ describe("apply / status / rollback", () => {
 			expect(state.notionAdded).toBe(true);
 			expect(state.linearAdded).toBe(true);
 
-			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const rollbackRun = ownedRun();
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(true);
 			expect(result.linear.removed).toBe(true);
@@ -333,7 +347,7 @@ describe("apply / status / rollback", () => {
 			expect(again.claude?.linear.added).toBe(false);
 			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
 
-			const rollbackRun = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const rollbackRun = ownedRun();
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(true);
 			expect(result.linear.removed).toBe(true);
@@ -387,7 +401,7 @@ describe("apply / status / rollback", () => {
 		try {
 			apply(repo, mcpRun(""), env);
 			expect(existsSync(setupStatePath(env))).toBe(true);
-			expect(rollback(env, fakeRun(() => ({ stdout: "", stderr: "", code: 0 }))).state.status).toBe("removed");
+			expect(rollback(env, ownedRun()).state.status).toBe("removed");
 			expect(existsSync(setupStatePath(env))).toBe(false);
 
 			const again = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
@@ -402,8 +416,8 @@ describe("apply / status / rollback", () => {
 		const { env, repo, cleanup } = tempSetup();
 		try {
 			apply(repo, mcpRun(""), env);
-			const failing = fakeRun((cmd) =>
-				cmd[2] === "remove" && cmd.at(-1) === "notion" ? { stdout: "", stderr: "claude: not found", code: 127 } : { stdout: "", stderr: "", code: 0 },
+			const failing = ownedRun((cmd) =>
+				cmd[2] === "remove" && cmd.at(-1) === "notion" ? { stdout: "", stderr: "claude: not found", code: 127 } : undefined,
 			);
 			const first = rollback(env, failing);
 			expect(first.notion).toEqual({ removed: false, error: "exit 127: claude: not found" });
@@ -414,12 +428,70 @@ describe("apply / status / rollback", () => {
 			expect(report).toContain("Notion MCP: removal failed (exit 127: claude: not found)");
 			expect(report).toContain("claude mcp remove --scope user notion");
 
-			const retry = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const retry = ownedRun();
 			const second = rollback(env, retry);
-			expect(retry.calls).toEqual([["claude", "mcp", "remove", "--scope", "user", "notion"]]);
+			expect(retry.calls).toEqual([
+				["claude", "mcp", "get", "notion"],
+				["claude", "mcp", "remove", "--scope", "user", "notion"],
+			]);
 			expect(second.notion.removed).toBe(true);
 			expect(second.state.status).toBe("removed");
 			expect(existsSync(setupStatePath(env))).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("rollback leaves a server the user replaced since setup added it, and forgets it; setup's unchanged entry is removed", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			// notion now points at a gateway the user registered in place of setup's hosted server.
+			const gateway: Reply = {
+				stdout: "notion:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: /opt/tools/bin/ultrathink-mcp\n  Args: serve notion\n",
+				stderr: "",
+				code: 0,
+			};
+			const run = ownedRun((cmd) => (cmd[2] === "get" && cmd[3] === "notion" ? gateway : undefined));
+			const result = rollback(env, run);
+			expect(result.notion).toEqual({ removed: false, kept: "changed" });
+			expect(result.linear.removed).toBe(true);
+			expect(run.calls).not.toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(run.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
+			expect(rollbackReport(result).join("\n")).toContain("left in place: notion was changed since setup added it");
+			expect(result.state.status).toBe("removed");
+			expect(existsSync(setupStatePath(env))).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a same-named server at another URL or scope counts as changed", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const otherUrl = setupEntry("notion");
+			otherUrl.stdout = otherUrl.stdout.replace("https://mcp.notion.com/mcp", "https://notion.example.com/mcp");
+			const localScope = setupEntry("linear");
+			localScope.stdout = localScope.stdout.replace("User config (available in all your projects)", "Local config (private to you in this project)");
+			const run = ownedRun((cmd) => (cmd[2] === "get" ? (cmd[3] === "notion" ? otherUrl : localScope) : undefined));
+			const result = rollback(env, run);
+			expect(result.notion.kept).toBe("changed");
+			expect(result.linear.kept).toBe("changed");
+			expect(run.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("without the claude CLI, rollback keeps both servers recorded so a later rollback can still check and remove them", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const result = rollback(env, fakeRun(noClaude));
+			expect(result.notion.error).toContain("exit 127");
+			expect(result.state.status).toBe("kept");
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: true });
 		} finally {
 			cleanup();
 		}

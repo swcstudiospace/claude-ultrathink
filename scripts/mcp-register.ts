@@ -71,6 +71,8 @@ export interface PlanOptions {
 	mode?: Mode;
 	/** Reads Hermes' config.yaml (fresh on every call); undefined when it is missing or unreadable. */
 	hermesConfig?: () => string | undefined;
+	/** Reads Claude Code's ~/.claude.json (fresh on every call), whose top-level mcpServers is the user scope. */
+	claudeConfig?: () => string | undefined;
 }
 
 /** What a host holds under one server name. `ours` is false whenever ownership cannot be determined. */
@@ -79,6 +81,8 @@ export interface Found {
 	ours: boolean;
 	matches: boolean;
 	disabled: boolean;
+	/** Why a same-named entry in another scope was ignored; reported when the decision has no reason of its own. */
+	note?: string;
 }
 
 type Json = Record<string, unknown>;
@@ -217,7 +221,9 @@ const CLI_COMMANDS: Record<CliHost, { add: (entry: Entry) => string[][]; remove:
 function planFrom(host: CliHost, entries: Entry[], find: (entry: Entry) => Found, mode: Mode): Plan {
 	const plan: Plan = { commands: [], changes: [] };
 	for (const entry of entries) {
-		const change = decide(entry.id, find(entry), mode);
+		const found = find(entry);
+		const change = decide(entry.id, found, mode);
+		if (found.note && !change.reason) change.reason = found.note;
 		plan.changes.push(change);
 		if (change.action === "removed") plan.commands.push(...CLI_COMMANDS[host].remove(entry.id));
 		else if (ACTING[change.action]) plan.commands.push(...CLI_COMMANDS[host].add(entry));
@@ -225,26 +231,53 @@ function planFrom(host: CliHost, entries: Entry[], find: (entry: Entry) => Found
 	return plan;
 }
 
-// `claude mcp get <name>` exits non-zero when the name is unknown and otherwise prints `Command: <path>` / `Args: …`.
+// add/remove act on the user scope only, so ownership comes from the user-scope entry alone.
+// `claude mcp get <name>` exits non-zero when the name is unknown in every scope; otherwise it prints the entry that
+// wins by precedence (local > project > user) with a `Scope:` line such as "User config (available in all your
+// projects)". When another scope wins, the user-scope entry is read from ~/.claude.json's top-level mcpServers.
 export function planClaude(run: Run, entries: Entry[], options: PlanOptions = {}): Plan {
 	return planFrom(
 		"claude",
 		entries,
-		(entry) => {
+		(entry): Found => {
 			const got = run(["claude", "mcp", "get", entry.id]);
 			if (got.code !== 0) return ABSENT;
 			const text = `${got.stdout}\n${got.stderr}`;
-			const command = /^\s*Command:\s*(.+?)\s*$/m.exec(text)?.[1];
-			const matches =
-				text.includes([entry.command, ...entry.args].join(" ")) ||
-				(text.includes(`Command: ${entry.command}`) && text.includes(`Args: ${entry.args.join(" ")}`));
-			return { present: true, ours: matches || isOurs(command), matches, disabled: false };
+			const scope = /^\s*Scope:\s*(.+?)\s*$/m.exec(text)?.[1];
+			if (scope === undefined || /^User config\b/i.test(scope)) {
+				const command = /^\s*Command:\s*(.+?)\s*$/m.exec(text)?.[1];
+				const matches =
+					text.includes([entry.command, ...entry.args].join(" ")) ||
+					(text.includes(`Command: ${entry.command}`) && text.includes(`Args: ${entry.args.join(" ")}`));
+				return { present: true, ours: matches || isOurs(command), matches, disabled: false };
+			}
+			const note = `${scope.split(" (")[0]?.toLowerCase()} entry with this name is left alone`;
+			let servers: Json | undefined;
+			try {
+				const parsed: unknown = JSON.parse(options.claudeConfig?.() ?? "");
+				if (isObject(parsed)) servers = isObject(parsed.mcpServers) ? parsed.mcpServers : {};
+			} catch {
+				servers = undefined;
+			}
+			if (servers === undefined) return { ...UNKNOWN, note };
+			const user = servers[entry.id];
+			if (user === undefined) return { ...ABSENT, note };
+			const command = isObject(user) ? user.command : undefined;
+			const args = isObject(user) ? (user.args ?? []) : undefined;
+			return {
+				present: true,
+				ours: isOurs(command),
+				matches: command === entry.command && sameJson(args, entry.args),
+				disabled: false,
+				note,
+			};
 		},
 		options.mode ?? "add",
 	);
 }
 
-// `grok mcp list --json` prints an array of `{ name, command?, args?, url?, scope }`; unreadable output is UNKNOWN.
+// `grok mcp list --json` prints an array of `{ name, command?, args?, url?, scope }` across scopes; only user-scope
+// entries (or ones without a scope field) count. Unreadable output is UNKNOWN.
 export function planGrok(run: Run, entries: Entry[], options: PlanOptions = {}): Plan {
 	const listed = run(["grok", "mcp", "list", "--json"]);
 	let servers: Json[] | undefined;
@@ -260,12 +293,16 @@ export function planGrok(run: Run, entries: Entry[], options: PlanOptions = {}):
 		(entry) => {
 			if (!servers) return UNKNOWN;
 			const named = servers.filter((s) => s.name === entry.id);
-			if (!named.length) return ABSENT;
+			const user = named.filter((s) => s.scope === undefined || s.scope === "user");
+			const others = [...new Set(named.filter((s) => !user.includes(s)).map((s) => String(s.scope)))];
+			const note = others.length ? `${others.join(", ")}-scope entry with this name is left alone` : undefined;
+			if (!user.length) return { ...ABSENT, note };
 			return {
 				present: true,
-				ours: named.every((s) => isOurs(s.command)),
-				matches: named.some((s) => s.command === entry.command && sameJson(s.args ?? [], entry.args)),
+				ours: user.every((s) => isOurs(s.command)),
+				matches: user.some((s) => s.command === entry.command && sameJson(s.args ?? [], entry.args)),
 				disabled: false,
+				note,
 			};
 		},
 		options.mode ?? "add",
@@ -504,10 +541,12 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	const home = env.HOME?.trim() || homedir();
 	const config = env.XDG_CONFIG_HOME?.trim() || join(home, ".config");
 	const hermesFile = hermesConfigFile(env, home);
+	const claudeFile = join(env.CLAUDE_CONFIG_DIR?.trim() || home, ".claude.json");
 	const options: ApplyOptions = {
 		mode,
 		log,
 		hermesConfig: () => (hermesFile === undefined ? undefined : readText(hermesFile)),
+		claudeConfig: () => readText(claudeFile),
 	};
 	let failed = false;
 	if (dryRun) log("dry run: no file is written and no host is changed; read-only list/get commands still run");
@@ -544,7 +583,7 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		if (!plan.commands.length) continue;
 		const configFile =
 			host === "claude"
-				? join(env.CLAUDE_CONFIG_DIR?.trim() || home, ".claude.json")
+				? claudeFile
 				: host === "grok"
 					? join(env.GROK_HOME?.trim() || join(home, ".grok"), "config.toml")
 					: hermesFile;

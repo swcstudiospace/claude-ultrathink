@@ -273,17 +273,17 @@ About the Hermes hook cap: Hermes abandons a plugin hook that runs longer than i
 hermes config set plugins.hook_callback_timeout 600
 ```
 
-The plugin asks Hermes for the cap it enforces. When that Hermes does not report it, the plugin reads `plugins.hook_callback_timeout` from `$HERMES_HOME/config.yaml` (`~/.hermes/config.yaml` when `HERMES_HOME` is unset), else assumes 30 seconds, and logs one warning naming the command above.
+The plugin asks Hermes for the cap it enforces. When that Hermes does not report it, the plugin reads `plugins.hook_callback_timeout` from the active Hermes profile's `config.yaml`, else assumes 30 seconds, and logs one warning naming the command above. That file is `$HERMES_HOME/config.yaml` (`~/.hermes/config.yaml` when `HERMES_HOME` is unset), or `<Hermes home>/profiles/<name>/config.yaml` when `active_profile` names a profile other than `default` or `HERMES_HOME` points at a profile directory.
 
 #### GSD tools lookup
 
 GSD (Get Shit Done) is a planning workflow that keeps a roadmap in `.planning/ROADMAP.md`. When a repository has one, `bin/ultrathink-ship assess` runs `gsd-tools.cjs` with `node` to read it, so Node.js must be on `PATH`. It looks for `gsd-tools.cjs` in this order, and the first match wins:
 
 1. `$GSD_TOOLS`, when set.
-2. `<repo>/gsd-core/bin/gsd-tools.cjs`, then the same under `<repo>/.claude` and `<repo>/.codex`.
+2. `<repo>/gsd-core/bin/gsd-tools.cjs`, then `gsd-core/bin/gsd-tools.cjs` under `<repo>/.claude` and `<repo>/.codex`, then the legacy `<repo>/.claude/get-shit-done/bin/gsd-tools.cjs`.
 3. `$CLAUDE_CONFIG_DIR/gsd-core/bin/gsd-tools.cjs`, when `CLAUDE_CONFIG_DIR` is set.
 4. `gsd-core/bin/gsd-tools.cjs` under `~/.claude`, `~/.agents`, `$HERMES_HOME` (else `~/.hermes`), `$CODEX_HOME` (else `~/.codex`), `$GEMINI_CONFIG_DIR` (else `~/.gemini`), `~/.cursor` and `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), in that order.
-5. `~/.claude/get-shit-done/bin/gsd-tools.cjs`.
+5. The legacy `~/.claude/get-shit-done/bin/gsd-tools.cjs`.
 
 When a roadmap exists and none of these is found, the assessment reports the gap `GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd`. When the tools are found but `node` is not on `PATH`, it reports `GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd`.
 

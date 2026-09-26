@@ -210,6 +210,7 @@ describe("resolveGsdTools", () => {
 			"/work/app/gsd-core/bin/gsd-tools.cjs",
 			"/work/app/.claude/gsd-core/bin/gsd-tools.cjs",
 			"/work/app/.codex/gsd-core/bin/gsd-tools.cjs",
+			"/work/app/.claude/get-shit-done/bin/gsd-tools.cjs",
 			"/cfg/claude/gsd-core/bin/gsd-tools.cjs",
 			"/home/u/.claude/gsd-core/bin/gsd-tools.cjs",
 			"/home/u/.agents/gsd-core/bin/gsd-tools.cjs",
@@ -222,9 +223,13 @@ describe("resolveGsdTools", () => {
 		]);
 	});
 
-	test("the legacy get-shit-done install is the last resort; nothing installed is undefined", () => {
-		const legacy = "/home/u/.claude/get-shit-done/bin/gsd-tools.cjs";
-		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => p === legacy })).toBe(legacy);
+	test("the legacy get-shit-done install resolves project-local before home, home last; nothing installed is undefined", () => {
+		const projectLegacy = "/work/app/.claude/get-shit-done/bin/gsd-tools.cjs";
+		const homeLegacy = "/home/u/.claude/get-shit-done/bin/gsd-tools.cjs";
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => p === projectLegacy })).toBe(projectLegacy);
+		const bothLegacy = new Set([projectLegacy, homeLegacy, "/home/u/.claude/gsd-core/bin/gsd-tools.cjs"]);
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => bothLegacy.has(p) })).toBe(projectLegacy);
+		expect(resolveGsdTools({ cwd, home, env: {}, exists: (p) => p === homeLegacy })).toBe(homeLegacy);
 		expect(resolveGsdTools({ cwd, home, env: {}, exists: () => false })).toBeUndefined();
 	});
 });

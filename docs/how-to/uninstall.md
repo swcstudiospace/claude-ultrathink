@@ -84,13 +84,13 @@ bun <clone>/scripts/setup.ts rollback
 | Item | What `rollback` does |
 |---|---|
 | `CLAUDE.md` tracking block | Removes the block between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->` from `${CLAUDE_CONFIG_DIR:-~/.claude}/CLAUDE.md`. The rest of the file stays. |
-| Claude Code `notion` and `linear` MCP servers | Runs `claude mcp remove --scope user` for each one that any `apply` run added (a re-run of `apply` keeps earlier records). A server that was already configured before `apply` stays, reported as `left in place (setup did not add it)`. |
-| Setup state file | Deletes `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink-setup-state.json`, where `apply` recorded which servers it added. If a server removal failed, the line says `removal failed (…)` and the state file is kept, so running `rollback` again retries it; or run the printed `claude mcp remove --scope user <name>` yourself. |
+| Claude Code `notion` and `linear` MCP servers | For each one that any `apply` run added (a re-run of `apply` keeps earlier records), checks it with `claude mcp get` and runs `claude mcp remove --scope user` only while it is still the user-scope HTTP server `apply` added, with the hosted URL. A changed entry is reported as `left in place: <name> was changed since setup added it`, a missing one as `already removed`, and a server that was configured before `apply` as `left in place (setup did not add it)`. |
+| Setup state file | Deletes `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink-setup-state.json`, where `apply` recorded which servers it added. If `claude` failed, the line says `removal failed (…)` and the state file is kept, so running `rollback` again retries it; or run the printed `claude mcp remove --scope user <name>` yourself. |
 | Grok hook file | Deletes `${GROK_HOME:-~/.grok}/hooks/ultrathink.json`. |
 | Grok rule | Removes the ultrathink block from `${GROK_HOME:-~/.grok}/rules/ultrathink.md`. The file is deleted when nothing else is left in it; text you added around the block stays. |
 | Claude Code plugin | Not removed. The last line prints `claude plugin uninstall ultrathink@ultrathink && claude plugin marketplace remove ultrathink` for you to run (step 1). |
 
-`rollback` removes the Claude Code `notion` and `linear` servers by name. If `apply` added them and you later replaced them with gateway entries, the gateway entries go.
+If you replaced the hosted `notion` and `linear` servers with gateway entries (`mcp-register --replace`), `rollback` leaves those in place; step 3 removes them.
 
 ## 3. Remove the MCP gateway entries
 
@@ -101,7 +101,7 @@ bun <clone>/scripts/mcp-register.ts --remove --dry-run   # show what would be re
 bun <clone>/scripts/mcp-register.ts --remove
 ```
 
-`--remove` deletes only ultrathink's `notion`, `linear` and `greptile` entries, meaning entries whose command ends in `/bin/ultrathink-mcp`. A same-named entry that runs something else is left in place and reported as `kept`. Hosts whose CLI (`claude`, `grok`, `hermes`) is not on `PATH` are skipped. Limit the run with `--hosts` and `--providers` if you only want some of them removed.
+`--remove` deletes only ultrathink's `notion`, `linear` and `greptile` entries, meaning entries whose command ends in `/bin/ultrathink-mcp`. A same-named entry that runs something else is left in place and reported as `kept`. Hosts whose CLI (`claude`, `grok`, `hermes`) is not on `PATH` are skipped. Limit the run with `--hosts` and `--providers` if you only want some of them removed. Only user-scope entries are touched; same-named local or project entries are left alone.
 
 Every file the script changed, now or when you registered, has a backup next to it named `<file>.bak-ultrathink-mcp-<timestamp>`. Delete the backups once you are happy with the result:
 

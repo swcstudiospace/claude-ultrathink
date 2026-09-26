@@ -123,7 +123,8 @@ def host_hook_cap() -> float | None:
 	"""The pre_llm_call cap Hermes enforces right now, resolved the way Hermes does per
 	hook invocation; None outside Hermes (hermes_cli.plugins not importable). A Hermes
 	whose private resolver is missing or fails gets plugins.hook_callback_timeout from
-	${HERMES_HOME:-~/.hermes}/config.yaml, else Hermes' 30 s default, and one warning."""
+	the active profile's config.yaml (_hermes_config_file), else Hermes' 30 s default,
+	and one warning."""
 	try:
 		from hermes_cli import plugins as hermes_plugins  # type: ignore[import-not-found]
 	except Exception:
@@ -132,17 +133,16 @@ def host_hook_cap() -> float | None:
 		return float(hermes_plugins._resolve_hook_callback_timeout())
 	except Exception:
 		pass
-	home = os.environ.get("HERMES_HOME", "").strip()
-	# Expanded the way Hermes expands HERMES_HOME.
-	config = (Path(os.path.expanduser(os.path.expandvars(home))) if home else Path.home() / ".hermes") / "config.yaml"
-	configured = _config_hook_cap(config)
+	config = _hermes_config_file()
+	configured = None if config is None else _config_hook_cap(config)
 	cap = HERMES_DEFAULT_CAP_S if configured is None else configured
 	if _first_warning("cap"):
-		source = (
-			f"plugins.hook_callback_timeout = {cap:g} from {config}"
-			if configured is not None
-			else f"Hermes' {cap:g}s default, as {config} sets no plugins.hook_callback_timeout"
-		)
+		if configured is not None:
+			source = f"plugins.hook_callback_timeout = {cap:g} from {config}"
+		elif config is not None:
+			source = f"Hermes' {cap:g}s default, as {config} sets no plugins.hook_callback_timeout"
+		else:
+			source = f"Hermes' {cap:g}s default, as the active Hermes profile (active_profile) has no directory"
 		logger.warning(
 			"ultrathink: this Hermes does not report its plugin hook cap, so ultrathink uses %s; "
 			"prompts are planned only when the cap is at least %ss (`hermes config set plugins.hook_callback_timeout 600`)",
@@ -150,6 +150,32 @@ def host_hook_cap() -> float | None:
 			MIN_PLAN_S + HOOK_MARGIN_S,
 		)
 	return cap
+
+
+def _hermes_config_file() -> Path | None:
+	"""The config.yaml Hermes reads, resolved like its profile override (and scripts/mcp-register.ts
+	hermesConfigFile): a HERMES_HOME that is a `<root>/profiles/<name>` directory is used as is;
+	otherwise a non-default `active_profile` in the Hermes root selects `profiles/<name>` under
+	HERMES_HOME (or ~/.hermes). None when that profile cannot be resolved, which Hermes refuses to run with."""
+	native = Path.home() / ".hermes"
+	raw = os.environ.get("HERMES_HOME", "").strip()
+	# Expanded the way Hermes expands HERMES_HOME.
+	env_home = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
+	if env_home is not None and env_home.parent.name == "profiles":
+		return env_home / "config.yaml"
+	base = env_home or native
+	env_path = None if env_home is None else env_home.absolute()
+	root = native if env_path is None or env_path == native or native in env_path.parents else base
+	try:
+		active = (root / "active_profile").read_text(encoding="utf-8").strip().lower()
+	except (OSError, ValueError):
+		active = ""
+	if not active or active == "default":
+		return base / "config.yaml"
+	if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", active) is None:
+		return None
+	profile = base / "profiles" / active
+	return profile / "config.yaml" if profile.exists() else None
 
 
 def _config_hook_cap(path: Path) -> float | None:

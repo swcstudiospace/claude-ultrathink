@@ -224,7 +224,8 @@ For each provider it adds a server named `notion`, `linear` or `greptile` that r
 | Omp | writes `mcpServers` in `~/.omp/agent/mcp.json` (`$PI_CODING_AGENT_DIR/mcp.json` when set) | the same file |
 
 - It writes user-level config only, and backs up each file it changes as `<file>.bak-ultrathink-mcp-<timestamp>`.
-- It changes only ultrathink's entries: those whose command ends with `/bin/ultrathink-mcp`, from any clone. A same-named entry that is not ultrathink's, such as the hosted `notion` or `linear` HTTP server that `scripts/setup.ts apply` adds to Claude Code, is kept and reported as `kept`. `--replace` overwrites it.
+- It changes only ultrathink's entries: those whose command ends with `/bin/ultrathink-mcp`, from any clone. A same-named entry that is not ultrathink's, such as the hosted `notion` or `linear` HTTP server that `scripts/setup.ts apply` adds to Claude Code, is kept and reported as `kept`. `--replace` overwrites it. Ownership is decided from the user-scope entry only. Same-named entries in other scopes (Claude Code local or project, Grok non-user) are neither blocking nor touched.
+- `bun scripts/setup.ts rollback` removes Claude Code's `notion` and `linear` only while they are still setup's hosted HTTP servers. It leaves a gateway entry swapped in with `--replace` in place; remove that with `mcp-register --remove`.
 - `--remove` deletes ultrathink's entries and keeps every other one.
 - `--dry-run` prints the changes without writing a file or changing a host.
 - A host whose CLI is not on `PATH` (Claude Code, Grok Build, Hermes Agent) is skipped. Muse and Omp files are written whether or not the host is installed; use `--hosts` to leave them out.

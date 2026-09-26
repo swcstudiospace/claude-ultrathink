@@ -84,6 +84,13 @@ claude:
 
 An entry is **ultrathink's** when its command ends with `/bin/ultrathink-mcp`, in any clone. Anything else under the same name, such as the hosted HTTP `notion` server that `scripts/setup.ts apply` adds to Claude Code, belongs to someone else and is kept unless you pass `--replace`.
 
+Only the user-scope entry counts, because the script adds and removes at user scope only:
+
+- **Claude Code:** the script reads the `Scope:` line of `claude mcp get <name>`. When a local or project entry wins there, it reads the user-scope entry from the top-level `mcpServers` of `~/.claude.json` instead. If that file cannot be read, the entry is treated as not ultrathink's.
+- **Grok Build:** of the `grok mcp list --json` entries, only those with scope `user` or no scope count.
+
+A same-named entry in another scope neither blocks the user-scope change nor is touched. The result line then ends with `<scope> entry with this name is left alone`.
+
 | Result | Meaning |
 |---|---|
 | `added` | No entry had that name; ultrathink's was added. |
@@ -101,7 +108,7 @@ To switch Claude Code from the hosted servers to the gateway:
 bun scripts/mcp-register.ts --hosts claude --replace
 ```
 
-`bun scripts/setup.ts rollback` later removes the Claude Code `notion` and `linear` entries by name if `setup.ts apply` added them, even when the gateway has replaced them since. Run `mcp-register` again afterwards if you want to keep the gateway there.
+`bun scripts/setup.ts rollback` removes the Claude Code `notion` and `linear` entries only while they are still the hosted HTTP servers `setup.ts apply` added. After `--replace` has swapped in the gateway, rollback leaves the gateway entry in place and reports `left in place: <name> was changed since setup added it`. Remove it with `bun scripts/mcp-register.ts --hosts claude --remove`.
 
 To remove ultrathink's entries everywhere and keep everything else:
 

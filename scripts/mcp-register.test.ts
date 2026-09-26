@@ -178,6 +178,40 @@ describe("CLI host planners", () => {
 		]);
 	});
 
+	test("claude: a local-scope entry neither blocks nor gets touched; the user scope decides", () => {
+		const { run } = fakeRun(
+			(cmd) =>
+				`${cmd[3]}:\n  Scope: Local config (private to you in this project)\n  Type: http\n  URL: https://mcp.example/${cmd[3]}\n`,
+		);
+		const userConfig = JSON.stringify({
+			mcpServers: { linear: { type: "stdio", command: OTHER_CLONE, args: ["serve", "linear"] }, greptile: { command: "npx" } },
+			projects: { "/p": { mcpServers: { notion: { type: "http", url: "https://mcp.example/notion" } } } },
+		});
+		const plan = planClaude(run, entries, { claudeConfig: () => userConfig });
+		expect(plan.changes.map((c) => c.action)).toEqual(["added", "replaced", "kept"]);
+		expect(plan.changes[0]?.reason).toContain("local config entry");
+		expect(plan.commands.filter((c) => c[2] === "add").map((c) => c[5])).toEqual(["notion", "linear"]);
+		const removing = planClaude(run, entries, { mode: "remove", claudeConfig: () => userConfig });
+		expect(removing.changes.map((c) => c.action)).toEqual(["not registered", "removed", "kept"]);
+		expect(removing.commands).toEqual([["claude", "mcp", "remove", "--scope", "user", "linear"]]);
+	});
+
+	test("grok: only user-scope entries decide; project entries neither block nor get removed", () => {
+		const listed = JSON.stringify([
+			{ name: "notion", url: "https://mcp.notion.com/mcp", scope: "project" },
+			{ name: "linear", command: CMD, args: ["serve", "linear"], scope: "project" },
+			{ name: "linear", command: "/opt/other/linear", scope: "user" },
+			{ name: "greptile", command: OTHER_CLONE, args: ["serve", "greptile"], scope: "project" },
+		]);
+		const { run } = fakeRun(() => listed);
+		const plan = planGrok(run, entries);
+		expect(plan.changes.map((c) => c.action)).toEqual(["added", "kept", "added"]);
+		expect(plan.changes[0]?.reason).toBe("project-scope entry with this name is left alone");
+		const removing = planGrok(run, entries, { mode: "remove" });
+		expect(removing.changes.map((c) => c.action)).toEqual(["not registered", "kept", "not registered"]);
+		expect(removing.commands).toEqual([]);
+	});
+
 	test("grok: unreadable list is treated as foreign", () => {
 		const { run } = fakeRun(() => "error: leader unavailable");
 		const plan = planGrok(run, entries.slice(0, 1));

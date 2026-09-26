@@ -127,7 +127,7 @@ describe("store", () => {
 			path,
 			async () => {
 				events.push("a-start");
-				await Bun.sleep(400);
+				await Bun.sleep(1_200);
 				events.push("a-end");
 			},
 			{ staleMs: 60_000, pollMs: 5 },
@@ -153,12 +153,12 @@ describe("store", () => {
 
 	test("heartbeat keeps a long-running holder from being judged stale", async () => {
 		const events: string[] = [];
-		const opts = { staleMs: 150, pollMs: 10, waitMs: 5_000 };
+		const opts = { staleMs: 500, pollMs: 10, waitMs: 10_000 };
 		const a = withStoreLock(
 			path,
 			async () => {
 				events.push("a-start");
-				await Bun.sleep(400);
+				await Bun.sleep(1_200);
 				events.push("a-end");
 			},
 			opts,
@@ -328,10 +328,10 @@ describe("resolveAuthHeader", () => {
 		// (every staleMs / 3) stops the second caller from stealing the lock; the margins tolerate slow CI runners.
 		const slowFetch = (async () => {
 			tokenCalls++;
-			await Bun.sleep(400);
+			await Bun.sleep(1_200);
 			return json({ access_token: "at-new", refresh_token: "rt-new", expires_in: 28_800 });
 		}) as unknown as typeof fetch;
-		const deps = { fetch: slowFetch, now: () => NOW, storePath: path, lock: { staleMs: 150, pollMs: 10, waitMs: 5_000 } };
+		const deps = { fetch: slowFetch, now: () => NOW, storePath: path, lock: { staleMs: 500, pollMs: 10, waitMs: 10_000 } };
 		const results = await Promise.all([resolveAuthHeader("notion", deps), resolveAuthHeader("notion", deps)]);
 		expect(results).toEqual(["Bearer at-new", "Bearer at-new"]);
 		expect(tokenCalls).toBe(1);

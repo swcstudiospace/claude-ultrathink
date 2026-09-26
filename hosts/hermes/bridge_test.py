@@ -431,6 +431,27 @@ def test_the_config_yaml_cap_counts_the_way_hermes_counts_it():
 			assert bridge.host_hook_cap() == cap, value
 
 
+def test_a_hermes_without_its_cap_resolver_reads_the_active_profiles_config_yaml():
+	# The root config.yaml sets no cap; the active profile's does, and that is what Hermes enforces.
+	with hermes(config="plugins:\n  enabled: []\n") as home, bridge_warnings() as warnings:
+		profile = home / "profiles" / "work"
+		profile.mkdir(parents=True)
+		(profile / "config.yaml").write_text("plugins:\n  hook_callback_timeout: 600\n")
+		(home / "active_profile").write_text("work\n")
+		assert bridge.host_hook_cap() == 600
+		assert len(warnings) == 1 and str(profile / "config.yaml") in warnings[0], warnings
+		# A HERMES_HOME that already is a profile directory is used as is, whatever active_profile names.
+		other = home / "profiles" / "other"
+		other.mkdir()
+		(other / "config.yaml").write_text("plugins:\n  hook_callback_timeout: 300\n")
+		os.environ["HERMES_HOME"] = str(other)
+		assert bridge.host_hook_cap() == 300
+		# An active profile without a directory is one Hermes refuses to run with: assume its 30s default.
+		os.environ["HERMES_HOME"] = str(home)
+		(home / "active_profile").write_text("gone\n")
+		assert bridge.host_hook_cap() == 30
+
+
 def test_a_hermes_without_its_cap_resolver_or_a_configured_cap_assumes_30s_and_never_starts_bun():
 	with tempfile.TemporaryDirectory() as tmp, hermes() as home, bridge_warnings() as warnings:
 		fake = fake_bun(Path(tmp) / "bun")
@@ -841,6 +862,7 @@ if __name__ == "__main__":
 	test_inside_hermes_its_own_cap_resolver_wins_and_outside_there_is_no_cap()
 	test_a_hermes_without_its_cap_resolver_uses_the_config_yaml_cap_and_warns_once()
 	test_the_config_yaml_cap_counts_the_way_hermes_counts_it()
+	test_a_hermes_without_its_cap_resolver_reads_the_active_profiles_config_yaml()
 	test_a_hermes_without_its_cap_resolver_or_a_configured_cap_assumes_30s_and_never_starts_bun()
 	test_a_plugin_directory_without_its_engine_warns_once_and_never_starts_bun()
 	test_deadline_kills_bun_and_everything_it_spawned()

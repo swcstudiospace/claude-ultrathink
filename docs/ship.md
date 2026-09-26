@@ -107,15 +107,16 @@ GSD is a separate open-source planning workflow for coding agents. Its skills ar
 1. `<repo>/gsd-core/bin/gsd-tools.cjs`
 2. `<repo>/.claude/gsd-core/bin/gsd-tools.cjs`
 3. `<repo>/.codex/gsd-core/bin/gsd-tools.cjs`
-4. `$CLAUDE_CONFIG_DIR/gsd-core/bin/gsd-tools.cjs`, when `CLAUDE_CONFIG_DIR` is set
-5. `~/.claude/gsd-core/bin/gsd-tools.cjs`
-6. `~/.agents/gsd-core/bin/gsd-tools.cjs`
-7. `${HERMES_HOME:-~/.hermes}/gsd-core/bin/gsd-tools.cjs`
-8. `${CODEX_HOME:-~/.codex}/gsd-core/bin/gsd-tools.cjs`
-9. `${GEMINI_CONFIG_DIR:-~/.gemini}/gsd-core/bin/gsd-tools.cjs`
-10. `~/.cursor/gsd-core/bin/gsd-tools.cjs`
-11. `${XDG_CONFIG_HOME:-~/.config}/opencode/gsd-core/bin/gsd-tools.cjs`
-12. `~/.claude/get-shit-done/bin/gsd-tools.cjs` (older installs)
+4. `<repo>/.claude/get-shit-done/bin/gsd-tools.cjs` (older project-local installs)
+5. `$CLAUDE_CONFIG_DIR/gsd-core/bin/gsd-tools.cjs`, when `CLAUDE_CONFIG_DIR` is set
+6. `~/.claude/gsd-core/bin/gsd-tools.cjs`
+7. `~/.agents/gsd-core/bin/gsd-tools.cjs`
+8. `${HERMES_HOME:-~/.hermes}/gsd-core/bin/gsd-tools.cjs`
+9. `${CODEX_HOME:-~/.codex}/gsd-core/bin/gsd-tools.cjs`
+10. `${GEMINI_CONFIG_DIR:-~/.gemini}/gsd-core/bin/gsd-tools.cjs`
+11. `~/.cursor/gsd-core/bin/gsd-tools.cjs`
+12. `${XDG_CONFIG_HOME:-~/.config}/opencode/gsd-core/bin/gsd-tools.cjs`
+13. `~/.claude/get-shit-done/bin/gsd-tools.cjs` (older installs)
 
 It runs the script with `node`, which must be on `PATH`. If the repository has `.planning/ROADMAP.md` and none of these exists, the assessment reports the gap `GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd`. If the script is found but `node` cannot be started (exit 127 or `ENOENT`), the gap is `GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd`. If the script runs but fails or prints no usable JSON, the roadmap counts as 0 of 0 phases and the other rules, including the latest verification status, still apply.
 
