@@ -146,7 +146,8 @@ Ship is opt-in. With the defaults, no skill run ever pushes a branch, opens a pu
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Tell the agent to run `ultrathink-ship` after a matching skill run: the plan gets a Ship section and the end-of-run nudge fires. `bin/ultrathink-ship` still works when you run it by hand with this off. |
-| `autoMerge` | boolean | `false` | Allow `bin/ultrathink-ship merge`. When `false`, `merge` refuses (`autoMerge disabled`) and `run` stops once the PR is ready, with `next: "autoMerge disabled: merge manually"`. When `true`, the done assessment also requires an engine judge. |
+| `autoMerge` | boolean | `false` | Allow `bin/ultrathink-ship merge`. When `false`, `merge` refuses (`autoMerge disabled`) and `run` stops once the PR is ready, with `next: "autoMerge disabled: merge manually"`. When `true` and `judge` is `"gate"`, the done assessment also requires an engine judge. |
+| `judge` | `"gate"` or `"advisory"` | `"gate"` | What the LLM done judge decides. `"gate"`: the judge must say done with a confidence of at least 0.7 before `pr` opens a PR. `"advisory"`: only the deterministic rules gate `done`; the judge's verdict is recorded in the assessment and shown in the PR body, and a failed or missing judge never blocks. Either way the merge gate below is unchanged. See [Done assessment](ship.md#done-assessment). |
 | `skills` | array of non-empty strings | `["gsd-"]` | Skill name prefixes that trigger ship. `[]` matches every skill run, and every planned prompt gets the ship instruction. |
 | `minScore` | number, 1 to 5 | `5` | Lowest Greptile confidence score that may merge. 5 is Greptile's maximum ("5/5"). |
 | `requireNoComments` | boolean | `true` | Refuse to merge while the head review has open comments. |
@@ -162,7 +163,7 @@ Ship is opt-in. With the defaults, no skill run ever pushes a branch, opens a pu
 
 `ULTRATHINK_SHIP=0` turns the ship instruction and nudge off for one process whatever `ship.enabled` says.
 
-The merge gate never weakens: a completed Greptile review of the exact PR head with a score of at least `minScore` (default 5, Greptile's maximum) and no open threads, an open mergeable PR, and CI neither pending nor failing. A PR merged outside the flow without such a review is reported blocked, never recorded as a ship merge; agents must never merge any other way (no `gh pr merge`, no web UI). Every review result and merge outcome is recorded in `ship.attempts` in the session record (newest 50), shown by `bin/ultrathink-ship status`.
+The merge gate never weakens, and `judge: "advisory"` does not change it: a completed Greptile review of the exact PR head with a score of at least `minScore` (default 5, Greptile's maximum) and no open threads, an open mergeable PR, and CI neither pending nor failing. A PR merged outside the flow without such a review is reported blocked, never recorded as a ship merge; agents must never merge any other way (no `gh pr merge`, no web UI). Every review result and merge outcome is recorded in `ship.attempts` in the session record (newest 50), shown by `bin/ultrathink-ship status`.
 
 ### `substrate`: Agent Substrate brief
 
@@ -217,6 +218,7 @@ All keys are optional; write only the ones you change. This file shows every key
   "ship": {
     "enabled": false,
     "autoMerge": false,
+    "judge": "gate",
     "skills": ["gsd-"],
     "minScore": 5,
     "requireNoComments": true,

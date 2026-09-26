@@ -7,7 +7,7 @@ import type { ReviewThreads } from "./github.ts";
 import { mergeGate } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
 import { DEFAULT_SHIP_CONFIG } from "./types.ts";
-import type { PrStatus, ReviewResult, Run } from "./types.ts";
+import type { Assessment, PrStatus, ReviewResult, Run } from "./types.ts";
 
 type Reply = { exitCode?: number; stdout?: string; stderr?: string };
 
@@ -282,6 +282,37 @@ describe("buildPr", () => {
 		expect(body).toContain("- Done: yes");
 		expect(body).toContain("  - docs");
 		expect(body).toContain("ultrathink graph g-1");
+	});
+
+	const assessment: Assessment = {
+		done: true,
+		confidence: 0.6,
+		summary: "ok",
+		gaps: [],
+		signals: { git: { onBase: false, ahead: 1, dirty: [], untracked: 0, pushed: true } },
+		source: "llm",
+		at: 1,
+	};
+
+	test("advisory assessment renders the judge verdict, error and notes, scrubbed", () => {
+		const { body } = buildPr(base, {
+			...assessment,
+			mode: "advisory",
+			judge: { done: false, confidence: 0.6, summary: "", gaps: ["docs in /root/x.md", "tests"], error: "timeout\u0007" },
+		});
+		expect(body).toContain("- Judge (advisory): done no, confidence 0.6, error: timeout\n");
+		expect(body).toContain("- Judge notes:\n  - docs in <local path>\n  - tests");
+		expect(body).not.toContain("/root/");
+	});
+
+	test("gate assessment renders no judge line", () => {
+		const { body } = buildPr(base, {
+			...assessment,
+			mode: "gate",
+			judge: { done: false, confidence: 0.6, summary: "", gaps: ["docs"] },
+		});
+		expect(body).toContain("- Done: yes");
+		expect(body).not.toContain("Judge");
 	});
 });
 

@@ -8,7 +8,8 @@ import type { Github, ReviewThreads } from "./github.ts";
 import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
-import { appendAttempts, readShip, writeShip } from "./state.ts";
+import { appendAttempts, archiveShip, readShip, writeShip } from "./state.ts";
+import { MAX_SHIP_HISTORY } from "./types.ts";
 import type { Assessment, GitSignals, PrRef, PrStatus, ReviewResult, ShipAttempt, ShipConfig, ShipSignals } from "./types.ts";
 
 const CONFIG: ShipConfig = {
@@ -26,6 +27,7 @@ const CONFIG: ShipConfig = {
 	waitMs: 100,
 	reviewRetries: 3,
 	mergeTimeoutMs: 10_000,
+	judge: "gate",
 };
 const PR: PrRef = { number: 7, url: "https://github.com/o/r/pull/7", head: "feat", base: "master" };
 const PASSED: ReviewResult = { source: "cli", status: "completed", score: 5, comments: [], headSha: "abc", at: 1 };
@@ -153,6 +155,19 @@ describe("state", () => {
 		expect(full?.attempts?.find((a) => a.at === 46)?.detail).toHaveLength(200);
 		expect(readShip(statePath)).toMatchObject({ pr: PR, updatedAt: 7 });
 	});
+	test("archiveShip replaces the ship with a fresh one and keeps the newest finished ships in history", () => {
+		for (let n = 1; n <= MAX_SHIP_HISTORY + 2; n++) {
+			writeShip(statePath, { pr: { ...PR, number: n }, phase: "merged", rounds: [PASSED], mergedAt: n }, n);
+			archiveShip(statePath, n);
+		}
+		const fresh = readShip(statePath);
+		expect(fresh).toMatchObject({ phase: "not-done", rounds: [], updatedAt: MAX_SHIP_HISTORY + 2 });
+		expect(fresh?.pr).toBeUndefined();
+		expect(fresh?.mergedAt).toBeUndefined();
+		expect(fresh?.history?.map((entry) => entry.pr?.number)).toEqual(Array.from({ length: MAX_SHIP_HISTORY }, (_, i) => i + 3));
+		expect(fresh?.history?.every((entry) => !("history" in entry))).toBe(true);
+		expect(JSON.parse(readFileSync(statePath, "utf8")).sessionId).toBe("s");
+	});
 });
 
 describe("runShip", () => {
@@ -201,6 +216,63 @@ describe("runShip", () => {
 		expect(ignored.output.done).toBe(true);
 	});
 
+	test("advisory judge mode: rules-only assessment is done under autoMerge; gate mode refuses it", async () => {
+		const d = { ...deps(), assess: assessDone, engine: async () => undefined };
+		const advisory = await ship("assess", { ...d, config: { ...CONFIG, judge: "advisory" } });
+		expect(advisory.output).toMatchObject({ ok: true, done: true, mode: "advisory", gaps: [] });
+		expect(readShip(statePath)?.assessment?.done).toBe(true);
+		const gate = await ship("assess", d);
+		expect(gate.output).toMatchObject({ done: false, mode: "gate" });
+		expect(gate.output.gaps).toContain("no judge available");
+	});
+
+	test("assess archives a finished ship of another branch or repository and assesses into a fresh ship", async () => {
+		const cases: [Partial<PrRef>, Partial<GitSignals>, "merged" | "blocked"][] = [
+			[{ head: "old" }, {}, "merged"],
+			// Same branch name, other repository: the prior repo is parsed from the PR url.
+			[{}, { repo: "o/other" }, "blocked"],
+		];
+		for (const [prior, git, phase] of cases) {
+			writeFileSync(statePath, JSON.stringify({ sessionId: "s", at: 1, result: { original: "ship it" } }));
+			writeShip(statePath, { pr: { ...PR, ...prior }, phase, rounds: [PASSED] }, 5);
+			const out = await ship("assess", deps({ git }));
+			expect(out.output).toMatchObject({ ok: true, done: true });
+			const state = readShip(statePath);
+			expect(state).toMatchObject({ phase: "not-done", rounds: [], assessment: { done: true } });
+			expect(state?.pr).toBeUndefined();
+			expect(state?.history).toHaveLength(1);
+			expect(state?.history?.[0]).toMatchObject({ phase, pr: { ...PR, ...prior }, rounds: [PASSED] });
+		}
+	});
+
+	test("assess refuses while a ship of another branch is still active and leaves the state untouched", async () => {
+		writeShip(statePath, { pr: { ...PR, head: "old" }, phase: "needs-fixes", rounds: [PASSED] }, 5);
+		const before = readFileSync(statePath, "utf8");
+		const out = await ship("assess", deps());
+		expect(out.output).toMatchObject({ ok: false, done: false });
+		expect(String(out.output.reason)).toContain(PR.url);
+		expect(readFileSync(statePath, "utf8")).toBe(before);
+	});
+
+	test("assess on the ship's own branch and repository keeps an active ship without archiving", async () => {
+		writeShip(statePath, { pr: { ...PR, repo: "o/r" }, phase: "needs-fixes", rounds: [PASSED] }, 5);
+		const out = await ship("assess", deps({ git: { repo: "o/r" } }));
+		expect(out.output).toMatchObject({ ok: true, done: true });
+		const state = readShip(statePath);
+		expect(state?.history).toBeUndefined();
+		expect(state).toMatchObject({ phase: "pr-open", pr: { ...PR, repo: "o/r" }, rounds: [PASSED] });
+	});
+
+	test("assess never reopens a merged ship on its own branch: it is archived", async () => {
+		writeShip(statePath, { pr: { ...PR, repo: "o/r" }, phase: "merged", rounds: [PASSED] }, 5);
+		const out = await ship("assess", deps({ git: { repo: "o/r" } }));
+		expect(out.output).toMatchObject({ ok: true, done: true });
+		const state = readShip(statePath);
+		expect(state).toMatchObject({ phase: "not-done", rounds: [] });
+		expect(state?.pr).toBeUndefined();
+		expect(state?.history?.[0]).toMatchObject({ phase: "merged", pr: { ...PR, repo: "o/r" } });
+	});
+
 	test("pr refuses when not assessed done", async () => {
 		await ship("assess", deps({ done: false }));
 		expect((await ship("pr", deps())).output.ok).toBe(false);
@@ -217,7 +289,8 @@ describe("runShip", () => {
 	test("pr creates into default branch when absent, reuses when present", async () => {
 		await ship("assess", deps());
 		const created = await ship("pr", deps());
-		expect(created.output).toMatchObject({ ok: true, pr: PR, reused: false });
+		expect(created.output).toMatchObject({ ok: true, pr: { ...PR, repo: "o/r" }, reused: false });
+		expect(readShip(statePath)?.pr?.repo).toBe("o/r");
 		expect(calls).toEqual(["push:feat", "create:master<-feat"]);
 		expect(readShip(statePath)?.phase).toBe("pr-open");
 		calls = [];
