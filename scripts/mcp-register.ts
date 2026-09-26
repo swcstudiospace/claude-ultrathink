@@ -4,7 +4,7 @@
 // Usage: see USAGE below (`bun scripts/mcp-register.ts --help`).
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const HOSTS = ["claude", "grok", "hermes", "muse", "omp"] as const;
@@ -315,8 +315,34 @@ export function hermesServerCommands(text: string): Map<string, string | undefin
 	return found;
 }
 
-// `hermes mcp list` rows are `<name>  <transport>  <tools>  <status>`; long transports are truncated with "...",
-// so ownership comes from config.yaml when it names the server, else from an untruncated transport.
+/**
+ * The config.yaml that `hermes mcp` edits, resolved the way Hermes' profile override does: a HERMES_HOME that is a
+ * `<root>/profiles/<name>` directory is used as is; otherwise a non-default `active_profile` in the Hermes root
+ * selects `profiles/<name>` under HERMES_HOME (or ~/.hermes). Undefined when that profile cannot be resolved,
+ * which Hermes itself refuses to run with.
+ */
+export function hermesConfigFile(env: Record<string, string | undefined>, home: string): string | undefined {
+	const native = resolve(home, ".hermes");
+	const envHome = env.HERMES_HOME?.trim() || undefined;
+	if (envHome && basename(dirname(envHome)) === "profiles") return join(envHome, "config.yaml");
+	const base = envHome ?? native;
+	const envPath = envHome === undefined ? undefined : resolve(envHome);
+	const root = envPath === undefined || envPath === native || envPath.startsWith(`${native}/`) ? native : base;
+	let active = "";
+	try {
+		active = readFileSync(join(root, "active_profile"), "utf8").trim().toLowerCase();
+	} catch {
+		active = "";
+	}
+	if (!active || active === "default") return join(base, "config.yaml");
+	if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(active)) return undefined;
+	const profile = join(base, "profiles", active);
+	return existsSync(profile) ? join(profile, "config.yaml") : undefined;
+}
+
+// `hermes mcp list` rows are `<name>  <transport>  <tools>  <status>`; long transports are truncated with "...".
+// A row's command is trusted only when config.yaml agrees with it (or, without a config entry, when the row is
+// untruncated); a missing row, a url server or any disagreement between the two makes the entry foreign.
 export function planHermes(run: Run, entries: Entry[], options: PlanOptions = {}): Plan {
 	const lines = run(["hermes", "mcp", "list"]).stdout.split("\n").map((line) => line.trim());
 	const config = options.hermesConfig?.();
@@ -335,9 +361,18 @@ export function planHermes(run: Run, entries: Entry[], options: PlanOptions = {}
 			// Status column is `✓ enabled` or `✗ disabled`; Hermes saves failed connection tests disabled.
 			const disabled = shown.length > 0 && shown.every((line) => /\bdisabled\s*$/.test(line));
 			const inConfig = commands?.has(entry.id) ?? false;
-			const ours = inConfig
-				? isOurs(commands?.get(entry.id))
-				: transports.some((t) => !t.endsWith("...") && isOurs(t.split(/\s+/)[0]));
+			const configured = commands?.get(entry.id);
+			const ours =
+				named.length > 0 &&
+				!(inConfig && configured === undefined) &&
+				transports.every((t) => {
+					const truncated = t.endsWith("...");
+					const text = truncated ? t.slice(0, -3) : t;
+					if (configured === undefined) return !truncated && isOurs(text.split(/\s+/)[0]);
+					const agrees =
+						text === configured || text.startsWith(`${configured} `) || (truncated && configured.startsWith(text));
+					return agrees && isOurs(configured);
+				});
 			return { present: named.length > 0 || inConfig, ours, matches: shown.length > 0, disabled };
 		},
 		options.mode ?? "add",
@@ -468,8 +503,12 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	const stamp = backupSuffix((deps.now ?? (() => new Date()))());
 	const home = env.HOME || homedir();
 	const config = env.XDG_CONFIG_HOME || join(home, ".config");
-	const hermesFile = join(env.HERMES_HOME || join(home, ".hermes"), "config.yaml");
-	const options: ApplyOptions = { mode, log, hermesConfig: () => readText(hermesFile) };
+	const hermesFile = hermesConfigFile(env, home);
+	const options: ApplyOptions = {
+		mode,
+		log,
+		hermesConfig: () => (hermesFile === undefined ? undefined : readText(hermesFile)),
+	};
 	let failed = false;
 	if (dryRun) log("dry run: nothing will be written or executed");
 	if (mode !== "remove" && `${root}/`.includes("/plugins/cache/")) {
@@ -509,7 +548,9 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 				: host === "grok"
 					? join(env.GROK_HOME || join(home, ".grok"), "config.toml")
 					: hermesFile;
-		backup(configFile, stamp, dryRun, log);
+		if (configFile === undefined) {
+			log("  hermes: the active Hermes profile could not be resolved (check `hermes profile list`); config.yaml not backed up");
+		} else backup(configFile, stamp, dryRun, log);
 		if (dryRun) {
 			for (const cmd of plan.commands) log(`  $ ${cmd.join(" ")}`);
 			continue;

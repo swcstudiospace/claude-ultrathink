@@ -186,7 +186,7 @@ describe("apply / status / rollback", () => {
 			const rolledBack = rollback(env, run);
 			expect(rolledBack.claudeMd.changed).toBe(true);
 			expect(rolledBack.grok).toEqual({ rule: { path: rulePath, removed: true }, hooks: { path: hooksPath, removed: true } });
-			expect(rolledBack.state).toEqual({ path: setupStatePath(env), removed: true });
+			expect(rolledBack.state).toEqual({ path: setupStatePath(env), status: "removed" });
 			expect(readFileSync(claudeMdPath(env), "utf8")).not.toContain("<!-- ultrathink:start -->");
 			expect(existsSync(rulePath)).toBe(false);
 			expect(existsSync(hooksPath)).toBe(false);
@@ -315,8 +315,8 @@ describe("apply / status / rollback", () => {
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(true);
 			expect(result.linear.removed).toBe(true);
-			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "notion"]);
-			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "linear"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "notion"]);
+			expect(rollbackRun.calls).toContainEqual(["claude", "mcp", "remove", "--scope", "user", "linear"]);
 		} finally {
 			cleanup();
 		}
@@ -336,8 +336,8 @@ describe("apply / status / rollback", () => {
 			const result = rollback(env, rollbackRun);
 			expect(result.notion.removed).toBe(false);
 			expect(result.linear.removed).toBe(false);
-			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "notion"]);
-			expect(rollbackRun.calls).not.toContainEqual(["claude", "mcp", "remove", "linear"]);
+			expect(rollbackRun.calls.some((cmd) => cmd[2] === "remove")).toBe(false);
+			expect(rollbackReport(result).join("\n")).toContain("Notion MCP: left in place (setup did not add it)");
 		} finally {
 			cleanup();
 		}
@@ -365,12 +365,39 @@ describe("apply / status / rollback", () => {
 		try {
 			apply(repo, mcpRun(""), env);
 			expect(existsSync(setupStatePath(env))).toBe(true);
-			expect(rollback(env, fakeRun(() => ({ stdout: "", stderr: "", code: 0 }))).state.removed).toBe(true);
+			expect(rollback(env, fakeRun(() => ({ stdout: "", stderr: "", code: 0 }))).state.status).toBe("removed");
 			expect(existsSync(setupStatePath(env))).toBe(false);
 
 			const again = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
-			expect(rollback(env, again).state.removed).toBe(false);
+			expect(rollback(env, again).state.status).toBe("absent");
 			expect(again.calls).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a failed removal is reported with its error and stays recorded, so the next rollback retries only that server", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			apply(repo, mcpRun(""), env);
+			const failing = fakeRun((cmd) =>
+				cmd[2] === "remove" && cmd.at(-1) === "notion" ? { stdout: "", stderr: "claude: not found", code: 127 } : { stdout: "", stderr: "", code: 0 },
+			);
+			const first = rollback(env, failing);
+			expect(first.notion).toEqual({ removed: false, error: "exit 127: claude: not found" });
+			expect(first.linear.removed).toBe(true);
+			expect(first.state.status).toBe("kept");
+			expect(readSetupState(env)).toEqual({ notionAdded: true, linearAdded: false });
+			const report = rollbackReport(first).join("\n");
+			expect(report).toContain("Notion MCP: removal failed (exit 127: claude: not found)");
+			expect(report).toContain("claude mcp remove --scope user notion");
+
+			const retry = fakeRun(() => ({ stdout: "", stderr: "", code: 0 }));
+			const second = rollback(env, retry);
+			expect(retry.calls).toEqual([["claude", "mcp", "remove", "--scope", "user", "notion"]]);
+			expect(second.notion.removed).toBe(true);
+			expect(second.state.status).toBe("removed");
+			expect(existsSync(setupStatePath(env))).toBe(false);
 		} finally {
 			cleanup();
 		}

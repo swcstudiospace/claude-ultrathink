@@ -284,25 +284,46 @@ function removeBlock(path: string, deleteEmpty: boolean): boolean {
 	return true;
 }
 
+/** `error` is set when the removal ran and failed; the server stays recorded so a later rollback retries it. */
+export interface McpRemoval {
+	removed: boolean;
+	error?: string;
+}
+
 export interface RollbackResult {
 	claudeMd: { changed: boolean };
-	notion: { removed: boolean };
-	linear: { removed: boolean };
-	state: { path: string; removed: boolean };
+	notion: McpRemoval;
+	linear: McpRemoval;
+	/** `kept` when a removal failed and the file still records what is left to undo. */
+	state: { path: string; status: "removed" | "kept" | "absent" };
 	grok: { rule: { path: string; removed: boolean }; hooks: { path: string; removed: boolean } };
 }
 
 /** Plugin removal is left to the user: uninstalling from a running Claude Code session is theirs to decide. */
 export const PLUGIN_UNINSTALL_COMMANDS = ["claude plugin uninstall ultrathink@ultrathink", "claude plugin marketplace remove ultrathink"] as const;
 
+/** Removes a server `apply` added; `apply` adds at user scope, so a same-named local/project server is never touched. */
+function removeMcpServer(name: string, added: boolean, run: Run): McpRemoval {
+	if (!added) return { removed: false };
+	const result = run(["claude", "mcp", "remove", "--scope", "user", name]);
+	if (result.code === 0) return { removed: true };
+	return { removed: false, error: `exit ${result.code}: ${result.stderr.trim() || result.stdout.trim() || "no output"}` };
+}
+
 export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): RollbackResult {
 	const claudeMdChanged = removeBlock(claudeMdPath(env), false);
 	const state = readSetupState(env);
-	const notion = state.notionAdded ? run(["claude", "mcp", "remove", "notion"]) : undefined;
-	const linear = state.linearAdded ? run(["claude", "mcp", "remove", "linear"]) : undefined;
+	const notion = removeMcpServer("notion", state.notionAdded, run);
+	const linear = removeMcpServer("linear", state.linearAdded, run);
 	const statePath = setupStatePath(env);
-	const hadState = existsSync(statePath);
-	rmSync(statePath, { force: true });
+	const left: SetupState = { notionAdded: notion.error !== undefined, linearAdded: linear.error !== undefined };
+	let stateStatus: RollbackResult["state"]["status"] = existsSync(statePath) ? "removed" : "absent";
+	if (left.notionAdded || left.linearAdded) {
+		writeSetupState(left, env);
+		stateStatus = "kept";
+	} else {
+		rmSync(statePath, { force: true });
+	}
 	const grokDir = grokHome(env);
 	const rulePath = join(grokDir, "rules", "ultrathink.md");
 	const hooksPath = join(grokDir, "hooks", "ultrathink.json");
@@ -310,9 +331,9 @@ export function rollback(env: Record<string, string | undefined> = process.env, 
 	rmSync(hooksPath, { force: true });
 	return {
 		claudeMd: { changed: claudeMdChanged },
-		notion: { removed: notion !== undefined && notion.code === 0 },
-		linear: { removed: linear !== undefined && linear.code === 0 },
-		state: { path: statePath, removed: hadState },
+		notion,
+		linear,
+		state: { path: statePath, status: stateStatus },
 		// The rule is ours only through its marker block; text a user added around it stays.
 		grok: { rule: { path: rulePath, removed: removeBlock(rulePath, true) }, hooks: { path: hooksPath, removed: hadHooks } },
 	};
@@ -359,12 +380,23 @@ export function applyReport(repoRoot: string, result: ApplyResult, env: Record<s
 	];
 }
 
+function mcpRemovalLine(label: string, name: string, removal: McpRemoval): string {
+	if (removal.removed) return `${label}: removed`;
+	if (removal.error === undefined) return `${label}: left in place (setup did not add it)`;
+	return `${label}: removal failed (${removal.error}) — fix that, then re-run rollback or run: claude mcp remove --scope user ${name}`;
+}
+
 export function rollbackReport(result: RollbackResult): string[] {
+	const stateLine = {
+		removed: "removed",
+		kept: "kept, so a re-run of rollback retries the failed removal",
+		absent: "not found",
+	}[result.state.status];
 	return [
 		`CLAUDE.md: ${result.claudeMd.changed ? "block removed" : "no block found"}`,
-		`Notion MCP: ${result.notion.removed ? "removed" : "not removed (may not have existed)"}`,
-		`Linear MCP: ${result.linear.removed ? "removed" : "not removed (may not have existed)"}`,
-		`Setup state: ${result.state.removed ? "removed" : "not found"} (${result.state.path})`,
+		mcpRemovalLine("Notion MCP", "notion", result.notion),
+		mcpRemovalLine("Linear MCP", "linear", result.linear),
+		`Setup state: ${stateLine} (${result.state.path})`,
 		`Grok rule: ${result.grok.rule.removed ? "removed" : "not installed"} (${result.grok.rule.path})`,
 		`Grok hooks: ${result.grok.hooks.removed ? "removed" : "not installed"} (${result.grok.hooks.path})`,
 		`Claude Code plugin: still installed if you added it — to remove it, run: ${PLUGIN_UNINSTALL_COMMANDS.join(" && ")}`,

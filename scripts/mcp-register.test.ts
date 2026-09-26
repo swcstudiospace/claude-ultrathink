@@ -4,7 +4,17 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyCliPlan, main, mergeMuseSettings, mergeOmpMcp, planClaude, planGrok, planHermes, writeJson } from "./mcp-register.ts";
+import {
+	applyCliPlan,
+	hermesConfigFile,
+	main,
+	mergeMuseSettings,
+	mergeOmpMcp,
+	planClaude,
+	planGrok,
+	planHermes,
+	writeJson,
+} from "./mcp-register.ts";
 import type { CliHost, Entry, Run } from "./mcp-register.ts";
 
 const CMD = "/repo/claude-ultrathink/bin/ultrathink-mcp";
@@ -233,6 +243,15 @@ describe("CLI host planners", () => {
 		expect(planHermes(run, entries, { mode: "remove", hermesConfig: () => config }).commands).toEqual([
 			["hermes", "mcp", "remove", "linear"],
 		]);
+	});
+
+	test("hermes: a list row that contradicts config.yaml makes the entry foreign", () => {
+		const { run } = fakeRun(() => "  notion           /opt/other/n...   all  ✓ enabled\n");
+		const config = `mcp_servers:\n  notion:\n    command: ${OTHER_CLONE}\n`;
+		const plan = planHermes(run, entries.slice(0, 1), { hermesConfig: () => config });
+		expect(plan.changes[0]?.action).toBe("kept");
+		expect(plan.commands).toEqual([]);
+		expect(planHermes(run, entries.slice(0, 1), { mode: "remove", hermesConfig: () => config }).commands).toEqual([]);
 	});
 
 	test("hermes: disabled row is re-added, enabled row stays unchanged", () => {
@@ -523,10 +542,57 @@ describe("main", () => {
 		});
 	});
 
+	test("hermes: the active profile's config.yaml decides ownership and is the one backed up", () => {
+		const rows = ["  notion           /opt/other/n...   all  ✓ enabled"];
+		const calls: string[][] = [];
+		const run: Run = (cmd) => {
+			calls.push(cmd);
+			if (cmd[2] === "add") rows.push(`  ${(cmd[3] ?? "").padEnd(16)} ${cmd[5]} serve ${cmd[3]}   all  ✓ enabled`);
+			return { code: 0, stdout: cmd[2] === "list" ? rows.join("\n") : "", stderr: "" };
+		};
+		sandbox(({ home, lines, deps }) => {
+			const root = join(home, ".hermes");
+			const profile = join(root, "profiles", "work");
+			mkdirSync(profile, { recursive: true });
+			writeFileSync(join(root, "config.yaml"), `mcp_servers:\n  notion:\n    command: ${OTHER_CLONE}\n`);
+			writeFileSync(join(profile, "config.yaml"), "mcp_servers:\n  notion:\n    command: /opt/other/notion-server\n");
+			writeFileSync(join(root, "active_profile"), "work\n");
+			expect(main(["--hosts", "hermes", "--providers", "notion,linear"], deps())).toBe(0);
+			expect(lines.find((l) => l.includes("notion kept"))).toContain("--replace");
+			expect(calls.filter((c) => c[2] !== "list")).toEqual([
+				["hermes", "mcp", "remove", "linear"],
+				["hermes", "mcp", "add", "linear", "--command", OURS_HERE, "--args", "serve", "linear"],
+			]);
+			expect(existsSync(join(profile, `config.yaml${STAMP}`))).toBe(true);
+			expect(existsSync(join(root, `config.yaml${STAMP}`))).toBe(false);
+		}, run);
+	});
+
 	test("--replace and --remove together are refused", () => {
 		sandbox(({ deps }) => {
 			expect(() => main(["--replace", "--remove"], deps())).toThrow("cannot be combined");
 		});
+	});
+});
+
+describe("hermesConfigFile", () => {
+	test("follows HERMES_HOME profiles, active_profile and refuses an unresolvable profile", () => {
+		const home = mkdtempSync(join(tmpdir(), "mcp-register-hermes-home-"));
+		try {
+			const root = join(home, ".hermes");
+			mkdirSync(join(root, "profiles", "work"), { recursive: true });
+			expect(hermesConfigFile({}, home)).toBe(join(root, "config.yaml"));
+			writeFileSync(join(root, "active_profile"), "Work\n");
+			expect(hermesConfigFile({}, home)).toBe(join(root, "profiles", "work", "config.yaml"));
+			expect(hermesConfigFile({ HERMES_HOME: root }, home)).toBe(join(root, "profiles", "work", "config.yaml"));
+			expect(hermesConfigFile({ HERMES_HOME: "/srv/h/profiles/ops" }, home)).toBe("/srv/h/profiles/ops/config.yaml");
+			writeFileSync(join(root, "active_profile"), "default\n");
+			expect(hermesConfigFile({}, home)).toBe(join(root, "config.yaml"));
+			writeFileSync(join(root, "active_profile"), "gone\n");
+			expect(hermesConfigFile({}, home)).toBeUndefined();
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
 	});
 });
 
