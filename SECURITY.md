@@ -34,11 +34,21 @@ The MCP gateway (`bin/ultrathink-mcp`) relays to the hosted Notion, Linear and G
 - `ultrathink-mcp auth status` shows whether each provider is ready, never the secret itself.
 - `ultrathink-mcp auth logout <provider>` deletes that provider's entry from the store. It does not revoke anything at the provider, so if a token or key may have leaked, revoke it there too.
 
+The same store holds the OpenRouter API key for the optional Jev decisions (`decisions.enabled`), under the key-only provider `openrouter`:
+
+- Store it with `ultrathink-mcp auth set-key openrouter --stdin` (or `--env-file <path> --var <NAME>`). It gets the same file, mode `0600` and atomic write as every other credential. `openrouter` is not an MCP server: `serve`, `check` and `auth login` refuse it, and it is never relayed or registered with a host.
+- Without a stored key, ultrathink falls back to the `OPENROUTER_API_KEY` environment variable. When both exist, the stored key wins.
+- The key is never printed. `auth set-key` prints only its length, `auth status` shows `api key set (<n> chars)`, and `bin/ultrathink status` names only its source (`key from store` or `key from OPENROUTER_API_KEY`). It never appears in summaries, session records, the ship assessment or pull requests. Decisions error messages replace the key, any `sk-or-…` value and `Bearer` tokens with `[redacted]` and are cut to 200 characters.
+- The key is sent only as `Authorization: Bearer <key>` to `https://openrouter.ai/api/alpha/decisions`. The endpoint is not configurable from any config file, including a repository's `<project>/.claude/ultrathink.json`, so a cloned repository cannot redirect your key. Only the `ULTRATHINK_DECISIONS_URL` environment variable, which you set yourself, changes it, and only to an `https://openrouter.ai/…` URL or an `http://` or `https://` URL on `localhost`, `127.0.0.1` or `[::1]`, with no user name or password in it. Any other value is ignored and the default endpoint is used, and only the URL's origin and path are ever used or printed. The Decisions client never follows an HTTP redirect, so a redirect cannot carry the key to another host.
+- A project file cannot opt you in. In `<project>/.claude/ultrathink.json`, `decisions.enabled` can only turn Jev off, `decisions.zdr` can only turn zero data retention on, and `decisions.points` can only drop points, so a repository you open never makes your key pay for decisions, or sends your prompt, patch or knowledge-base text to OpenRouter, unless you turned Jev on in your own config. `ULTRATHINK_DECISIONS=0` in the environment turns every decision off for that process.
+
 ultrathink does not store an Anthropic or xAI key: the planning engine uses your existing `claude` or `grok` login.
+
+`bin/run-bun`, which starts Bun for every hook and CLI, passes `--no-env-file`, so Bun 1.3.3 and later do not load the `.env*` files of the repository you work in into ultrathink. Such a file could otherwise set `OPENROUTER_API_KEY`, `ULTRATHINK_DECISIONS_URL` or any other variable ultrathink reads. Bun 1.2.x ignores the flag and still loads them: on Bun 1.2, check a repository's `.env*` files before you work in it, or upgrade Bun. The Hermes plugin starts Bun in the ultrathink clone, not in your repository.
 
 ## What leaves your machine
 
-ultrathink sends no telemetry. Your prompts go to the planning engine, and plans go to Notion, Linear, Greptile and GitHub only when you configure those services. [Privacy and data flow](docs/privacy.md) lists every destination, what it receives, and how to turn it off.
+ultrathink sends no telemetry. Your prompts go to the planning engine, and plans go to Notion, Linear, Greptile and GitHub only when you configure those services; small, capped decision states go to OpenRouter only when you turn on Jev decisions. [Privacy and data flow](docs/privacy.md) lists every destination, what it receives, and how to turn it off.
 
 Credentials from the store are never written to logs, tracker rows or pull requests. Engine and command error messages pass through a filter that masks `Bearer` tokens and JWT-like strings before they are shown.
 

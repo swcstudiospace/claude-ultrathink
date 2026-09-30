@@ -8,6 +8,7 @@ This guide turns ship on. [Ship: PR, Greptile review, merge](../ship.md) is the 
 - [2. Set up Greptile](#2-set-up-greptile)
 - [3. Turn ship on](#3-turn-ship-on)
 - [4. Decide about GSD](#4-decide-about-gsd)
+- [Optional: add the Jev check](#optional-add-the-jev-check)
 - [5. Run it](#5-run-it)
 - [Merge by hand](#merge-by-hand)
 - [Turn it off again](#turn-it-off-again)
@@ -83,7 +84,7 @@ The three switches are separate, and all default to `false`:
 | Key | `true` means |
 |---|---|
 | `ship.enabled` | The plan gets a `## Ship` section and the agent is nudged to ship at the end of a matching skill run. Pushing and opening the PR are part of this. |
-| `ship.autoMerge` | `merge` may merge the PR once the gate passes. Off, the flow stops with the PR ready for you. |
+| `ship.autoMerge` | `merge` may merge the PR once the gate passes. Off, the flow stops with the PR ready for you. On, in gate mode, the done assessment also needs a usable verdict from the engine judge: neither the rules alone nor a Jev answer stands in for it. |
 | `ship.deleteBranch` | After a confirmed merge, delete the remote and local branch and fast-forward the base branch. |
 
 Check it from the project directory:
@@ -128,11 +129,37 @@ A repository without `.planning/ROADMAP.md` needs no GSD at all.
 - `[]` matches every prompt: every plan gets the `## Ship` section, and the end-of-run nudge fires after any skill run.
 - A list such as `["my-release-"]` matches only skill runs whose name starts with one of the prefixes.
 
+## Optional: add the Jev check
+
+Jev is a decision model on OpenRouter that answers one yes/no question with a calibrated probability. With Jev decisions on, the done assessment also asks it whether the patch fully delivers the request and every acceptance criterion in the spec, with nothing missing, stubbed or left as a TODO. It is off by default and applies to every ship run, so to every GSD run. Setup: [Use Jev decisions](use-jev-decisions.md). The short version:
+
+```sh
+<clone>/bin/ultrathink-mcp auth set-key openrouter --stdin   # paste the OpenRouter key, then Ctrl-D
+```
+
+```json
+{ "decisions": { "enabled": true, "points": ["ship"] } }
+```
+
+Put it in your user config, `~/.config/ultrathink/config.json`: a project file cannot turn Jev on. `"points": ["ship"]` asks Jev only here. The short form `{ "decisions": { "enabled": true } }` turns on all four points, so the plan gate (which can skip planning for your messages) and the knowledge and blocking checks of the clarifying questions ask Jev too.
+
+What it does to a ship run:
+
+- **It runs only after the deterministic checks pass.** A rule gap (feature branch, committed work, GSD roadmap and verification) returns before Jev is asked, and Jev never overrides one. The GSD signals never go to Jev: it gets only the original request, the acceptance criteria and the patch.
+- **Gate mode, veto.** When the LLM judge says done but Jev's P(complete) is at or below `decisions.shipVetoAtOrBelow` (default `0.2`) and the patch was not truncated, the task is not done, with the gap `Jev judged the change incomplete (P(complete) <P>)`. The agent hands it back to you like any other not-done result and opens no PR.
+- **Gate mode, no LLM verdict, `ship.autoMerge` off.** When the judge is unavailable or its reply can't be used, Jev decides alone: done at or above `decisions.shipApproveAt` (default `0.7`), otherwise not done with the gap `Jev P(complete) <P> is below 0.7`. The `assess` JSON then carries `"source": "jev"`.
+- **Gate mode, no LLM verdict, `ship.autoMerge` on.** Jev never stands in for the judge when a merge can follow. The result is exactly what it is without Jev: not done, with `no judge available` when there is no engine, or `assessment unavailable: …` when the judge failed or its reply couldn't be parsed. The Jev decision is still recorded, with the action `none`.
+- **Advisory mode.** The PR still opens whatever Jev says. A P(complete) at or below `decisions.shipVetoAtOrBelow` on an untruncated patch is recorded as `advise-veto`, whatever the judge said, and the agent treats it as "fix and proceed": it finishes the missing work within the task, commits and assesses again.
+- **What you see.** The `assess` JSON gains `decision` (`p`, `model`, `action`, or `action: "fail-open"` with `error`), and the PR body's `## Assessment` ends with a line such as `- Jev: P(complete) 0.94 · typesafe/jev-1.13-20260917`, `- Jev: P(complete) 0.03 · typesafe/jev-1.13-20260917 · veto (advisory: shipped anyway)` or `- Jev: error (credits)`.
+- **Fails open.** When Jev can't answer (no key, an HTTP error, a timeout), the assessment is exactly what it would be without Jev.
+
+**The Greptile merge gate does not change.** Jev never merges. A PR that Jev approved still needs a completed Greptile review of the exact head at 5/5 with no open threads, and CI neither pending nor failing, before `merge` will merge it. See [Jev decision](../ship.md#jev-decision) for every case.
+
 ## 5. Run it
 
 Invoke a matching skill as usual. When the run ends with committed work on a feature branch (at least one commit ahead of the default branch), the agent invokes the `ultrathink-ship` skill. It:
 
-1. runs `assess`. When the task is not done, in gate mode it hands the gaps back to you and opens no PR; in advisory mode it fixes the gaps itself and hands back only decisions it cannot make;
+1. runs `assess`. When the task is not done, in gate mode it hands the gaps back to you and opens no PR; in advisory mode it fixes the gaps itself and hands back only decisions it cannot make. A Jev veto (when the Jev check is on) is handled the same way: handed back in gate mode, fixed and assessed again in advisory mode;
 2. commits only the files it edited, pushes, and opens (or reuses) a PR into the default branch;
 3. runs Greptile review rounds, fixing findings and pushing, until the review is 5/5 with no open comments. After `ship.maxRounds` (5) completed reviews below 5/5 or with open threads it stops, comments on the PR and leaves it for you;
 4. merges, only with `ship.autoMerge`, and keeps retrying the merge until the 5/5-reviewed PR merges;
@@ -170,5 +197,7 @@ Merge on GitHub the way you normally do. ultrathink does not watch the PR after 
 - `ULTRATHINK_SHIP=0` in the environment, for that process only.
 
 Either way the plan has no `## Ship` section and no nudge is sent. `bin/ultrathink-ship` still works when you run it yourself.
+
+To keep ship but drop only the Jev check, remove `"ship"` from `decisions.points`, or leave `decisions.enabled` off.
 
 For what ship sends to GitHub, Greptile and the engine, see [Privacy](../privacy.md).

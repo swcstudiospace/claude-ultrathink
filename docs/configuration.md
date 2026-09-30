@@ -1,6 +1,6 @@
 # Configuration
 
-ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, and never pushes, opens a pull request or merges.
+ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, asks no Jev decision, and never pushes, opens a pull request or merges.
 
 Terms used on this page:
 
@@ -37,8 +37,9 @@ How the merge works (`src/config.ts`):
 - A missing file, a file that is not valid JSON, or a file whose top level is not an object is skipped.
 - Unknown sections and keys are ignored.
 - A value with the wrong type or outside its allowed range is ignored, and the value from the earlier file (or the default) stays.
-- Some string keys only accept a non-empty value, so an empty string in a later file does not clear a value an earlier file set: `notion.dataSourceUrl`, `linear.team`, `grok.baseUrl`, `grok.model`, `grok.bin`, `grok.shuntModel`, `claude.bin`, and the URL keys `grok.shuntBaseUrl` and `substrate.url`. To stop row creation, use `/ultrathink-track off` (see [Turning tracking off](tracking.md#turning-tracking-off)). To turn the Agent Substrate brief off, set `SUBSTRATE_DISABLED=1`.
+- Some string keys only accept a non-empty value, so an empty string in a later file does not clear a value an earlier file set: `notion.dataSourceUrl`, `linear.team`, `grok.baseUrl`, `grok.model`, `grok.bin`, `grok.shuntModel`, `claude.bin`, `decisions.model`, and the URL keys `grok.shuntBaseUrl` and `substrate.url`. To stop row creation, use `/ultrathink-track off` (see [Turning tracking off](tracking.md#turning-tracking-off)). To turn the Agent Substrate brief off, set `SUBSTRATE_DISABLED=1`.
 - The URL keys `grok.shuntBaseUrl` and `substrate.url` must be `http://` or `https://` URLs. Trailing slashes are removed.
+- The project file can only make Jev decisions more restrictive: there, `decisions.enabled` can only turn them off (a `true` is ignored), `decisions.zdr` can only turn zero data retention on (a `false` is ignored), and `decisions.points` can only drop points (it is intersected with the list from the earlier files, or the default). The other `decisions` keys (`model`, `timeoutMs` and the thresholds) merge as usual, and the two user files merge every key as usual. See [`decisions`](#decisions-jev-decisions-openrouter-decisions-api).
 
 `bin/ultrathink status`, run from the project directory, prints the merged result for the parts most people change. See [Commands](commands.md#binultrathink) for its output.
 
@@ -175,13 +176,43 @@ Agent Substrate is an optional service that tells the planner what other agents 
 
 The request times out after 1.5 seconds (`SUBSTRATE_TIMEOUT_MS` changes that). A missing, slow or failing server never blocks a prompt: the plan is built without the brief. `bin/ultrathink status` shows the `Substrate:` line with the URL in use and where it came from.
 
+### `decisions`: Jev decisions (OpenRouter Decisions API)
+
+Decisions are opt-in. With `enabled: true` and an OpenRouter key, ultrathink asks Jev, a decision model from TypeSafe served through OpenRouter's Decisions API (`https://openrouter.ai/api/alpha/decisions`, marked alpha by OpenRouter), one yes/no question at each active decision point. Jev answers with a probability P, and the thresholds below turn P into an action. Jev is asked only after every deterministic rule has run and left the action open, and it never merges, never demotes a blocking question and never overrides a rule gap. Any failure fails open: the point behaves exactly as it does with Decisions off. See [Use Jev decisions](how-to/use-jev-decisions.md) for a walk-through and [What leaves your machine](privacy.md#jev-decisions-openrouter) for what is sent.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Opt-in master switch. When `false`, no point sends a request and nothing is recorded. Only a user file can set it to `true`: in the project file only `false` counts. `ULTRATHINK_DECISIONS=0` in the environment turns every point off whatever this says. |
+| `model` | non-empty string | `"~typesafe/jev-latest"` | Decisions model id or alias. The alias follows OpenRouter's latest Jev; set `"typesafe/jev-1.13"` to pin the version the default thresholds were probed on. Every decision records the resolved model, for example `typesafe/jev-1.13-20260917`. |
+| `points` | array of `"plan"`, `"ship"`, `"knowledge"`, `"blocking"` | `["plan", "ship", "knowledge", "blocking"]` | Which decision points ask Jev. Unknown names and repeats are dropped; `[]` means none. The project file can only remove points: its list is intersected with the one from the earlier files. |
+| `timeoutMs` | number, > 0 and <= 30000 | `3000` | Total budget for one decision in milliseconds, the retry included. |
+| `zdr` | boolean | `true` | Send `provider: {"zdr": true, "data_collection": "deny"}`, so OpenRouter routes only to zero-data-retention endpoints and denies data collection. `false` sends no provider preferences. In the project file only `true` counts. |
+| `planSkipBelow` | number, 0 to 1 | `0.2` | Plan gate: a message is not planned when P(`plan_worthy`) is below this. |
+| `shipVetoAtOrBelow` | number, 0 to 1 | `0.2` | Ship veto: in gate mode, an LLM "done" becomes not done when P(`complete`) is at or below this and the patch Jev saw was not truncated. In advisory mode nothing is blocked: a P(`complete`) at or below this on an untruncated patch is recorded as `advise-veto`, whatever the judge said. |
+| `shipApproveAt` | number, 0 to 1 | `0.7` | Ship verdict when there is no usable LLM verdict (gate mode with `ship.autoMerge` off): done when P(`complete`) is at or above this, not done below it. With `ship.autoMerge` on, Jev never stands in for the LLM judge. |
+| `groundedAt` | number, 0 to 1 | `0.8` | Knowledge check: a question the Greptile knowledge base settled stays settled when P(`supported`) is at or above this; below it, the question is asked after the clarifier's own questions while fewer than `hitl.maxQuestions` are open, and dropped when no slot is left. |
+| `blockingAt` | number, 0 to 1 | `0.5` | Blocking check: a non-blocking question becomes blocking when P(`risky`) is at or above this. A blocking question is never made non-blocking. |
+
+How Decisions work when `enabled` is `true`:
+
+- `ULTRATHINK_DECISIONS=0` in the environment turns every point off for that process, whatever the config says: no request, no record, no plan-skip notice and no `Decisions ·` segment. `bin/ultrathink status` then shows `Decisions: off (ULTRATHINK_DECISIONS=0)`.
+- Only your own config turns Decisions on. The project file can turn them off, drop points, set `zdr` to `true`, and change `model`, `timeoutMs` and the thresholds, but it cannot turn them on, add points or turn `zdr` off. A repository you open therefore never sends your prompt, patch or knowledge-base text to OpenRouter unless you enabled Jev in your own config.
+- The key comes from the credential store (`bin/ultrathink-mcp auth set-key openrouter --stdin`), else from `OPENROUTER_API_KEY`. The stored key wins. Without either, no point sends a request, and `bin/ultrathink status` says so.
+- There is no config key for the endpoint. Any other key under `decisions` (a `url` or `endpoint`, for example) is ignored, so a project file cannot send your OpenRouter key anywhere else. Only `ULTRATHINK_DECISIONS_URL` in the environment changes the endpoint, and only to an `https://openrouter.ai/…` URL or a loopback URL (see [Environment variables](#environment-variables)). A request never follows an HTTP redirect.
+- The four points: `plan` can skip planning for a message the rules would plan; `ship` can veto an LLM "done", or decide when there is no usable LLM verdict and `ship.autoMerge` is off; `knowledge` can take back a question the knowledge base settled, which is then asked if a question slot is free; `blocking` can make a non-blocking question blocking. A skill invocation (every `/gsd-*` run included) and a message that starts with `uplift:` make no `plan` decision, but their clarifying questions can still get `knowledge` and `blocking` decisions, and each ship `assess` whose rule checks pass makes one `ship` decision, GSD runs included. A message the deterministic rules skip makes none.
+- One decision makes at most one retry, only for a network error or HTTP 408, 429, 500, 502, 503, 524 or 529, and only when at least 500 ms of `timeoutMs` remain. It honours `Retry-After` when that fits the budget.
+- A request whose estimated size is over 28 000 tokens is not sent; it fails locally as `too-large`.
+- Each decision is recorded without any of the state it was asked about: point, resolved model, probability, threshold, action, latency, attempts, cost and error kind. You see it in the summary (`Decisions · plan 0.97`, with `claude.echo` on), the plan-skip notice, the session record's `decisions` field, the ship assessment's `decision`, the pull request's `- Jev:` line and, with `ULTRATHINK_DEBUG=1`, one stderr line per decision. `bin/ultrathink status` shows the `Decisions:` line.
+
+The default thresholds were set from probes on `typesafe/jev-1.13-20260917`. Tune them on your own cases with `bin/ultrathink decisions probe` (see [Commands](commands.md#binultrathink-decisions)).
+
 ## Full example
 
 All keys are optional; write only the ones you change. This file shows every key. The values are the defaults, with these exceptions:
 
 - `notion.dataSourceUrl` and `linear.team` hold placeholders. Replace them with your own values, or leave them `""` to keep tracking unconfigured.
 - `grok.shuntBaseUrl`, `grok.shuntModel` and `substrate.url` are `""`, which is the default and means off. Set them only if you run those services.
-- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch` and `hitl.knowledgeBase` are `false`, the opt-in defaults.
+- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch`, `hitl.knowledgeBase` and `decisions.enabled` are `false`, the opt-in defaults.
 
 ```json
 {
@@ -232,7 +263,19 @@ All keys are optional; write only the ones you change. This file shows every key
     "waitMs": 100000,
     "mergeTimeoutMs": 3600000
   },
-  "substrate": { "url": "" }
+  "substrate": { "url": "" },
+  "decisions": {
+    "enabled": false,
+    "model": "~typesafe/jev-latest",
+    "points": ["plan", "ship", "knowledge", "blocking"],
+    "timeoutMs": 3000,
+    "zdr": true,
+    "planSkipBelow": 0.2,
+    "shipVetoAtOrBelow": 0.2,
+    "shipApproveAt": 0.7,
+    "groundedAt": 0.8,
+    "blockingAt": 0.5
+  }
 }
 ```
 
@@ -265,6 +308,12 @@ Read the repository's Greptile knowledge base before the clarifying questions. S
 { "hitl": { "knowledgeBase": true }, "ship": { "greptileOrganization": "<your Greptile organization>" } }
 ```
 
+Ask Jev at the four decision points. Put this in a user file such as `~/.config/ultrathink/config.json`: the project file cannot turn Jev on. Store an OpenRouter key first with `bin/ultrathink-mcp auth set-key openrouter --stdin` (or set `OPENROUTER_API_KEY`); `"model": "typesafe/jev-1.13"` pins the version the default thresholds were probed on:
+
+```json
+{ "decisions": { "enabled": true, "model": "typesafe/jev-1.13" } }
+```
+
 ## Environment variables
 
 Every variable ultrathink reads, grouped by who sets it. Variables that expect `1` or `0` compare the exact string: `ULTRATHINK_SHIP=false` does nothing.
@@ -276,12 +325,13 @@ Every variable ultrathink reads, grouped by who sets it. Variables that expect `
 | `ULTRATHINK_UPLIFT=0` | Do not plan any prompt in this process. The `uplift:` prefix does not override it. Useful for automation and `claude -p` runs. |
 | `ULTRATHINK_TRACK=0` | The planner creates no rows in this process. The `ultrathink-kickoff` skill still creates them through `track complete`. To stop all rows, use `/ultrathink-track off`. |
 | `ULTRATHINK_SHIP=0` | No ship instruction in the plan and no ship nudge at the end of a run, even with `ship.enabled: true`. `bin/ultrathink-ship` still works when you run it yourself. |
+| `ULTRATHINK_DECISIONS=0` | No Jev decision at any point in this process, even with `decisions.enabled: true`: no request to OpenRouter, no decision record, no plan-skip notice and no `Decisions ·` summary segment. It is checked before `decisions.enabled`: `bin/ultrathink status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` print `Decisions check: off (ULTRATHINK_DECISIONS=0)` or `Decisions probe: off (ULTRATHINK_DECISIONS=0)` and exit 1 without a request. |
 | `ULTRATHINK_HOST` | Which host's state directory to use: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. Any other value is ignored. Without it the host is detected from its environment, and Claude Code is the fallback. Set it for `bin/ultrathink` to change another host's control state, for example `ULTRATHINK_HOST=omp bin/ultrathink off`. The Grok hook file, the Muse hook wrappers, the Hermes plugin and the Omp extension set it for their own processes. |
 | `ULTRATHINK_STATE_DIR` | Use this directory instead of the host's state directory. Give an absolute path: a relative one is resolved against the session's working directory on Claude Code, Grok Build, Muse and Omp, but against the ultrathink checkout on Hermes. It is ignored when the path is inside a `.planning` directory. The Hermes plugin sets it for its own control commands. |
 | `ULTRATHINK_MCP_STORE` | Path of the credential store. Default `~/.config/ultrathink/mcp-credentials.json` (under `$XDG_CONFIG_HOME` when set). |
 | `ULTRATHINK_OAUTH_REDIRECT` | OAuth callback URL for `bin/ultrathink-mcp auth login`. Must be https, or http on `127.0.0.1`, `localhost` or `[::1]`. The `--redirect` flag wins over it. |
 | `ULTRATHINK_OAUTH_TAILSCALE=1` | Same as `auth login --tailscale`: on a remote (SSH) session, receive the OAuth callback through `tailscale serve`. Without it, ultrathink never runs `tailscale`. Only the exact value `1` opts in. See [Commands](commands.md#binultrathink-mcp). |
-| `ULTRATHINK_DEBUG=1` | The prompt hook (`hooks/uplift.ts`, used by Claude Code, Grok Build and Muse) writes `[ultrathink]` log lines to stderr. |
+| `ULTRATHINK_DEBUG=1` | The prompt hook (`hooks/uplift.ts`, used by Claude Code, Grok Build and Muse) writes `[ultrathink]` log lines to stderr. With Decisions on, every process that asks Jev (the prompt hook, the Hermes and Omp engine, `bin/ultrathink-ship`) also writes one `[ultrathink] decisions …` line per decision: the point, P or the error kind, the model, latency, attempts and cost. Never the message, the state or the key. |
 | `ULTRATHINK_MCP_DEBUG=1` | `bin/ultrathink-mcp serve` writes relay log lines to stderr. |
 | `ULTRATHINK_HERMES_TIMEOUT` | Hermes only. Longest time in seconds the Hermes plugin lets one plan run. A positive integer; anything else means the default, `540`. The plugin stops the plan at min(this, cap − 15) seconds, where the cap is Hermes' `plugins.hook_callback_timeout`, and does not start planning when that leaves less than 90 seconds. See the note below the table. |
 | `SUBSTRATE_URL` | Agent Substrate base URL. Wins over `substrate.url`. |
@@ -290,6 +340,8 @@ Every variable ultrathink reads, grouped by who sets it. Variables that expect `
 | `SUBSTRATE_DISABLED=1` | Never contact Agent Substrate, even when `SUBSTRATE_URL` or `substrate.url` is set. |
 | `GSD_TOOLS` | Path of `gsd-tools.cjs`, which the ship assessment runs to read a GSD roadmap. See [GSD tools lookup](#gsd-tools-lookup). |
 | `BUN` | Path of the `bun` binary. See [Finding Bun](#finding-bun). |
+| `OPENROUTER_API_KEY` | OpenRouter API key for Jev decisions, used only when no `openrouter` key is stored with `bin/ultrathink-mcp auth set-key openrouter`. The stored key wins. Empty or whitespace-only counts as unset. `bin/ultrathink status` shows `key from OPENROUTER_API_KEY` when it is the one in use, never the key. |
+| `ULTRATHINK_DECISIONS_URL` | Replaces the Decisions endpoint (`https://openrouter.ai/api/alpha/decisions`), for a local proxy or a test server. It is accepted only as an `https://` URL on `openrouter.ai`, or an `http://` or `https://` URL on `localhost`, `127.0.0.1` or `[::1]`, and never with a user name or password in it; any other value is ignored and the default endpoint is used. Only its origin and path are used and printed: a query or fragment is dropped. Environment only: there is no config key for it, so a project file cannot redirect your OpenRouter key. When it is in effect, the `Decisions:` status line (when Decisions are on with a key) and the `decisions check` line end with ` · url <origin and path>`; when it is set but ignored, they end with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)`. |
 
 About the Hermes hook cap: Hermes abandons a plugin hook that runs longer than its `plugins.hook_callback_timeout` (30 seconds unless you change it). A plan needs at least 90 seconds, so the cap must be at least 105 seconds; 600 is recommended. It is a global Hermes setting that affects every plugin, and nothing in ultrathink changes it. Set it yourself:
 
@@ -313,7 +365,7 @@ When a roadmap exists and none of these is found, the assessment reports the gap
 
 #### Finding Bun
 
-The launcher `bin/run-bun` looks for `bun` in this order: `$BUN`, `PATH`, `$BUN_INSTALL/bin/bun`, `~/.bun/bin/bun`, `/usr/local/bin/bun`, `/opt/homebrew/bin/bun`, then `~/.local/share/*/bun/bin/bun`. It adds the directory it found to `PATH` for everything Bun starts. When there is no Bun, it prints `ultrathink: bun not found. Install Bun 1.2 or later (https://bun.sh) or set BUN=/path/to/bun`; the hooks then exit 0 so the prompt still goes through, and the three CLIs exit 127. The Hermes plugin runs `$BUN` directly when it is set, else `bin/run-bun`.
+The launcher `bin/run-bun` looks for `bun` in this order: `$BUN`, `PATH`, `$BUN_INSTALL/bin/bun`, `~/.bun/bin/bun`, `/usr/local/bin/bun`, `/opt/homebrew/bin/bun`, then `~/.local/share/*/bun/bin/bun`. It adds the directory it found to `PATH` for everything Bun starts, and starts Bun with `--no-env-file`, so Bun 1.3.3 and later load no `.env*` files from the working directory (your repository) into ultrathink; Bun 1.2.x ignores the flag and still loads them. When there is no Bun, it prints `ultrathink: bun not found. Install Bun 1.2 or later (https://bun.sh) or set BUN=/path/to/bun`; the hooks then exit 0 so the prompt still goes through, and the three CLIs exit 127. The Hermes plugin runs `$BUN` directly when it is set, else `bin/run-bun`, both from the ultrathink clone, so a repository's `.env*` files never reach it.
 
 ### Internal variables
 
@@ -367,7 +419,7 @@ What a state directory holds:
 | Path | Contents |
 |---|---|
 | `control.json` | The per-host control state, described in the next section. |
-| `sessions/<session-id>.json` | The session record: the spec, the graph, the clarifications, the tracking plan, the created row links and the ship progress. The kickoff, sync and ship skills take this file as `stateFile`. |
+| `sessions/<session-id>.json` | The session record: the spec, the graph, the clarifications, the tracking plan, the created row links, the ship progress and, with Decisions on, the Jev decision records (`decisions`, and the ship assessment's `decision`). The kickoff, sync and ship skills take this file as `stateFile`. |
 | `sessions/<session-id>.xml` | The full uplifted spec. |
 | `last.json` | A copy of the latest session record. `bin/ultrathink last` reads it. |
 | `last-plan.json` | The plan carrier for hosts that do not read hook output directly, such as Grok Build. |

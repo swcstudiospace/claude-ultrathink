@@ -75,6 +75,7 @@ To avoid extra plans for follow-ups, prefix them with `raw:` or run `/ultrathink
 | One shell or process | `ULTRATHINK_UPLIFT=0` |
 | Tracker rows only | `/ultrathink-track off` |
 | The ship flow | It is off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` also turns it off |
+| Jev decisions | They are off unless you set `decisions.enabled`; set it back to `false` (see [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again)) |
 | Everything | [Uninstall](how-to/uninstall.md) |
 
 Full list in [Commands](commands.md) and [Privacy and data flow](privacy.md#turning-things-off).
@@ -91,6 +92,6 @@ Never into your repository's working tree, and never into `.planning/`.
 
 ## What data leaves my machine?
 
-Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, Agent Substrate and Tailscale only after you configure them. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
+Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, OpenRouter (Jev decisions, `decisions.enabled`), Agent Substrate and Tailscale only after you configure them. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
 
 The full table, with what each destination receives and how to turn it off, is in [Privacy and data flow](privacy.md).

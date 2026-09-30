@@ -74,6 +74,7 @@ Optional:
 | `gh`, logged in | [Ship](ship.md) (opt-in): pushing, opening and merging the PR |
 | Greptile CLI (`greptile login`) | Ship's CLI review mode |
 | Notion, Linear, Greptile credentials | [Tracking](tracking.md) and ship, through the [shared MCP gateway](#shared-mcp-gateway) |
+| An OpenRouter API key (`bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) | [Jev decisions](how-to/use-jev-decisions.md) (opt-in, `decisions.enabled`): it is stored in the same credential store, but `openrouter` is not an MCP server and is never registered in a host |
 
 A fresh install only plans prompts. Linear and Notion tracking, ship, the Agent Substrate brief and the Tailscale OAuth callback are all off until you configure them. See [Configuration](configuration.md) and [Tracking](tracking.md).
 

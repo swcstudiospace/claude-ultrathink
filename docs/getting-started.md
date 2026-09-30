@@ -95,11 +95,13 @@ Notion: not configured
 Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
+Knowledge base: off (opt-in: set hitl.knowledgeBase)
+Decisions: off (opt-in: set decisions.enabled)
 Model: sonnet · concurrency 3
 State: /home/<you>/.claude/ultrathink
 ```
 
-The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship.
+The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base and no Jev decisions.
 
 ## 5. Send your first prompt
 
@@ -246,6 +248,7 @@ Rows and their properties in full: [tracking.md](tracking.md).
 - [Choose the engine](how-to/choose-engine.md): plan with Grok instead of Claude.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer nodes, no questions, skipping planning for small messages.
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to opening, reviewing and merging pull requests.
+- [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model, which skips planning for messages that are not new work and double-checks ship's done verdict.
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository.
 - [Headless and CI](how-to/headless-and-ci.md): turn planning off for scripts.
 - [What leaves your machine](privacy.md) and [Configuration](configuration.md).
