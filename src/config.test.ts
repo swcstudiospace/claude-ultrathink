@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeConfigPaths, defaultConfig, loadConfig, mergeConfig, userConfigPath } from "./config.ts";
+import { claudeConfigPaths, defaultConfig, loadConfig, mergeConfig, type UltrathinkConfig, userConfigPath } from "./config.ts";
+import type { DecisionsConfig } from "./decisions/types.ts";
 
 function tempConfigFile(content: unknown): { path: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-config-"));
@@ -168,11 +169,11 @@ describe("config paths", () => {
 		expect(userConfigPath({})).toBe(join(homedir(), ".config", "ultrathink", "config.json"));
 	});
 
-	test("user, then Claude home, then project, in that order", () => {
+	test("user, then Claude home, then project, in that order; only the project file is tagged as a project layer", () => {
 		expect(claudeConfigPaths("/repo", { XDG_CONFIG_HOME: "/xdg", CLAUDE_CONFIG_DIR: "/home/.claude" })).toEqual([
 			"/xdg/ultrathink/config.json",
 			"/home/.claude/ultrathink.json",
-			"/repo/.claude/ultrathink.json",
+			{ path: "/repo/.claude/ultrathink.json", project: true },
 		]);
 		expect(claudeConfigPaths("/repo", {})[1]).toBe(join(homedir(), ".claude", "ultrathink.json"));
 	});
@@ -180,7 +181,11 @@ describe("config paths", () => {
 	test("the project file overrides ~/.claude, which overrides the user config", () => {
 		const root = mkdtempSync(join(tmpdir(), "ultrathink-paths-"));
 		const env = { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") };
-		const [user, claude, project] = claudeConfigPaths(join(root, "repo"), env) as [string, string, string];
+		const [user, claude, project] = claudeConfigPaths(join(root, "repo"), env).map((s) => (typeof s === "string" ? s : s.path)) as [
+			string,
+			string,
+			string,
+		];
 		const files: [string, unknown][] = [
 			[user, { linear: { team: "User" }, notion: { dataSourceUrl: "collection://user" }, hitl: { maxQuestions: 1 } }],
 			[claude, { linear: { team: "Claude" }, notion: { dataSourceUrl: "collection://claude" } }],
@@ -294,5 +299,222 @@ describe("substrate config", () => {
 		expect(mergeConfig({ substrate: { url: "ftp://x" } }, base).substrate.url).toBe("");
 		const set = mergeConfig({ substrate: { url: "https://substrate.example" } }, base);
 		expect(mergeConfig({ substrate: { url: "" } }, set).substrate.url).toBe("https://substrate.example");
+	});
+});
+
+/** Brief §5 defaults, written out so a drifted constant fails here (AC-1.6). */
+const DECISIONS_DEFAULTS: DecisionsConfig = {
+	enabled: false,
+	model: "~typesafe/jev-latest",
+	points: ["plan", "ship", "knowledge", "blocking"],
+	timeoutMs: 3000,
+	zdr: true,
+	planSkipBelow: 0.2,
+	shipVetoAtOrBelow: 0.2,
+	shipApproveAt: 0.7,
+	groundedAt: 0.8,
+	blockingAt: 0.5,
+};
+
+describe("decisions config", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	/**
+	 * Runs the real loader over the user layer (XDG config.json), the Claude home layer (a second user layer) and the project
+	 * layer (<project>/.claude/ultrathink.json); `undefined` = no file.
+	 */
+	function loadLayers(user: unknown, claude?: unknown, project?: unknown): UltrathinkConfig {
+		const root = mkdtempSync(join(tmpdir(), "ut-decisions-config-"));
+		roots.push(root);
+		const env = { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") };
+		const cwd = join(root, "repo");
+		const sources = claudeConfigPaths(cwd, env);
+		for (const [source, content] of [
+			[sources[0], user],
+			[sources[1], claude],
+			[sources[2], project],
+		] as const) {
+			if (content === undefined || source === undefined) continue;
+			const path = typeof source === "string" ? source : source.path;
+			mkdirSync(join(path, ".."), { recursive: true });
+			writeFileSync(path, JSON.stringify(content));
+		}
+		return loadConfig(sources);
+	}
+
+	test("a fresh install has decisions off with the brief §5 defaults (AC-1.6)", () => {
+		expect(defaultConfig().decisions).toEqual(DECISIONS_DEFAULTS);
+		expect(loadLayers(undefined).decisions).toEqual(DECISIONS_DEFAULTS);
+		expect(loadLayers({ uplift: { enabled: false } }, { hitl: { maxQuestions: 2 } }).decisions).toEqual(DECISIONS_DEFAULTS);
+	});
+
+	test("each defaultConfig() owns its points list, so mutating one never changes the next default", () => {
+		defaultConfig().decisions.points.splice(0);
+		expect(defaultConfig().decisions.points).toEqual(["plan", "ship", "knowledge", "blocking"]);
+	});
+
+	test("enabled adopts only a boolean; \"yes\" and 1 keep the earlier layer's value (AC-10.5)", () => {
+		expect(loadLayers({}, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
+		expect(loadLayers({ decisions: { enabled: true } }, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
+		for (const enabled of ["yes", 1]) {
+			expect(loadLayers({ decisions: { enabled: true } }, { decisions: { enabled } }).decisions.enabled).toBe(true);
+			expect(loadLayers({}, { decisions: { enabled } }).decisions.enabled).toBe(false);
+		}
+	});
+
+	test("model is trimmed; empty, blank and non-string values keep the earlier layer's model (AC-10.6)", () => {
+		const user = { decisions: { model: "typesafe/jev-user" } };
+		expect(loadLayers(user, { decisions: { model: "typesafe/jev-1.13" } }).decisions.model).toBe("typesafe/jev-1.13");
+		expect(loadLayers(user, { decisions: { model: "  typesafe/jev-1.13  " } }).decisions.model).toBe("typesafe/jev-1.13");
+		for (const model of ["", "   ", 42]) {
+			expect(loadLayers(user, { decisions: { model } }).decisions.model).toBe("typesafe/jev-user");
+			expect(loadLayers({}, { decisions: { model } }).decisions.model).toBe("~typesafe/jev-latest");
+		}
+	});
+
+	test("points keeps known names in input order, drops unknowns and duplicates, allows []; a non-array keeps the earlier layer (AC-10.7)", () => {
+		const user = { decisions: { points: ["ship", "knowledge"] } };
+		expect(loadLayers(user, { decisions: { points: ["plan", "ship"] } }).decisions.points).toEqual(["plan", "ship"]);
+		expect(loadLayers(user, { decisions: { points: ["plan", "bogus"] } }).decisions.points).toEqual(["plan"]);
+		expect(loadLayers(user, { decisions: { points: [] } }).decisions.points).toEqual([]);
+		expect(loadLayers(user, { decisions: { points: "plan" } }).decisions.points).toEqual(["ship", "knowledge"]);
+		expect(loadLayers(user, { decisions: { points: null } }).decisions.points).toEqual(["ship", "knowledge"]);
+		expect(
+			loadLayers({}, { decisions: { points: ["blocking", "PLAN", "plan", "blocking", 3, null, "plan"] } }).decisions.points,
+		).toEqual(["blocking", "plan"]);
+		expect(loadLayers({ decisions: { points: [] } }, { decisions: { enabled: true } }).decisions.points).toEqual([]);
+	});
+
+	test("timeoutMs adopts a finite number in (0, 30000]; 0, negatives, larger values and strings keep the earlier layer (AC-10.8, K4)", () => {
+		const user = { decisions: { timeoutMs: 4000 } };
+		expect(loadLayers(user, { decisions: { timeoutMs: 5000 } }).decisions.timeoutMs).toBe(5000);
+		expect(loadLayers(user, { decisions: { timeoutMs: 1.5 } }).decisions.timeoutMs).toBe(1.5);
+		expect(loadLayers(user, { decisions: { timeoutMs: 30000 } }).decisions.timeoutMs).toBe(30000);
+		for (const timeoutMs of [0, -1, 30001, 1e300, "3000", null]) {
+			expect(loadLayers(user, { decisions: { timeoutMs } }).decisions.timeoutMs).toBe(4000);
+		}
+		const base = defaultConfig();
+		for (const timeoutMs of [Number.POSITIVE_INFINITY, Number.NaN]) {
+			expect(mergeConfig({ decisions: { timeoutMs } }, base).decisions.timeoutMs).toBe(3000);
+		}
+	});
+
+	test("zdr adopts only a boolean; the string \"false\" keeps the earlier layer (AC-10.9)", () => {
+		expect(loadLayers({}, { decisions: { zdr: false } }).decisions.zdr).toBe(false);
+		expect(loadLayers({}, { decisions: { zdr: "false" } }).decisions.zdr).toBe(true);
+		expect(loadLayers({ decisions: { zdr: false } }, { decisions: { zdr: "true" } }).decisions.zdr).toBe(false);
+		expect(loadLayers({ decisions: { zdr: false } }, { decisions: { zdr: 1 } }).decisions.zdr).toBe(false);
+	});
+
+	test("every threshold adopts a finite number in [0, 1] and only its own key; out-of-range and strings keep the earlier layer (AC-10.10)", () => {
+		const thresholds = ["planSkipBelow", "shipVetoAtOrBelow", "shipApproveAt", "groundedAt", "blockingAt"] as const;
+		const previous = 0.45;
+		for (const key of thresholds) {
+			const user = { decisions: { [key]: previous } };
+			for (const value of [0, 1, 0.35]) {
+				expect(loadLayers(user, { decisions: { [key]: value } }).decisions).toEqual({ ...DECISIONS_DEFAULTS, [key]: value });
+			}
+			for (const value of [-0.1, 1.1, "0.3", null]) {
+				expect(loadLayers(user, { decisions: { [key]: value } }).decisions).toEqual({ ...DECISIONS_DEFAULTS, [key]: previous });
+			}
+			expect(mergeConfig({ decisions: { [key]: Number.NaN } }, defaultConfig()).decisions[key]).toBe(
+				DECISIONS_DEFAULTS[key],
+			);
+		}
+	});
+
+	test("layers merge per field: a later layer overrides only the keys it sets (AC-10.11)", () => {
+		const config = loadLayers(
+			{ decisions: { enabled: true, planSkipBelow: 0.3 } },
+			{ decisions: { planSkipBelow: 0.1, zdr: false } },
+		);
+		expect(config.decisions).toEqual({ ...DECISIONS_DEFAULTS, enabled: true, planSkipBelow: 0.1, zdr: false });
+	});
+
+	test("a non-object decisions section keeps the earlier layer whole", () => {
+		const user = { decisions: { enabled: true, points: ["plan"] } };
+		for (const decisions of ["on", true, ["plan"], null]) {
+			expect(loadLayers(user, { decisions }).decisions).toEqual({ ...DECISIONS_DEFAULTS, enabled: true, points: ["plan"] });
+		}
+	});
+
+	test("url and endpoint keys in any layer are ignored: the merged section has exactly the ten keys and no URL (D1, AC-2.12)", () => {
+		const config = loadLayers(
+			{ decisions: { url: "https://evil.example/user" } },
+			{ decisions: { enabled: true, url: "https://evil.example/x", endpoint: "https://evil.example/y" } },
+			{ decisions: { url: "https://evil.example/project", endpoint: "https://evil.example/z" } },
+		);
+		expect(config.decisions).toEqual({ ...DECISIONS_DEFAULTS, enabled: true });
+		expect(Object.keys(config.decisions).sort()).toEqual(Object.keys(DECISIONS_DEFAULTS).sort());
+		expect(JSON.stringify(config)).not.toContain("evil.example");
+	});
+
+	describe("a project file can only tighten consent (K5)", () => {
+		test("a project `enabled: true` never opts a user in; a project `enabled: false` turns off a user's `true`", () => {
+			expect(loadLayers({}, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(false);
+			expect(loadLayers({ decisions: { enabled: false } }, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(false);
+			expect(loadLayers({ decisions: { enabled: true } }, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
+			expect(loadLayers({ decisions: { enabled: true } }, undefined, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
+			expect(loadLayers({}, { decisions: { enabled: true } }, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
+		});
+
+		test("a project `zdr: false` never lowers a user's retention guard; a project `zdr: true` raises a user's `false`", () => {
+			expect(loadLayers({}, undefined, { decisions: { zdr: false } }).decisions.zdr).toBe(true);
+			expect(loadLayers({ decisions: { zdr: true } }, undefined, { decisions: { zdr: false } }).decisions.zdr).toBe(true);
+			expect(loadLayers({ decisions: { zdr: false } }, undefined, { decisions: { zdr: true } }).decisions.zdr).toBe(true);
+			expect(loadLayers({ decisions: { zdr: false } }, undefined, { decisions: { zdr: false } }).decisions.zdr).toBe(false);
+		});
+
+		test("project points are intersected with the user's: they narrow, never widen, and keep the user's order", () => {
+			const user = { decisions: { enabled: true, points: ["ship", "plan"] } };
+			expect(loadLayers(user, undefined, { decisions: { points: ["plan"] } }).decisions.points).toEqual(["plan"]);
+			expect(loadLayers(user, undefined, { decisions: { points: ["plan", "knowledge", "blocking"] } }).decisions.points).toEqual([
+				"plan",
+			]);
+			expect(loadLayers(user, undefined, { decisions: { points: ["knowledge"] } }).decisions.points).toEqual([]);
+			expect(loadLayers(user, undefined, { decisions: { points: ["plan", "ship", "bogus"] } }).decisions.points).toEqual([
+				"ship",
+				"plan",
+			]);
+			expect(loadLayers(user, undefined, { decisions: { points: "knowledge" } }).decisions.points).toEqual(["ship", "plan"]);
+			expect(loadLayers({ decisions: { points: [] } }, undefined, { decisions: { points: ["plan"] } }).decisions.points).toEqual([]);
+			expect(loadLayers({}, { decisions: { points: ["blocking"] } }, { decisions: { points: ["blocking", "ship"] } }).decisions.points).toEqual([
+				"blocking",
+			]);
+		});
+
+		test("model, thresholds and timeoutMs from a project file still merge as usual", () => {
+			const config = loadLayers(
+				{ decisions: { enabled: true, model: "typesafe/jev-user", planSkipBelow: 0.3, timeoutMs: 4000 } },
+				undefined,
+				{ decisions: { model: "typesafe/jev-1.13", planSkipBelow: 0.1, blockingAt: 0.9, timeoutMs: 8000 } },
+			);
+			expect(config.decisions).toEqual({
+				...DECISIONS_DEFAULTS,
+				enabled: true,
+				model: "typesafe/jev-1.13",
+				planSkipBelow: 0.1,
+				blockingAt: 0.9,
+				timeoutMs: 8000,
+			});
+			expect(loadLayers({ decisions: { timeoutMs: 4000 } }, undefined, { decisions: { timeoutMs: 30001 } }).decisions.timeoutMs).toBe(4000);
+		});
+
+		test("a plain path list keeps user semantics, so only the tagged project entry is restricted", () => {
+			const file = tempConfigFile({ decisions: { enabled: true, zdr: false, points: ["plan", "ship"] } });
+			try {
+				expect(loadConfig([file.path]).decisions).toMatchObject({ enabled: true, zdr: false, points: ["plan", "ship"] });
+				expect(loadConfig([{ path: file.path, project: true }]).decisions).toMatchObject({
+					enabled: false,
+					zdr: true,
+					points: ["plan", "ship"],
+				});
+			} finally {
+				file.cleanup();
+			}
+		});
 	});
 });

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import type { DecisionRecord } from "../decisions/types.ts";
+
 /** Greptile's confidence scale: scores run 0..5 and 5 ("5/5") is the maximum. */
 export const GREPTILE_MAX_SCORE = 5;
 
@@ -117,11 +119,13 @@ export interface Assessment {
 	summary: string;
 	gaps: string[];
 	signals: ShipSignals;
-	source: "llm" | "rules";
+	source: "llm" | "rules" | "jev";
 	/** Judge mode the assessment ran under. */
 	mode?: JudgeMode;
 	/** Advisory mode: the judge verdict, or `error` when the judge was unavailable or failed. */
 	judge?: JudgeVerdict & { error?: string };
+	/** Jev ship decision; absent when the point was inactive or a rule gap returned first. */
+	decision?: DecisionRecord;
 	at: number;
 }
 

@@ -6,6 +6,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
 import type { ThoughtGraph } from "../think/types.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
@@ -51,6 +52,8 @@ export interface SessionRecord {
 	ship?: ShipState;
 	/** Greptile knowledge-base lookup the planner ran before the HITL clarify step. */
 	knowledge?: KnowledgeLookup;
+	/** Jev decisions made while planning this prompt (plan, knowledge, blocking), in call order. Absent on older records and when none ran. */
+	decisions?: DecisionRecord[];
 }
 
 export function defaultStateDir(env: Record<string, string | undefined> = process.env): string {

@@ -13,6 +13,7 @@ import {
 	planClaude,
 	planGrok,
 	planHermes,
+	PROVIDER_IDS,
 	writeJson,
 } from "./mcp-register.ts";
 import type { CliHost, Entry, Run } from "./mcp-register.ts";
@@ -636,6 +637,59 @@ describe("main", () => {
 		sandbox(({ deps }) => {
 			expect(() => main(["--replace", "--remove"], deps())).toThrow("cannot be combined");
 		});
+	});
+});
+
+describe("API-key providers are never registered", () => {
+	test("PROVIDER_IDS lists the three MCP servers only", () => {
+		expect([...PROVIDER_IDS]).toEqual(["notion", "linear", "greptile"]);
+	});
+
+	test("--providers openrouter is a usage error before any host is touched", () => {
+		sandbox(({ deps, lines }) => {
+			expect(() => main(["--providers", "openrouter", "--dry-run"], deps())).toThrow("unknown provider: openrouter");
+			expect(lines).toEqual([]);
+		});
+		const home = mkdtempSync(join(tmpdir(), "mcp-register-api-key-"));
+		try {
+			const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "mcp-register.ts"), "--providers", "openrouter", "--dry-run"], {
+				env: { HOME: home, PATH: "" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(proc.exitCode).toBe(2);
+			const stderr = proc.stderr.toString();
+			expect(stderr).toContain("mcp-register: unknown provider: openrouter");
+			expect(stderr).toContain("Usage: bun scripts/mcp-register.ts");
+			// Every host config path main() reads or writes under HOME; bun's own ~/.bun cache is not a host.
+			const hostPaths = [".claude.json", ".omp", join(".config", "muse"), ".grok", ".hermes"];
+			expect(hostPaths.filter((path) => existsSync(join(home, path)))).toEqual([]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("the default dry run plans the three MCP servers and no openrouter entry for any host", () => {
+		const servers: Record<CliHost, Record<string, string>> = { claude: {}, grok: {}, hermes: {} };
+		const dir = mkdtempSync(join(tmpdir(), "mcp-register-api-key-"));
+		const fake = fakeHosts(servers, join(dir, "config.yaml"));
+		try {
+			sandbox(({ env, lines, deps }) => {
+				env.HERMES_HOME = dir;
+				expect(main(["--dry-run"], deps())).toBe(0);
+				for (const host of ["claude", "grok", "hermes", "muse", "omp"]) expect(lines).toContain(`${host}:`);
+				expect(lines.filter((line) => line.endsWith(" added"))).toHaveLength(15);
+				const adds = lines.filter((line) => line.startsWith("  $ ") && line.includes(" add "));
+				expect(adds).toHaveLength(9);
+				for (const id of PROVIDER_IDS) expect(adds.filter((line) => line.includes(`serve ${id}`))).toHaveLength(3);
+				// A provider token (`serve openrouter`, an `openrouter:` entry, `add openrouter`), never a path fragment.
+				const token = /(?:^|\s)openrouter(?::|\s|$)/;
+				expect(lines.filter((line) => token.test(line))).toEqual([]);
+				expect(fake.calls.filter((call) => call.includes("openrouter"))).toEqual([]);
+			}, fake.run);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

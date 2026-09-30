@@ -4,7 +4,18 @@ import { existsSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import type { Clarification } from "../hitl/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
-import { formatPromptContext, formatSummary, HANDOFF_MAX_CHARS, SKILL_CONTEXT_HEADER, TRACKING_OFF_NOTE, truncateXml, UPLIFT_CONTEXT_HEADER } from "./output.ts";
+import type { DecisionPoint, DecisionRecord, DecisionsErrorKind } from "../decisions/types.ts";
+import {
+	formatDecisionsBit,
+	formatPlanSkipNotice,
+	formatPromptContext,
+	formatSummary,
+	HANDOFF_MAX_CHARS,
+	SKILL_CONTEXT_HEADER,
+	TRACKING_OFF_NOTE,
+	truncateXml,
+	UPLIFT_CONTEXT_HEADER,
+} from "./output.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 
@@ -183,6 +194,99 @@ describe("formatSummary", () => {
 			"Prompt Uplift · BUILD_PROMPT · llm · claude:sonnet · Graph of Thought · 5 nodes · HITL · 1 question(s) · Engine error · claude timed out after 5ms · 1.0s",
 		);
 		expect(formatSummary({ result, clarifications: [] })).toBe("Prompt Uplift · BUILD_PROMPT · llm");
+	});
+});
+
+describe("Decisions summary bit and plan-skip notice", () => {
+	const KEYS: Record<DecisionPoint, string> = { plan: "plan_worthy", ship: "complete", knowledge: "supported", blocking: "risky" };
+	const ok = (point: DecisionPoint, p: number, action: DecisionRecord["action"]): DecisionRecord => ({
+		point,
+		outcome: "ok",
+		model: "typesafe/jev-1.13-20260917",
+		id: "gen-dec-test",
+		p,
+		probabilities: { [KEYS[point]]: p },
+		threshold: 0.5,
+		action,
+		latencyMs: 40,
+		attempts: 1,
+		cost: 0.000019,
+		at: 1,
+	});
+	const failed = (point: DecisionPoint, error: DecisionsErrorKind): DecisionRecord => ({
+		point,
+		outcome: "error",
+		model: "~typesafe/jev-latest",
+		probabilities: {},
+		threshold: 0.2,
+		action: "fail-open",
+		latencyMs: 3000,
+		attempts: 1,
+		error,
+		at: 1,
+	});
+
+	test("each point reads as its pinned bit", () => {
+		expect(formatDecisionsBit([ok("plan", 0.97, "plan")])).toBe("Decisions · plan 0.97");
+		expect(formatDecisionsBit([failed("plan", "credits")])).toBe("Decisions · error (credits)");
+		expect(formatDecisionsBit([ok("knowledge", 0.93, "keep"), ok("knowledge", 0.31, "reject-claim")])).toBe(
+			"Decisions · knowledge 1/2 kept",
+		);
+		expect(
+			formatDecisionsBit([ok("blocking", 0.8, "promote"), ok("blocking", 0.1, "keep"), ok("blocking", 0.2, "keep")]),
+		).toBe("Decisions · blocking 1/3 promoted");
+	});
+
+	test("a mixed prompt is one bit: plan, knowledge, blocking, then the errors; failed records add no count", () => {
+		const records = [
+			ok("plan", 0.97, "plan"),
+			ok("knowledge", 0.93, "keep"),
+			failed("knowledge", "timeout"),
+			ok("knowledge", 0.31, "reject-claim"),
+			ok("blocking", 0.8, "promote"),
+			ok("blocking", 0.1, "keep"),
+			ok("blocking", 0.2, "keep"),
+		];
+		expect(formatDecisionsBit(records)).toBe("Decisions · plan 0.97 · knowledge 1/2 kept · blocking 1/3 promoted · error (timeout)");
+	});
+
+	test("error kinds are listed once each, in record order", () => {
+		const records = [failed("knowledge", "timeout"), failed("blocking", "credits"), failed("blocking", "timeout")];
+		expect(formatDecisionsBit(records)).toBe("Decisions · error (timeout, credits)");
+	});
+
+	test("every failure kind of the plan point reads Decisions · error (<kind>)", () => {
+		for (const kind of ["auth", "credits", "bad-request", "rate-limit", "upstream", "timeout", "invalid-response"] as const) {
+			expect(formatDecisionsBit([failed("plan", kind)])).toBe(`Decisions · error (${kind})`);
+		}
+	});
+
+	test("ship records and an empty list add no bit, so the summary is unchanged", () => {
+		expect(formatDecisionsBit([])).toBeUndefined();
+		expect(formatDecisionsBit([ok("ship", 0.94, "none"), failed("ship", "credits")])).toBeUndefined();
+		expect(formatSummary({ result, clarifications, decisions: [] })).toBe(formatSummary({ result, clarifications }));
+		expect(formatSummary({ result, decisions: [ok("ship", 0.94, "none")] })).toBe("Prompt Uplift · BUILD_PROMPT · llm");
+	});
+
+	test("the bit follows the HITL bit and precedes the Tracking bit", () => {
+		expect(formatSummary({ result, clarifications, decisions: [ok("plan", 0.97, "plan")], tracked: true, elapsedMs: 1_000 })).toBe(
+			"Prompt Uplift · BUILD_PROMPT · llm · HITL · 1 question(s) · Decisions · plan 0.97 · Tracking · ultrathink-kickoff pending · 1.0s",
+		);
+		expect(formatSummary({ result, decisions: [failed("plan", "credits")], trackingOff: true })).toBe(
+			"Prompt Uplift · BUILD_PROMPT · llm · Decisions · error (credits) · Tracking · off",
+		);
+	});
+
+	test("P prints truncated to two decimals, so a printed value never crosses its threshold", () => {
+		expect(formatDecisionsBit([ok("plan", 0.199, "skip-plan")])).toBe("Decisions · plan 0.19");
+		expect(formatDecisionsBit([ok("plan", 1, "plan")])).toBe("Decisions · plan 1.00");
+	});
+
+	test("the plan-skip notice names Jev's P and the uplift: prefix", () => {
+		expect(formatPlanSkipNotice(0.04)).toBe(
+			"Prompt Uplift · not planned: Jev judged this is not new multi-step work (0.04) · start with uplift: to plan it",
+		);
+		expect(formatPlanSkipNotice(0.199)).toContain("(0.19)");
 	});
 });
 

@@ -19,6 +19,8 @@ export interface ShipDiff {
 	stat: string;
 	log: string;
 	patch?: string;
+	/** True when gatherDiff cut the patch at 24,000 chars. */
+	patchTruncated?: true;
 }
 
 function out(run: Run, argv: string[], cwd: string, timeoutMs?: number): string | undefined {
@@ -273,9 +275,8 @@ const LOCKFILES = [":(exclude)*.lock", ":(exclude)*.lockb", ":(exclude)package-l
 export function gatherDiff(input: { cwd: string; base: string; run?: Run }): ShipDiff {
 	const run = input.run ?? defaultRun;
 	const range = `origin/${input.base}...HEAD`;
-	return {
-		stat: cap(out(run, ["git", "diff", "--stat", range], input.cwd) ?? ""),
-		log: cap(out(run, ["git", "log", "--oneline", `origin/${input.base}..HEAD`], input.cwd) ?? ""),
-		patch: cap(out(run, ["git", "diff", range, "--", ".", ...LOCKFILES], input.cwd) ?? "", PATCH_CAP),
-	};
+	const stat = cap(out(run, ["git", "diff", "--stat", range], input.cwd) ?? "");
+	const log = cap(out(run, ["git", "log", "--oneline", `origin/${input.base}..HEAD`], input.cwd) ?? "");
+	const patch = out(run, ["git", "diff", range, "--", ".", ...LOCKFILES], input.cwd) ?? "";
+	return { stat, log, patch: cap(patch, PATCH_CAP), ...(patch.length > PATCH_CAP ? { patchTruncated: true as const } : {}) };
 }

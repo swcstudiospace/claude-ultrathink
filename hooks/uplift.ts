@@ -126,6 +126,9 @@ async function main(): Promise<void> {
 		trackCommand: trackCommand(),
 	});
 	if (result.skipped) log(`skipped: ${result.skipped}`);
+	// A Jev skip shows its notice only: no hookSpecificOutput, so the prompt reaches the model unchanged. Grok discards
+	// stdout, and its carrier was cleared at the start of the owned turn, exactly as for a deterministic skip.
+	if (result.skipped && result.notice) process.stdout.write(JSON.stringify({ systemMessage: result.notice }));
 	if (result.output) {
 		// Claude reads stdout first, so a carrier failure can never cost it the plan.
 		// Grok discards stdout; last-plan.json is the carrier there.
