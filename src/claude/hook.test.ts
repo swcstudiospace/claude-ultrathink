@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig, type UltrathinkConfig } from "../config.ts";
+import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
+import type { DecisionAction, DecisionRecord, DecisionsConfig, DecisionsErrorKind } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
 import type { KnowledgeReader, KnowledgeResult } from "../greptile/knowledge.ts";
 import type { RunClarifyOptions } from "../hitl/pipeline.ts";
 import type { ProgressEvent } from "../host/progress.ts";
 import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
-import { runPromptSubmit, type HookDeps, type PromptSubmitInput } from "./hook.ts";
-import { readSession, writeSession } from "./state.ts";
+import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
+import { readSession, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 import type { TrackingRefs } from "../track/types.ts";
 
 function tempStateDir(): { dir: string; cleanup: () => void } {
@@ -779,4 +780,615 @@ describe("Greptile knowledge base before clarify", () => {
 			cleanup();
 		}
 	});
+});
+
+// ---- Jev plan gate (DP-PLAN) and the prompt's decision records ----
+
+const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
+interface Recorded {
+	url: string;
+	method: string;
+	headers: Record<string, string>;
+	body: unknown;
+}
+
+const realFetch = globalThis.fetch;
+const jevDirs: string[] = [];
+afterEach(() => {
+	globalThis.fetch = realFetch;
+	for (const dir of jevDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+/** Recording fetch R: records every call, answers from a queue (last entry repeats). Installed as globalThis.fetch too. */
+function recordingFetch(queue: Array<() => Response | Promise<Response>>): { fetch: typeof fetch; calls: Recorded[] } {
+	const calls: Recorded[] = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const headers: Record<string, string> = {};
+		new Headers(init?.headers).forEach((value, key) => {
+			headers[key] = value;
+		});
+		const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : init?.body;
+		calls.push({ url: String(input), method: init?.method ?? "GET", headers, body });
+		const next = queue[Math.min(calls.length, queue.length) - 1];
+		if (!next) throw new Error("empty queue");
+		return next();
+	}) as typeof fetch;
+	globalThis.fetch = fetchImpl;
+	return { fetch: fetchImpl, calls };
+}
+
+const JEV =
+	(p: number, key = "plan_worthy") =>
+	() =>
+		Response.json({
+			id: "gen-dec-test",
+			model: "typesafe/jev-1.13-20260917",
+			provider: "TypeSafe",
+			answers: { [key]: { type: "noul", noul: p } },
+			usage: { input_tokens: 450, output_tokens: 0, cost: 0.000019 },
+		});
+const ERR = (s: number, headers?: Record<string, string>) => () =>
+	Response.json({ error: { code: s, message: `upstream said no for ${K}` } }, { status: s, headers });
+
+/** Never resolves; rejects with an AbortError when its signal fires (as src/grok/complete.test.ts hangingFetch). Installed as globalThis.fetch too. */
+function hangingFetch(onCall?: () => void): typeof fetch {
+	const fetchImpl = ((_input: string | URL | Request, init?: RequestInit) =>
+		new Promise<Response>((_resolve, reject) => {
+			init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			onCall?.();
+		})) as typeof fetch;
+	globalThis.fetch = fetchImpl;
+	return fetchImpl;
+}
+
+/** A credential store path in a temp dir: empty, or holding `key` for openrouter. */
+function tempStore(key?: string): string {
+	const dir = mkdtempSync(join(tmpdir(), "ut-decisions-hook-"));
+	jevDirs.push(dir);
+	const path = join(dir, "mcp-credentials.json");
+	if (key !== undefined) {
+		writeFileSync(path, JSON.stringify({ version: 1, providers: { openrouter: { kind: "api_key", apiKey: key, updatedAt: 1 } } }), {
+			mode: 0o600,
+		});
+	}
+	return path;
+}
+
+/** `ON`: decisions enabled with every other key at its default unless overridden; `claude.echo` on unless `echo` is false. */
+function onConfig(decisions: Partial<DecisionsConfig> = {}, echo = true): UltrathinkConfig {
+	const config = trackedConfig();
+	config.decisions = { ...config.decisions, enabled: true, ...decisions };
+	config.claude = { ...config.claude, echo };
+	return config;
+}
+
+const ACK = "thanks, that works now";
+const NEW_WORK = "Add OAuth login with GitHub to the web app";
+const NOTICE_004 = "Prompt Uplift · not planned: Jev judged this is not new multi-step work (0.04) · start with uplift: to plan it";
+
+interface JevHarness {
+	deps: HookDeps;
+	calls: { engine: number; track: number; brief: number; knowledge: number };
+	events: ProgressEvent[];
+	logs: string[];
+	cleanup: () => void;
+}
+
+/** Hook deps that count every engine, tracker, brief and knowledge-base call, with the Decisions seams injected (key K, empty store). */
+function jevHarness(config: UltrathinkConfig, fetchImpl: typeof fetch, overrides: Partial<HookDeps> = {}): JevHarness {
+	const calls = { engine: 0, track: 0, brief: 0, knowledge: 0 };
+	const events: ProgressEvent[] = [];
+	const logs: string[] = [];
+	const complete = smartComplete();
+	const { deps, cleanup } = baseDeps({
+		config,
+		complete: async (system, user) => {
+			calls.engine++;
+			return complete(system, user);
+		},
+		brief: async () => {
+			calls.brief++;
+			return "";
+		},
+		track: async () => {
+			calls.track++;
+			return undefined;
+		},
+		knowledge: {
+			start: () => {
+				calls.knowledge++;
+				return { read: async () => ({ lookup: { outcome: "none", docs: [], chars: 0, ms: 1 }, digest: "" }), close: () => {} };
+			},
+		},
+		conversation: () => "User: the login page is broken\n\nAssistant: Fixed the redirect; it works now.",
+		log: (message) => logs.push(message),
+		progress: (event) => events.push(event),
+		decisionsDeps: { env: { OPENROUTER_API_KEY: K }, storePath: tempStore(), fetch: fetchImpl, sleep: async () => {} },
+		...overrides,
+	});
+	return { deps, calls, events, logs, cleanup };
+}
+
+/** The same run with a different config (e.g. BASELINE: decisions.enabled false), sharing the state dir and counters. */
+function withConfig(h: JevHarness, config: UltrathinkConfig): HookDeps {
+	return { ...h.deps, config };
+}
+
+/** `value` with the random graph id replaced, so two planned runs compare equal. */
+function normalized(value: unknown, graphId?: string): unknown {
+	const text = JSON.stringify(value);
+	if (text === undefined) return undefined;
+	return JSON.parse(graphId ? text.replaceAll(graphId, "GRAPH") : text);
+}
+
+function withoutDecisions(record: SessionRecord | undefined): SessionRecord | undefined {
+	if (!record) return undefined;
+	const copy = { ...record };
+	delete copy.decisions;
+	return copy;
+}
+
+/** A planned Jev run deep-equals its BASELINE apart from the Decisions additions (records and the summary bit). */
+function expectBaseline(jev: PromptSubmitResult, base: PromptSubmitResult, bit?: string): void {
+	const jevGraph = jev.record?.plan?.graphId;
+	const baseGraph = base.record?.plan?.graphId;
+	expect(normalized(jev.output?.hookSpecificOutput, jevGraph)).toEqual(normalized(base.output?.hookSpecificOutput, baseGraph));
+	expect(normalized(withoutDecisions(jev.record), jevGraph)).toEqual(normalized(base.record, baseGraph));
+	const summary = jev.output?.systemMessage;
+	if (bit === undefined) expect(summary).toBe(base.output?.systemMessage);
+	else {
+		expect(summary).toContain(` · ${bit}`);
+		expect(summary?.replace(` · ${bit}`, "")).toBe(base.output?.systemMessage);
+	}
+}
+
+/** Rule T6: the key and a bearer header never appear in anything the run produced. */
+function expectNoKey(...outputs: unknown[]): void {
+	for (const output of outputs) {
+		const text = typeof output === "string" ? output : (JSON.stringify(output) ?? "");
+		expect(text).not.toContain(K);
+		expect(text).not.toContain("Bearer sk-or-");
+	}
+}
+
+function sessionText(stateDir: string): string {
+	const path = sessionPath(stateDir, "s1");
+	return existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
+/** The 4.1–4.9 failures and the kind each maps to; `respond` gets the asked question key. */
+const FAILURES: ReadonlyArray<{ name: string; kind: DecisionsErrorKind; respond?: (key: string) => () => Response }> = [
+	{ name: "401", kind: "auth", respond: () => ERR(401) },
+	{ name: "402", kind: "credits", respond: () => ERR(402) },
+	{ name: "400", kind: "bad-request", respond: () => ERR(400) },
+	{ name: "429 then 429", kind: "rate-limit", respond: () => ERR(429) },
+	{ name: "503 then 503", kind: "upstream", respond: () => ERR(503) },
+	{ name: "a hanging request", kind: "timeout" },
+	{ name: "invalid JSON", kind: "invalid-response", respond: () => () => new Response("not json", { status: 200 }) },
+	{ name: "a missing answer key", kind: "invalid-response", respond: () => JEV(0.97, "not_asked") },
+	{ name: "noul out of range", kind: "invalid-response", respond: (key) => JEV(1.5, key) },
+];
+
+/**
+ * R for one failure: a recording fetch that repeats it, or a hanging fetch. The hanging case needs a real clock: the
+ * client's per-attempt budget is an AbortSignal.timeout, so it gets the shortest budget that still proves `timeout`.
+ */
+function failureFetch(failure: (typeof FAILURES)[number], key: string): { fetch: typeof fetch; timeoutMs: number } {
+	if (!failure.respond) return { fetch: hangingFetch(), timeoutMs: 50 };
+	return { fetch: recordingFetch([failure.respond(key)]).fetch, timeoutMs: 3000 };
+}
+
+describe("Jev plan gate", () => {
+	test("a fresh install sends nothing on the Claude and Grok surfaces and plans as today (AC-1.1)", async () => {
+		for (const surface of ["claude-code", "grok-build"]) {
+			const R = recordingFetch([JEV(0.01)]);
+			// FRESH: no decisions key anywhere, yet K is both stored and in the environment.
+			const h = jevHarness(trackedConfig(), R.fetch, {
+				surface,
+				decisionsDeps: { env: { OPENROUTER_API_KEY: K }, storePath: tempStore(K), fetch: R.fetch },
+			});
+			try {
+				const result = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
+				expect(R.calls).toHaveLength(0);
+				expect(h.calls.engine).toBeGreaterThanOrEqual(1);
+				expect(result.record?.plan).toBeDefined();
+				expect(result).not.toHaveProperty("decisions");
+				expect(result.record).not.toHaveProperty("decisions");
+				expect(result.output?.systemMessage).not.toContain("Decisions ·");
+			} finally {
+				h.cleanup();
+			}
+		}
+	});
+
+	test("an acknowledgement Jev scores below planSkipBelow is not planned and shows the notice, on Claude and Grok (AC-3.1)", async () => {
+		for (const surface of ["claude-code", "grok-build"]) {
+			const R = recordingFetch([JEV(0.04)]);
+			const h = jevHarness(onConfig(), R.fetch, { surface });
+			try {
+				// An earlier planned prompt of this session: the skip must leave its record untouched (A13).
+				const earlier = await runPromptSubmit({ ...input, prompt: NEW_WORK }, withConfig(h, trackedConfig()));
+				const before = sessionText(h.deps.stateDir);
+				const counts = { ...h.calls };
+				h.events.length = 0;
+
+				const result = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+				expect(R.calls).toHaveLength(1);
+				expect(result).toEqual({ skipped: "jev-skip", decisions: [expect.objectContaining({ point: "plan", p: 0.04 })], notice: NOTICE_004 });
+				// Not planned, exactly as a deterministic skip: no engine, tracker, brief or knowledge call, no event, no write.
+				expect(h.calls).toEqual(counts);
+				expect(h.events).toEqual([]);
+				expect(sessionText(h.deps.stateDir)).toBe(before);
+				expect(readSession(h.deps.stateDir, "s1")?.plan?.graphId).toBe(earlier.record?.plan?.graphId);
+
+				const trivial = await runPromptSubmit({ ...input, prompt: "thanks" }, h.deps);
+				expect(trivial).toEqual({ skipped: "skip" });
+				expect(Object.keys(result).filter((k) => k !== "decisions" && k !== "notice")).toEqual(Object.keys(trivial));
+				expectNoKey(result, h.logs, sessionText(h.deps.stateDir));
+			} finally {
+				h.cleanup();
+			}
+		}
+	});
+
+	test("with claude.echo off a Jev skip carries no notice and no Decisions bit (AC-3.3)", async () => {
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(onConfig({}, false), R.fetch);
+		try {
+			const result = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+			expect(result.skipped).toBe("jev-skip");
+			expect(result.output).toBeUndefined();
+			expect(result).not.toHaveProperty("notice");
+			expect(JSON.stringify(result)).not.toContain("Prompt Uplift · not planned");
+			expect(JSON.stringify(result)).not.toContain("Decisions ·");
+			expect(h.calls.engine).toBe(0);
+			expectNoKey(result);
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("new work Jev scores at or above planSkipBelow is planned as today, with the Decisions bit (AC-3.4)", async () => {
+		for (const surface of ["claude-code", "grok-build"]) {
+			const R = recordingFetch([JEV(0.97)]);
+			const h = jevHarness(onConfig(), R.fetch, { surface });
+			try {
+				const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, withConfig(h, onConfig({ enabled: false })));
+				expect(R.calls).toHaveLength(0);
+				const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
+				expect(R.calls).toHaveLength(1);
+				expect(jev.record?.plan).toBeDefined();
+				expectBaseline(jev, base, "Decisions · plan 0.97");
+				expectNoKey(jev, h.logs, sessionText(h.deps.stateDir));
+			} finally {
+				h.cleanup();
+			}
+		}
+	});
+
+	test("a skill invocation (gsd-quick) bypasses the gate with zero requests and still plans with the skill (AC-3.6)", async () => {
+		const R = recordingFetch([JEV(0.01)]);
+		const h = jevHarness(onConfig(), R.fetch);
+		try {
+			const result = await runPromptSubmit(
+				{ ...input, prompt: "3", skill: { name: "gsd-quick", instruction: "3", summary: "Quick task", source: "slash" } },
+				h.deps,
+			);
+			expect(R.calls).toHaveLength(0);
+			expect(result.record?.skill?.name).toBe("gsd-quick");
+			expect(result.record?.plan).toBeDefined();
+			expect(readSession(h.deps.stateDir, "s1")?.plan?.graphId).toBe(result.record?.plan?.graphId);
+			expect(result).not.toHaveProperty("decisions");
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("uplift: forces a plan with zero requests (AC-3.7)", async () => {
+		const R = recordingFetch([JEV(0.01)]);
+		const h = jevHarness(onConfig(), R.fetch);
+		try {
+			const result = await runPromptSubmit({ ...input, prompt: "uplift: thanks" }, h.deps);
+			expect(R.calls).toHaveLength(0);
+			expect(h.calls.engine).toBeGreaterThanOrEqual(1);
+			expect(result.record?.plan).toBeDefined();
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("on Grok, a wrapped uplift: or /gsd-quick plans with zero requests; a wrapped acknowledgement still asks Jev", async () => {
+		const grok = (typed: string) =>
+			`<user_query>\n${typed}\n</user_query>\n<skill_information>\n<skill name="gsd-quick" args="3">\nShip a small task fast.\n</skill>\n</skill_information>`;
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(onConfig(), R.fetch, { surface: "grok-build" });
+		try {
+			for (const prompt of ["<user_query>\nuplift: thanks\n</user_query>", grok("/gsd-quick 3")]) {
+				const result = await runPromptSubmit({ ...input, prompt }, h.deps);
+				expect(result.record?.plan).toBeDefined();
+				expect(result).not.toHaveProperty("decisions");
+			}
+			expect(R.calls).toHaveLength(0);
+
+			const ack = await runPromptSubmit({ ...input, prompt: `<user_query>\n${ACK}\n</user_query>` }, h.deps);
+			expect(R.calls).toHaveLength(1);
+			expect(ack.skipped).toBe("jev-skip");
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("TRIVIAL_RE acks are skipped as today with zero requests and no notice (AC-3.8)", async () => {
+		const R = recordingFetch([JEV(0.01)]);
+		const h = jevHarness(onConfig(), R.fetch);
+		try {
+			for (const prompt of ["yes", "ok", "thanks", "go ahead", "lgtm!"]) {
+				const base = await runPromptSubmit({ ...input, prompt }, withConfig(h, onConfig({ enabled: false })));
+				const jev = await runPromptSubmit({ ...input, prompt }, h.deps);
+				expect(jev).toEqual(base);
+				expect(jev).toEqual({ skipped: "skip" });
+			}
+			expect(R.calls).toHaveLength(0);
+			expect(h.calls.engine).toBe(0);
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("every other deterministic skip sends nothing and matches today (AC-3.9)", async () => {
+		const R = recordingFetch([JEV(0.01)]);
+		const h = jevHarness(onConfig(), R.fetch);
+		try {
+			const cases: Array<[string, Partial<HookDeps>]> = [
+				["raw: add a flag", {}],
+				["/help", {}],
+				["<BUILD_PROMPT><ORIGINAL>add a flag</ORIGINAL></BUILD_PROMPT>", {}],
+				[NEW_WORK, { control: { enabled: false } }],
+			];
+			for (const [prompt, extra] of cases) {
+				const base = await runPromptSubmit({ ...input, prompt }, { ...h.deps, ...extra, config: onConfig({ enabled: false }) });
+				const jev = await runPromptSubmit({ ...input, prompt }, { ...h.deps, ...extra });
+				expect(jev).toEqual(base);
+				expect(jev.skipped).toBeDefined();
+			}
+			expect(R.calls).toHaveLength(0);
+			expect(h.calls.engine).toBe(0);
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("an inactive plan point sends nothing and plans as today (AC-3.10)", async () => {
+		for (const points of [["ship"], []] as DecisionsConfig["points"][]) {
+			const R = recordingFetch([JEV(0.01)]);
+			const h = jevHarness(onConfig({ points }), R.fetch);
+			try {
+				const base = await runPromptSubmit({ ...input, prompt: ACK }, withConfig(h, onConfig({ enabled: false })));
+				const jev = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+				expect(R.calls).toHaveLength(0);
+				expect(jev.record?.plan).toBeDefined();
+				expect(jev).not.toHaveProperty("decisions");
+				expectBaseline(jev, base);
+			} finally {
+				h.cleanup();
+			}
+		}
+	});
+
+	test("the record holds no content; a skip returns it unpersisted, a plan stores it in the session (AC-3.13)", async () => {
+		const R = recordingFetch([JEV(0.04), JEV(0.97)]);
+		const h = jevHarness(onConfig(), R.fetch);
+		const expected = (p: number, action: DecisionAction): DecisionRecord => ({
+			point: "plan",
+			outcome: "ok",
+			model: "typesafe/jev-1.13-20260917",
+			id: "gen-dec-test",
+			p,
+			probabilities: { plan_worthy: p },
+			threshold: 0.2,
+			action,
+			latencyMs: expect.any(Number),
+			attempts: 1,
+			cost: 0.000019,
+			at: expect.any(Number),
+		});
+		try {
+			const skipped = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+			expect(skipped.decisions).toEqual([expected(0.04, "skip-plan")]);
+			const skipRecord = skipped.decisions?.[0];
+			expect(Number.isFinite(skipRecord?.latencyMs) && (skipRecord?.latencyMs ?? -1) >= 0).toBe(true);
+			expect(skipRecord).not.toHaveProperty("error");
+			expect(JSON.stringify(skipRecord)).not.toContain(ACK);
+			expect(readSession(h.deps.stateDir, "s1")).toBeUndefined();
+
+			const planned = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
+			expect(planned.decisions).toEqual([expected(0.97, "plan")]);
+			const planRecord = planned.decisions?.[0];
+			expect(planRecord).not.toHaveProperty("error");
+			expect(JSON.stringify(planRecord)).not.toContain(NEW_WORK);
+			expect(planned.record?.decisions).toEqual(planned.decisions);
+			expect(readSession(h.deps.stateDir, "s1")?.decisions).toEqual(planned.decisions);
+			expectNoKey(skipped, planned, sessionText(h.deps.stateDir));
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("the request carries the host session id (none for an unknown session) and only the message and last assistant turn", async () => {
+		const R = recordingFetch([JEV(0.97)]);
+		const h = jevHarness(onConfig({ points: ["plan"] }), R.fetch);
+		try {
+			await runPromptSubmit({ ...input, session_id: "sess-123", prompt: NEW_WORK }, h.deps);
+			await runPromptSubmit({ cwd: "/repo", prompt: NEW_WORK }, h.deps);
+			expect(R.calls).toHaveLength(2);
+			expect((R.calls[0]?.body as { session_id?: string }).session_id).toBe("sess-123");
+			expect(R.calls[1]?.body).not.toHaveProperty("session_id");
+			expect((R.calls[0]?.body as { state: unknown }).state).toEqual({
+				message: NEW_WORK,
+				recent_conversation: "Assistant: Fixed the redirect; it works now.",
+			});
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("a project layer cannot redirect the request: only the default endpoint is called (AC-2.12)", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ut-decisions-project-"));
+		jevDirs.push(root);
+		const project = join(root, "project");
+		mkdirSync(join(project, ".claude"), { recursive: true });
+		// Consent is the user's: a project layer can only narrow decisions, so the Claude user layer turns them on.
+		mkdirSync(join(root, "claude"), { recursive: true });
+		writeFileSync(join(root, "claude", "ultrathink.json"), JSON.stringify({ decisions: { enabled: true } }));
+		writeFileSync(
+			join(project, ".claude", "ultrathink.json"),
+			JSON.stringify({ decisions: { enabled: true, url: "https://evil.example/x", endpoint: "https://evil.example/y" } }),
+		);
+		const config = loadConfig(claudeConfigPaths(project, { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") }));
+		expect(Object.keys(config.decisions).sort()).toEqual(
+			["blockingAt", "enabled", "groundedAt", "model", "planSkipBelow", "points", "shipApproveAt", "shipVetoAtOrBelow", "timeoutMs", "zdr"],
+		);
+		expect(JSON.stringify(config.decisions)).not.toContain("evil.example");
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(config, R.fetch);
+		try {
+			const result = await runPromptSubmit({ ...input, cwd: project, prompt: ACK }, h.deps);
+			expect(R.calls.map((call) => call.url)).toEqual([ENDPOINT]);
+			expect(R.calls.some((call) => call.url.includes("evil.example"))).toBe(false);
+			expect(result.skipped).toBe("jev-skip");
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test(
+		"every plan failure kind plans exactly as today and reports the kind (AC-4.11)",
+		async () => {
+			for (const failure of FAILURES) {
+				const { fetch: fetchImpl, timeoutMs } = failureFetch(failure, "plan_worthy");
+				const h = jevHarness(onConfig({ points: ["plan"], timeoutMs }), fetchImpl);
+				try {
+					const base = await runPromptSubmit({ ...input, prompt: ACK }, withConfig(h, onConfig({ enabled: false })));
+					const jev = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+					expect(jev.record?.plan).toBeDefined();
+					expectBaseline(jev, base, `Decisions · error (${failure.kind})`);
+					expect(jev.decisions).toEqual([
+						expect.objectContaining({ point: "plan", outcome: "error", error: failure.kind, action: "fail-open", probabilities: {} }),
+					]);
+					expect(readSession(h.deps.stateDir, "s1")?.decisions).toEqual(jev.decisions);
+					expectNoKey(jev, h.logs, sessionText(h.deps.stateDir));
+				} finally {
+					h.cleanup();
+				}
+			}
+		},
+		30_000,
+	);
+
+	test("a caller abort during the plan gate is re-thrown as an AbortError before anything runs (AC-5.7)", async () => {
+		const controller = new AbortController();
+		const fetchImpl = hangingFetch(() => queueMicrotask(() => controller.abort()));
+		const h = jevHarness(onConfig(), fetchImpl, { signal: controller.signal });
+		try {
+			let caught: unknown;
+			try {
+				await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+			} catch (error) {
+				caught = error;
+			}
+			expect((caught as Error | undefined)?.name).toBe("AbortError");
+			expect(h.calls).toEqual({ engine: 0, track: 0, brief: 0, knowledge: 0 });
+			expect(h.events).toEqual([]);
+			expect(readSession(h.deps.stateDir, "s1")).toBeUndefined();
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+describe("Jev knowledge and blocking points through the hook", () => {
+	const DOCS = ["index.md", "docs/auth.md", "docs/storage.md"];
+	const DIGEST =
+		"## Greptile knowledge base\n\n### index.md\n\nRouting table.\n\n### docs/auth.md\n\nSessions are JWTs signed with RS256.\n\n### docs/storage.md\n\nWidgets persist in the widgets table.";
+	const usedReader: KnowledgeReader = {
+		start: () => ({
+			read: async () => ({
+				lookup: { outcome: "used", repo: "acme/widgets", namespaceId: "ns1", docs: DOCS, chars: DIGEST.length, ms: 1 },
+				digest: DIGEST,
+			}),
+			close: () => {},
+		}),
+	};
+	/** Two claims the knowledge base settles. */
+	const SETTLED = JSON.stringify({
+		questions: [
+			{ question: "How are sessions signed?", header: "Auth", why: "w", options: [], blocking: false, knowledge: { answer: "JWTs signed with RS256", source: "docs/auth.md" } },
+			{ question: "Where do widgets persist?", header: "Storage", why: "w", options: [], blocking: false, knowledge: { answer: "In the widgets table", source: "docs/storage.md" } },
+		],
+	});
+	/** Two open questions the clarifier did not mark blocking. */
+	const OPEN = JSON.stringify({
+		questions: [
+			{ question: "Which OAuth scopes?", header: "Scopes", why: "w", options: [{ label: "read:user" }, { label: "repo" }], default: "read:user", blocking: false },
+			{ question: "Where are tokens stored?", header: "Tokens", why: "w", options: [{ label: "Cookie" }, { label: "Local storage" }], default: "Cookie", blocking: false },
+		],
+	});
+	/** smartComplete, with `reply` as the clarifier's answer. */
+	function clarifying(reply: string): HookDeps["complete"] {
+		const complete = smartComplete();
+		return async (system, user) => (user.startsWith("<spec>") ? reply : complete(system, user));
+	}
+
+	test(
+		"every knowledge failure kind keeps both claims settled and reports the kind (AC-4.13)",
+		async () => {
+			for (const failure of FAILURES) {
+				const { fetch: fetchImpl, timeoutMs } = failureFetch(failure, "supported");
+				const h = jevHarness(onConfig({ points: ["knowledge"], timeoutMs }), fetchImpl, { knowledge: usedReader });
+				const deps = { ...h.deps, complete: clarifying(SETTLED) };
+				try {
+					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...deps, config: onConfig({ enabled: false }) });
+					expect(base.record?.clarifications?.filter((c) => c.source === "knowledge")).toHaveLength(2);
+					const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, deps);
+					expect(jev.record?.clarifications).toEqual(base.record?.clarifications);
+					expectBaseline(jev, base, `Decisions · error (${failure.kind})`);
+					expect(jev.decisions).toHaveLength(2);
+					for (const record of jev.decisions ?? []) {
+						expect(record).toMatchObject({ point: "knowledge", outcome: "error", error: failure.kind, action: "fail-open" });
+					}
+					expectNoKey(jev, h.logs, sessionText(h.deps.stateDir));
+				} finally {
+					h.cleanup();
+				}
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"every blocking failure kind keeps both questions non-blocking and reports the kind (AC-4.14)",
+		async () => {
+			for (const failure of FAILURES) {
+				const { fetch: fetchImpl, timeoutMs } = failureFetch(failure, "risky");
+				const h = jevHarness(onConfig({ points: ["blocking"], timeoutMs }), fetchImpl);
+				const deps = { ...h.deps, complete: clarifying(OPEN) };
+				try {
+					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...deps, config: onConfig({ enabled: false }) });
+					expect(base.record?.clarifications?.map((c) => c.blocking)).toEqual([false, false]);
+					const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, deps);
+					expect(jev.record?.clarifications).toEqual(base.record?.clarifications);
+					expectBaseline(jev, base, `Decisions · error (${failure.kind})`);
+					expect(jev.decisions).toHaveLength(2);
+					for (const record of jev.decisions ?? []) {
+						expect(record).toMatchObject({ point: "blocking", outcome: "error", error: failure.kind, action: "fail-open" });
+					}
+					expectNoKey(jev, h.logs, sessionText(h.deps.stateDir));
+				} finally {
+					h.cleanup();
+				}
+			}
+		},
+		30_000,
+	);
 });

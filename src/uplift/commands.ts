@@ -7,6 +7,9 @@
  */
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
+import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
+import { runDecisionsCommand } from "../decisions/cli.ts";
+import { decisionsKilled, resolveOpenRouterKey } from "../decisions/gate.ts";
 import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
@@ -36,6 +39,8 @@ const USAGE = [
 	"  think on|off|last      Graph of Thought",
 	"  hitl on|off|last       HITL clarifications",
 	"  grok [engine grok|claude]",
+	"  decisions check        one live Jev decision: resolved model, latency, cost",
+	"  decisions probe <plan|ship|knowledge|blocking> <cases.json>",
 	"In an agent: /ultrathink-status, /ultrathink-off, /ultrathink-on, /ultrathink-skip, /ultrathink-track off|on,",
 	"and /ultrathink-quick <message> sends one message as typed (no planning, no Linear/Notion rows).",
 ].join("\n");
@@ -133,6 +138,23 @@ function knowledgeLine(config: UltrathinkConfig, state: ControlState, env: Recor
 	return `Knowledge base: on · Greptile${org ? ` · organization ${org}` : ""}`;
 }
 
+/** Jev Decisions are opt-in and need an OpenRouter key; the key's source is shown, never the key. `ULTRATHINK_DECISIONS=0`
+ *  turns them off for this shell whatever the config says. */
+function decisionsLine(config: UltrathinkConfig, env: Record<string, string | undefined>): string {
+	const { decisions } = config;
+	if (decisionsKilled(env)) return "Decisions: off (ULTRATHINK_DECISIONS=0)";
+	if (!decisions.enabled) return "Decisions: off (opt-in: set decisions.enabled)";
+	const key = resolveOpenRouterKey(storePath(env), env);
+	if (!key) {
+		return "Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
+	}
+	const points = decisions.points.length ? decisions.points.join(", ") : "no points";
+	const endpoint = resolveDecisionsUrl(env);
+	const url =
+		endpoint.source === "ULTRATHINK_DECISIONS_URL" ? ` · url ${endpoint.url}` : endpoint.ignored ? DECISIONS_URL_IGNORED : "";
+	return `Decisions: on · ${decisions.model} · ${points} · key from ${key.source} · zdr ${decisions.zdr ? "on" : "off"}${url}`;
+}
+
 async function grokOauthLine(config: UltrathinkConfig): Promise<string> {
 	if (config.grok.transport === "shunt") return "SuperGrok OAuth: not used (shunt gateway owns upstream auth)";
 	const auth = await grokAuthStatusFresh({ home: config.grok.home || undefined, bin: config.grok.bin });
@@ -154,6 +176,7 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		substrateLine(config, process.env),
 		shipLine(config, process.env),
 		knowledgeLine(config, state, process.env),
+		decisionsLine(config, process.env),
 		`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
 		`State: ${stateDir}`,
 	];
@@ -245,8 +268,16 @@ export async function runControl(args: string[], input: { stateDir: string; cwd:
 }
 
 // `bin/ultrathink <verb> [args…]`: the host state dir comes from ULTRATHINK_HOST, else the detected host.
+// `decisions …` bypasses runControl, which lower-cases its args (probe takes a file path).
 if (import.meta.main) {
-	runControl(process.argv.slice(2), { stateDir: resolveStateDir(), cwd: process.cwd() }).then((text) => {
-		process.stdout.write(`${text}\n`, () => process.exit(0));
-	});
+	const argv = process.argv.slice(2);
+	if (argv[0]?.trim().toLowerCase() === "decisions") {
+		runDecisionsCommand(argv.slice(1), { cwd: process.cwd() }).then(({ code, text }) => {
+			process.stdout.write(`${text}\n`, () => process.exit(code));
+		});
+	} else {
+		runControl(argv, { stateDir: resolveStateDir(), cwd: process.cwd() }).then((text) => {
+			process.stdout.write(`${text}\n`, () => process.exit(0));
+		});
+	}
 }

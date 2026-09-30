@@ -19,8 +19,8 @@ import {
 	status,
 } from "./oauth.ts";
 import type { AuthDeps } from "./oauth.ts";
-import { isProviderId, PROVIDERS, USER_AGENT } from "./providers.ts";
-import type { ProviderId } from "./providers.ts";
+import { isMcpProviderId, isProviderId, MCP_PROVIDER_IDS, MCP_PROVIDERS, notMcpServer, USER_AGENT } from "./providers.ts";
+import type { McpProviderId, ProviderId } from "./providers.ts";
 import { defaultRun, mountTailscale, planRedirect, readTailscaleDns, unmountTailscale } from "./redirect.ts";
 import type { RedirectPlan, Run } from "./redirect.ts";
 import { createRelay, runStdioRelay } from "./relay.ts";
@@ -31,6 +31,7 @@ const USAGE = `usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
+  (openrouter is API-key only: set-key, status and logout; never serve, check or login)
   ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
@@ -48,9 +49,19 @@ function err(line: string): void {
 	process.stderr.write(`${line}\n`);
 }
 
+/** Any credential provider: set-key, logout. */
 function provider(value: string | undefined): ProviderId {
 	if (!value || !isProviderId(value)) throw new UsageError(`unknown provider: ${value ?? "(none)"}`);
 	return value;
+}
+
+/** An MCP server: serve, check, login. A key provider is refused here, before any I/O. */
+function mcpProvider(value: string | undefined): McpProviderId {
+	const id = provider(value);
+	if (!isMcpProviderId(id)) {
+		throw new UsageError(`${notMcpServer(id)}: store its key with ultrathink-mcp auth set-key ${id} --stdin`);
+	}
+	return id;
 }
 
 function flag(args: string[], name: string): string | undefined {
@@ -61,7 +72,7 @@ function flag(args: string[], name: string): string | undefined {
 	return value;
 }
 
-function relayAuth(id: ProviderId, deps: AuthDeps): RelayAuth {
+function relayAuth(id: McpProviderId, deps: AuthDeps): RelayAuth {
 	return {
 		header: () => resolveAuthHeader(id, deps),
 		unauthorized: (failed) => recoverUnauthorized(id, failed, deps),
@@ -141,7 +152,7 @@ export function prepareRedirect(input: {
 	};
 }
 
-async function login(id: ProviderId, args: string[], deps: AuthDeps): Promise<void> {
+async function login(id: McpProviderId, args: string[], deps: AuthDeps): Promise<void> {
 	const portText = flag(args, "--port") ?? "8765";
 	const port = Number(portText);
 	if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`invalid port: ${portText}`);
@@ -166,7 +177,7 @@ async function login(id: ProviderId, args: string[], deps: AuthDeps): Promise<vo
 	let server: Bun.Server<undefined> | undefined;
 	try {
 		const pending = await beginLogin(id, { ...deps, redirectUri: plan.redirectUri });
-		out(`Open this URL in any browser to authorize ${PROVIDERS[id].label}:\n\n${pending.url}\n`);
+		out(`Open this URL in any browser to authorize ${MCP_PROVIDERS[id].label}:\n\n${pending.url}\n`);
 		for (const line of plan.hint) out(line);
 		out(
 			listen
@@ -232,10 +243,10 @@ interface RpcMessage {
 	error?: { message?: string };
 }
 
-async function checkOne(id: ProviderId, deps: AuthDeps): Promise<number> {
+async function checkOne(id: McpProviderId, deps: AuthDeps): Promise<number> {
 	const responses = new Map<number | string, RpcMessage>();
 	const relay = createRelay({
-		url: PROVIDERS[id].url,
+		url: MCP_PROVIDERS[id].url,
 		userAgent: USER_AGENT,
 		loginHint: loginHint(id),
 		auth: relayAuth(id, deps),
@@ -376,15 +387,20 @@ async function notionInit(args: string[], deps: AuthDeps): Promise<number> {
 	return 1;
 }
 
-export async function main(argv: string[]): Promise<number> {
+export interface CliSeams {
+	/** Test seam for one provider check (default: the real relay-based check). */
+	checkOne?: (id: McpProviderId, deps: AuthDeps) => Promise<number>;
+}
+
+export async function main(argv: string[], seams: CliSeams = {}): Promise<number> {
 	const [command, ...rest] = argv;
 	const deps: AuthDeps = { storePath: storePath() };
 	try {
 		if (command === "serve") {
-			const id = provider(rest[0]);
+			const id = mcpProvider(rest[0]);
 			const debug = process.env.ULTRATHINK_MCP_DEBUG === "1";
 			await runStdioRelay({
-				url: PROVIDERS[id].url,
+				url: MCP_PROVIDERS[id].url,
 				userAgent: USER_AGENT,
 				loginHint: loginHint(id),
 				auth: relayAuth(id, deps),
@@ -393,11 +409,12 @@ export async function main(argv: string[]): Promise<number> {
 			return 0;
 		}
 		if (command === "check") {
-			const ids = rest.length ? rest.map(provider) : (Object.keys(PROVIDERS) as ProviderId[]);
+			const ids = rest.length ? rest.map(mcpProvider) : MCP_PROVIDER_IDS;
+			const check = seams.checkOne ?? checkOne;
 			let failed = false;
 			for (const id of ids) {
 				try {
-					out(`${id}: OK ${await checkOne(id, deps)} tools`);
+					out(`${id}: OK ${await check(id, deps)} tools`);
 				} catch (error) {
 					failed = true;
 					out(`${id}: FAIL ${error instanceof Error ? error.message : String(error)}`);
@@ -420,7 +437,7 @@ export async function main(argv: string[]): Promise<number> {
 				return 0;
 			}
 			if (sub === "login") {
-				await login(provider(args[0]), args.slice(1), deps);
+				await login(mcpProvider(args[0]), args.slice(1), deps);
 				return 0;
 			}
 			if (sub === "logout") {

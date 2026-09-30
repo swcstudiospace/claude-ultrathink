@@ -10,11 +10,13 @@ import type { ClaudeCompleter } from "../claude/complete.ts";
 import type { SessionRecord } from "../claude/state.ts";
 import { readControl } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
+import { createDecisions } from "../decisions/gate.ts";
+import type { Decisions } from "../decisions/gate.ts";
 import { selectEngine } from "../host/engine.ts";
 import { createMcpClientIfCredentialed } from "../mcp/client.ts";
 import type { McpClient } from "../mcp/client.ts";
 import { storePath } from "../mcp/store.ts";
-import { assessDone } from "./assess.ts";
+import { assessDecisionJson, assessDone } from "./assess.ts";
 import { createGithub } from "./github.ts";
 import type { Github } from "./github.ts";
 import { openThreadComments, runReview } from "./greptile.ts";
@@ -41,6 +43,8 @@ export interface ShipDeps {
 	greptile: () => ToolCaller | undefined;
 	/** Waits between merge polls; tests inject a fake clock. */
 	sleep: (ms: number) => Promise<void>;
+	/** Jev runtime for the `ship` decision of this session; absent = no Jev (today's assessment). */
+	decisions?: (record: SessionRecord) => Decisions | undefined;
 }
 
 type Output = Record<string, unknown>;
@@ -171,13 +175,18 @@ async function stepAssess(ctx: Ctx): Promise<Output & { done: boolean }> {
 	const diff = signals.git.base ? deps.diff({ cwd, base: signals.git.base, run: deps.run }) : { stat: "", log: "" };
 	const complete = await deps.engine();
 	const mode = deps.config.judge;
-	let assessment: Assessment = await deps.assess({ record, signals, diff, complete, now: deps.now, mode });
-	if (mode === "gate" && deps.config.autoMerge && assessment.source === "rules" && assessment.done) {
+	const decisions = deps.decisions?.(record);
+	const { autoMerge } = deps.config;
+	let assessment: Assessment = await deps.assess({ record, signals, diff, complete, now: deps.now, mode, decisions, autoMerge });
+	// A rules-only "done" (no judge ran) never auto-merges in gate mode; with autoMerge assess never lets Jev stand in.
+	if (mode === "gate" && autoMerge && assessment.source === "rules" && assessment.done) {
 		assessment = { ...assessment, done: false, gaps: [...assessment.gaps, "no judge available"] };
 	}
 	writeShip(statePath, { assessment, phase: assessment.done && pr ? "pr-open" : "not-done" }, deps.now());
-	const { done, confidence, summary, gaps, judge } = assessment;
-	return { ok: true, done, confidence, summary, gaps, mode: assessment.mode ?? mode, ...(judge ? { judge } : {}), signals };
+	const { done, confidence, summary, gaps, judge, source, decision } = assessment;
+	// Jev additions only: `decision` when the point ran, plus `source` when Jev itself gave the verdict.
+	const jev = decision ? { ...(source === "jev" ? { source } : {}), decision: assessDecisionJson(decision) } : {};
+	return { ok: true, done, confidence, summary, gaps, mode: assessment.mode ?? mode, ...(judge ? { judge } : {}), ...jev, signals };
 }
 
 async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
@@ -657,6 +666,7 @@ async function main(): Promise<number> {
 			return client;
 		},
 		sleep: Bun.sleep,
+		decisions: (record) => createDecisions({ config: config.decisions, sessionId: record.sessionId }),
 	};
 	const { code, output } = await runShip(argv, deps);
 	client?.close();

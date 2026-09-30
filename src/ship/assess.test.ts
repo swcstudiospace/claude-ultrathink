@@ -4,10 +4,17 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ClaudeCompleter } from "../claude/complete.ts";
 import type { SessionRecord } from "../claude/state.ts";
-import { assessDone } from "./assess.ts";
+import { createDecisions } from "../decisions/gate.ts";
+import type { Decisions } from "../decisions/gate.ts";
+import { QUESTIONS } from "../decisions/questions.ts";
+import { DEFAULT_DECISIONS_CONFIG, DecisionsError } from "../decisions/types.ts";
+import type { DecisionsConfig, DecisionsErrorKind } from "../decisions/types.ts";
+import { assessDecisionJson, assessDone } from "./assess.ts";
 import { collectSignals, gatherDiff, gsdToolsCandidates, resolveGsdTools } from "./signals.ts";
-import type { Run, ShipSignals } from "./types.ts";
+import type { ShipDiff } from "./signals.ts";
+import type { Assessment, JudgeMode, Run, ShipSignals } from "./types.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -314,6 +321,17 @@ test("gatherDiff caps output at 8000 chars", () => {
 	expect(d.log).toBe("abc feat");
 });
 
+test("gatherDiff flags patchTruncated only when it cut the patch at 24,000 chars", () => {
+	const patchCommand =
+		"git diff origin/master...HEAD -- . :(exclude)*.lock :(exclude)*.lockb :(exclude)package-lock.json :(exclude)pnpm-lock.yaml";
+	const exact = gatherDiff({ cwd: "/", base: "master", run: fakeRun({ [patchCommand]: "p".repeat(24_000) }) });
+	expect(exact.patch).toBe("p".repeat(24_000));
+	expect("patchTruncated" in exact).toBe(false);
+	const over = gatherDiff({ cwd: "/", base: "master", run: fakeRun({ [patchCommand]: "p".repeat(24_001) }) });
+	expect(over.patchTruncated).toBe(true);
+	expect(over.patch).toBe(`${"p".repeat(24_000)}\n…[truncated]`);
+});
+
 function signals(git: Partial<ShipSignals["git"]> = {}, gsd?: ShipSignals["gsd"]): ShipSignals {
 	return {
 		git: { branch: "feat", base: "master", onBase: false, ahead: 2, dirty: [], untracked: 0, pushed: true, ...git },
@@ -572,4 +590,538 @@ describe("assessDone modes", () => {
 			"latest milestone: v2.0 archived: 2/2 phase verifications passed; audit passed (requirements 12/12, integration 5/5)",
 		);
 	});
+});
+
+// Jev ship decision point (DP-SHIP). Canonical Decisions fixtures, defined per test file.
+const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
+interface Recorded {
+	url: string;
+	method: string;
+	headers: Record<string, string>;
+	body: unknown;
+}
+
+function toRecorded(input: string | URL | Request, init?: RequestInit): Recorded {
+	const headers: Record<string, string> = {};
+	new Headers(init?.headers).forEach((value, key) => {
+		headers[key] = value;
+	});
+	const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : init?.body;
+	return { url: String(input), method: init?.method ?? "GET", headers, body };
+}
+
+/** Recording fetch R: records every call, answers from a queue (last entry repeats). Installed as globalThis.fetch too. */
+function recordingFetch(queue: Array<() => Response | Promise<Response>>): { fetch: typeof fetch; calls: Recorded[] } {
+	const calls: Recorded[] = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		calls.push(toRecorded(input, init));
+		const next = queue[Math.min(calls.length, queue.length) - 1];
+		if (!next) throw new Error("empty queue");
+		return next();
+	}) as typeof fetch;
+	globalThis.fetch = fetchImpl;
+	return { fetch: fetchImpl, calls };
+}
+
+const JEV =
+	(p: number, key = "plan_worthy") =>
+	() =>
+		Response.json({
+			id: "gen-dec-test",
+			model: "typesafe/jev-1.13-20260917",
+			provider: "TypeSafe",
+			answers: { [key]: { type: "noul", noul: p } },
+			usage: { input_tokens: 450, output_tokens: 0, cost: 0.000019 },
+		});
+const ERR = (s: number, headers?: Record<string, string>) => () =>
+	Response.json({ error: { code: s, message: `upstream said no for ${K}` } }, { status: s, headers });
+
+/** Never resolves; rejects with an AbortError when its signal fires (as src/grok/complete.test.ts hangingFetch). */
+function hangingFetch(onCall?: () => void): typeof fetch {
+	return ((_input: string | URL | Request, init?: RequestInit) =>
+		new Promise<Response>((_resolve, reject) => {
+			init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			onCall?.();
+		})) as typeof fetch;
+}
+
+/** Holds every response until `release()`; for "N requests before any response". Installed as globalThis.fetch too. */
+function heldFetch(respond: (call: Recorded) => Response): { fetch: typeof fetch; calls: Recorded[]; release(): void } {
+	const calls: Recorded[] = [];
+	const waiting: Array<() => void> = [];
+	let released = false;
+	const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+		const call = toRecorded(input, init);
+		calls.push(call);
+		return new Promise<Response>((resolve) => {
+			const answer = () => resolve(respond(call));
+			if (released) answer();
+			else waiting.push(answer);
+		});
+	}) as typeof fetch;
+	globalThis.fetch = fetchImpl;
+	return {
+		fetch: fetchImpl,
+		calls,
+		release() {
+			released = true;
+			for (const answer of waiting.splice(0)) answer();
+		},
+	};
+}
+
+const COMPLETE = "complete";
+const MODEL = "typesafe/jev-1.13-20260917";
+const ON: DecisionsConfig = { ...DEFAULT_DECISIONS_CONFIG, enabled: true, points: [...DEFAULT_DECISIONS_CONFIG.points] };
+const realFetch = globalThis.fetch;
+
+function decisionsDir(): string {
+	const dir = mkdtempSync(join(tmpdir(), "ut-decisions-ship-"));
+	dirs.push(dir);
+	return dir;
+}
+
+/** The Jev runtime: ON (overridable), K in the injected env only, an empty temp store, no real waits, debug lines kept. */
+function jevRuntime(fetchImpl: typeof fetch, config: Partial<DecisionsConfig> = {}): { decisions: Decisions; lines: string[] } {
+	const lines: string[] = [];
+	const decisions = createDecisions({
+		config: { ...ON, ...config },
+		sessionId: RECORD.sessionId,
+		env: { OPENROUTER_API_KEY: K },
+		storePath: join(decisionsDir(), "mcp-credentials.json"),
+		fetch: fetchImpl,
+		sleep: async () => {},
+		random: () => 0.5,
+		debug: (line) => lines.push(line),
+	});
+	return { decisions, lines };
+}
+
+/** T6: the key and a bearer header never reach a collected output. */
+function expectNoKey(...outputs: unknown[]): void {
+	for (const output of outputs) {
+		const text = typeof output === "string" ? output : JSON.stringify(output);
+		expect(text).not.toContain(K);
+		expect(text).not.toContain("Bearer sk-or-");
+	}
+}
+
+/** The assessment without its Jev addition, for BASELINE comparisons. */
+function withoutDecision(assessment: Assessment): Assessment {
+	const { decision: _decision, ...rest } = assessment;
+	return rest;
+}
+
+const reply =
+	(verdict: object): ClaudeCompleter =>
+	async () =>
+		JSON.stringify(verdict);
+const DONE_09 = reply({ done: true, confidence: 0.9, summary: "ok", gaps: [] });
+const PATCH = "diff --git a/src/flag.ts b/src/flag.ts\n--- a/src/flag.ts\n+++ b/src/flag.ts\n@@ -1 +1,2 @@\n+export const verbose = true;\n";
+const FULL_DIFF: ShipDiff = { stat: "1 file", log: "abc x", patch: PATCH };
+const vetoGap = (p: string) => `Jev judged the change incomplete (P(complete) ${p})`;
+const now = () => 7;
+
+/** Every failure of AC-4.1–4.9, as a fresh fetch per run. */
+const FAILURES: { name: string; kind: DecisionsErrorKind; fetch: () => typeof fetch; timeoutMs?: number }[] = [
+	{ name: "401", kind: "auth", fetch: () => recordingFetch([ERR(401)]).fetch },
+	{ name: "402", kind: "credits", fetch: () => recordingFetch([ERR(402)]).fetch },
+	{ name: "400", kind: "bad-request", fetch: () => recordingFetch([ERR(400)]).fetch },
+	{ name: "429 twice", kind: "rate-limit", fetch: () => recordingFetch([ERR(429)]).fetch },
+	...[500, 502, 503, 524, 529].map((status) => ({
+		name: `${status} twice`,
+		kind: "upstream" as const,
+		fetch: () => recordingFetch([ERR(status)]).fetch,
+	})),
+	{ name: "a hanging request", kind: "timeout", fetch: () => hangingFetch(), timeoutMs: 50 },
+	{ name: "a body that is not JSON", kind: "invalid-response", fetch: () => recordingFetch([() => new Response("{not json")]).fetch },
+	{
+		name: "a missing answer key",
+		kind: "invalid-response",
+		fetch: () =>
+			recordingFetch([
+				() => Response.json({ model: MODEL, answers: {}, usage: { input_tokens: 450, output_tokens: 0, cost: 0.000019 } }),
+			]).fetch,
+	},
+	{ name: "a noul out of range", kind: "invalid-response", fetch: () => recordingFetch([JEV(1.5, COMPLETE)]).fetch },
+];
+
+describe("assessDone with Jev (DP-SHIP)", () => {
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+	});
+	const clean = signals();
+
+	test("a fresh install makes zero requests and every assessment equals the pre-change result (AC-1.3)", async () => {
+		const store = join(decisionsDir(), "mcp-credentials.json");
+		const credential = { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } };
+		writeFileSync(store, JSON.stringify({ version: 1, providers: credential }), { mode: 0o600 });
+		const r = recordingFetch([JEV(0.03, COMPLETE)]);
+		const decisions = createDecisions({
+			config: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
+			sessionId: RECORD.sessionId,
+			env: { OPENROUTER_API_KEY: K },
+			storePath: store,
+			fetch: r.fetch,
+		});
+		const runs: { mode: JudgeMode; complete?: ClaudeCompleter; expected: Partial<Assessment> }[] = [
+			{ mode: "gate", complete: DONE_09, expected: { done: true, source: "llm" } },
+			{ mode: "gate", expected: { done: true, confidence: 0.5, source: "rules" } },
+			{ mode: "advisory", complete: DONE_09, expected: { done: true, source: "llm", mode: "advisory" } },
+		];
+		for (const { mode, complete, expected } of runs) {
+			const input = { record: RECORD, signals: clean, diff: FULL_DIFF, complete, now, mode };
+			const fresh = await assessDone({ ...input, decisions });
+			expect(fresh).toEqual(await assessDone(input));
+			expect(fresh).toMatchObject(expected);
+			expect("decision" in fresh).toBe(false);
+		}
+		expect(r.calls).toHaveLength(0);
+	});
+
+	test("Jev vetoes a confident LLM done on a full patch, after the judge's own gaps (AC-6.1)", async () => {
+		const r = recordingFetch([JEV(0.03, COMPLETE)]);
+		const { decisions, lines } = jevRuntime(r.fetch);
+		const a = await assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, complete: DONE_09, now, decisions });
+		expect(a).toMatchObject({ done: false, confidence: 0.9, summary: vetoGap("0.03"), gaps: [vetoGap("0.03")], source: "llm" });
+		expect(a.decision).toMatchObject({
+			point: "ship",
+			outcome: "ok",
+			model: MODEL,
+			p: 0.03,
+			probabilities: { complete: 0.03 },
+			action: "veto",
+			threshold: 0.2,
+		});
+		expect(a.decision && assessDecisionJson(a.decision)).toEqual({ p: 0.03, model: MODEL, action: "veto" });
+		expect(r.calls.map((call) => call.url)).toEqual([ENDPOINT]);
+		expectNoKey(a, lines);
+
+		const noted = reply({ done: true, confidence: 0.9, summary: "ok", gaps: ["follow-up: docs"] });
+		const withGaps = await assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, complete: noted, now, decisions });
+		expect(withGaps.gaps).toEqual(["follow-up: docs", vetoGap("0.03")]);
+	});
+
+	test("a truncated patch disables the veto, whether gatherDiff or the state builder cut it (AC-6.2)", async () => {
+		const long = `${PATCH}${"+const filler = 1;\n".repeat(1400)}`;
+		expect(long.length).toBeGreaterThan(24_000);
+		const diffs: ShipDiff[] = [
+			{ ...FULL_DIFF, patch: long },
+			{ ...FULL_DIFF, patchTruncated: true },
+		];
+		for (const diff of diffs) {
+			const { decisions } = jevRuntime(recordingFetch([JEV(0.03, COMPLETE)]).fetch);
+			const a = await assessDone({ record: RECORD, signals: clean, diff, complete: DONE_09, now, decisions });
+			expect(a).toMatchObject({ done: true, source: "llm", gaps: [] });
+			expect(a.gaps.some((gap) => gap.startsWith("Jev "))).toBe(false);
+			expect(a.decision).toMatchObject({ outcome: "ok", p: 0.03, action: "none", threshold: 0.2 });
+		}
+	});
+
+	test("without a completer Jev judges: done at or above shipApproveAt with source jev (AC-6.3)", async () => {
+		const { decisions } = jevRuntime(recordingFetch([JEV(0.79, COMPLETE)]).fetch);
+		const a = await assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, now, decisions });
+		expect(a).toEqual({
+			done: true,
+			confidence: 0.79,
+			summary: "Jev judged the change complete (P(complete) 0.79)",
+			gaps: [],
+			signals: clean,
+			source: "jev",
+			mode: "gate",
+			at: 7,
+			decision: expect.objectContaining({ outcome: "ok", p: 0.79, model: MODEL, action: "approve", threshold: 0.7 }),
+		});
+	});
+
+	test("without a completer a Jev P below shipApproveAt is not done (AC-6.5)", async () => {
+		const { decisions } = jevRuntime(recordingFetch([JEV(0.3, COMPLETE)]).fetch);
+		const a = await assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, now, decisions });
+		const gap = "Jev P(complete) 0.30 is below 0.7";
+		expect(a).toMatchObject({ done: false, confidence: 0.3, summary: gap, gaps: [gap], source: "jev", mode: "gate" });
+		expect(a.decision).toMatchObject({ outcome: "ok", p: 0.3, action: "reject", threshold: 0.7 });
+	});
+
+	test("Jev judges when the LLM verdict is unusable; a failed Jev keeps today's unavailable gap (AC-6.6)", async () => {
+		const offline: ClaudeCompleter = async () => {
+			throw new Error("offline");
+		};
+		const notJson: ClaudeCompleter = async () => "not json";
+		for (const complete of [offline, notJson]) {
+			const input = { record: RECORD, signals: clean, diff: FULL_DIFF, complete, now };
+			const baseline = await assessDone(input);
+			expect(baseline.gaps[0]).toStartWith("assessment unavailable: ");
+
+			const approved = await assessDone({ ...input, decisions: jevRuntime(recordingFetch([JEV(0.79, COMPLETE)]).fetch).decisions });
+			expect(approved).toMatchObject({ done: true, source: "jev", gaps: [] });
+			expect(approved.decision?.action).toBe("approve");
+
+			const rejected = await assessDone({ ...input, decisions: jevRuntime(recordingFetch([JEV(0.3, COMPLETE)]).fetch).decisions });
+			expect(rejected).toMatchObject({ done: false, source: "jev", gaps: ["Jev P(complete) 0.30 is below 0.7"] });
+			expect(rejected.decision?.action).toBe("reject");
+
+			const r = recordingFetch([ERR(503)]);
+			const { decisions, lines } = jevRuntime(r.fetch);
+			const failed = await assessDone({ ...input, decisions });
+			expect(withoutDecision(failed)).toEqual(baseline);
+			expect(failed.decision).toMatchObject({ outcome: "error", error: "upstream", action: "fail-open", threshold: 0.7, attempts: 2 });
+			expect(r.calls).toHaveLength(2);
+			expectNoKey(failed, lines);
+		}
+	});
+
+	test("a rule gap returns before any request, in gate and advisory mode (AC-6.7)", async () => {
+		const unverified = signals({}, { phaseCount: 1, completedPhases: 1, trusted: true, verification: { phase: "01", status: "gaps_found" } });
+		for (const mode of ["gate", "advisory"] as const) {
+			const r = recordingFetch([JEV(0.95, COMPLETE)]);
+			const input = { record: RECORD, signals: unverified, diff: FULL_DIFF, complete: DONE_09, now, mode };
+			const a = await assessDone({ ...input, decisions: jevRuntime(r.fetch).decisions });
+			expect(a).toEqual(await assessDone(input));
+			expect(a).toMatchObject({ done: false, source: "rules", gaps: ["latest GSD verification is gaps_found"] });
+			expect(r.calls).toHaveLength(0);
+		}
+	});
+
+	test("Jev never turns an LLM not done into done (AC-6.8)", async () => {
+		const cases: [object, string[]][] = [
+			[{ done: false, confidence: 0.9, summary: "", gaps: ["missing flag"] }, ["missing flag"]],
+			[{ done: true, confidence: 0.6, summary: "", gaps: [] }, ["judge confidence 0.6 below 0.7"]],
+		];
+		for (const [verdict, gaps] of cases) {
+			const input = { record: RECORD, signals: clean, diff: FULL_DIFF, complete: reply(verdict), now };
+			const { decisions } = jevRuntime(recordingFetch([JEV(0.95, COMPLETE)]).fetch);
+			const a = await assessDone({ ...input, decisions });
+			expect(withoutDecision(a)).toEqual(await assessDone(input));
+			expect(a).toMatchObject({ done: false, gaps, source: "llm" });
+			expect(a.decision).toMatchObject({ p: 0.95, action: "none", threshold: 0.2 });
+		}
+	});
+
+	test("threshold boundaries: veto at P <= shipVetoAtOrBelow, done at P >= shipApproveAt, both read from config (AC-6.9)", async () => {
+		const run = (p: number, complete?: ClaudeCompleter, config: Partial<DecisionsConfig> = {}) =>
+			assessDone({
+				record: RECORD,
+				signals: clean,
+				diff: FULL_DIFF,
+				complete,
+				now,
+				decisions: jevRuntime(recordingFetch([JEV(p, COMPLETE)]).fetch, config).decisions,
+			});
+		expect(await run(0.2, DONE_09)).toMatchObject({ done: false, gaps: [vetoGap("0.20")], decision: { action: "veto" } });
+		expect(await run(0.21, DONE_09)).toMatchObject({ done: true, gaps: [], decision: { action: "none" } });
+		expect(await run(0.7)).toMatchObject({ done: true, source: "jev", decision: { action: "approve" } });
+		expect(await run(0.69)).toMatchObject({
+			done: false,
+			source: "jev",
+			gaps: ["Jev P(complete) 0.69 is below 0.7"],
+			decision: { action: "reject" },
+		});
+		const strict = { shipVetoAtOrBelow: 0.5, shipApproveAt: 0.9 };
+		expect(await run(0.45, DONE_09, strict)).toMatchObject({ done: false, decision: { action: "veto", threshold: 0.5 } });
+		expect(await run(0.85, undefined, strict)).toMatchObject({
+			done: false,
+			gaps: ["Jev P(complete) 0.85 is below 0.9"],
+			decision: { action: "reject", threshold: 0.9 },
+		});
+	});
+
+	test("advisory mode always ships; Jev is recorded as advise-veto only where gate mode would veto", async () => {
+		const cases: [number, ShipDiff, string][] = [
+			[0.03, FULL_DIFF, "advise-veto"],
+			[0.03, { ...FULL_DIFF, patchTruncated: true }, "none"],
+			[0.94, FULL_DIFF, "none"],
+		];
+		for (const [p, diff, action] of cases) {
+			const input = { record: RECORD, signals: clean, diff, complete: DONE_09, now, mode: "advisory" as const };
+			const { decisions } = jevRuntime(recordingFetch([JEV(p, COMPLETE)]).fetch);
+			const a = await assessDone({ ...input, decisions });
+			expect(withoutDecision(a)).toEqual(await assessDone(input));
+			expect(a).toMatchObject({ done: true, gaps: [], mode: "advisory" });
+			expect(a.decision).toMatchObject({ p, action, threshold: 0.2 });
+		}
+	});
+
+	test("with autoMerge Jev never stands in for a missing or unusable judge; its veto of a usable done still applies", async () => {
+		const offline: ClaudeCompleter = async () => {
+			throw new Error("offline");
+		};
+		const notJson: ClaudeCompleter = async () => "not json";
+		const run = (jev: () => Response, complete: ClaudeCompleter | undefined, autoMerge: boolean) => {
+			const r = recordingFetch([jev]);
+			const input = { record: RECORD, signals: clean, diff: FULL_DIFF, complete, now, autoMerge };
+			return { calls: r.calls, input, result: assessDone({ ...input, decisions: jevRuntime(r.fetch).decisions }) };
+		};
+		// Jev at 0.95 is ignored: exactly the result without Jev, the decision recorded as "none".
+		for (const complete of [undefined, offline, notJson]) {
+			const { calls, input, result } = run(JEV(0.95, COMPLETE), complete, true);
+			const a = await result;
+			expect(withoutDecision(a)).toEqual(await assessDone(input));
+			expect(a.source).not.toBe("jev");
+			expect(a.decision).toMatchObject({ outcome: "ok", p: 0.95, action: "none", threshold: 0.2 });
+			expect(calls).toHaveLength(1);
+		}
+		// No completer: the rules-only result that ship's cli turns into "no judge available".
+		expect(await run(JEV(0.95, COMPLETE), undefined, true).result).toMatchObject({ done: true, confidence: 0.5, source: "rules" });
+		expect(await run(JEV(0.95, COMPLETE), offline, true).result).toMatchObject({
+			done: false,
+			source: "llm",
+			gaps: ["assessment unavailable: offline"],
+		});
+		expect(await run(JEV(0.03, COMPLETE), DONE_09, true).result).toMatchObject({
+			done: false,
+			source: "llm",
+			gaps: [vetoGap("0.03")],
+			decision: { action: "veto", threshold: 0.2 },
+		});
+		expect(await run(ERR(503), offline, true).result).toMatchObject({
+			done: false,
+			gaps: ["assessment unavailable: offline"],
+			decision: { action: "fail-open", threshold: 0.2 },
+		});
+		// autoMerge off: Jev alone still decides when there is no completer.
+		expect(await run(JEV(0.79, COMPLETE), undefined, false).result).toMatchObject({
+			done: true,
+			confidence: 0.79,
+			source: "jev",
+			decision: { action: "approve", threshold: 0.7 },
+		});
+	});
+
+	test("the ship state holds only request, capped criteria and the lockfile-free capped patch (AC-6.12)", async () => {
+		const items = Array.from({ length: 25 }, (_, i) => `<item>${`AC-${String(i + 1).padStart(2, "0")} `.padEnd(800, "x")}</item>`);
+		const spec = `<UPLIFTED_PROMPT><ACCEPTANCE_CRITERIA>\n${items.join("\n")}\n</ACCEPTANCE_CRITERIA></UPLIFTED_PROMPT>`;
+		const lockHunk =
+			"diff --git a/bun.lock b/bun.lock\nindex 1111111..2222222 100644\n--- a/bun.lock\n+++ b/bun.lock\n@@ -1 +1 @@\n+LOCK-MARKER-2d4\n";
+		const source = `diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1,1250 @@\n${"+const filler = 1; // x\n".repeat(1250)}`;
+		const gsd = {
+			phaseCount: 1,
+			completedPhases: 1,
+			trusted: true,
+			state: "GSD-MARKER-7f3",
+			verification: { phase: "01-GSD-MARKER-7f3", status: "passed" },
+		};
+		const diff: ShipDiff = { stat: "src/app.ts | 1250 +++ STAT-MARKER-9c1", log: "abc1234 add app", patch: `${lockHunk}${source}` };
+		let judgePrompt = "";
+		const complete: ClaudeCompleter = async (_system, user) => {
+			judgePrompt = user;
+			return JSON.stringify({ done: true, confidence: 0.9, summary: "ok", gaps: [] });
+		};
+		const r = recordingFetch([JEV(0.9, COMPLETE)]);
+		const { decisions } = jevRuntime(r.fetch);
+		for (const xml of [spec, "<UPLIFTED_PROMPT><GOAL>ship</GOAL></UPLIFTED_PROMPT>"]) {
+			const record = { ...RECORD, result: { ...RECORD.result, xml } };
+			await assessDone({ record, signals: signals({}, gsd), diff, complete, now, decisions });
+		}
+		// The judge still reads the GSD and stat signals; Jev never does (D9).
+		expect(judgePrompt).toContain("GSD-MARKER-7f3");
+		expect(judgePrompt).toContain("STAT-MARKER-9c1");
+		expect(r.calls).toHaveLength(2);
+		type Body = { state: { request: string; acceptance_criteria: string[]; patch: string }; questions: object; trace: object };
+		const [first, second] = r.calls.map((call) => call.body as Body);
+		if (!first || !second) throw new Error("expected two requests");
+		expect(Object.keys(first.state).sort()).toEqual(["acceptance_criteria", "patch", "request"]);
+		expect(first.state.request).toBe("add ship");
+		expect(first.state.acceptance_criteria).toHaveLength(20);
+		expect(first.state.acceptance_criteria.every((item) => item.length <= 500)).toBe(true);
+		expect(first.state.acceptance_criteria[0]).toStartWith("AC-01 ");
+		expect(first.state.acceptance_criteria[19]).toStartWith("AC-20 ");
+		expect(first.state.patch.length).toBeLessThanOrEqual(24_000);
+		expect(first.state.patch).toStartWith("diff --git a/src/app.ts b/src/app.ts");
+		expect(first.state.patch).not.toContain("bun.lock");
+		expect(first.state.patch).not.toContain("LOCK-MARKER-2d4");
+		expect(second.state.acceptance_criteria).toEqual([]);
+		for (const body of [first, second]) {
+			const serialized = JSON.stringify(body);
+			expect(serialized).not.toContain("GSD-MARKER-7f3");
+			expect(serialized).not.toContain("STAT-MARKER-9c1");
+			expect(body.questions).toEqual({ complete: QUESTIONS.ship });
+			expect(body.trace).toMatchObject({ trace_name: "ultrathink", span_name: "ship" });
+		}
+	});
+
+	test("Jev runs concurrently with the LLM judge: its request is sent before the judge answers (AC-6.13)", async () => {
+		const held = heldFetch(() => JEV(0.9, COMPLETE)());
+		const { decisions } = jevRuntime(held.fetch);
+		let requestsWhenJudged = -1;
+		let judgeCalled!: () => void;
+		const judging = new Promise<void>((resolve) => {
+			judgeCalled = resolve;
+		});
+		let answer!: (text: string) => void;
+		const complete: ClaudeCompleter = () => {
+			requestsWhenJudged = held.calls.length;
+			judgeCalled();
+			return new Promise<string>((resolve) => {
+				answer = resolve;
+			});
+		};
+		const pending = assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, complete, now, decisions });
+		await judging;
+		expect(requestsWhenJudged).toBe(1);
+		expect(held.calls).toHaveLength(1);
+		answer(JSON.stringify({ done: true, confidence: 0.9, summary: "ok", gaps: [] }));
+		held.release();
+		const a = await pending;
+		expect(a).toMatchObject({ done: true, source: "llm", decision: { p: 0.9, action: "none" } });
+	});
+
+	test("a caller abort during the decision rejects assessDone with an AbortError instead of failing open (AC-5.7)", async () => {
+		const hangingJudge: ClaudeCompleter = (_system, _user, signal) =>
+			new Promise<string>((_resolve, reject) => {
+				signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			});
+		const runs: { mode: JudgeMode; complete?: ClaudeCompleter }[] = [
+			{ mode: "gate" },
+			{ mode: "gate", complete: hangingJudge },
+			{ mode: "advisory", complete: hangingJudge },
+		];
+		for (const { mode, complete } of runs) {
+			const controller = new AbortController();
+			let requested!: () => void;
+			const started = new Promise<void>((resolve) => {
+				requested = resolve;
+			});
+			const { decisions, lines } = jevRuntime(hangingFetch(() => requested()));
+			const pending = assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, complete, now, mode, signal: controller.signal, decisions });
+			await started;
+			controller.abort();
+			const error = await pending.then(
+				() => undefined,
+				(rejection: unknown) => rejection,
+			);
+			expect((error as { name?: unknown } | undefined)?.name).toBe("AbortError");
+			expect(error).not.toBeInstanceOf(DecisionsError);
+			expect(lines).toEqual([]);
+		}
+	});
+
+	for (const failure of FAILURES) {
+		test(`${failure.name} fails open to today's assessment in gate and advisory mode (AC-4.12)`, async () => {
+			const runs: [JudgeMode, ClaudeCompleter | undefined, number][] = [
+				["gate", DONE_09, 0.2],
+				["gate", undefined, 0.7],
+				["advisory", DONE_09, 0.2],
+			];
+			for (const [mode, complete, threshold] of runs) {
+				const input = { record: RECORD, signals: clean, diff: FULL_DIFF, complete, now, mode };
+				const config: Partial<DecisionsConfig> = { points: ["ship"], ...(failure.timeoutMs ? { timeoutMs: failure.timeoutMs } : {}) };
+				const { decisions, lines } = jevRuntime(failure.fetch(), config);
+				const a = await assessDone({ ...input, decisions });
+				expect(withoutDecision(a)).toEqual(await assessDone(input));
+				expect(a.decision).toMatchObject({
+					point: "ship",
+					outcome: "error",
+					model: ON.model,
+					probabilities: {},
+					error: failure.kind,
+					action: "fail-open",
+					threshold,
+				});
+				expect(a.decision && assessDecisionJson(a.decision)).toEqual({ action: "fail-open", error: failure.kind });
+				expect(lines).toHaveLength(1);
+				expectNoKey(a, lines);
+			}
+		});
+	}
 });

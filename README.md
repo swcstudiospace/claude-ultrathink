@@ -80,7 +80,8 @@ To spend less: send small messages with `/ultrathink-quick` or a `raw:` prefix, 
 
 - **Always, for a planned prompt:** your message and the recent conversation go to the planning engine: Anthropic through the `claude` CLI by default, or xAI when you choose the Grok engine (or a gateway you run, with the Grok `shunt` transport).
 - **Only when you configure them:** plan contents (the uplifted prompt, node titles and reasoning, repository name and branch) go to Notion and Linear through their hosted MCP servers; ship pushes to GitHub with `gh` and sends the pull request to Greptile; the Greptile knowledge-base read sends only list and read calls to Greptile (never your prompt or code) and passes the documents it reads to the engine; the Agent Substrate brief request sends the repository, branch and host name to the URL you set.
-- Credentials for Notion, Linear and Greptile stay in one local file, `~/.config/ultrathink/mcp-credentials.json` (mode 0600). ultrathink has no telemetry of its own.
+- **Only with `decisions.enabled: true` in your own config and an OpenRouter key:** Jev decisions go to OpenRouter at `openrouter.ai` (`/api/alpha/decisions`). A repository's `.claude/ultrathink.json` can turn them off but never on, and `ULTRATHINK_DECISIONS=0` turns them off for a process. Each request carries a small, capped state for one yes/no question: the message and the last assistant turn (plan gate), the request, acceptance criteria and patch (ship), a knowledge-base question, answer and cited document (knowledge), or the task, question and default answer (blocking). Requests ask for zero data retention and `data_collection: "deny"` by default.
+- Credentials for Notion, Linear, Greptile and OpenRouter stay in one local file, `~/.config/ultrathink/mcp-credentials.json` (mode 0600). ultrathink has no telemetry of its own.
 
 Details for every service: [What leaves your machine](docs/privacy.md).
 
@@ -96,8 +97,9 @@ A fresh install plans prompts and contacts nothing but the engine. Each of these
 | Agent Substrate brief | `substrate.url` or `SUBSTRATE_URL` | Fetches a cross-agent brief for the repository and branch before the graph is built |
 | Tailscale OAuth callback | `bin/ultrathink-mcp auth login <provider> --tailscale` or `ULTRATHINK_OAUTH_TAILSCALE=1` | Receives the OAuth callback over `tailscale serve` for logins on a remote machine |
 | Grok `shunt` transport | `grok.transport: "shunt"` plus `grok.shuntBaseUrl` | Sends Grok engine calls to an Anthropic-compatible gateway you run; there is no built-in one |
+| Jev decisions (OpenRouter Decisions API) | `decisions.enabled: true` in your user config and an OpenRouter key (`bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) | Asks the `~typesafe/jev-latest` decision model one yes/no question at each of four points, after the deterministic rules: skip planning for a message that is not new work, veto an incomplete ship "done" (or, without auto-merge, judge it when there is no LLM verdict), reject a knowledge-base answer the document does not support, promote a risky default to a blocking question (see [Use Jev decisions](docs/how-to/use-jev-decisions.md)) |
 
-`bin/ultrathink status` shows tracking, Substrate, Ship, the knowledge base and the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
+`bin/ultrathink status` shows tracking, Substrate, Ship, the knowledge base, Decisions (the `Decisions:` line) and the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
 
 ## Quickstart
 

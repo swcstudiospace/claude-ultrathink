@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import type { DecisionOutcome, Decisions } from "../decisions/gate.ts";
+import { buildBlockingState, buildKnowledgeState, extractDigestDocument, formatDefaultOption } from "../decisions/questions.ts";
+import type { DecisionRecord } from "../decisions/types.ts";
 import { extractJsonObject } from "../think/graph.ts";
 import type { ThoughtGraph } from "../think/types.ts";
 import type { UpliftResult } from "../types.ts";
@@ -26,6 +29,10 @@ export interface RunClarifyOptions {
 	onProgress?: (message: string) => void;
 	/** Greptile knowledge-base digest (untrusted evidence) and the document paths it holds; questions it settles are recorded, not asked. */
 	knowledge?: { digest: string; docs: string[] };
+	/** Jev runtime for the knowledge and blocking points; absent = no checks (today's behaviour). */
+	decisions?: Decisions;
+	/** Receives every DecisionRecord of this clarify pass: round-1 knowledge, round-1 blocking, then round-2 blocking. */
+	onDecision?: (record: DecisionRecord) => void;
 }
 
 const MIN_OPTIONS = 2;
@@ -143,6 +150,18 @@ function knowledgeClaim(knowledge: Record<string, unknown>, docs: ReadonlySet<st
 	return { answer, source };
 }
 
+/** The collapsed claimed answer shown as the "As stated" description of a rejected knowledge claim. */
+function claimedAnswer(knowledge: Record<string, unknown>): string {
+	return asString(knowledge.answer).replace(/\s+/g, " ").slice(0, MAX_CLAIMED_DESCRIPTION_CHARS).trim();
+}
+
+/** The clarifier's raw items: a bare array or the `questions` array of an object; [] otherwise. */
+function clarifierItems(raw: unknown): unknown[] {
+	if (Array.isArray(raw)) return raw;
+	if (raw && typeof raw === "object" && "questions" in raw && Array.isArray(raw.questions)) return raw.questions;
+	return [];
+}
+
 function normalizeSettledItem(raw: Record<string, unknown>, index: number, claim: { answer: string; source: string }): Clarification | undefined {
 	const question = normalizeQuestionText(raw.question);
 	if (!question) return undefined;
@@ -177,11 +196,7 @@ function normalizeSettledItem(raw: Record<string, unknown>, index: number, claim
  */
 export function normalizeClarifications(raw: unknown, maxQuestions: number, knowledgeDocs?: string[]): Clarification[] {
 	const max = Math.max(0, Math.floor(Number.isFinite(maxQuestions) ? maxQuestions : MAX_QUESTIONS));
-	let items: unknown[] = [];
-	if (Array.isArray(raw)) items = raw;
-	else if (raw && typeof raw === "object" && "questions" in raw && Array.isArray(raw.questions)) {
-		items = raw.questions;
-	}
+	const items = clarifierItems(raw);
 	const docs = new Set((knowledgeDocs ?? []).map((path) => path.trim()).filter(Boolean));
 
 	const seen = new Set<string>();
@@ -191,18 +206,49 @@ export function normalizeClarifications(raw: unknown, maxQuestions: number, know
 		if (open.length >= max && (docs.size === 0 || settled.length >= MAX_SETTLED)) break;
 		const obj = docs.size > 0 && item && typeof item === "object" ? (item as Record<string, unknown>) : undefined;
 		const knowledge = obj?.knowledge && typeof obj.knowledge === "object" ? (obj.knowledge as Record<string, unknown>) : undefined;
-		const claim = knowledge && obj?.blocking !== true && settled.length < MAX_SETTLED ? knowledgeClaim(knowledge, docs) : undefined;
+		const claim = obj && knowledge && obj.blocking !== true && settled.length < MAX_SETTLED ? knowledgeClaim(knowledge, docs) : undefined;
 		let clarification: Clarification | undefined;
 		if (obj && claim) clarification = normalizeSettledItem(obj, settled.length, claim);
-		else if (open.length < max) {
-			const claimed = knowledge ? asString(knowledge.answer).replace(/\s+/g, " ").slice(0, MAX_CLAIMED_DESCRIPTION_CHARS).trim() : undefined;
-			clarification = normalizeItem(item, open.length, claimed);
-		}
+		else if (open.length < max) clarification = normalizeItem(item, open.length, knowledge ? claimedAnswer(knowledge) : undefined);
 		if (!clarification) continue;
 		const key = normalizeQuestion(clarification.question);
 		if (!key || seen.has(key)) continue;
 		seen.add(key);
 		(claim ? settled : open).push(clarification);
+	}
+	return [...open, ...settled];
+}
+
+/**
+ * Pass 2: the pass-1 `list` with the claims Jev `rejected` taken out of the settled items and asked instead. Every
+ * pass-1 open question keeps its place and content; a rejected claim is appended after them, in the clarifier's
+ * order, only while fewer than `max` questions are open, so a rejection never displaces a clarifier question.
+ * Open ids stay q1.. in final order; settled ids are re-numbered k1..
+ */
+function reopenRejected(
+	parsed: unknown,
+	list: Clarification[],
+	rejected: ReadonlySet<string>,
+	max: number,
+	knowledgeDocs: string[],
+): Clarification[] {
+	const docs = new Set(knowledgeDocs.map((path) => path.trim()).filter(Boolean));
+	const open = list.filter((item) => item.source !== "knowledge");
+	const settled = list
+		.filter((item) => item.source === "knowledge" && !rejected.has(normalizeQuestion(item.question)))
+		.map((item, index) => ({ ...item, id: `k${index + 1}` }));
+	const pending = new Set(rejected);
+	for (const item of clarifierItems(parsed)) {
+		if (open.length >= max || pending.size === 0) break;
+		if (!item || typeof item !== "object") continue;
+		const obj = item as Record<string, unknown>;
+		const knowledge = obj.knowledge && typeof obj.knowledge === "object" ? (obj.knowledge as Record<string, unknown>) : undefined;
+		// The item pass 1 settled: the first non-blocking one with this question and a valid claim.
+		const key = normalizeQuestion(normalizeQuestionText(obj.question));
+		if (!knowledge || obj.blocking === true || !pending.has(key) || !knowledgeClaim(knowledge, docs)) continue;
+		pending.delete(key);
+		const reopened = normalizeItem(obj, open.length, claimedAnswer(knowledge));
+		if (reopened) open.push(reopened);
 	}
 	return [...open, ...settled];
 }
@@ -246,6 +292,95 @@ export function clarifyUserPayload(opts: RunClarifyOptions, maxQuestions: number
 	return parts.join("\n");
 }
 
+/** One Jev check, keyed by normalizeQuestion(question): results map back by key, never by id (pass 2 renumbers settled ids). */
+interface Checked {
+	key: string;
+	outcome: DecisionOutcome;
+}
+
+/**
+ * DP-KNOWLEDGE and DP-BLOCKING on the pass-1 `list` (contract §6.3). Round 1 checks, concurrently, every settled claim
+ * against its cited digest section and the default of every open question the clarifier left non-blocking. A claim Jev
+ * finds unsupported is asked instead (pass 2, {@link reopenRejected}) when an open slot is left; round 2 then checks
+ * the default of each one admitted. A risky default makes its question blocking; nothing is demoted.
+ * Errors change nothing; only a caller abort rejects.
+ */
+async function checkClarifications(
+	opts: RunClarifyOptions,
+	decisions: Decisions,
+	parsed: unknown,
+	max: number,
+	knowledge: { digest: string; docs: string[] } | undefined,
+	list: Clarification[],
+): Promise<Clarification[]> {
+	const kb = knowledge && decisions.active("knowledge") ? knowledge : undefined;
+	const blockingOn = decisions.active("blocking");
+	if (!kb && !blockingOn) return list;
+	const { groundedAt, blockingAt } = decisions.config;
+
+	// LLM-blocking questions are never sent: Jev may only promote.
+	const checkBlocking = (open: Clarification[]): Promise<Checked>[] =>
+		blockingOn
+			? open
+					.filter((item) => !item.blocking)
+					.map(async (item) => ({
+						key: normalizeQuestion(item.question),
+						outcome: await decisions.run(
+							"blocking",
+							buildBlockingState({
+								task: opts.uplift.original,
+								question: item.question,
+								defaultText: formatDefaultOption(item.default, item.options),
+							}),
+							{ signal: opts.signal, threshold: blockingAt, action: (p) => (p >= blockingAt ? "promote" : "keep") },
+						),
+					}))
+			: [];
+
+	const settled = list.filter((item) => item.source === "knowledge");
+	const knowledgeChecks: Promise<Checked>[] = [];
+	if (kb) {
+		for (const claim of settled) {
+			const document = extractDigestDocument(kb.digest, claim.evidence ?? "", kb.docs);
+			// No section for the cited document: nothing to check against, so no request and the claim stays settled.
+			if (!document) continue;
+			const key = normalizeQuestion(claim.question);
+			knowledgeChecks.push(
+				decisions
+					.run("knowledge", buildKnowledgeState({ question: claim.question, answer: claim.answer ?? "", document }), {
+						signal: opts.signal,
+						threshold: groundedAt,
+						action: (p) => (p >= groundedAt ? "keep" : "reject-claim"),
+					})
+					.then((outcome) => ({ key, outcome })),
+			);
+		}
+	}
+	const [known, risky] = await Promise.all([
+		Promise.all(knowledgeChecks),
+		Promise.all(checkBlocking(list.filter((item) => item.source !== "knowledge"))),
+	]);
+	for (const { outcome } of [...known, ...risky]) if (outcome.status !== "inactive") opts.onDecision?.(outcome.record);
+
+	const rejected = new Set(known.flatMap(({ key, outcome }) => (outcome.status === "ok" && outcome.p < groundedAt ? [key] : [])));
+	let checked = list;
+	let second: Checked[] = [];
+	if (kb && rejected.size > 0) {
+		checked = reopenRejected(parsed, list, rejected, max, kb.docs);
+		second = await Promise.all(
+			checkBlocking(checked.filter((item) => item.source !== "knowledge" && rejected.has(normalizeQuestion(item.question)))),
+		);
+		for (const { outcome } of second) if (outcome.status !== "inactive") opts.onDecision?.(outcome.record);
+	}
+
+	const promote = new Set(
+		[...risky, ...second].flatMap(({ key, outcome }) => (outcome.status === "ok" && outcome.p >= blockingAt ? [key] : [])),
+	);
+	return checked.map((item) =>
+		item.source !== "knowledge" && !item.blocking && promote.has(normalizeQuestion(item.question)) ? { ...item, blocking: true } : item,
+	);
+}
+
 /** Fail-open: returns [] on any failure except an abort, which is rethrown. */
 export async function runClarify(opts: RunClarifyOptions): Promise<Clarification[]> {
 	const max = Math.max(0, Math.floor(opts.maxQuestions ?? MAX_QUESTIONS));
@@ -257,7 +392,8 @@ export async function runClarify(opts: RunClarifyOptions): Promise<Clarification
 		const text = await opts.complete(system, clarifyUserPayload(opts, max), opts.signal);
 		const parsed = extractJsonObject(text);
 		if (!parsed || typeof parsed !== "object") throw new Error("unparsable JSON");
-		const list = normalizeClarifications(parsed, max, knowledge?.docs);
+		const normalized = normalizeClarifications(parsed, max, knowledge?.docs);
+		const list = opts.decisions ? await checkClarifications(opts, opts.decisions, parsed, max, knowledge, normalized) : normalized;
 		const settled = list.filter((item) => item.source === "knowledge").length;
 		const settledBit = settled > 0 ? ` (+${settled} settled)` : "";
 		opts.onProgress?.(`Clarifications → ${list.length - settled}${settledBit}`);

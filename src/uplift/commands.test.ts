@@ -117,6 +117,10 @@ describe("runControl", () => {
 		"SUBSTRATE_URL",
 		"SUBSTRATE_DISABLED",
 		"ULTRATHINK_MCP_STORE",
+		"OPENROUTER_API_KEY",
+		"ULTRATHINK_DECISIONS_URL",
+		"ULTRATHINK_DECISIONS",
+		"ULTRATHINK_DEBUG",
 	] as const;
 	const saved: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
 	let dir: string;
@@ -136,6 +140,10 @@ describe("runControl", () => {
 		process.env.XDG_CONFIG_HOME = join(dir, "xdg");
 		process.env.CLAUDE_CONFIG_DIR = join(dir, "claude");
 		for (const key of ["ULTRATHINK_TRACK", "ULTRATHINK_SHIP", "SUBSTRATE_URL", "SUBSTRATE_DISABLED"] as const) delete process.env[key];
+		// Neither the machine's OpenRouter key nor its endpoint override may reach a test.
+		for (const key of ["OPENROUTER_API_KEY", "ULTRATHINK_DECISIONS_URL", "ULTRATHINK_DECISIONS", "ULTRATHINK_DEBUG"] as const) {
+			delete process.env[key];
+		}
 		// The credential store must never be the real one.
 		process.env.ULTRATHINK_MCP_STORE = join(dir, "mcp-credentials.json");
 		projectConfig({});
@@ -273,5 +281,147 @@ describe("runControl", () => {
 		const blocker = join(dir, "blocker");
 		writeFileSync(blocker, "");
 		expect(await runControl(["off"], { stateDir: join(blocker, "state"), cwd: io.cwd })).toStartWith("ultrathink: ");
+	});
+
+	describe("Decisions status line", () => {
+		const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+		const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
+		const ON_DEFAULTS = "Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking";
+
+		/** User-layer config (`~/.config/ultrathink/config.json`); undefined leaves no decisions key in any layer. */
+		function userConfig(decisions: Record<string, unknown> | undefined): void {
+			mkdirSync(join(dir, "xdg", "ultrathink"), { recursive: true });
+			writeFileSync(join(dir, "xdg", "ultrathink", "config.json"), JSON.stringify(decisions ? { decisions } : {}));
+		}
+
+		function storeKey(): void {
+			writeStore(process.env.ULTRATHINK_MCP_STORE as string, {
+				version: 1,
+				providers: { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } },
+			});
+		}
+
+		/** The status text with every Jev request recorded (the endpoint, or the active override): status never asks Jev. */
+		async function status(): Promise<{ text: string; line: string | undefined; jevCalls: string[] }> {
+			const jevCalls: string[] = [];
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = (async (input: string | URL | Request) => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url === ENDPOINT || url === process.env.ULTRATHINK_DECISIONS_URL) jevCalls.push(url);
+				return new Response(null, { status: 500 });
+			}) as unknown as typeof fetch;
+			try {
+				const text = await runControl(["status"], io);
+				return { text, line: text.split("\n").find((l) => l.startsWith("Decisions:")), jevCalls };
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+		}
+
+		test("a fresh install shows Decisions off right after the knowledge-base line, even with a key stored and in the env", async () => {
+			userConfig(undefined);
+			storeKey();
+			process.env.OPENROUTER_API_KEY = K;
+			const { text, line, jevCalls } = await status();
+			expect(line).toBe("Decisions: off (opt-in: set decisions.enabled)");
+			if (line === undefined) throw new Error("status printed no Decisions line");
+			const lines = text.split("\n");
+			expect(lines[lines.findIndex((l) => l.startsWith("Knowledge base:")) + 1]).toBe(line);
+			expect(jevCalls).toEqual([]);
+			expect(text).not.toContain(K);
+		});
+
+		test("on without a stored or env key names both ways to supply one", async () => {
+			userConfig({ enabled: true });
+			const { line, jevCalls } = await status();
+			expect(line).toBe(
+				"Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)",
+			);
+			expect(jevCalls).toEqual([]);
+		});
+
+		test("on with a key reports where the key comes from, never the key", async () => {
+			userConfig({ enabled: true });
+			storeKey();
+			const stored = await status();
+			expect(stored.line).toBe(`${ON_DEFAULTS} · key from store · zdr on`);
+			expect(stored.text).not.toContain(K);
+			expect(stored.text).not.toContain("Bearer sk-or-");
+
+			rmSync(process.env.ULTRATHINK_MCP_STORE as string);
+			process.env.OPENROUTER_API_KEY = K;
+			const fromEnv = await status();
+			expect(fromEnv.line).toBe(`${ON_DEFAULTS} · key from OPENROUTER_API_KEY · zdr on`);
+			expect(fromEnv.text).not.toContain(K);
+			expect(fromEnv.text).not.toContain("Bearer sk-or-");
+			expect([...stored.jevCalls, ...fromEnv.jevCalls]).toEqual([]);
+		});
+
+		test("the stored key wins over the env key", async () => {
+			userConfig({ enabled: true });
+			storeKey();
+			process.env.OPENROUTER_API_KEY = "sk-or-v1-ENVKEY";
+			const { line, text } = await status();
+			expect(line).toBe(`${ON_DEFAULTS} · key from store · zdr on`);
+			expect(text).not.toContain("sk-or-v1-ENVKEY");
+		});
+
+		test("the line shows the configured model, points and zdr, the normalised URL when an override is in effect, and flags a rejected one", async () => {
+			userConfig({ enabled: true, model: "typesafe/jev-1.13-20260917", points: ["ship", "plan"], zdr: false });
+			storeKey();
+			const base = "Decisions: on · typesafe/jev-1.13-20260917 · ship, plan · key from store · zdr off";
+			expect((await status()).line).toBe(base);
+			process.env.ULTRATHINK_DECISIONS_URL = "http://127.0.0.1:9999/decisions?token=secret#frag";
+			const override = await status();
+			expect(override.line).toBe(`${base} · url http://127.0.0.1:9999/decisions`);
+			expect(override.text).not.toContain("secret");
+			const ignored = `${base} · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)`;
+			for (const rejected of ["ftp://127.0.0.1/x", "https://gw.example/d", "http://openrouter.ai/api", "https://me:pw@openrouter.ai/api"]) {
+				process.env.ULTRATHINK_DECISIONS_URL = rejected;
+				const out = await status();
+				expect(out.line).toBe(ignored);
+				expect(out.text).not.toContain(rejected);
+			}
+			delete process.env.ULTRATHINK_DECISIONS_URL;
+			userConfig({ enabled: true, points: [] });
+			expect((await status()).line).toBe("Decisions: on · ~typesafe/jev-latest · no points · key from store · zdr on");
+		});
+
+		test("K1: ULTRATHINK_DECISIONS=0 shows Decisions off whatever the config and key say", async () => {
+			userConfig({ enabled: true });
+			storeKey();
+			process.env.ULTRATHINK_DECISIONS = "0";
+			const { line, jevCalls } = await status();
+			expect(line).toBe("Decisions: off (ULTRATHINK_DECISIONS=0)");
+			expect(jevCalls).toEqual([]);
+			userConfig(undefined);
+			expect((await status()).line).toBe("Decisions: off (ULTRATHINK_DECISIONS=0)");
+		});
+	});
+
+	test("usage lists the decisions commands right after the grok line", async () => {
+		expect(await runControl(["bogus"], io)).toContain(
+			[
+				"  grok [engine grok|claude]",
+				"  decisions check        one live Jev decision: resolved model, latency, cost",
+				"  decisions probe <plan|ship|knowledge|blocking> <cases.json>",
+				"In an agent:",
+			].join("\n"),
+		);
+	});
+
+	test("bin/ultrathink decisions goes to the decisions command, not the control verbs", () => {
+		// beforeEach already removed OPENROUTER_API_KEY and pointed config and the store at temp paths.
+		const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "commands.ts"), "Decisions"], {
+			cwd: io.cwd,
+			env: { ...process.env, HOME: join(dir, "home") },
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(proc.exitCode).toBe(2);
+		expect(proc.stdout.toString()).toBe(
+			"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>\n",
+		);
 	});
 });

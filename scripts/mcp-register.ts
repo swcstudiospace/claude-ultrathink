@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 export const HOSTS = ["claude", "grok", "hermes", "muse", "omp"] as const;
 export type Host = (typeof HOSTS)[number];
+/** MCP servers only: API-key providers such as openrouter are never registered with a host. */
 export const PROVIDER_IDS = ["notion", "linear", "greptile"] as const;
 
 export const USAGE = `Usage: bun scripts/mcp-register.ts [--hosts claude,grok,hermes,muse,omp] [--providers notion,linear,greptile] [--replace | --remove] [--dry-run]

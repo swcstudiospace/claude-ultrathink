@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
-import { prepareRedirect } from "./cli.ts";
+import { resolveOpenRouterKey } from "../decisions/gate.ts";
+import { main, prepareRedirect } from "./cli.ts";
+import type { McpProviderId } from "./providers.ts";
 import type { Run } from "./redirect.ts";
+import { readStore, writeStore } from "./store.ts";
 
 const CLI = join(import.meta.dir, "cli.ts");
 
@@ -16,17 +19,23 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-/** Runs the real CLI with its config files, credential store and cwd all inside `root`. */
+/** Runs the real CLI with its config files, credential store and cwd all inside `root`; never the machine's OpenRouter key. */
 function run(...args: string[]): { code: number | null; stdout: string; stderr: string } {
+	return runWith({}, ...args);
+}
+
+function runWith(opts: { stdin?: string }, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
+	const { OPENROUTER_API_KEY: _machineKey, ...env } = process.env;
 	const proc = Bun.spawnSync([process.execPath, CLI, ...args], {
 		cwd: root,
 		env: {
-			...process.env,
+			...env,
 			HOME: join(root, "home"),
 			XDG_CONFIG_HOME: join(root, "xdg"),
 			CLAUDE_CONFIG_DIR: join(root, "claude"),
 			ULTRATHINK_MCP_STORE: join(root, "credentials.json"),
 		},
+		stdin: opts.stdin === undefined ? "ignore" : new TextEncoder().encode(opts.stdin),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -259,5 +268,143 @@ describe("auth login redirect", () => {
 		const { code, stderr } = run("auth", "login");
 		expect(code).toBe(2);
 		expect(stderr).toContain("auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]");
+	});
+});
+
+describe("openrouter API-key provider", () => {
+	const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+	const REFUSAL =
+		"ultrathink-mcp: openrouter is an API-key provider, not an MCP server: store its key with ultrathink-mcp auth set-key openrouter --stdin";
+	const store = (): string => join(root, "credentials.json");
+	const storeKey = (): void =>
+		writeStore(store(), { version: 1, providers: { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } } });
+	const noLeak = (...outputs: string[]): void => {
+		for (const output of outputs) {
+			expect(output).not.toContain(K);
+			expect(output).not.toContain("Bearer sk-or-");
+		}
+	};
+
+	test("set-key --stdin stores the key 0600 and prints only its length", () => {
+		const { code, stdout, stderr } = runWith({ stdin: `${K}\n` }, "auth", "set-key", "openrouter", "--stdin");
+		expect(code).toBe(0);
+		expect(stdout).toBe("openrouter: api key stored (35 chars)\n");
+		noLeak(stdout, stderr);
+		expect(statSync(store()).mode & 0o777).toBe(0o600);
+		expect(resolveOpenRouterKey(store(), {})).toEqual({ key: K, source: "store" });
+	});
+
+	test("set-key --env-file --var stores the key from an env file", () => {
+		const file = join(root, "openrouter.env");
+		writeFileSync(file, `# keys\nOPENROUTER_API_KEY=${K}\n`);
+		const { code, stdout, stderr } = run("auth", "set-key", "openrouter", "--env-file", file, "--var", "OPENROUTER_API_KEY");
+		expect(code).toBe(0);
+		expect(stdout).toBe("openrouter: api key stored (35 chars)\n");
+		noLeak(stdout, stderr);
+		expect(statSync(store()).mode & 0o777).toBe(0o600);
+		expect(resolveOpenRouterKey(store(), {})).toEqual({ key: K, source: "store" });
+	});
+
+	test("auth status lists openrouter by key length, or as not configured, never the key", () => {
+		const empty = run("auth", "status");
+		expect(empty.code).toBe(0);
+		expect(empty.stdout.split("\n")).toContain("openrouter  none  not ready  not configured");
+		storeKey();
+		const stored = run("auth", "status");
+		expect(stored.code).toBe(0);
+		expect(stored.stdout.split("\n")).toContain("openrouter  api_key  ready  api key set (35 chars)");
+		noLeak(stored.stdout, stored.stderr);
+	});
+
+	test("auth logout openrouter removes only its key", () => {
+		writeStore(store(), {
+			version: 1,
+			providers: {
+				openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 },
+				linear: { kind: "api_key", apiKey: "lin_api_x", updatedAt: 1 },
+			},
+		});
+		const { code, stdout } = run("auth", "logout", "openrouter");
+		expect(code).toBe(0);
+		expect(stdout).toBe("openrouter: logged out\n");
+		expect(Object.keys(readStore(store()).providers)).toEqual(["linear"]);
+	});
+
+	test.each<string[]>([
+		["serve", "openrouter"],
+		["check", "openrouter"],
+		["auth", "login", "openrouter"],
+	])("%s … openrouter is a usage error that names set-key, with no relay, connection or login", (...args) => {
+		storeKey();
+		const before = readFileSync(store(), "utf8");
+		const { code, stdout, stderr } = run(...args);
+		expect(code).toBe(2);
+		expect(stderr.split("\n")[0]).toBe(REFUSAL);
+		expect(stderr).toContain("usage:\n");
+		expect(stdout).toBe("");
+		noLeak(stdout, stderr);
+		expect(readFileSync(store(), "utf8")).toBe(before);
+	});
+
+	test("the usage text says openrouter is API-key only", () => {
+		const { stderr } = run("auth", "set-key");
+		expect(stderr).toContain(
+			"  ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)\n  (openrouter is API-key only: set-key, status and logout; never serve, check or login)\n",
+		);
+	});
+
+	describe("check in process", () => {
+		let savedStore: string | undefined;
+		beforeEach(() => {
+			savedStore = process.env.ULTRATHINK_MCP_STORE;
+			process.env.ULTRATHINK_MCP_STORE = store();
+			storeKey();
+		});
+		afterEach(() => {
+			if (savedStore === undefined) delete process.env.ULTRATHINK_MCP_STORE;
+			else process.env.ULTRATHINK_MCP_STORE = savedStore;
+		});
+
+		/** main() with stdout/stderr captured and every provider check recorded instead of connecting. */
+		async function check(argv: string[]): Promise<{ code: number; stdout: string; stderr: string; attempted: McpProviderId[] }> {
+			const attempted: McpProviderId[] = [];
+			const stdout: string[] = [];
+			const stderr: string[] = [];
+			const writes = { out: process.stdout.write, err: process.stderr.write };
+			process.stdout.write = ((chunk: string | Uint8Array) => stdout.push(String(chunk)) > 0) as unknown as typeof process.stdout.write;
+			process.stderr.write = ((chunk: string | Uint8Array) => stderr.push(String(chunk)) > 0) as unknown as typeof process.stderr.write;
+			let code: number;
+			try {
+				code = await main(argv, {
+					checkOne: async (id) => {
+						attempted.push(id);
+						return 3;
+					},
+				});
+			} finally {
+				process.stdout.write = writes.out;
+				process.stderr.write = writes.err;
+			}
+			return { code, stdout: stdout.join(""), stderr: stderr.join(""), attempted };
+		}
+
+		test("check with no ids connects to the MCP servers only, never openrouter", async () => {
+			const result = await check(["check"]);
+			expect(result.code).toBe(0);
+			expect(result.attempted).toEqual(["notion", "linear", "greptile"]);
+			expect(result.stdout).toBe("notion: OK 3 tools\nlinear: OK 3 tools\ngreptile: OK 3 tools\n");
+			expect(result.stdout).not.toContain("openrouter");
+			noLeak(result.stdout, result.stderr);
+		});
+
+		test("check openrouter, alone or among MCP ids, fails before any connection attempt", async () => {
+			for (const argv of [["check", "openrouter"], ["check", "linear", "openrouter"]]) {
+				const result = await check(argv);
+				expect(result.code).toBe(2);
+				expect(result.attempted).toEqual([]);
+				expect(result.stderr.split("\n")[0]).toBe(REFUSAL);
+				noLeak(result.stdout, result.stderr);
+			}
+		});
 	});
 });

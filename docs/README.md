@@ -17,6 +17,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Choose the engine](how-to/choose-engine.md): plan with Claude (the default) or Grok.
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to the pull request, Greptile review and merge flow.
 - [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md): opt in to reading the repository's Greptile knowledge base before the clarifying questions.
+- [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model at the plan, ship, knowledge and blocking points, check it, tune its thresholds and pin the model.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer engine calls per prompt, or none for small messages.
 - [Headless and CI](how-to/headless-and-ci.md): run hosts in scripts without planning or tracking.
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository and layer them with your own.

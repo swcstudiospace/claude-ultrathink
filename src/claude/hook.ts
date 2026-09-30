@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 /**
- * Orchestrates one UserPromptSubmit event: decide → uplift → Graph of Thought
+ * Orchestrates one UserPromptSubmit event: decide → Jev plan gate (opt-in) → uplift → Graph of Thought
  * with per-node rationale/conclusion fills → HITL clarifications → build a Notion/Linear
  * TrackPlan → persist session state → return the spec plus an instruction to
  * invoke ultrathink-kickoff as hook context. Everything after "decide" is
- * fail-open: the user's prompt always goes through.
+ * fail-open: the user's prompt always goes through (a caller abort is re-thrown).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
+import { createDecisions, type DecisionsDeps } from "../decisions/gate.ts";
+import type { DecisionRecord } from "../decisions/types.ts";
 import { createGreptileKnowledge, type KnowledgeLookup, type KnowledgeReader, type KnowledgeResult, type KnowledgeSession } from "../greptile/knowledge.ts";
 import { injectClarificationsXml } from "../hitl/format.ts";
 import { normalizeQuestion, type RunClarifyOptions, runClarify } from "../hitl/pipeline.ts";
@@ -28,7 +30,8 @@ import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
 import type { ClaudeCompleter } from "./complete.ts";
-import { formatPromptContext, formatSummary } from "./output.ts";
+import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
+import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
 import { type ControlState, readSession, type SessionRecord, sessionPath, writeControl, writeSession } from "./state.ts";
 
@@ -76,12 +79,20 @@ export interface HookDeps {
 	progress?: ProgressSink;
 	/** Test seam for the Greptile knowledge-base prefetch; defaults to `createGreptileKnowledge(config)` (undefined unless opted in). */
 	knowledge?: KnowledgeReader;
+	/** Caller abort for the Jev plan gate (re-thrown as AbortError). */
+	signal?: AbortSignal;
+	/** Seams for the Decisions runtime (env, storePath, fetch, now, sleep, random, debug); config comes from config.decisions. */
+	decisionsDeps?: DecisionsDeps;
 }
 
 export interface PromptSubmitResult {
 	output?: HookOutput;
 	record?: SessionRecord;
 	skipped?: string;
+	/** Jev skip notice (§5.3); set only on a Jev skip with claude.echo on. */
+	notice?: string;
+	/** Every DecisionRecord of this prompt, in call order; absent when none. */
+	decisions?: DecisionRecord[];
 }
 
 function specFile(stateDir: string, sessionId: string): string {
@@ -143,6 +154,24 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	}
 	if (decision.action !== "uplift") return { skipped: decision.action };
 	const skill = input.skill;
+	// Read once: the plan gate's last assistant turn and the planner's recent conversation.
+	const history = deps.conversation?.(input.transcript_path) ?? "";
+	// DP-PLAN (D8): consulted once every deterministic rule has left the prompt to plan, before anything runs. A skip
+	// looks exactly like a deterministic one: no event, engine, brief, knowledge or tracker call, and no state write.
+	const decisions = createDecisions({
+		config: deps.config.decisions,
+		...(sessionId === "unknown" ? {} : { sessionId }),
+		...deps.decisionsDeps,
+	});
+	const gate = await planGate({ prompt: input.prompt ?? "", text: decision.text, skill, history }, decisions, deps.signal);
+	if (!gate.plan) {
+		return {
+			skipped: JEV_PLAN_SKIP,
+			decisions: [gate.record],
+			...(deps.config.claude.echo ? { notice: formatPlanSkipNotice(gate.p) } : {}),
+		};
+	}
+	const records: DecisionRecord[] = gate.record ? [gate.record] : [];
 	emit({
 		type: "begin",
 		at: now(),
@@ -160,7 +189,6 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		deps.config.claude.budgetMs > 0 ? setTimeout(() => controller.abort(), deps.config.claude.budgetMs) : undefined;
 	try {
 		const original = decision.text;
-		const history = deps.conversation?.(input.transcript_path) ?? "";
 		const skillLine = skill
 			? `The user invoked the "${skill.name}" skill with this message.${skill.summary ? ` Skill summary: ${skill.summary}` : ""}`
 			: "";
@@ -216,7 +244,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			stage("uplift", "end", false);
 			outcome = "skipped";
 			outcomeDetail = "uplift-failed";
-			return { skipped: "uplift-failed" };
+			return { skipped: "uplift-failed", ...(records.length ? { decisions: records } : {}) };
 		}
 		stage("uplift", "end", true, `${result.root} · ${result.source}`);
 
@@ -279,6 +307,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					maxQuestions: deps.config.hitl.maxQuestions,
 					onProgress: log,
 					...(knowledgeInput ? { knowledge: knowledgeInput } : {}),
+					// DP-KNOWLEDGE and DP-BLOCKING share the plan gate's runtime; every record lands in this prompt's list.
+					decisions,
+					onDecision: (decisionRecord) => records.push(decisionRecord),
 				});
 				const seen = new Set(clarifications.map((c) => normalizeQuestion(c.question)));
 				const kept = fresh.filter((c) => !seen.has(normalizeQuestion(c.question)));
@@ -347,6 +378,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			kickedOff: false,
 			synced: false,
 			...(knowledge ? { knowledge } : {}),
+			...(records.length ? { decisions: records } : {}),
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
@@ -406,10 +438,11 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				knowledge,
 				engineError: deps.engineError?.(),
 				elapsedMs: now() - started,
+				decisions: records,
 			});
 		}
 		outcome = "planned";
-		return { output, record };
+		return { output, record, ...(records.length ? { decisions: records } : {}) };
 	} catch (error) {
 		outcomeDetail = error instanceof Error ? error.name : "error";
 		throw error;

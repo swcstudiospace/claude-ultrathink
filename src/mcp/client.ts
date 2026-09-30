@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { recoverUnauthorized, resolveAuthHeader } from "./oauth.ts";
-import { PROVIDERS, USER_AGENT } from "./providers.ts";
-import type { ProviderId } from "./providers.ts";
+import { isMcpProviderId, MCP_PROVIDERS, notMcpServer, PROVIDERS, USER_AGENT } from "./providers.ts";
+import type { McpProviderId, ProviderId } from "./providers.ts";
 import { createRelay } from "./relay.ts";
 import { readStore } from "./store.ts";
 import type { ToolCaller } from "../track/create.ts";
@@ -38,12 +38,17 @@ interface ToolResult {
 
 /**
  * What to run when `provider` has no usable credential: OAuth login, plus the API-key route where the provider
- * takes one (a personal key created in the provider's account settings).
+ * takes one (a personal key created in the provider's account settings). A key provider has no login: only set-key,
+ * or its environment variable.
  */
 export function loginHint(provider: ProviderId): string {
+	const info = PROVIDERS[provider];
+	if (info.kind === "key") {
+		return `run: ultrathink-mcp auth set-key ${provider} --stdin (API key from your ${info.label} account settings; or set ${info.envVar})`;
+	}
 	const login = `ultrathink-mcp auth login ${provider}`;
-	if (!PROVIDERS[provider].apiKey) return `run: ${login}`;
-	return `run: ${login} (OAuth) or ultrathink-mcp auth set-key ${provider} --stdin (API key from your ${PROVIDERS[provider].label} account settings)`;
+	if (!info.apiKey) return `run: ${login}`;
+	return `run: ${login} (OAuth) or ultrathink-mcp auth set-key ${provider} --stdin (API key from your ${info.label} account settings)`;
 }
 
 function short(text: string): string {
@@ -64,7 +69,9 @@ function unwrapToolResult(name: string, raw: unknown): unknown {
 	}
 }
 
-export function createMcpClient(provider: ProviderId, deps: McpClientDeps): McpClient {
+export function createMcpClient(provider: McpProviderId, deps: McpClientDeps): McpClient {
+	// Runtime guard for untyped callers: a key provider is never relayed or fetched.
+	if (!isMcpProviderId(provider)) throw new Error(notMcpServer(provider));
 	const timeoutMs = deps.callTimeoutMs ?? 30_000;
 	const authDeps = { storePath: deps.storePath, fetch: deps.fetch };
 	const pending = new Map<number, Pending>();
@@ -73,7 +80,7 @@ export function createMcpClient(provider: ProviderId, deps: McpClientDeps): McpC
 	let initialized: Promise<void> | undefined;
 
 	const relay = createRelay({
-		url: PROVIDERS[provider].url,
+		url: MCP_PROVIDERS[provider].url,
 		userAgent: USER_AGENT,
 		loginHint: loginHint(provider),
 		fetch: deps.fetch,
@@ -182,7 +189,7 @@ export function hasUsableCredential(provider: ProviderId, storePath: string): bo
 }
 
 /** A client for `provider` when hasUsableCredential is true; otherwise undefined. Never throws. */
-export function createMcpClientIfCredentialed(provider: ProviderId, deps: McpClientDeps): McpClient | undefined {
+export function createMcpClientIfCredentialed(provider: McpProviderId, deps: McpClientDeps): McpClient | undefined {
 	try {
 		return hasUsableCredential(provider, deps.storePath) ? createMcpClient(provider, deps) : undefined;
 	} catch {

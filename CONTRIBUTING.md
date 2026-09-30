@@ -62,6 +62,8 @@ src/uplift/        Prompt Uplift (spec XML), which prompts to skip, skill invoca
 src/grok/          optional Grok engine and its transports
 src/hitl/          HITL clarification questions and answers
 src/substrate/     optional Agent Substrate brief (only when substrate.url or SUBSTRATE_URL is set)
+src/decisions/     optional OpenRouter Decisions (Jev) client: config defaults and thresholds, the
+                   four questions and their state builders, fail-open runner, decisions check|probe
 src/config.ts      config files, defaults and merging
 ```
 

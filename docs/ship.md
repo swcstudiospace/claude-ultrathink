@@ -37,6 +37,7 @@ The skill drives `bin/ultrathink-ship`. Each gate is enforced by that CLI, not l
 | The Greptile CLI (tested with 3.4.1), signed in with `greptile login` | CLI mode review, when PR mode is not available |
 | A working engine: a logged-in `claude` CLI, or `grok login` (or your shunt gateway) when `think.engine` is `"grok"` | the done judge; required when `ship.autoMerge` is `true` |
 | Optional: GSD's `gsd-tools.cjs`, and `node` on `PATH` to run it | GSD roadmap progress in the assessment, when the repository has `.planning/ROADMAP.md` (see [GSD tools](#gsd-tools)) |
+| Optional: Jev decisions (`decisions.enabled: true` and an OpenRouter key) | a calibrated second check on the done assessment (see [Jev decision](#jev-decision)) |
 | Bun 1.2 or later | `bin/ultrathink-ship` itself; without Bun it exits 127 with an install hint |
 
 You need at least one of the two Greptile setups. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md) for the credential store, and [Choose the engine](how-to/choose-engine.md) for the engine.
@@ -98,11 +99,49 @@ When the rules pass, an LLM judge runs on the configured engine. It reads:
 
 If no engine is available (for example the Grok login is missing):
 
-- in gate mode with `ship.autoMerge: true`, the task is not done ("no judge available");
-- in gate mode with `ship.autoMerge: false`, the rules alone decide, with confidence 0.5;
+- in gate mode with `ship.autoMerge: true`, the task is not done ("no judge available"), with or without the [Jev decision](#jev-decision);
+- in gate mode with `ship.autoMerge: false`, the rules alone decide, with confidence 0.5 (with the Jev decision on, Jev decides instead when it answers);
 - in advisory mode, the rules alone decide, with confidence 0.5, and the verdict is recorded as `no judge available`.
 
 When the task is not done in gate mode, the skill hands the gaps back to you and opens no PR. The agent may finish work only when the gaps are clearly its own unfinished work from the same run. In advisory mode the agent fixes rule gaps itself, never asks you to open or merge a PR, and hands back only decisions it cannot make.
+
+### Jev decision
+
+Optional and off by default. With Jev decisions on (`decisions.enabled: true`, `ship` in `decisions.points`, which it is by default, and an OpenRouter key; see [Use Jev decisions](how-to/use-jev-decisions.md)), `assess` also asks OpenRouter's Jev decision model one question: does the patch fully deliver the request and every acceptance criterion, with nothing missing, stubbed or left as a TODO? Jev answers with a probability, P(complete). This applies to every ship run, so to every GSD run by default.
+
+- Jev is asked only after the rules pass. A rule gap returns before any request, and Jev never overrides one. The GSD roadmap and verification signals stay rules and never go to Jev.
+- Jev gets only the original request, the items of the spec's `ACCEPTANCE_CRITERIA` element (up to 20, 500 characters each) and the patch (lockfiles left out, 24,000 characters at most). No diff stat, commit log, GSD or git signals.
+- It runs at the same time as the LLM judge, so it adds no waiting beyond the judge's own.
+
+In gate mode:
+
+| LLM judge | Jev | Result | `decision.action` |
+|---|---|---|---|
+| Done with a confidence of at least 0.7 | P(complete) at or below `decisions.shipVetoAtOrBelow` (0.2), and the patch Jev saw was not truncated | Not done, with the gap `Jev judged the change incomplete (P(complete) <P>)`. No PR is opened. | `veto` |
+| Done | Any other P, or the patch was cut at 24,000 characters | Done, as without Jev. | `none` |
+| Not done (including a confidence below 0.7) | Any P | Not done, as without Jev. Jev never turns a "not done" into done. | `none` |
+| No usable verdict (no engine, the judge failed, or its reply could not be parsed), with `ship.autoMerge` off | P(complete) at or above `decisions.shipApproveAt` (0.7) | Done, with `source: "jev"` and the summary `Jev judged the change complete (P(complete) <P>)`. | `approve` |
+| No usable verdict, with `ship.autoMerge` off | P(complete) below `decisions.shipApproveAt` | Not done, with `source: "jev"` and the gap `Jev P(complete) <P> is below 0.7` (the configured `shipApproveAt`). | `reject` |
+| No usable verdict, with `ship.autoMerge` on | Any P | Exactly the result without Jev: not done, with `no judge available` when there is no engine, or `assessment unavailable: <reason>` when the judge failed or its reply could not be parsed. Jev never stands in for the judge when a merge can follow. | `none` |
+| Any | Failed (no answer, an HTTP error, an invalid answer) | Exactly the result without Jev. | `fail-open` |
+
+A gate-mode veto is a not-done result like any other: the skill hands the gaps back to you and opens no PR. In advisory mode the run still ships whatever Jev says, and Jev is only recorded: the action is `advise-veto` whenever P(complete) is at or below `decisions.shipVetoAtOrBelow` on an untruncated patch, whatever the judge said, else `none` (or `fail-open`). The skill treats an advisory veto as "fix and proceed": it finishes the missing work inside the task's scope, commits and runs `assess` again before it opens the PR.
+
+Where you see the decision:
+
+- **Assess JSON.** `decision` is `{"p": <P>, "model": "<resolved model>", "action": "<action>"}`, for example `{"p": 0.94, "model": "typesafe/jev-1.13-20260917", "action": "none"}`, or `{"action": "fail-open", "error": "<kind>"}` when Jev could not answer. `"source": "jev"` appears only when Jev gave the verdict. With Decisions off, the point not listed, no key, or a rule gap, the JSON is exactly as without Jev.
+- **Session record.** The full decision record (P, threshold, action, model, latency, attempts, cost, error kind; never the request, criteria or patch) is stored as `decision` in the ship state's `assessment`.
+- **Pull request body.** The last line of `## Assessment`:
+
+  | Action | Line |
+  |---|---|
+  | `none` | `- Jev: P(complete) 0.94 · typesafe/jev-1.13-20260917` |
+  | `approve` | `- Jev: P(complete) 0.79 · typesafe/jev-1.13-20260917 · approved (no LLM verdict)` |
+  | `advise-veto` | `- Jev: P(complete) 0.03 · typesafe/jev-1.13-20260917 · veto (advisory: shipped anyway)` |
+  | `veto`, `reject` | `- Jev: P(complete) <P> · <model> · veto`, `- Jev: P(complete) <P> · <model> · rejected (no LLM verdict)` (these runs are not done, so a PR normally isn't opened) |
+  | `fail-open` | `- Jev: error (<kind>)` |
+
+P is printed with two decimals, cut rather than rounded, so a printed value never crosses its threshold. The [merge gate](#merge-gate) does not change: Jev never merges, and a PR that Jev approved still needs a completed Greptile review of the exact head at 5/5 with no open threads, and CI neither pending nor failing. Jev is never the only gate in front of a merge. With `ship.autoMerge` on, a merge also always needs a usable engine verdict: Jev can veto the engine's "done", but never replaces a missing or failed one.
 
 ### Several PRs in one session
 
@@ -287,7 +326,7 @@ These keys go in the `ship` section of any [config file](configuration.md#config
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Add the ship instruction and nudges. |
-| `autoMerge` | `false` | Allow `merge`. When `true` and `judge` is `"gate"`, the assessment also requires the engine judge. |
+| `autoMerge` | `false` | Allow `merge`. When `true` and `judge` is `"gate"`, the assessment also requires the engine judge; a Jev verdict never replaces it. |
 | `judge` | `"gate"` | `"gate"`: the LLM judge must say done with confidence >= 0.7. `"advisory"`: only the rules gate `done`; the judge verdict is recorded and shown in the PR body. The merge gate is unchanged in both modes (see [Done assessment](#done-assessment)). |
 | `deleteBranch` | `false` | Delete the remote and local branch after a confirmed merge. |
 | `skills` | `["gsd-"]` | Skill name prefixes that trigger ship. `[]` matches every planned prompt. |
@@ -340,9 +379,13 @@ Full auto-merge, with every other key at its default:
 
 `bin/ultrathink status` shows the result as `Ship: off (opt-in: set ship.enabled)`, `Ship: off (ULTRATHINK_SHIP=0)` or `Ship: on · auto-merge on|off · delete branch on|off`.
 
+The Jev thresholds for the done assessment are `decisions.shipVetoAtOrBelow` (default `0.2`) and `decisions.shipApproveAt` (default `0.7`), in the `decisions` section (see [Configuration](configuration.md#decisions-jev-decisions-openrouter-decisions-api)).
+
 ## Turning ship off
 
 - `"ship": { "enabled": false }` in config (the default) turns it off for every host.
 - `ULTRATHINK_SHIP=0` in the environment turns it off for that process.
 
 Either way, the plan has no `## Ship` section and no nudge is sent. `bin/ultrathink-ship` still works when you run it yourself. To keep the review but merge by hand, leave `"autoMerge": false`: `run` then stops once the PR is ready.
+
+To keep ship but stop only the Jev check, remove `"ship"` from `decisions.points`, or leave `decisions.enabled` off (the default).

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { createHash, randomBytes } from "node:crypto";
-import { PROVIDERS, USER_AGENT } from "./providers.ts";
-import type { ProviderId } from "./providers.ts";
+import { MCP_PROVIDERS, PROVIDERS, USER_AGENT } from "./providers.ts";
+import type { McpProviderId, ProviderId } from "./providers.ts";
 import { readStore, withStoreLock, writeStore } from "./store.ts";
 import type { CredentialStore, OAuthClient, OAuthTokens } from "./store.ts";
 
@@ -15,7 +15,7 @@ export interface AuthDeps {
 }
 
 export interface PendingLogin {
-	provider: ProviderId;
+	provider: McpProviderId;
 	url: string;
 	state: string;
 	verifier: string;
@@ -105,7 +105,7 @@ async function tokenRequest(client: OAuthClient, params: Record<string, string>,
 }
 
 /** Refresh inside an already-held lock; mutates `store` (caller persists). */
-async function refreshLocked(provider: ProviderId, store: CredentialStore, deps: AuthDeps): Promise<string | undefined> {
+async function refreshLocked(provider: McpProviderId, store: CredentialStore, deps: AuthDeps): Promise<string | undefined> {
 	const credential = store.providers[provider];
 	if (credential?.kind !== "oauth" || !credential.tokens?.refreshToken) return undefined;
 	try {
@@ -114,7 +114,7 @@ async function refreshLocked(provider: ProviderId, store: CredentialStore, deps:
 			{
 				grant_type: "refresh_token",
 				refresh_token: credential.tokens.refreshToken,
-				resource: PROVIDERS[provider].resource,
+				resource: MCP_PROVIDERS[provider].resource,
 			},
 			deps,
 		);
@@ -132,8 +132,8 @@ async function refreshLocked(provider: ProviderId, store: CredentialStore, deps:
 	}
 }
 
-export async function beginLogin(provider: ProviderId, deps: AuthDeps & { redirectUri: string }): Promise<PendingLogin> {
-	const info = PROVIDERS[provider];
+export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { redirectUri: string }): Promise<PendingLogin> {
+	const info = MCP_PROVIDERS[provider];
 	if (!info.oauth) throw new Error(`${provider} does not support OAuth`);
 	const prm = await getJson(info.protectedResourceMetadata, deps);
 	const servers = prm?.authorization_servers;
@@ -246,7 +246,7 @@ export async function completeLogin(pending: PendingLogin, input: string, deps: 
 			code: parsed.code,
 			redirect_uri: pending.redirectUri,
 			code_verifier: pending.verifier,
-			resource: PROVIDERS[pending.provider].resource,
+			resource: MCP_PROVIDERS[pending.provider].resource,
 		},
 		deps,
 	);
@@ -275,7 +275,7 @@ export async function logout(provider: ProviderId, deps: AuthDeps): Promise<void
 	});
 }
 
-export async function resolveAuthHeader(provider: ProviderId, deps: AuthDeps): Promise<string | undefined> {
+export async function resolveAuthHeader(provider: McpProviderId, deps: AuthDeps): Promise<string | undefined> {
 	const now = deps.now ?? Date.now;
 	const credential = readStore(deps.storePath).providers[provider];
 	if (!credential) return undefined;
@@ -298,7 +298,7 @@ export async function resolveAuthHeader(provider: ProviderId, deps: AuthDeps): P
 }
 
 export async function recoverUnauthorized(
-	provider: ProviderId,
+	provider: McpProviderId,
 	failedHeader: string | undefined,
 	deps: AuthDeps,
 ): Promise<boolean> {

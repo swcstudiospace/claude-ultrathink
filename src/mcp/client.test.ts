@@ -4,7 +4,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMcpClient, hasUsableCredential, loginHint } from "./client.ts";
+import { createMcpClient, createMcpClientIfCredentialed, hasUsableCredential, loginHint } from "./client.ts";
+import type { McpProviderId } from "./providers.ts";
 import { writeStore } from "./store.ts";
 
 interface Rpc {
@@ -118,6 +119,40 @@ describe("createMcpClient", () => {
 		expect(hint).toContain("ultrathink-mcp auth login notion");
 		expect(hint).not.toContain("set-key");
 		expect(hint).not.toContain("API key");
+	});
+
+	test("the openrouter hint names set-key and the env variable, never a login", () => {
+		const hint = loginHint("openrouter");
+		expect(hint).toBe(
+			"run: ultrathink-mcp auth set-key openrouter --stdin (API key from your OpenRouter account settings; or set OPENROUTER_API_KEY)",
+		);
+		expect(hint).not.toContain("auth login openrouter");
+	});
+
+	test("openrouter is refused as an MCP server before any request, even with its key stored", () => {
+		const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+		const dir = mkdtempSync(join(tmpdir(), "mcp-client-"));
+		dirs.push(dir);
+		const storePath = join(dir, "creds.json");
+		writeStore(storePath, { version: 1, providers: { openrouter: { kind: "api_key", apiKey: K, updatedAt: 0 } } });
+		const calls: unknown[] = [];
+		const recording = (async (url: unknown) => {
+			calls.push(url);
+			return new Response(null, { status: 500 });
+		}) as unknown as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = recording;
+		try {
+			// Untyped callers (JSON config, CLI args) can still pass the id: the runtime guard refuses it.
+			const id = "openrouter" as McpProviderId;
+			expect(() => createMcpClient(id, { storePath, fetch: recording })).toThrow(
+				new Error("openrouter is an API-key provider, not an MCP server"),
+			);
+			expect(createMcpClientIfCredentialed(id, { storePath, fetch: recording })).toBeUndefined();
+			expect(calls).toEqual([]);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
 	});
 
 	// Real 20ms timer: the timeout lives inside the client and is the behaviour under test.

@@ -290,6 +290,26 @@ def test_engine_failure_returns_empty():
 	assert context == ""
 
 
+def test_a_jev_skip_from_the_engine_returns_empty():
+	# A Jev plan skip: no context, the skip reason, and the notice in summary. The bridge reads only context.
+	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
+		fake = Path(tmp) / "bun"
+		skip = {
+			"context": "",
+			"skipped": "jev-skip",
+			"summary": "Prompt Uplift · not planned: Jev judged this is not new multi-step work (0.04) · start with uplift: to plan it",
+		}
+		fake.write_text(
+			f"#!{sys.executable}\nimport json, sys\nrequest = json.load(sys.stdin)\n"
+			f"open({str(fake) + '.calls'!r}, 'a').write(request['prompt'] + '\\n')\n"
+			f"print(json.dumps({skip!r}))\n",
+			encoding="utf-8",
+		)
+		fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+		assert plan({"user_message": "thanks, that works now", "session_id": "s1"}, env={"BUN": str(fake)}) == ""
+		assert bun_calls(fake) == ["thanks, that works now"]
+
+
 def test_slash_commands_and_uplifted_xml_never_start_bun():
 	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
 		fake = fake_bun(Path(tmp) / "bun")
@@ -854,6 +874,7 @@ if __name__ == "__main__":
 	test_skill_scaffold_reaches_the_engine()
 	test_engine_is_found_off_path_when_bun_is_unset()
 	test_engine_failure_returns_empty()
+	test_a_jev_skip_from_the_engine_returns_empty()
 	test_slash_commands_and_uplifted_xml_never_start_bun()
 	test_only_the_senders_own_tag_is_stripped_and_it_never_defeats_the_skips()
 	test_the_planner_runs_in_the_terminal_cwd_hermes_tools_use()

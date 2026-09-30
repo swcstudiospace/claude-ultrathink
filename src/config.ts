@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type DecisionsConfig } from "./decisions/types.ts";
 import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
 import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
@@ -98,6 +99,8 @@ export interface UltrathinkConfig {
 	track: TrackConfig;
 	ship: ShipConfig;
 	substrate: SubstrateConfig;
+	/** Jev decision points (OpenRouter Decisions API). Opt-in; no URL key by design (D1). */
+	decisions: DecisionsConfig;
 }
 
 export function defaultConfig(): UltrathinkConfig {
@@ -122,6 +125,7 @@ export function defaultConfig(): UltrathinkConfig {
 		track: { ...DEFAULT_TRACK_CONFIG },
 		ship: { ...DEFAULT_SHIP_CONFIG, skills: [...DEFAULT_SHIP_CONFIG.skills] },
 		substrate: { ...DEFAULT_SUBSTRATE_CONFIG },
+		decisions: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
 	};
 }
 
@@ -320,7 +324,53 @@ function mergeSubstrate(substrate: Record<string, unknown> | undefined, defaults
 	return { url: httpUrl(substrate.url, defaults.url) };
 }
 
-export function mergeConfig(file: Record<string, unknown> | undefined, base: UltrathinkConfig): UltrathinkConfig {
+/** A finite number in [0, 1]; anything else falls back. */
+function unitInterval(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
+}
+
+/** Upper bound for `decisions.timeoutMs`; a larger (or non-finite) value keeps the previous layer's (K4). */
+const MAX_DECISIONS_TIMEOUT_MS = 30_000;
+
+/**
+ * Per-field merge; only the ten known keys are read, so a layer can never add a URL (D1). A project layer (a file a cloned
+ * repository controls) may only tighten consent (K5): `enabled` true→false, `zdr` false→true, `points` narrowed to the
+ * intersection with the lower layers; the remaining keys merge as usual.
+ */
+function mergeDecisions(decisions: Record<string, unknown> | undefined, defaults: DecisionsConfig, project: boolean): DecisionsConfig {
+	if (!decisions) return defaults;
+	let points = Array.isArray(decisions.points)
+		? [...new Set(decisions.points.filter((p): p is DecisionPoint => DECISION_POINTS.includes(p as DecisionPoint)))]
+		: defaults.points;
+	if (project && points !== defaults.points) points = defaults.points.filter((p) => points.includes(p));
+	const enabled = typeof decisions.enabled === "boolean" ? decisions.enabled : defaults.enabled;
+	const zdr = typeof decisions.zdr === "boolean" ? decisions.zdr : defaults.zdr;
+	return {
+		enabled: project ? defaults.enabled && enabled : enabled,
+		model: nonEmpty(decisions.model, defaults.model),
+		points,
+		timeoutMs:
+			typeof decisions.timeoutMs === "number" &&
+			Number.isFinite(decisions.timeoutMs) &&
+			decisions.timeoutMs > 0 &&
+			decisions.timeoutMs <= MAX_DECISIONS_TIMEOUT_MS
+				? decisions.timeoutMs
+				: defaults.timeoutMs,
+		zdr: project ? defaults.zdr || zdr : zdr,
+		planSkipBelow: unitInterval(decisions.planSkipBelow, defaults.planSkipBelow),
+		shipVetoAtOrBelow: unitInterval(decisions.shipVetoAtOrBelow, defaults.shipVetoAtOrBelow),
+		shipApproveAt: unitInterval(decisions.shipApproveAt, defaults.shipApproveAt),
+		groundedAt: unitInterval(decisions.groundedAt, defaults.groundedAt),
+		blockingAt: unitInterval(decisions.blockingAt, defaults.blockingAt),
+	};
+}
+
+/** Merges one config layer onto `base`; `project` marks a repository-controlled layer (consent may only tighten, K5). */
+export function mergeConfig(
+	file: Record<string, unknown> | undefined,
+	base: UltrathinkConfig,
+	options: { project?: boolean } = {},
+): UltrathinkConfig {
 	if (!file) return base;
 	return {
 		uplift: mergeUplift(asRecord(file.uplift), base.uplift),
@@ -333,6 +383,7 @@ export function mergeConfig(file: Record<string, unknown> | undefined, base: Ult
 		track: mergeTrack(asRecord(file.track), base.track),
 		ship: mergeShip(asRecord(file.ship), base.ship),
 		substrate: mergeSubstrate(asRecord(file.substrate), base.substrate),
+		decisions: mergeDecisions(asRecord(file.decisions), base.decisions, options.project === true),
 	};
 }
 
@@ -341,17 +392,21 @@ export function userConfigPath(env: Record<string, string | undefined> = process
 	return join(env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"), "ultrathink", "config.json");
 }
 
+/** A config file: a plain path merges as a user layer; `{ path, project: true }` is a repository-controlled project layer. */
+export type ConfigSource = string | { path: string; project: true };
+
 /** Config files for ultrathink, lowest precedence first — later files win: user, then Claude user, then project. */
-export function claudeConfigPaths(cwd: string, env: Record<string, string | undefined> = process.env): string[] {
+export function claudeConfigPaths(cwd: string, env: Record<string, string | undefined> = process.env): ConfigSource[] {
 	const home = env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
-	return [userConfigPath(env), join(home, "ultrathink.json"), join(cwd, ".claude", "ultrathink.json")];
+	return [userConfigPath(env), join(home, "ultrathink.json"), { path: join(cwd, ".claude", "ultrathink.json"), project: true }];
 }
 
 /** Loads config from `files` in order (later files win); defaults when none override. */
-export function loadConfig(files: string[]): UltrathinkConfig {
+export function loadConfig(files: readonly ConfigSource[]): UltrathinkConfig {
 	let config = defaultConfig();
 	for (const file of files) {
-		config = mergeConfig(asRecord(readJson(file)), config);
+		const project = typeof file !== "string";
+		config = mergeConfig(asRecord(readJson(project ? file.path : file)), config, { project });
 	}
 	return config;
 }

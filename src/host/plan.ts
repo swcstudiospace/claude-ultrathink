@@ -160,9 +160,11 @@ export async function planPrompt(
 				trackingOff: trackingOff(config, control),
 				trackCommand: trackCommand(),
 				progress: options.progress,
+				// The plan gate itself runs in runPromptSubmit (AD-P1); the host's env holds its key and URL override.
+				decisionsDeps: { env },
 			},
 		);
-		if (result.skipped || !result.output) return skip(result.skipped);
+		if (result.skipped || !result.output) return { ...skip(result.skipped), ...(result.notice ? { summary: result.notice } : {}) };
 		const context = result.output.hookSpecificOutput.additionalContext;
 		const specPath = sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml");
 		const statePath = sessionPath(stateDir, sessionId);

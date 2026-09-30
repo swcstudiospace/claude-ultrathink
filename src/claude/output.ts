@@ -10,6 +10,7 @@
  */
 import { join } from "node:path";
 import { SHIP_CLI } from "../ship/nudge.ts";
+import { type DecisionRecord, formatP } from "../decisions/types.ts";
 import { formatHitlAddendum } from "../hitl/format.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -120,6 +121,35 @@ function knowledgeBit(lookup: KnowledgeLookup | undefined): string | undefined {
 	}
 	if (lookup.outcome === "off") return "Knowledge · off (no Greptile login)";
 	return `Knowledge · ${lookup.outcome}`;
+}
+
+/**
+ * One summary bit for the prompt's Jev decisions (A17): `Decisions · plan 0.97 · knowledge 1/2 kept ·
+ * blocking 1/3 promoted · error (timeout)`. Parts count successful records only; failures share one error part with
+ * their distinct kinds in record order. Undefined when no plan, knowledge or blocking record exists (ship has its
+ * own outputs).
+ */
+export function formatDecisionsBit(records: readonly DecisionRecord[]): string | undefined {
+	const prompt = records.filter((r) => r.point !== "ship");
+	if (prompt.length === 0) return undefined;
+	const ok = prompt.filter((r) => r.outcome === "ok");
+	const parts: string[] = [];
+	const plan = ok.find((r) => r.point === "plan");
+	if (plan?.p !== undefined) parts.push(`plan ${formatP(plan.p)}`);
+	const knowledge = ok.filter((r) => r.point === "knowledge");
+	if (knowledge.length) parts.push(`knowledge ${knowledge.filter((r) => r.action === "keep").length}/${knowledge.length} kept`);
+	const blocking = ok.filter((r) => r.point === "blocking");
+	if (blocking.length) {
+		parts.push(`blocking ${blocking.filter((r) => r.action === "promote").length}/${blocking.length} promoted`);
+	}
+	const kinds = [...new Set(prompt.flatMap((r) => (r.outcome === "error" && r.error ? [r.error] : [])))];
+	if (kinds.length) parts.push(`error (${kinds.join(", ")})`);
+	return parts.length ? `Decisions · ${parts.join(" · ")}` : undefined;
+}
+
+/** Shown instead of a plan when Jev judged the prompt not worth planning (§5.3). */
+export function formatPlanSkipNotice(p: number): string {
+	return `Prompt Uplift · not planned: Jev judged this is not new multi-step work (${formatP(p)}) · start with uplift: to plan it`;
 }
 
 export interface PromptContextInput {
@@ -339,6 +369,8 @@ export function formatSummary(input: {
 	providers?: TrackerProviders;
 	/** Greptile knowledge-base lookup before clarify; absent when none ran. */
 	knowledge?: KnowledgeLookup;
+	/** Jev decisions of this prompt (plan, knowledge, blocking); absent or empty leaves the summary unchanged. */
+	decisions?: readonly DecisionRecord[];
 }): string {
 	const bits = [`Prompt Uplift · ${input.result.root} · ${input.result.source}`];
 	if (input.engine) bits.push(input.engine);
@@ -352,6 +384,8 @@ export function formatSummary(input: {
 		const open = input.clarifications.filter((c) => !c.answer).length;
 		bits.push(`HITL · ${open} question(s)`);
 	}
+	const decisions = input.decisions ? formatDecisionsBit(input.decisions) : undefined;
+	if (decisions) bits.push(decisions);
 	if (input.tracking) {
 		const t = input.tracking;
 		const providers = input.providers ?? BOTH_PROVIDERS;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import type { SessionRecord } from "../claude/state.ts";
+import type { DecisionAction, DecisionRecord } from "../decisions/types.ts";
+import { formatP } from "../decisions/types.ts";
 import type { Assessment } from "./types.ts";
 
 const TITLE_MAX = 72;
@@ -11,6 +13,21 @@ const LOCAL_PATH = /(?:[A-Za-z]:\\|\/(?:root|home|Users|tmp|var|private)\/)[^\s)
 function scrub(text: string): string {
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
 	return text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").replace(LOCAL_PATH, "<local path>");
+}
+
+/** Suffix of the `- Jev:` line by what Jev did to the outcome; `none` adds nothing. */
+const JEV_SUFFIX: Partial<Record<DecisionAction, string>> = {
+	approve: " · approved (no LLM verdict)",
+	reject: " · rejected (no LLM verdict)",
+	veto: " · veto",
+	"advise-veto": " · veto (advisory: shipped anyway)",
+};
+
+/** The `## Assessment` Jev line: `- Jev: P(complete) <P> · <model>[ · <action>]` or `- Jev: error (<kind>)`. */
+function jevLine(decision: DecisionRecord): string {
+	if (decision.outcome === "error") return `- Jev: error (${scrub(decision.error ?? "unknown")})`;
+	const model = scrub(decision.model).replace(/\s+/g, " ").trim();
+	return `- Jev: P(complete) ${formatP(decision.p ?? 0)} · ${model}${JEV_SUFFIX[decision.action] ?? ""}`;
 }
 
 export function buildPr(record: SessionRecord, assessment?: Assessment): { title: string; body: string } {
@@ -44,6 +61,7 @@ export function buildPr(record: SessionRecord, assessment?: Assessment): { title
 			lines.push(`- Judge (advisory): done ${judge.done ? "yes" : "no"}, confidence ${judge.confidence}${error}`);
 			if (judge.gaps.length > 0) lines.push("- Judge notes:", ...judge.gaps.map((gap) => `  - ${scrub(gap)}`));
 		}
+		if (assessment.decision) lines.push(jevLine(assessment.decision));
 		sections.push(`## Assessment\n\n${lines.join("\n")}`);
 	}
 

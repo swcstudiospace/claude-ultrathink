@@ -18,7 +18,7 @@ ultrathink plans every non-trivial prompt by default. The commands on this page 
 | `/ultrathink-on` | Planning back on for this host. |
 | `/ultrathink-track off` | Planning continues, but no Linear/Notion rows are created. |
 | `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. `on` and `off` are per-host settings that beat `track.enabled` in the config until you change them again. |
-| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship and knowledge-base state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
+| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship, knowledge-base and Jev Decisions state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
 
 Some details:
 
@@ -110,11 +110,12 @@ Set these in the environment of the host process. They override config and the c
 | `ULTRATHINK_UPLIFT=0` | No planning at all for this process. Useful for automation and `claude -p` runners. |
 | `ULTRATHINK_TRACK=0` | The planner creates no Linear/Notion rows. Planning continues, and `ultrathink-kickoff` creates the rows in the agent's turn instead. With a tracker configured, `/ultrathink-status` shows `Tracking: kickoff`. `track.enabled: false` in config does the same, unless `/ultrathink-track on` was run on that host (the per-host setting beats `track.enabled`; this variable beats both). |
 | `ULTRATHINK_SHIP=0` | No ship nudge and no `## Ship` section in the plan, even with `ship.enabled: true`. See [Ship](ship.md). |
-| `ULTRATHINK_DEBUG=1` | `hooks/uplift.ts` (Claude Code, Grok, Muse) logs every skip reason and failure to stderr as `[ultrathink] …`. |
+| `ULTRATHINK_DECISIONS=0` | No Jev decision at any point, even with `decisions.enabled: true`: no request, no decision record, no plan-skip notice. `/ultrathink-status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` refuse with exit 1. See [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again). |
+| `ULTRATHINK_DEBUG=1` | `hooks/uplift.ts` (Claude Code, Grok, Muse) logs every skip reason and failure to stderr as `[ultrathink] …`. With Jev decisions on, every decision also logs one `[ultrathink] decisions <point> · …` line (P or the error kind, model, latency, attempts, cost; never the message or the key). |
 | `ULTRATHINK_HOST` | Forces the host id: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. This selects the state directory, which matters for `bin/ultrathink` run from a plain terminal. |
 | `ULTRATHINK_STATE_DIR` | Overrides the state directory. Use an absolute path (a relative one resolves differently per host; see [Configuration](configuration.md#environment-variables)). It is ignored if it points into a `.planning/` directory. |
 
-The other variables (credential store, OAuth callback and Tailscale opt-in, Hermes timeout, Agent Substrate, GSD tools, Bun) are listed in [Configuration: Environment variables](configuration.md#environment-variables).
+The other variables (credential store, OAuth callback and Tailscale opt-in, Hermes timeout, Agent Substrate, OpenRouter key and Decisions endpoint, GSD tools, Bun) are listed in [Configuration: Environment variables](configuration.md#environment-variables).
 
 ## CLI reference
 
@@ -136,6 +137,8 @@ Usage: ultrathink <command>
   think on|off|last      Graph of Thought
   hitl on|off|last       HITL clarifications
   grok [engine grok|claude]
+  decisions check        one live Jev decision: resolved model, latency, cost
+  decisions probe <plan|ship|knowledge|blocking> <cases.json>
 ```
 
 | Verb | Effect |
@@ -150,6 +153,8 @@ Usage: ultrathink <command>
 | `hitl last` | The clarifications of the last plan, with answers. |
 | `grok` or `grok status` | Engine label, Grok model, effort and transport, and Grok login state. |
 | `grok engine grok`, `grok engine claude` | Switches the planning engine for this host. |
+| `decisions check` | One live Jev decision to prove the integration end to end. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
+| `decisions probe <plan\|ship\|knowledge\|blocking> <cases.json>` | Runs your own cases through one decision point and prints P and the action under the current thresholds. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
 
 The state directory comes from `ULTRATHINK_HOST`, or else from the detected host. A plain terminal is detected as Claude Code. To change another host's state from a terminal, set the host explicitly:
 
@@ -175,6 +180,7 @@ Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
+Decisions: off (opt-in: set decisions.enabled)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -192,19 +198,86 @@ What the lines can say:
 | `Substrate` | `off (optional: set substrate.url or SUBSTRATE_URL)`, `off (SUBSTRATE_DISABLED=1)`, or `<url> (SUBSTRATE_URL)` / `<url> (config)` showing where the URL came from. |
 | `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
 | `Knowledge base` | The Greptile knowledge-base read before the clarifying questions (see [`hitl.knowledgeBase`](configuration.md#hitl-clarifying-questions)): `off (opt-in: set hitl.knowledgeBase)`; `on · not read while HITL is off`; `on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)`; or `on · Greptile` (`on · Greptile · organization <org>` when `ship.greptileOrganization` is set). |
+| `Decisions` | Jev decisions through the OpenRouter Decisions API (see [`decisions`](configuration.md#decisions-jev-decisions-openrouter-decisions-api)): `off (ULTRATHINK_DECISIONS=0)` when that variable is set, whatever the config says; `off (opt-in: set decisions.enabled)`; `on · no OpenRouter key (…)` when no key is stored and `OPENROUTER_API_KEY` is unset; or `on · <model> · <points> · key from <source> · zdr on\|off`, where `<points>` is the `decisions.points` list joined by `, ` (or `no points`), `<source>` is `store` or `OPENROUTER_API_KEY` (never the key), and ` · url <url>` (origin and path only) is added while `ULTRATHINK_DECISIONS_URL` is in effect, or ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted. |
 | `Model` | `claude.model` and `claude.concurrency`. |
 | `State` | The state directory in use. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
 
+The `Decisions:` line in full, in its four forms:
+
+- `Decisions: off (ULTRATHINK_DECISIONS=0)`: `ULTRATHINK_DECISIONS=0` is set in the environment. It is checked before `decisions.enabled`, and no point sends a request.
+- `Decisions: off (opt-in: set decisions.enabled)`: `decisions.enabled` is `false`, the default. No point sends a request.
+- `Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`: turned on, but there is no key, so no point sends a request.
+- `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking · key from store · zdr on`: turned on with the defaults and a stored key. With no stored key and the key in the environment it reads `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking · key from OPENROUTER_API_KEY · zdr on`.
+
+The ready form ends with ` · url <url>` while an accepted `ULTRATHINK_DECISIONS_URL` is in effect, showing only its origin and path, or with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted; requests then go to the default endpoint. See [Configuration: Environment variables](configuration.md#environment-variables).
+
+#### `bin/ultrathink decisions`
+
+Operator tools for [Jev decisions](how-to/use-jev-decisions.md). Both read the `decisions` config for the current directory (`model`, `zdr`, `timeoutMs` and the thresholds) and ignore `decisions.enabled` and `decisions.points`, so you can try them before you turn Decisions on. `ULTRATHINK_DECISIONS=0` still applies: with it set, both refuse without a request. Both need an OpenRouter key (stored with `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) and send real requests to the Decisions API; one decision costs about $0.000019.
+
+```text
+Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>
+```
+
+Any other arguments print that usage line and exit 2.
+
+`decisions check` sends one plan-gate decision about a fixed test message (`Add a --verbose flag to the export command`, no session id) and prints one line, for example:
+
+```text
+Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 512 ms · attempts 1 · cost 0.000019 · zdr on · key from store
+```
+
+| Result | Output | Exit |
+|---|---|---|
+| Answered | `Decisions check: ok · <resolved model> (requested <decisions.model>) · <ms> ms · attempts <n> · cost <cost> · zdr on\|off · key from <store\|OPENROUTER_API_KEY>`. `<cost>` is `n/a` when OpenRouter reports none. | 0 |
+| Failed | `Decisions check: error (<kind>) · <message> · <ms> ms · attempts <n> · zdr on\|off · key from <source>`. `<message>` is the redacted one-line error, for example `decisions auth: HTTP 401: User not found.` See [Troubleshooting: Decisions](troubleshooting.md#decisions) for every `<kind>`. | 1 |
+| Turned off | `Decisions check: off (ULTRATHINK_DECISIONS=0)`, with `ULTRATHINK_DECISIONS=0` set; no request is sent | 1 |
+| No key | `Decisions check: no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)` | 1 |
+
+While `ULTRATHINK_DECISIONS_URL` is in effect, the ok and error lines end with ` · url <url>`, its origin and path only. When it is set but not accepted, they end with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` instead, and the check used the default endpoint. The key is never printed.
+
+`decisions probe <plan|ship|knowledge|blocking> <cases.json>` runs your own cases through one decision point, one request after another, and shows what that point would do with each under the current thresholds. `<cases.json>` is resolved against the current directory and holds a JSON array of 1 to 200 case objects. Each case has the state fields of its point, plus an optional `label`: `true` when the right answer is yes (plan it, the patch is complete, the claim is supported, the default is risky), `false` when it is no.
+
+| Point | Fields | Actions printed |
+|---|---|---|
+| `plan` | `message` (non-empty string), `recent_conversation` (string, optional) | `skip-plan` when P is below `planSkipBelow`, else `plan` |
+| `ship` | `request` (non-empty string), `acceptance_criteria` (array of strings, optional), `patch` (string) | `veto` when P is at or below `shipVetoAtOrBelow`, `approve` when P is at or above `shipApproveAt`, else `pass` |
+| `knowledge` | `question`, `answer`, `document` (non-empty strings) | `reject-claim` when P is below `groundedAt`, else `keep` |
+| `blocking` | `task`, `question`, `default` (non-empty strings) | `promote` when P is at or above `blockingAt`, else `keep` |
+
+The fields go through the same caps as the live points (see [Privacy: Jev decisions](privacy.md#jev-decisions-openrouter)). Every case is checked before the first request. For example, `plan-cases.json`:
+
+```json
+[
+  { "message": "thanks, that works now", "label": false },
+  { "message": "Add OAuth login with GitHub to the web app", "label": true }
+]
+```
+
+`bin/ultrathink decisions probe plan plan-cases.json` then prints one line per case and a summary:
+
+```text
+#1 P 0.03 · skip-plan · label false · agree
+#2 P 0.97 · plan · label true · agree
+Decisions probe: plan · typesafe/jev-1.13-20260917 · cases 2 · labelled 2 · agree 2/2 · errors 0
+```
+
+- A case line is `#<n> P <P> · <action>`, plus ` · label <true|false> · agree` (or `DISAGREE`) when the case has a label. P is printed with two decimals, cut rather than rounded, so a printed value never crosses a threshold. A case whose decision failed prints `#<n> error (<kind>)`.
+- For `plan`, `knowledge` and `blocking`, a case agrees when `label: true` meets `plan`, `keep` or `promote` and `label: false` meets the other action. For `ship`, `label: true` agrees unless the action is `veto`, and `label: false` agrees unless it is `approve`.
+- The summary is `Decisions probe: <point> · <model> · cases <n> · labelled <m> · agree <a>/<m> · errors <e>`, with the resolved model of the first answered case.
+- Exit 0 when every case was answered, 1 when any case failed, when `ULTRATHINK_DECISIONS=0` is set (`Decisions probe: off (ULTRATHINK_DECISIONS=0)`, printed once the file is checked; no request is sent) or when there is no key (`Decisions probe: no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`). An unreadable or invalid file exits 2 before any request, with `Decisions probe: <reason>`, for example `Decisions probe: case #3: "message" must be a non-empty string` or `Decisions probe: plan-cases.json is not a JSON array of 1 to 200 cases`.
+
 ### `bin/ultrathink-mcp`
 
-The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md).
+The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md). It also keeps the OpenRouter API key for [Jev decisions](how-to/use-jev-decisions.md) in the same credential store; `openrouter` is an API-key provider, not an MCP server, so it is never served, checked or registered.
 
 ```text
 usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
+  (openrouter is API-key only: set-key, status and logout; never serve, check or login)
   ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
@@ -216,14 +289,16 @@ usage:
 | Command | Effect |
 |---|---|
 | `serve <provider>` | Stdio MCP server that relays to the hosted provider and adds credentials from the store. Hosts run this; `bun scripts/mcp-register.ts` registers it. `ULTRATHINK_MCP_DEBUG=1` logs relay events to stderr. When a credential is missing, the error says how to add one: for Notion `ultrathink-mcp auth login notion`; for Linear and Greptile either `auth login <provider>` (OAuth) or `auth set-key <provider> --stdin` (an API key from that account's settings). |
-| `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. |
-| `auth set-key <provider>` | Stores an API key for `linear` or `greptile`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. Notion has no API-key route. |
+| `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. The `openrouter` row reads `openrouter  api_key  ready  api key set (<n> chars)` or `openrouter  none  not ready  not configured`; the key itself is never printed. |
+| `auth set-key <provider>` | Stores an API key for `linear`, `greptile` or `openrouter`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. It prints only the key's length, for example `openrouter: api key stored (<n> chars)`. Notion has no API-key route. For Jev decisions: `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `bin/ultrathink-mcp auth set-key openrouter --env-file <file> --var OPENROUTER_API_KEY`. A stored `openrouter` key wins over `OPENROUTER_API_KEY`. |
 | `auth login <provider>` | OAuth login (Notion needs it; Linear and Greptile can use it instead of a key). See [OAuth login options](#oauth-login-options). |
 | `auth logout <provider>` | Removes that provider's credentials. |
-| `check [provider...]` | Runs `initialize` and `tools/list` against each provider (all three by default) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
+| `check [provider...]` | Runs `initialize` and `tools/list` against each provider (`notion`, `linear` and `greptile` by default; never `openrouter`) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
 | `track complete --state <file>` | Creates the rows still missing for a planned session, rewrites its spec and state file, and prints the linked TODO lines. `ultrathink-kickoff` runs this. Run it from the project directory: it reads the config files, including `<project>/.claude/ultrathink.json`, from the current directory. Does nothing (exit 0) when `/ultrathink-track off` is set or no tracker is configured. Exits 1 when the record cannot be read, has no plan, there are no tracker credentials, or tracking failed. |
 | `session mark --state <file> <kicked-off\|synced>` | Sets `kickedOff` or `synced` to `true` in the session record and prints nothing. `ultrathink-kickoff` runs it with `kicked-off` as its last step. The marks describe the plan now in the record: the session's next planned prompt writes a new graph with both back at `false`. A missing or unreadable record exits 1 and is left untouched. |
 | `notion init --parent <page>` | Creates the Agent Task Graph database under a Notion page. `--title` sets its name. `--write-config` saves `notion.dataSourceUrl` to `~/.config/ultrathink/config.json` (under `$XDG_CONFIG_HOME` when set). Exits 1 when Notion is not logged in, or when the database was created but its `Parent Item` self-relation could not be added. |
+
+`serve openrouter`, `check openrouter` and `auth login openrouter` exit 2 without any network call, printing `ultrathink-mcp: openrouter is an API-key provider, not an MCP server: store its key with ultrathink-mcp auth set-key openrouter --stdin` and then the usage text to stderr. `auth logout openrouter` removes the stored key.
 
 #### OAuth login options
 
@@ -257,6 +332,8 @@ usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.
 | `status` | Prints the stored ship state, including `attempts`: every review result and merge outcome (newest 50). |
 
 `--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it. `merge` is the only way the ship flow merges: agents must never merge any other way (no `gh pr merge`, no web UI), and a PR merged outside the flow without a passing review of its head is reported blocked, never recorded as a ship merge.
+
+With Jev decisions on (`decisions.enabled: true`, `ship` in `decisions.points` and an OpenRouter key), `assess` also asks Jev whether the patch fully delivers the request, alongside the engine judge, after the rule checks pass. Its JSON then gains `decision`: `{"p": <P>, "model": "<resolved model>", "action": "<action>"}`, or `{"action": "fail-open", "error": "<kind>"}` when Jev could not answer. It gains `"source": "jev"` only when Jev gave the verdict because there was no usable engine verdict, which happens only in gate mode with `ship.autoMerge` off. With Decisions off, the JSON is unchanged. See [Ship: Jev decision](ship.md#jev-decision).
 
 ### `scripts/setup.ts`
 
@@ -319,7 +396,7 @@ It prints one line per host and provider, `<host>: <provider> <action>`, where t
 
 | Program | Exit codes |
 |---|---|
-| `bin/ultrathink` | 0, including for unknown verbs (which print the usage text). |
+| `bin/ultrathink` | 0, including for unknown verbs (which print the usage text). `decisions check` and `decisions probe`: 0 on success, 1 on a failed decision, a missing OpenRouter key or `ULTRATHINK_DECISIONS=0`, 2 on a usage error or an invalid cases file. |
 | `bin/ultrathink-mcp` | 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr). During an `auth login` that set up a Tailscale route, Ctrl-C removes the route and exits 130 (143 on `SIGTERM`). |
 | `bin/ultrathink-ship` | 0, even when a step refuses (`ok: false` with a `reason`); 2 on a usage error. |
 | All three CLIs above | 127 when Bun is not found. When Bun is found but cannot start, the shell's own status (for example 126). |

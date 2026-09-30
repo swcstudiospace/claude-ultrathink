@@ -42,4 +42,7 @@ fi
 # bun and everything it starts must not inherit the CLI flag.
 unset ULTRATHINK_BUN_REQUIRED
 export PATH="$(dirname "$BUN_BIN"):${PATH:-/usr/bin:/bin}"
-exec "$BUN_BIN" "$@"
+# --no-env-file: a cloned repository's .env* must not reach ultrathink's environment (for example
+# OPENROUTER_API_KEY, ULTRATHINK_DECISIONS_URL, proxy or TLS variables). Bun 1.3.3 and later honour
+# it; older Bun ignores the flag and still loads .env* from the working directory.
+exec "$BUN_BIN" --no-env-file "$@"

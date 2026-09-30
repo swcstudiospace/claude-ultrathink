@@ -4,6 +4,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createDecisions } from "../decisions/gate.ts";
+import { DEFAULT_DECISIONS_CONFIG } from "../decisions/types.ts";
+import type { DecisionsConfig, DecisionsErrorKind } from "../decisions/types.ts";
 import type { Github, ReviewThreads } from "./github.ts";
 import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
@@ -871,4 +874,264 @@ describe("runShip", () => {
 			expect(calls).toEqual(["push:feat", "create:master<-feat", "review:7:abc", "merge:squash:abc", "delete:feat", "sync:master"]);
 		});
 	});
+});
+
+// Jev ship decision point through `ultrathink-ship assess` and `pr`. Canonical Decisions fixtures, defined per test file.
+const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
+interface Recorded {
+	url: string;
+	method: string;
+	headers: Record<string, string>;
+	body: unknown;
+}
+
+/** Recording fetch R: records every call, answers from a queue (last entry repeats). Installed as globalThis.fetch too. */
+function recordingFetch(queue: Array<() => Response | Promise<Response>>): { fetch: typeof fetch; calls: Recorded[] } {
+	const calls: Recorded[] = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const headers: Record<string, string> = {};
+		new Headers(init?.headers).forEach((value, key) => {
+			headers[key] = value;
+		});
+		const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : init?.body;
+		calls.push({ url: String(input), method: init?.method ?? "GET", headers, body });
+		const next = queue[Math.min(calls.length, queue.length) - 1];
+		if (!next) throw new Error("empty queue");
+		return next();
+	}) as typeof fetch;
+	globalThis.fetch = fetchImpl;
+	return { fetch: fetchImpl, calls };
+}
+
+const JEV =
+	(p: number, key = "plan_worthy") =>
+	() =>
+		Response.json({
+			id: "gen-dec-test",
+			model: "typesafe/jev-1.13-20260917",
+			provider: "TypeSafe",
+			answers: { [key]: { type: "noul", noul: p } },
+			usage: { input_tokens: 450, output_tokens: 0, cost: 0.000019 },
+		});
+const ERR = (s: number, headers?: Record<string, string>) => () =>
+	Response.json({ error: { code: s, message: `upstream said no for ${K}` } }, { status: s, headers });
+
+/** Never resolves; rejects with an AbortError when its signal fires (as src/grok/complete.test.ts hangingFetch). */
+function hangingFetch(onCall?: () => void): typeof fetch {
+	return ((_input: string | URL | Request, init?: RequestInit) =>
+		new Promise<Response>((_resolve, reject) => {
+			init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			onCall?.();
+		})) as typeof fetch;
+}
+
+const COMPLETE = "complete";
+const MODEL = "typesafe/jev-1.13-20260917";
+const JEV_ON: DecisionsConfig = { ...DEFAULT_DECISIONS_CONFIG, enabled: true, points: [...DEFAULT_DECISIONS_CONFIG.points] };
+const DONE_REPLY = JSON.stringify({ done: true, confidence: 0.9, summary: "ok", gaps: [] });
+/** A session record the real judge can read (the shared fixture has no spec XML). */
+const SPEC_STATE = JSON.stringify({
+	sessionId: "s",
+	at: 1,
+	result: { xml: "<spec/>", original: "ship it", root: "", source: "llm" },
+	kickedOff: true,
+});
+const realFetch = globalThis.fetch;
+
+/** Every failure of AC-4.1–4.9, as a fresh fetch per runtime. */
+const FAILURES: { name: string; kind: DecisionsErrorKind; fetch: () => typeof fetch; timeoutMs?: number }[] = [
+	{ name: "401", kind: "auth", fetch: () => recordingFetch([ERR(401)]).fetch },
+	{ name: "402", kind: "credits", fetch: () => recordingFetch([ERR(402)]).fetch },
+	{ name: "400", kind: "bad-request", fetch: () => recordingFetch([ERR(400)]).fetch },
+	{ name: "429 twice", kind: "rate-limit", fetch: () => recordingFetch([ERR(429)]).fetch },
+	...[500, 502, 503, 524, 529].map((status) => ({
+		name: `${status} twice`,
+		kind: "upstream" as const,
+		fetch: () => recordingFetch([ERR(status)]).fetch,
+	})),
+	{ name: "a hanging request", kind: "timeout", fetch: () => hangingFetch(), timeoutMs: 50 },
+	{ name: "a body that is not JSON", kind: "invalid-response", fetch: () => recordingFetch([() => new Response("{not json")]).fetch },
+	{
+		name: "a missing answer key",
+		kind: "invalid-response",
+		fetch: () =>
+			recordingFetch([
+				() => Response.json({ model: MODEL, answers: {}, usage: { input_tokens: 450, output_tokens: 0, cost: 0.000019 } }),
+			]).fetch,
+	},
+	{ name: "a noul out of range", kind: "invalid-response", fetch: () => recordingFetch([JEV(1.5, COMPLETE)]).fetch },
+];
+
+/** T6: the key and a bearer header never reach a collected output. */
+function expectNoKey(...outputs: unknown[]): void {
+	for (const output of outputs) {
+		const text = typeof output === "string" ? output : JSON.stringify(output);
+		expect(text).not.toContain(K);
+		expect(text).not.toContain("Bearer sk-or-");
+	}
+}
+
+describe("runShip assess with Jev (DP-SHIP)", () => {
+	let bodies: string[];
+	let debug: string[];
+	beforeEach(() => {
+		bodies = [];
+		debug = [];
+		writeFileSync(statePath, SPEC_STATE);
+	});
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+	});
+
+	/** The real assessDone with a Jev runtime (K only in its injected env), an optional judge reply and PR bodies captured. */
+	function jevShip(o: { fetch: typeof fetch; judge?: string; config?: Partial<ShipConfig>; decisions?: Partial<DecisionsConfig> }): ShipDeps {
+		const base = deps({ config: o.config });
+		const github = base.github(dir);
+		const { judge } = o;
+		return {
+			...base,
+			assess: assessDone,
+			engine: async () => (judge === undefined ? undefined : async () => judge),
+			github: () => ({ ...github, createPr: (input) => (bodies.push(input.body), github.createPr(input)) }),
+			decisions: (record) =>
+				createDecisions({
+					config: { ...JEV_ON, ...o.decisions },
+					sessionId: record.sessionId,
+					env: { OPENROUTER_API_KEY: K },
+					storePath: join(dir, "mcp-credentials.json"),
+					fetch: o.fetch,
+					sleep: async () => {},
+					random: () => 0.5,
+					debug: (line) => debug.push(line),
+				}),
+		};
+	}
+
+	test("Decisions off: zero requests, and assess JSON and PR body equal the run without a Jev runtime", async () => {
+		const r = recordingFetch([JEV(0.03, COMPLETE)]);
+		const d = jevShip({ fetch: r.fetch, judge: DONE_REPLY, decisions: { enabled: false } });
+		const baseline = await ship("assess", { ...d, decisions: undefined });
+		expect((await ship("pr", { ...d, decisions: undefined })).output.ok).toBe(true);
+		writeFileSync(statePath, SPEC_STATE);
+		const off = await ship("assess", d);
+		expect(off.output).toEqual(baseline.output);
+		expect((await ship("pr", d)).output.ok).toBe(true);
+		expect(bodies).toHaveLength(2);
+		expect(bodies[1]).toBe(bodies[0]);
+		expect(bodies[1]).not.toContain("Jev");
+		expect(r.calls).toHaveLength(0);
+	});
+
+	test("under autoMerge a Jev-only verdict never stands in for the judge: main's outcome, Jev recorded as none", async () => {
+		const offline = jevShip({ fetch: recordingFetch([JEV(0.95, COMPLETE)]).fetch });
+		const throwing: ShipDeps = {
+			...offline,
+			engine: async () => async () => {
+				throw new Error("offline");
+			},
+		};
+		const cases: [ShipDeps, string][] = [
+			[offline, "no judge available"],
+			[throwing, "assessment unavailable: offline"],
+		];
+		for (const [d, gap] of cases) {
+			writeFileSync(statePath, SPEC_STATE);
+			const out = await ship("assess", d);
+			expect(out.output).toMatchObject({ ok: true, done: false, decision: { p: 0.95, model: MODEL, action: "none" } });
+			expect(out.output.gaps).toContain(gap);
+			expect("source" in out.output).toBe(false);
+			expect(readShip(statePath)?.assessment).toMatchObject({ done: false, decision: { action: "none" } });
+			expect((await ship("pr", d)).output).toMatchObject({ ok: false, reason: "task not assessed as done; run assess first" });
+		}
+		expect(bodies).toEqual([]);
+
+		writeFileSync(statePath, SPEC_STATE);
+		const vetoed = await ship("assess", jevShip({ fetch: recordingFetch([JEV(0.03, COMPLETE)]).fetch, judge: DONE_REPLY }));
+		expect(vetoed.output).toMatchObject({ ok: true, done: false, decision: { p: 0.03, action: "veto" } });
+	});
+
+	test("without autoMerge a Jev approval stands in for a missing judge (AC-6.4)", async () => {
+		const r = recordingFetch([JEV(0.79, COMPLETE)]);
+		const out = await ship("assess", jevShip({ fetch: r.fetch, config: { autoMerge: false } }));
+		expect(out.output).toMatchObject({ ok: true, done: true, source: "jev", gaps: [], decision: { p: 0.79, model: MODEL, action: "approve" } });
+		expect(readShip(statePath)?.assessment).toMatchObject({ done: true, source: "jev" });
+		expect(r.calls).toHaveLength(1);
+	});
+
+	test("advisory mode ships and the PR body ends ## Assessment with the Jev line (AC-6.10)", async () => {
+		const cases: [number, string][] = [
+			[0.94, `- Jev: P(complete) 0.94 · ${MODEL}`],
+			[0.03, `- Jev: P(complete) 0.03 · ${MODEL} · veto (advisory: shipped anyway)`],
+		];
+		for (const [p, line] of cases) {
+			writeFileSync(statePath, SPEC_STATE);
+			const d = jevShip({ fetch: recordingFetch([JEV(p, COMPLETE)]).fetch, judge: DONE_REPLY, config: { judge: "advisory" } });
+			const assess = await ship("assess", d);
+			expect(assess.output).toMatchObject({ ok: true, done: true, mode: "advisory", decision: { p, model: MODEL } });
+			expect((await ship("pr", d)).output.ok).toBe(true);
+			const section = bodies.at(-1)?.split("## Assessment\n\n")[1]?.split("\n\n")[0]?.trimEnd() ?? "";
+			expect(section.split("\n").at(-1)).toBe(line);
+		}
+	});
+
+	test("assess JSON carries the decision and the stored assessment the DecisionRecord (AC-6.11)", async () => {
+		const ok = await ship("assess", jevShip({ fetch: recordingFetch([JEV(0.94, COMPLETE)]).fetch, judge: DONE_REPLY }));
+		expect(ok.output).toMatchObject({ ok: true, done: true });
+		expect(ok.output.decision).toEqual({ p: 0.94, model: MODEL, action: "none" });
+		expect("source" in ok.output).toBe(false);
+		expect(readShip(statePath)?.assessment?.decision).toMatchObject({
+			point: "ship",
+			outcome: "ok",
+			model: MODEL,
+			id: "gen-dec-test",
+			p: 0.94,
+			probabilities: { complete: 0.94 },
+			action: "none",
+			threshold: 0.2,
+			attempts: 1,
+			cost: 0.000019,
+		});
+		const okState = readFileSync(statePath, "utf8");
+
+		writeFileSync(statePath, SPEC_STATE);
+		const failed = await ship("assess", jevShip({ fetch: recordingFetch([ERR(402)]).fetch, judge: DONE_REPLY }));
+		expect(failed.output).toMatchObject({ ok: true, done: true });
+		expect(failed.output.decision).toEqual({ action: "fail-open", error: "credits" });
+		expect(readShip(statePath)?.assessment?.decision).toMatchObject({
+			point: "ship",
+			outcome: "error",
+			error: "credits",
+			action: "fail-open",
+			probabilities: {},
+			attempts: 1,
+		});
+		expectNoKey(ok.output, failed.output, okState, readFileSync(statePath, "utf8"), debug);
+	});
+
+	for (const failure of FAILURES) {
+		test(`${failure.name}: assess fails open and its JSON and PR body name the kind (AC-4.12)`, async () => {
+			const decisions: Partial<DecisionsConfig> = { points: ["ship"], ...(failure.timeoutMs ? { timeoutMs: failure.timeoutMs } : {}) };
+			const judged = jevShip({ fetch: failure.fetch(), judge: DONE_REPLY, decisions });
+			const baseline = await ship("assess", { ...judged, decisions: undefined });
+			const withJudge = await ship("assess", judged);
+			const { decision, ...rest } = withJudge.output;
+			expect(rest).toEqual(baseline.output);
+			expect(rest).toMatchObject({ ok: true, done: true, gaps: [] });
+			expect(decision).toEqual({ action: "fail-open", error: failure.kind });
+			expect((await ship("pr", judged)).output.ok).toBe(true);
+			const body = bodies.at(-1) ?? "";
+			const section = body.split("## Assessment\n\n")[1]?.split("\n\n")[0]?.trimEnd() ?? "";
+			expect(section.split("\n").at(-1)).toBe(`- Jev: error (${failure.kind})`);
+
+			writeFileSync(statePath, SPEC_STATE);
+			const bare = jevShip({ fetch: failure.fetch(), decisions });
+			const bareBaseline = await ship("assess", { ...bare, decisions: undefined });
+			const withoutJudge = await ship("assess", bare);
+			const { decision: bareDecision, ...bareRest } = withoutJudge.output;
+			expect(bareRest).toEqual(bareBaseline.output);
+			expect(bareRest).toMatchObject({ done: false, gaps: ["no judge available"] });
+			expect(bareDecision).toEqual({ action: "fail-open", error: failure.kind });
+			expectNoKey(withJudge.output, withoutJudge.output, body, readFileSync(statePath, "utf8"), debug);
+		});
+	}
 });
