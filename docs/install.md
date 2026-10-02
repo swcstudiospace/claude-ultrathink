@@ -75,10 +75,12 @@ Optional:
 | Greptile CLI (`greptile login`) | Ship's CLI review mode |
 | Notion, Linear, Greptile credentials | [Tracking](tracking.md) and ship, through the [shared MCP gateway](#shared-mcp-gateway) |
 | An OpenRouter API key (`bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) | [Jev decisions](how-to/use-jev-decisions.md) (opt-in, `decisions.enabled`): it is stored in the same credential store, but `openrouter` is not an MCP server and is never registered in a host |
+| A Hindsight API key (`bin/ultrathink-mcp auth set-key hindsight --stdin`, or `HINDSIGHT_API_KEY` / `HINDSIGHT_API_TOKEN`) | [Hindsight](how-to/connect-hindsight.md) (opt-in, `hindsight.enabled`). Not an MCP server. |
+| A RAGFlow API key (`bin/ultrathink-mcp auth set-key ragflow --stdin`, or `RAGFLOW_API_KEY`) | [RAGFlow](how-to/connect-ragflow.md) (opt-in, `ragflow.enabled`). Not an MCP server. |
 
-A fresh install only plans prompts. Linear and Notion tracking, ship, the Agent Substrate brief and the Tailscale OAuth callback are all off until you configure them. See [Configuration](configuration.md) and [Tracking](tracking.md).
+A fresh install only plans prompts. Linear and Notion tracking, ship, the Agent Substrate brief, Hindsight, RAGFlow, Teachable Moments and the Tailscale OAuth callback are all off until you configure them. See [Configuration](configuration.md) and [Tracking](tracking.md).
 
-Each host keeps its own state directory. Planning never writes `.planning/` into your working directory.
+Each host keeps its own state directory. Planning never writes `.planning/` into your working directory. Teachable Moments state, when you turn it on, is `<state directory>/teach/`, never `<cwd>/.planning`.
 
 | Host | State directory | `ULTRATHINK_HOST` id |
 |---|---|---|
@@ -175,7 +177,9 @@ See [Upgrade and move](how-to/upgrade-and-move.md#upgrade) and [Uninstall](how-t
 
 ## Hermes Agent
 
-Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. It needs Python 3.10 or later. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` (or through `$BUN` when set) and returns the plan as context. Hermes gives the hook no working directory, so the planner uses the tools' directory from `TERMINAL_CWD` (set by the gateway and `hermes -w`), falling back to the directory Hermes started in; the repository, branch and project config come from there. The plugin also registers the `/ultrathink-<verb>` commands, the `ultrathink-sync` nudges, and the four ultrathink skills. Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
+Hermes loads `hosts/hermes`, a Python plugin with `plugin.yaml` and `register()`. It needs Python 3.10 or later. Its `pre_llm_call` hook sends the prompt to `hooks/engine.ts` through `bin/run-bun` (or through `$BUN` when set) and returns the plan as context. Hermes gives the hook no working directory, so the planner uses the tools' directory from `TERMINAL_CWD` (set by the gateway and `hermes -w`), falling back to the directory Hermes started in; the repository, branch and project config come from there. The plugin also registers the `/ultrathink-<verb>` commands, the `ultrathink-sync` nudges, and the five ultrathink skills (`ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan`, `ultrathink-ship`, `ultrathink-teach`). Hermes does not list plugin skills in the model's system prompt, so they load as `ultrathink:<name>` with `skill_view` (for example `ultrathink:ultrathink-kickoff`), and every instruction that names one also gives its absolute `SKILL.md` path.
+
+`hosts/hermes/plugin.yaml` lists every hook: `pre_llm_call`, `transform_tool_result`, `post_tool_call`, `pre_verify`, `subagent_start`, `post_llm_call` and `on_session_finalize`. It also lists the tools `ultrathink_lesson_save` and `ultrathink_lesson_recall`. `register()` adds those two hooks, the two tools (hidden while `teach status` reports Teachable Moments off), the commands `/ultrathink-learn` and `/ultrathink-lessons`, and the skill `ultrathink-teach`. `post_llm_call` hands a finished turn to a detached `teach observe` when capture is `observe` or `auto`. `on_session_finalize` starts a detached `teach sync`. All of that fails open. Nothing in the plugin writes `~/.hermes/skills`. A Hermes skill is installed through Hermes `skill_manage`, so `skills.write_approval` applies. Teachable Moments state lives under the Hermes state directory's `teach/` (`${HERMES_HOME:-~/.hermes}/ultrathink/teach/`), never under `<cwd>/.planning`. See [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
 
 ### Install
 
@@ -195,7 +199,7 @@ The planner reads the cap Hermes enforces and stops the engine after `min(540, c
 
 If your Hermes version does not report its hook cap to plugins, the planner reads `plugins.hook_callback_timeout` from the active profile's config: `${HERMES_HOME:-~/.hermes}/config.yaml` (or, when `active_profile` names a Hermes profile, `${HERMES_HOME:-~/.hermes}/profiles/<name>/config.yaml`). If that file sets none, it assumes Hermes' 30 s default and therefore never plans. Either way it logs one warning that names the value it used and the same fix. See [Troubleshooting](troubleshooting.md#hermes-the-plan-never-arrives).
 
-ultrathink only registers hooks, commands and skills. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`).
+ultrathink registers hooks, commands, skills and the two lesson tools. It does not replace built-in tools, so if `enable` asks about tool override, decline (or pass `--no-allow-tool-override`).
 
 If another Hermes plugin already plans or rewrites prompts, disable it. Otherwise both will plan the same turn.
 
@@ -212,9 +216,9 @@ In gateways such as Telegram, `/ultrathink-quick` needs `plugins.entries.ultrath
 ### Verify
 
 1. `hermes config get plugins.hook_callback_timeout` prints `600`.
-2. `hermes plugins doctor ultrathink` prints `OK: runtime discovery, manifest parsing, import, and registration passed` with 6 hooks registered, and `hermes plugins list` shows `ultrathink` as enabled.
+2. `hermes plugins doctor ultrathink` prints `OK: runtime discovery, manifest parsing, import, and registration passed`, and `hermes plugins list` shows `ultrathink` as enabled. The plugin registers the hooks in `hosts/hermes/plugin.yaml`, including `post_llm_call` and `on_session_finalize`.
 3. Start a Hermes session and run `/ultrathink-status`. Hermes replies inline with the state.
-4. In a Hermes session, ask the agent to call its `skills_list` tool. The result includes `ultrathink:ultrathink-kickoff` and the other three ultrathink skills.
+4. In a Hermes session, ask the agent to call its `skills_list` tool. The result includes `ultrathink:ultrathink-kickoff`, `ultrathink:ultrathink-teach` and the other ultrathink skills.
 5. Send a non-trivial prompt. The short handoff reaches the model as context before its first call, the agent loads `ultrathink:ultrathink-kickoff`, and `${HERMES_HOME:-~/.hermes}/logs/agent.log` gets no new `Hook 'pre_llm_call' callback on_pre_llm_call timed out` line and no `ultrathink:` warning.
 
 Verified live on Hermes Agent v0.21.4 through its real CLI command dispatcher: `/ultrathink-status`, `/ultrathink-track off`, and `/ultrathink-quick`, which injected the message with no plan.

@@ -14,6 +14,8 @@ import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
 import { readSession, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 import type { TrackingRefs } from "../track/types.ts";
+import type { GroundOutcome } from "../ragflow/types.ts";
+import type { RecalledLesson, RecallOutcome } from "../teach/types.ts";
 
 function tempStateDir(): { dir: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-hook-"));
@@ -1247,7 +1249,7 @@ describe("Jev plan gate", () => {
 		);
 		const config = loadConfig(claudeConfigPaths(project, { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") }));
 		expect(Object.keys(config.decisions).sort()).toEqual(
-			["blockingAt", "enabled", "groundedAt", "model", "planSkipBelow", "points", "shipApproveAt", "shipVetoAtOrBelow", "timeoutMs", "zdr"],
+			["blockingAt", "enabled", "groundedAt", "model", "planSkipBelow", "points", "shipApproveAt", "shipVetoAtOrBelow", "skillworthyAt", "teachableAutoAt", "teachableBelow", "timeoutMs", "zdr"],
 		);
 		expect(JSON.stringify(config.decisions)).not.toContain("evil.example");
 		const R = recordingFetch([JEV(0.04)]);
@@ -1391,4 +1393,363 @@ describe("Jev knowledge and blocking points through the hook", () => {
 		},
 		30_000,
 	);
+});
+
+describe("lessons and RAGFlow documents in the plan", () => {
+	const lesson: RecalledLesson = {
+		id: "l1",
+		name: "Run migrations first MARKER_L1",
+		description: "Seeding before migrating fails",
+		body: "MARKER_L1 run the migration before the seed script",
+		kind: "pitfall",
+		project: "widgets",
+		host: "claude-code",
+		occurrences: 2,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		source: "local",
+	};
+	const recalled: RecallOutcome = { status: "used", lessons: [lesson], source: "local", chars: 200, ms: 5 };
+	const grounded: GroundOutcome = {
+		status: "used",
+		chunks: [{ id: "c1", content: "MARKER_D1 widgets are stored in the widgets table", documentName: "storage.md" }],
+		chars: 120,
+		ms: 7,
+		datasets: 1,
+	};
+	const never = (): Promise<never> => Promise.withResolvers<never>().promise;
+
+	function echoConfig(): UltrathinkConfig {
+		const config = trackedConfig();
+		config.claude = { ...config.claude, echo: true };
+		return config;
+	}
+
+	function contextOf(result: PromptSubmitResult): string {
+		return result.output?.hookSpecificOutput.additionalContext ?? "";
+	}
+
+	/** The planned context with the random graph id replaced, so two runs on one state dir compare equal. */
+	function plannedContext(result: PromptSubmitResult): unknown {
+		return normalized(result.output?.hookSpecificOutput, result.record?.plan?.graphId);
+	}
+
+	test("a used lookup adds both sections after the brief and before the spec, and the record and summary say so", async () => {
+		const { deps, cleanup } = baseDeps({
+			config: echoConfig(),
+			complete: smartComplete(),
+			clarify: async () => [],
+			brief: async () => "## Substrate brief: acme/widgets\n- 09:04 cursor edited widget.ts",
+			recall: async () => recalled,
+			ground: async () => grounded,
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const context = contextOf(result);
+			const at = (needle: string) => context.indexOf(needle);
+			expect(at("## Agent Substrate brief")).toBeGreaterThan(-1);
+			expect(at("## Agent Substrate brief")).toBeLessThan(at("## Lessons from earlier work"));
+			expect(at("## Lessons from earlier work")).toBeLessThan(at("## Documents (RAGFlow)"));
+			expect(at("## Documents (RAGFlow)")).toBeLessThan(at("<BUILD_PROMPT>"));
+			expect(context).toContain("MARKER_L1");
+			expect(context).toContain("MARKER_D1");
+			expect(result.output?.systemMessage).toContain("Lessons · 1 recalled (local)");
+			expect(result.output?.systemMessage).toContain("Docs · 1 excerpt (RAGFlow)");
+
+			// The record keeps the lookups, never their text, and reads back from disk.
+			expect(result.record?.lessons).toMatchObject({ outcome: "used", count: 1, ids: ["l1"], source: "local" });
+			expect(result.record?.docs).toMatchObject({ status: "used", count: 1, datasets: 1 });
+			const stored = readSession(deps.stateDir, "s1");
+			expect(stored?.lessons).toEqual(result.record?.lessons);
+			expect(stored?.docs).toEqual(result.record?.docs);
+			expect(JSON.stringify(stored)).not.toContain("MARKER_L1");
+			expect(JSON.stringify(stored)).not.toContain("MARKER_D1");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("off, none and error lookups leave the planner text exactly as without them", async () => {
+		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [] });
+		try {
+			const base = await runPromptSubmit(input, deps);
+			const quiet: Array<[RecallOutcome, GroundOutcome]> = [
+				[
+					{ status: "off", lessons: [], source: "none", chars: 0, ms: 0, reason: "disabled" },
+					{ status: "off", chunks: [], chars: 0, ms: 0, datasets: 0, reason: "grounding is off" },
+				],
+				[
+					{ status: "none", lessons: [], source: "none", chars: 0, ms: 1 },
+					{ status: "none", chunks: [], chars: 0, ms: 1, datasets: 1 },
+				],
+				[
+					{ status: "error", lessons: [], source: "none", chars: 0, ms: 1, reason: "hindsight unreachable" },
+					{ status: "error", chunks: [], chars: 0, ms: 1, datasets: 0, reason: "auth" },
+				],
+			];
+			for (const [lessons, docs] of quiet) {
+				const result = await runPromptSubmit(input, { ...deps, recall: async () => lessons, ground: async () => docs });
+				expect(plannedContext(result)).toEqual(plannedContext(base));
+				expect(contextOf(result)).not.toContain("## Lessons from earlier work");
+				expect(contextOf(result)).not.toContain("## Documents (RAGFlow)");
+				const summary = result.output?.systemMessage ?? "";
+				expect(summary).not.toContain("recalled");
+				expect(summary).not.toContain("excerpt");
+				if (lessons.status === "error") {
+					expect(summary).toContain("Lessons · error (hindsight unreachable)");
+					expect(summary).toContain("Docs · error (auth)");
+				} else {
+					expect(summary).not.toContain("Lessons");
+					expect(summary).not.toContain("Docs");
+				}
+				expect(result.record?.lessons?.outcome).toBe(lessons.status);
+				expect(result.record?.docs?.status).toBe(docs.status);
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("with nothing configured nothing runs, nothing is contacted and the record is unchanged", async () => {
+		const R = recordingFetch([() => new Response("")]);
+		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, fetch: R.fetch } });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record).not.toHaveProperty("lessons");
+			expect(result.record).not.toHaveProperty("docs");
+			expect(contextOf(result)).not.toContain("## Lessons from earlier work");
+			expect(contextOf(result)).not.toContain("## Documents (RAGFlow)");
+			expect(R.calls).toHaveLength(0);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a throwing seam fails open: the plan is the same and the record names an error, not the message", async () => {
+		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [] });
+		try {
+			const base = await runPromptSubmit(input, deps);
+			const result = await runPromptSubmit(input, {
+				...deps,
+				recall: async () => {
+					throw new Error("add a widget: the prompt text leaked into this message");
+				},
+				ground: () => {
+					throw new TypeError("synchronous failure with the prompt");
+				},
+			});
+			expect(plannedContext(result)).toEqual(plannedContext(base));
+			expect(result.record?.lessons).toMatchObject({ outcome: "error", count: 0, reason: "error" });
+			expect(result.record?.docs).toMatchObject({ status: "error", count: 0, reason: "TypeError" });
+			expect(JSON.stringify(result.record)).not.toContain("leaked");
+			expect(result.output?.systemMessage).toContain("Lessons · error (error)");
+			expect(result.output?.systemMessage).toContain("Docs · error (TypeError)");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a hanging seam is cut off by its timeout and an aborting one sees its signal fire", async () => {
+		const config = echoConfig();
+		config.teach.timeoutMs = 20;
+		config.ragflow.timeoutMs = 20;
+		const { deps, cleanup } = baseDeps({ config, complete: smartComplete(), clarify: async () => [] });
+		try {
+			const base = await runPromptSubmit(input, deps);
+			const started = Date.now();
+			const hung = await runPromptSubmit(input, { ...deps, recall: never, ground: never });
+			expect(Date.now() - started).toBeLessThan(2_000);
+			expect(plannedContext(hung)).toEqual(plannedContext(base));
+			expect(hung.record?.lessons).toMatchObject({ outcome: "error", reason: "timeout" });
+			expect(hung.record?.docs).toMatchObject({ status: "error", reason: "timeout" });
+
+			const signals: AbortSignal[] = [];
+			const abortable = (signal: AbortSignal): Promise<never> => {
+				signals.push(signal);
+				const { promise, reject } = Promise.withResolvers<never>();
+				signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+				return promise;
+			};
+			const aborted = await runPromptSubmit(input, { ...deps, recall: ({ signal }) => abortable(signal), ground: ({ signal }) => abortable(signal) });
+			expect(signals).toHaveLength(2);
+			expect(signals.every((signal) => signal.aborted)).toBe(true);
+			expect(plannedContext(aborted)).toEqual(plannedContext(base));
+			expect(aborted.record?.lessons).toMatchObject({ outcome: "error", reason: "AbortError" });
+			expect(aborted.record?.docs).toMatchObject({ status: "error", reason: "AbortError" });
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("both lookups start before the uplift call and see only the user's own words", async () => {
+		const order: string[] = [];
+		const queries: Array<{ query: string; cwd: string }> = [];
+		const complete = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			complete: async (system, user) => {
+				if (user.includes("<user_request>")) {
+					order.push("uplift");
+					return "<BUILD_PROMPT><ORIGINAL>add a widget</ORIGINAL><NOTES>SPEC_ONLY_TOKEN</NOTES></BUILD_PROMPT>";
+				}
+				return complete(system, user);
+			},
+			clarify: async () => [],
+			conversation: () => "User: PRIOR_HISTORY_TOKEN\n\nAssistant: ok",
+			recall: async ({ query, cwd }) => {
+				order.push("recall");
+				queries.push({ query, cwd });
+				return recalled;
+			},
+			ground: async ({ query }) => {
+				order.push("ground");
+				queries.push({ query, cwd: "" });
+				return grounded;
+			},
+		});
+		try {
+			await runPromptSubmit(input, deps);
+			expect(order.slice(0, 3).sort()).toEqual(["ground", "recall", "uplift"]);
+			expect(order.indexOf("uplift")).toBe(2);
+			expect(queries.map((q) => q.query)).toEqual(["add a widget", "add a widget"]);
+			expect(queries[0]?.cwd).toBe("/repo");
+			for (const { query } of queries) {
+				expect(query).not.toContain("SPEC_ONLY_TOKEN");
+				expect(query).not.toContain("PRIOR_HISTORY_TOKEN");
+				expect(query).not.toContain("<BUILD_PROMPT");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the query is cut to 1,500 characters", async () => {
+		const queries: string[] = [];
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			recall: async ({ query }) => {
+				queries.push(query);
+				return recalled;
+			},
+		});
+		try {
+			await runPromptSubmit({ ...input, prompt: `add a widget ${"x".repeat(3_000)}` }, deps);
+			expect(queries).toHaveLength(1);
+			expect(queries[0]).toHaveLength(1_500);
+			expect(queries[0]?.startsWith("add a widget xxx")).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("skill invocations and uplift: prompts are planned, so they get lessons and documents too", async () => {
+		const queries: string[] = [];
+		const { deps, cleanup } = baseDeps({
+			config: echoConfig(),
+			complete: smartComplete(),
+			clarify: async () => [],
+			recall: async ({ query }) => {
+				queries.push(query);
+				return recalled;
+			},
+			ground: async () => grounded,
+		});
+		try {
+			const skilled = await runPromptSubmit(
+				{ ...input, prompt: "fix the login redirect", skill: { name: "gsd-quick", instruction: "fix the login redirect", summary: "Fast atomic task.", source: "omp" } },
+				deps,
+			);
+			expect(contextOf(skilled)).toContain("MARKER_L1");
+			expect(contextOf(skilled)).toContain("MARKER_D1");
+			const forced = await runPromptSubmit({ ...input, prompt: "uplift: thanks" }, deps);
+			expect(contextOf(forced)).toContain("MARKER_L1");
+			expect(queries).toEqual(["fix the login redirect", "thanks"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a prompt the plan gate or the trivial check skips never looks anything up", async () => {
+		const calls = { recall: 0, ground: 0 };
+		const seams = {
+			recall: async () => {
+				calls.recall++;
+				return recalled;
+			},
+			ground: async () => {
+				calls.ground++;
+				return grounded;
+			},
+		};
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(onConfig(), R.fetch, seams);
+		try {
+			expect((await runPromptSubmit({ ...input, prompt: ACK }, h.deps)).skipped).toBe("jev-skip");
+			expect((await runPromptSubmit({ ...input, prompt: "thanks" }, { ...h.deps, config: trackedConfig() })).skipped).toBe("skip");
+			expect(calls).toEqual({ recall: 0, ground: 0 });
+			// The same seams do run for a prompt that is planned.
+			const planned = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...h.deps, config: trackedConfig() });
+			expect(planned.record).toBeDefined();
+			expect(calls).toEqual({ recall: 1, ground: 1 });
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("child invocations and subagent sessions never look anything up, and still plan", async () => {
+		const calls = { recall: 0, ground: 0 };
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			recall: async () => {
+				calls.recall++;
+				return recalled;
+			},
+			ground: async () => {
+				calls.ground++;
+				return grounded;
+			},
+		});
+		const saved = process.env.ULTRATHINK_CHILD;
+		try {
+			const subagent = { ...input, agent_id: "agent-7" };
+			const sub = await runPromptSubmit(subagent, deps);
+			expect(sub.record).toBeDefined();
+			expect(contextOf(sub)).not.toContain("MARKER_L1");
+			expect(calls).toEqual({ recall: 0, ground: 0 });
+
+			process.env.ULTRATHINK_CHILD = "1";
+			const child = await runPromptSubmit(input, deps);
+			expect(child.record).toBeDefined();
+			expect(contextOf(child)).not.toContain("MARKER_L1");
+			expect(child.record).not.toHaveProperty("lessons");
+			expect(calls).toEqual({ recall: 0, ground: 0 });
+		} finally {
+			if (saved === undefined) delete process.env.ULTRATHINK_CHILD;
+			else process.env.ULTRATHINK_CHILD = saved;
+			cleanup();
+		}
+	});
+
+	test("the default wiring recalls from the local store and grounds only when configured, with no network", async () => {
+		const R = recordingFetch([() => new Response("")]);
+		const config = echoConfig();
+		config.teach.enabled = true;
+		config.ragflow.enabled = true;
+		config.ragflow.ground = true;
+		const { deps, cleanup } = baseDeps({ config, complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, fetch: R.fetch } });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.lessons).toMatchObject({ outcome: "none", count: 0, source: "none" });
+			expect(result.record?.docs).toMatchObject({ status: "off", count: 0 });
+			expect(contextOf(result)).not.toContain("## Lessons from earlier work");
+			expect(R.calls).toHaveLength(0);
+
+			// The kill switch beats the config.
+			const killed = await runPromptSubmit(input, { ...deps, decisionsDeps: { env: { ULTRATHINK_TEACH: "0" }, fetch: R.fetch } });
+			expect(killed.record?.lessons?.outcome).toBe("off");
+			expect(R.calls).toHaveLength(0);
+		} finally {
+			cleanup();
+		}
+	});
 });

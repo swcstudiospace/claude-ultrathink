@@ -5,7 +5,7 @@ ultrathink fails open. When something is wrong, your prompt still goes through, 
 In the commands below, `<clone>` is the absolute path of your checkout. Paths written as `${NAME:-default}` use the environment variable when you set it, and the default otherwise.
 
 - [First checks](#first-checks)
-- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked) · [Greptile knowledge base](#greptile-knowledge-base) · [Decisions](#decisions)
+- By symptom: [Nothing happens](#nothing-happens) · [My control command printed nothing](#my-control-command-printed-nothing) · [Every plan shows fallback](#every-plan-shows-fallback) · [bun not found](#bun-not-found) · [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured) · [The plan is slow or cut off](#the-plan-is-slow-or-cut-off) · [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) · [Tracking rows don't appear](#tracking-rows-dont-appear) · [Linear rate limit](#linear-rate-limit) · [Notion OAuth over SSH](#notion-oauth-over-ssh) · [Ship is blocked](#ship-is-blocked) · [Greptile knowledge base](#greptile-knowledge-base) · [Decisions](#decisions) · [Hindsight](#hindsight) · [RAGFlow](#ragflow) · [Teachable Moments](#teachable-moments) · [Redaction](#redaction)
 - By host: [Claude Code](#claude-code) · [Grok Build](#grok-build) · [Muse Code](#muse-code) · [Hermes Agent](#hermes-agent) · [Omp](#omp)
 - [Uninstalling](#uninstalling)
 
@@ -27,6 +27,9 @@ Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Decisions: off (opt-in: set decisions.enabled)
+Hindsight: off (opt-in: set hindsight.enabled)
+RAGFlow: off (opt-in: set ragflow.enabled)
+Teach: off (opt-in: set teach.enabled)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -44,6 +47,9 @@ What the less obvious lines mean:
 | `Ship: …` | The PR, review and merge loop. Off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` turns it off for that shell. When on, it shows whether `autoMerge` and `deleteBranch` are on. |
 | `Knowledge base: …` | The Greptile knowledge-base read before the clarifying questions. Off unless you set `hitl.knowledgeBase`. See [Greptile knowledge base](#greptile-knowledge-base). |
 | `Decisions: …` | Jev decisions through the OpenRouter Decisions API. `Decisions: off (opt-in: set decisions.enabled)` until you set `decisions.enabled` in your own config (a project file cannot turn it on), and `Decisions: off (ULTRATHINK_DECISIONS=0)` whenever that variable is set, whatever the config says. When on, it shows the model, the active points, where the key came from (`key from store` or `key from OPENROUTER_API_KEY`, never the key) and whether zero data retention is requested, or `Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`. A trailing ` · url <url>` means `ULTRATHINK_DECISIONS_URL` is in effect; a trailing ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` means it is set but not accepted. See [Decisions](#decisions). |
+| `Hindsight: …` | The optional memory server. `Hindsight: off (opt-in: set hindsight.enabled)` until a user file sets `hindsight.enabled`, and `Hindsight: off (ULTRATHINK_HINDSIGHT=0)` whenever that variable is the exact string `0`. A missing key names the command to run: `Hindsight: on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`. See [Hindsight](#hindsight). |
+| `RAGFlow: …` | Optional document search. `RAGFlow: off (opt-in: set ragflow.enabled)` until you opt in, and `RAGFlow: off (ULTRATHINK_RAGFLOW=0)` when that variable is `0`. A missing key names `bin/ultrathink-mcp auth set-key ragflow --stdin`. See [RAGFlow](#ragflow). |
+| `Teach: …` | Teachable Moments. `Teach: off (opt-in: set teach.enabled)` until a user file turns it on. State is under the host state directory's `teach/`, never `<cwd>/.planning`. See [Teachable Moments](#teachable-moments). |
 
 After each planned prompt, hosts that show the summary (`claude.echo`, on by default) print one line such as `Prompt Uplift · UPLIFTED_PROMPT · llm · claude:sonnet · Graph of Thought · 6 nodes · Tracking · 6 issues · 18 sub-issues linked · 41.2s`. A `fallback` source means the engine call failed, and an `Engine error · …` segment shows the first error. With Jev decisions on, a `Decisions · …` segment shows what Jev decided, for example `Decisions · plan 0.97` or `Decisions · error (credits)`.
 
@@ -295,6 +301,57 @@ None of these show the error message. To see it, run `bin/ultrathink decisions c
 | Ship: `- Jev: P(complete) <P> · <model> · veto` in the PR body's assessment, or a veto gap from `assess` | See the `assess` rows in [Ship is blocked](#ship-is-blocked). With `ship.judge: "advisory"` the line reads `- Jev: P(complete) <P> · <model> · veto (advisory: shipped anyway)` and the PR opened anyway. | Finish the missing work. If Jev vetoes complete changes of your kind, lower `decisions.shipVetoAtOrBelow` after probing your cases with `bin/ultrathink decisions probe ship <cases.json>`, or remove `ship` from `decisions.points`. |
 | A question you expected the knowledge base to settle was asked or is missing, or a question became blocking | Jev's P(`supported`) was below `decisions.groundedAt` (0.8), so the settled answer was taken back: it is asked after the clarifier's own questions while fewer than `hitl.maxQuestions` are open, and dropped (neither settled nor asked) when no slot is left; or its P(`risky`) was at or above `decisions.blockingAt` (0.5), so the question is asked before work starts. The summary shows `Decisions · knowledge <kept>/<n> kept` and `Decisions · blocking <promoted>/<n> promoted`. | Answer the question. To change how often it happens, tune `groundedAt` or `blockingAt` after probing with `decisions probe knowledge` or `decisions probe blocking`. |
 
+## Hindsight
+
+Hindsight is opt-in. See [Configuration](configuration.md#hindsight-memory-server) and [Connect Hindsight](how-to/connect-hindsight.md) (`docs/how-to/connect-hindsight.md`). `bin/ultrathink hindsight check` exits 0 when `/health` reports healthy, 1 when the integration is not ready or the probe fails, and 2 on a usage error.
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `Hindsight: off (opt-in: set hindsight.enabled)` | The default. A project file cannot turn it on. | Set `hindsight.enabled: true` in `~/.config/ultrathink/config.json`, with `url` and `bank`. |
+| `Hindsight: off (ULTRATHINK_HINDSIGHT=0)` | The exact string `0` is set. No request is made. | Unset `ULTRATHINK_HINDSIGHT` in the host's environment. |
+| `Hindsight: on · no URL (set hindsight.url or HINDSIGHT_API_URL)` | Enabled, but neither the config URL nor `HINDSIGHT_API_URL` is set. | Set `hindsight.url` in a user file, or set `HINDSIGHT_API_URL`. Do not put a production URL in a project file: it is ignored. |
+| `Hindsight: on · bad URL (<reason>)` | The URL was refused. `http` is allowed only for `localhost`, `127.0.0.1`, `[::1]`, `*.ts.net` and `100.64.0.0/10`. A user name, password, query or fragment is refused. | Fix the URL. The status line shows the reason and never the key. |
+| `Hindsight: on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)` | No stored `hindsight` key, and `HINDSIGHT_API_KEY` is empty. | Run the command the line names. `HINDSIGHT_API_TOKEN` is also accepted, after the stored key and `HINDSIGHT_API_KEY`. A stored key wins. |
+| `Hindsight check: error (auth)` | The server rejected the key. | Store a valid key with the command the status line names. `bin/ultrathink-mcp auth logout hindsight` removes a stale stored key that hides a good environment key. |
+| Lessons are not retained, or a retain times out | The server has no LLM, and a mode other than `chunks` would call one. | Leave the bank in `chunks` mode. The client sets `retain_extraction_mode` to `chunks` itself. Do not enable verbatim or reflect. |
+
+`--roundtrip` proves retain, recall and delete in a throwaway `ultrathink-smoke-*` bank and then deletes that bank. It does not touch the configured bank. A failed step still runs the cleanup steps.
+
+## RAGFlow
+
+RAGFlow is opt-in. See [Configuration](configuration.md#ragflow-document-search) and [Connect RAGFlow](how-to/connect-ragflow.md) (`docs/how-to/connect-ragflow.md`). `bin/ultrathink ragflow check` exits 0 when the datasets probe answers, 1 when not ready or the probe fails, and 2 on a usage error.
+
+Never probe `/system/healthz`, `/v1/system/healthz` or `/api/v1/system/healthz`. On a deployment whose object storage is down, that route can block the API worker for minutes. The client does not call it. Health is the datasets probe the client uses: `GET /api/v1/datasets?page=1&page_size=1`, which is what `bin/ultrathink ragflow check` runs. `datasets` lists what the key can see. `search "<question>"` retrieves chunks.
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `RAGFlow: off (opt-in: set ragflow.enabled)` | The default. A project file cannot turn it on or turn `ground` on. | Set `ragflow.enabled` in a user file. Set `ground` only if plans should include excerpts. |
+| `RAGFlow: off (ULTRATHINK_RAGFLOW=0)` | That variable is `0` (whitespace around it is trimmed). | Unset it. |
+| `RAGFlow: on · no key (run bin/ultrathink-mcp auth set-key ragflow --stdin, or set RAGFLOW_API_KEY)` | No stored `ragflow` key, and `RAGFLOW_API_KEY` is empty. | Run the command the line names. A stored key wins over `RAGFLOW_API_KEY`. |
+| `RAGFlow check: error (auth)` | The server rejected the key (HTTP 401/403, or body code 109/108). | Store a valid key with the command the status line names. |
+| No `Docs` segment in the summary | `ragflow.ground` is off, RAGFlow is not ready, or the lookup found nothing. Grounding fails open: the plan is unchanged. | Turn `ground` on in a user file, then `bin/ultrathink ragflow check`. `Docs · error (<reason>)` names the failure; nothing else to do for one failed lookup. |
+
+## Teachable Moments
+
+Off until `teach.enabled` is set in a user file. See [Configuration](configuration.md#teach-teachable-moments) and [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`). On Hermes, see [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
+
+State is `<stateDir>/teach/` (`moments/`, `outbox/`, `inbox/`, `skill-drafts/`). `ULTRATHINK_STATE_DIR` overrides the state directory and is ignored when it points into `.planning`. Nothing is written into `<cwd>/.planning`.
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `Teach: off (opt-in: set teach.enabled)` | Off, including when a project file sets `enabled: true`. | Set `teach.enabled` in `~/.config/ultrathink/config.json`. |
+| `Teach: off (ULTRATHINK_TEACH=0)` | Enabled, and the exact string `0` is set. Mutating `teach` commands exit 1. | Unset `ULTRATHINK_TEACH`. |
+| `Teach: on · … · Hindsight no key` | Lessons stay local. A retain is not attempted. | Fix the `Hindsight:` line. The word after `Hindsight` is `ready`, `off`, `no URL`, `bad URL` or `no key`. |
+| `retain queued` | The local file was written. Hindsight did not take it. The outbox retries (1 minute, doubling, capped at 6 hours). | `bin/ultrathink teach sync` after Hindsight is ready. A failure does not block the caller. |
+| `promote --due` lists nothing you expected | The moment is not confirmed, occurrences are below `teach.promoteAfter` (unless kind is `playbook`), or Jev's P(`skillworthy`) was below `skillworthyAt`. | Confirm it, or `teach promote <id>` which does not ask `skillworthy`. A last line `Jev skipped <n> moment(s): not worth a standing skill.` is that gate. |
+| Hermes skill did not appear under `~/.hermes/skills` | ultrathink never writes that directory. `--install --target hermes` only drafts under `<stateDir>/teach/skill-drafts/`. | Install through Hermes `skill_manage`, so `skills.write_approval` applies, then `teach promote <id> --mark-promoted --skill <name> --target hermes`. |
+
+## Redaction
+
+Before a lesson is stored or sent, `Bearer` plus a token is redacted only when the token looks like a credential. `Bearer` plus a short English word is left as prose: `the Bearer key` and `Bearer token rotation` stay. A token is replaced with `[redacted]` when it is at least 16 characters, or at least 6 characters and contains a digit. Trailing dots stay after `[redacted]`. A short word with no digit, such as `Bearer token`, is not a credential.
+
+The same pass redacts PEM private keys, URL userinfo, assignment-shaped secrets, and home-directory paths that are outside the repository. The replacement `[redacted]` matches no pattern, so running it again changes nothing. A redaction failure yields `[redacted]` rather than the original text.
+
 ## Claude Code
 
 - The hooks come from `hooks/hooks.json`: `UserPromptSubmit`, `PostToolUse` (`AskUserQuestion`, `Bash`, PR-creation tools) and `Stop`. They run through `bin/run-bun`.
@@ -328,7 +385,7 @@ None of these show the error message. To see it, run `bin/ultrathink decisions c
 
 ## Hermes Agent
 
-- **Check that the plugin loads.** `hermes plugins doctor ultrathink` should print `OK: runtime discovery, manifest parsing, import, and registration passed`, with 6 hooks registered.
+- **Check that the plugin loads.** `hermes plugins doctor ultrathink` should print `OK: runtime discovery, manifest parsing, import, and registration passed`. `hosts/hermes/plugin.yaml` lists `pre_llm_call`, `transform_tool_result`, `post_tool_call`, `pre_verify`, `subagent_start`, `post_llm_call` and `on_session_finalize`, plus the tools `ultrathink_lesson_save` and `ultrathink_lesson_recall`. The commands `/ultrathink-learn` and `/ultrathink-lessons` and the skill `ultrathink-teach` are registered in code. Nothing is written to `~/.hermes/skills`; Hermes `skill_manage` is the install path. Lessons live under the Hermes state directory's `teach/`, never `<cwd>/.planning`. See [Teachable Moments](#teachable-moments).
 - **Check the hook cap and the warnings.** `hermes config get plugins.hook_callback_timeout` should print at least 105; 600 is recommended. Search `${HERMES_HOME:-~/.hermes}/logs/agent.log` for lines starting with `ultrathink:`. See [Hermes: the plan never arrives](#hermes-the-plan-never-arrives) for what each warning means, including the missing-engine warning for a copied plugin directory.
 - **One planner.** If another plugin also plans prompts before the model call, disable it, or both will plan the same turn.
 - **Gateway injection.** `/ultrathink-quick <message>` sends the message through `inject_message`. In gateways this needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, the command falls back to skipping your next message and replies `Ultrathink will not plan your next message. Send it now (or prefix any message with raw:).`

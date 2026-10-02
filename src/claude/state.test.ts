@@ -217,3 +217,32 @@ describe("session records and Jev decisions", () => {
 		}
 	});
 });
+
+describe("session records and lessons/docs lookups", () => {
+	const base: SessionRecord = { sessionId: "lk-1", at: 3, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+
+	test("both lookups round-trip through the session file and last.json", () => {
+		const dir = tempDir();
+		const record: SessionRecord = {
+			...base,
+			lessons: { outcome: "used", count: 2, ids: ["a1", "b2"], chars: 640, ms: 31, source: "hindsight" },
+			docs: { status: "error", count: 0, chars: 0, ms: 9, datasets: 2, reason: "auth" },
+		};
+		writeSession(dir, record);
+		expect(readSession(dir, "lk-1")).toEqual(record);
+		expect(readLast(dir)).toEqual(record);
+	});
+
+	test("a record written before they existed reads back without them", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		writeFileSync(sessionPath(dir, "old-2"), JSON.stringify({ sessionId: "old-2", at: 1, engine: "claude:sonnet", result: base.result, knowledge: { outcome: "none", docs: [], chars: 0, ms: 1 } }));
+		const record = readSession(dir, "old-2");
+		expect(record?.sessionId).toBe("old-2");
+		expect(record?.knowledge?.outcome).toBe("none");
+		expect(record).not.toHaveProperty("lessons");
+		expect(record).not.toHaveProperty("docs");
+		writeSession(dir, record as SessionRecord);
+		expect(readSession(dir, "old-2")).toEqual(record);
+	});
+});

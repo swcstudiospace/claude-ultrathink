@@ -22,6 +22,8 @@ import { formatTrackingTodos } from "../track/render.ts";
 import { shellArg } from "../track/gateway.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
+import type { DocsLookup } from "../ragflow/types.ts";
+import type { LessonsLookup } from "../teach/types.ts";
 
 /** Generous ceiling; the spec is normally far smaller. Over budget, RATIONALE bodies go first, then the tail. */
 export const DEFAULT_CONTEXT_CHARS = 90_000;
@@ -184,6 +186,10 @@ export interface PromptContextInput {
 	handoff?: boolean;
 	/** Greptile knowledge-base lookup before clarify; adds its section only when the outcome is "used". */
 	knowledge?: KnowledgeLookup;
+	/** Recalled lessons, already formatted by formatLessonsSection (carries its own header); empty or absent adds nothing. */
+	lessons?: string;
+	/** RAGFlow excerpts, already formatted by formatDocsSection (carries its own header); empty or absent adds nothing. */
+	docs?: string;
 }
 
 /**
@@ -272,7 +278,10 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 	const brief = input.brief?.trim();
 	const briefParts = brief ? [SUBSTRATE_CONTEXT_HEADER, brief] : [];
-	if (!input.handoff) parts.push(...briefParts);
+	const lessons = input.lessons?.trim() || undefined;
+	const docs = input.docs?.trim() || undefined;
+	// Evidence the plan should see sits after the brief and before the specification; a handoff places it in fitHandoff.
+	if (!input.handoff) parts.push(...briefParts, ...(lessons ? [lessons] : []), ...(docs ? [docs] : []));
 
 	const tail: string[] = [];
 	if (input.graph) {
@@ -319,32 +328,86 @@ export function formatPromptContext(input: PromptContextInput): string {
 		);
 	}
 
-	if (input.handoff) return fitHandoff(parts, briefParts, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
+	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
 	const budget = Math.max(2_000, maxChars - fixed);
 	parts.push(truncateXml(input.result.xml, budget, input.specPath));
 	return [...parts, ...tail].join("\n\n");
 }
 
+/** Smallest slice of the documents section worth keeping, and of the lessons section when it must shrink (below it, the section is dropped). */
+const DOCS_MIN_CHARS = 300;
+const LESSONS_MIN_CHARS = 600;
+const DOCS_CUT = "\n(documents truncated)";
+const LESSONS_CUT = "\n(lessons truncated)";
+
+/** Shortens a section to exactly `room` characters, marker included. */
+function cutSection(section: string, room: number, marker: string): string {
+	return `${section.slice(0, room - marker.length)}${marker}`;
+}
+
 /**
  * Joins a handoff under `limit` so no section can fall into the part Hermes drops. The fixed sections (header, paths,
- * orchestration, clarifications, kickoff, ship) always stay. The Linked issues list gives way first, to a pointer at
- * the spec's ISSUES block that holds the same lines; the substrate brief is saved nowhere else, so it is cut last.
+ * orchestration, clarifications, kickoff, ship) always stay. Order of sacrifice: the Linked issues list gives way
+ * first, to a pointer at the spec's ISSUES block that holds the same lines; then the RAGFlow excerpts shrink (dropped
+ * when under DOCS_MIN_CHARS would remain); then the lessons shrink (never below LESSONS_MIN_CHARS, else dropped); the
+ * substrate brief is saved nowhere else, so it is cut last.
  */
-function fitHandoff(parts: string[], briefParts: string[], tail: string[], linked: string | undefined, limit: number): string {
+function fitHandoff(
+	parts: string[],
+	briefParts: string[],
+	lessons: string | undefined,
+	docs: string | undefined,
+	tail: string[],
+	linked: string | undefined,
+	limit: number,
+): string {
 	const join = (sections: string[]): string => sections.join("\n\n");
-	const full = join([...parts, ...briefParts, ...tail]);
-	if (full.length <= limit) return full;
 	const body = linked ? tail.map((section) => (section === linked ? LINKED_POINTER : section)) : tail;
-	const pointed = join([...parts, ...briefParts, ...body]);
-	if (pointed.length <= limit) return pointed;
-	const bare = join([...parts, ...body]);
+	const compose = (evidence: Array<string | undefined>, rest: string[]): string =>
+		join([...parts, ...evidence.filter((section): section is string => Boolean(section)), ...rest]);
 	const [header, brief] = briefParts;
+	const withEvidence = (l: string | undefined, d: string | undefined): Array<string | undefined> => [...briefParts, l, d];
+
+	const full = compose(withEvidence(lessons, docs), tail);
+	if (full.length <= limit) return full;
+	const pointed = compose(withEvidence(lessons, docs), body);
+	if (pointed.length <= limit) return pointed;
+
+	const noDocs = compose(withEvidence(lessons, undefined), body);
+	if (docs) {
+		const room = limit - noDocs.length - 2;
+		if (room >= DOCS_MIN_CHARS) return compose(withEvidence(lessons, cutSection(docs, room, DOCS_CUT)), body);
+	}
+	if (noDocs.length <= limit) return noDocs;
+
+	const noLessons = compose(briefParts, body);
+	if (lessons) {
+		const room = limit - noLessons.length - 2;
+		if (room >= LESSONS_MIN_CHARS) return compose(withEvidence(cutSection(lessons, room, LESSONS_CUT), undefined), body);
+	}
+	if (noLessons.length <= limit) return noLessons;
+
+	const bare = join([...parts, ...body]);
 	if (header && brief) {
 		const room = limit - bare.length - header.length - BRIEF_CUT.length - 4;
 		if (room > 200) return join([...parts, header, `${brief.slice(0, room)}${BRIEF_CUT}`, ...body]);
 	}
 	return bare;
+}
+
+/** Summary bit for the lessons lookup; undefined when none ran, it was off, or it found nothing. */
+function lessonsBit(lookup: LessonsLookup | undefined): string | undefined {
+	if (lookup?.outcome === "used") return `Lessons · ${lookup.count} recalled (${lookup.source})`;
+	if (lookup?.outcome === "error") return `Lessons · error${lookup.reason ? ` (${lookup.reason})` : ""}`;
+	return undefined;
+}
+
+/** Summary bit for the RAGFlow grounding lookup; undefined when none ran, it was off, or it found nothing. */
+function docsBit(lookup: DocsLookup | undefined): string | undefined {
+	if (lookup?.status === "used") return `Docs · ${lookup.count} excerpt${lookup.count === 1 ? "" : "s"} (RAGFlow)`;
+	if (lookup?.status === "error") return `Docs · error${lookup.reason ? ` (${lookup.reason})` : ""}`;
+	return undefined;
 }
 
 export function formatSummary(input: {
@@ -369,6 +432,10 @@ export function formatSummary(input: {
 	providers?: TrackerProviders;
 	/** Greptile knowledge-base lookup before clarify; absent when none ran. */
 	knowledge?: KnowledgeLookup;
+	/** Lessons lookup (Teachable Moments); absent when none ran. */
+	lessons?: LessonsLookup;
+	/** RAGFlow grounding lookup; absent when none ran. */
+	docs?: DocsLookup;
 	/** Jev decisions of this prompt (plan, knowledge, blocking); absent or empty leaves the summary unchanged. */
 	decisions?: readonly DecisionRecord[];
 }): string {
@@ -380,6 +447,10 @@ export function formatSummary(input: {
 	if (briefLines > 0) bits.push(`Substrate · brief ${briefLines} lines`);
 	const kb = knowledgeBit(input.knowledge);
 	if (kb) bits.push(kb);
+	const lessonsPart = lessonsBit(input.lessons);
+	if (lessonsPart) bits.push(lessonsPart);
+	const docsPart = docsBit(input.docs);
+	if (docsPart) bits.push(docsPart);
 	if (input.clarifications?.length) {
 		const open = input.clarifications.filter((c) => !c.answer).length;
 		bits.push(`HITL · ${open} question(s)`);

@@ -25,6 +25,10 @@
 			{
 				"id": "ultrathink-ship",
 				"path": "skills/ultrathink-ship/SKILL.md"
+			},
+			{
+				"id": "ultrathink-teach",
+				"path": "skills/ultrathink-teach/SKILL.md"
 			}
 		],
 		"commands": [

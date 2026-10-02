@@ -4,7 +4,7 @@
 /**
  * A2A Agent Card mapping for Teachable Moments.
  *
- * Module: src/teachable-moments/agent-card.ts
+ * Module: src/teach/agent-card.ts
  * Per n5: wrap TeachableMoment as skills[] entry {id, name, description: body, tags}
  * + top-level card for the authoring agent.
  *
@@ -15,10 +15,10 @@
  * skills vs other sections, versioning) is not finalized.
  * Do not assume stability. Flag all A2A-DRAFT usages.
  *
- * No hooks/wiring yet (per wave). Use with mock Hindsight only.
+ * Used by `teach export --a2a`; nothing sends the card anywhere.
  */
 
-import type { TeachableMoment } from "./schema.ts";
+import type { TeachableMoment } from "./types.ts";
 
 // A2A-DRAFT: provisional top-level Agent Card shape.
 export interface A2AAgentCard {
@@ -127,5 +127,16 @@ function normalizePlaceholder(): TeachableMoment {
 		createdAt: new Date().toISOString(),
 		tags: ["a2a-draft"],
 		relatedIds: [],
+		schema: 2,
+		kind: "pattern",
+		status: "candidate",
+		origin: "import",
+		project: "unknown",
+		host: "unknown",
+		confidence: 0,
+		occurrences: 1,
+		lastSeenAt: new Date().toISOString(),
+		dedupeKey: "",
+		recalled: 0,
 	};
 }

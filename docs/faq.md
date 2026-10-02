@@ -11,6 +11,11 @@ Short answers to the questions people ask first. Each links to the page with the
 - [How do I turn it off?](#how-do-i-turn-it-off)
 - [Where does it write files?](#where-does-it-write-files)
 - [What data leaves my machine?](#what-data-leaves-my-machine)
+- [Is Teachable Moments on by default?](#is-teachable-moments-on-by-default)
+- [Where do lessons live?](#where-do-lessons-live)
+- [Can a project file turn lessons on?](#can-a-project-file-turn-lessons-on)
+- [What if Hindsight is down?](#what-if-hindsight-is-down)
+- [Does Hermes install skills by itself?](#does-hermes-install-skills-by-itself)
 
 ## What does it cost?
 
@@ -76,6 +81,9 @@ To avoid extra plans for follow-ups, prefix them with `raw:` or run `/ultrathink
 | Tracker rows only | `/ultrathink-track off` |
 | The ship flow | It is off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` also turns it off |
 | Jev decisions | They are off unless you set `decisions.enabled`; set it back to `false` (see [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again)) |
+| Teachable Moments | Off unless you set `teach.enabled`. `ULTRATHINK_TEACH=0` turns it off for that process (see [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again)) |
+| Hindsight | Off unless you set `hindsight.enabled`. `ULTRATHINK_HINDSIGHT=0` turns it off for that process |
+| RAGFlow | Off unless you set `ragflow.enabled`. `ULTRATHINK_RAGFLOW=0` turns it off for that process |
 | Everything | [Uninstall](how-to/uninstall.md) |
 
 Full list in [Commands](commands.md) and [Privacy and data flow](privacy.md#turning-things-off).
@@ -85,6 +93,7 @@ Full list in [Commands](commands.md) and [Privacy and data flow](privacy.md#turn
 Never into your repository's working tree, and never into `.planning/`.
 
 - **State directory**, per host: session records, specs, toggles and the plan carrier. For example `~/.claude/ultrathink` on Claude Code. The full table is in [Architecture](architecture.md#state-directory). `ULTRATHINK_STATE_DIR` moves it, unless it points into `.planning/`.
+- **Lessons**: `<state dir>/teach/` (moments, the Hindsight outbox, the observe inbox and skill drafts). Same state directory as above, never the repository and never `.planning/`.
 - **Credential store**: `${XDG_CONFIG_HOME:-~/.config}/ultrathink/mcp-credentials.json`, mode 0600.
 - **Config files you create**: `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`, `~/.claude/ultrathink.json` and `<project>/.claude/ultrathink.json`. `ultrathink-mcp notion init --write-config` writes the first one for you.
 - **`bun scripts/setup.ts apply`** writes the Grok hook file and rule under `${GROK_HOME:-~/.grok}/hooks/` and `rules/`. When the `claude` CLI is present, it also adds `notion` and `linear` MCP servers to Claude Code's user config if they are missing, installs the plugin, and writes an ultrathink block in `~/.claude/CLAUDE.md` plus `~/.claude/ultrathink-setup-state.json`. `bun scripts/setup.ts rollback` removes the hook file, the rule block, the CLAUDE.md block, the MCP servers it added and the state file, and prints the plugin uninstall commands for you to run.
@@ -92,6 +101,26 @@ Never into your repository's working tree, and never into `.planning/`.
 
 ## What data leaves my machine?
 
-Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, OpenRouter (Jev decisions, `decisions.enabled`), Agent Substrate and Tailscale only after you configure them. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
+Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, OpenRouter (Jev decisions, `decisions.enabled`), Hindsight (`hindsight.enabled`), RAGFlow (`ragflow.enabled`), Agent Substrate and Tailscale only after you configure them. A lesson is redacted before it is stored or sent. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
 
 The full table, with what each destination receives and how to turn it off, is in [Privacy and data flow](privacy.md).
+
+## Is Teachable Moments on by default?
+
+No. `teach.enabled`, `hindsight.enabled` and `ragflow.enabled` all default to false, so a fresh install stores nothing and contacts neither server. `bin/ultrathink status` shows `Teach: off (opt-in: set teach.enabled)`, `Hindsight: off (opt-in: set hindsight.enabled)` and `RAGFlow: off (opt-in: set ragflow.enabled)`. If you turn lessons on and set no capture mode, the mode is `explicit`: only a capture you run creates a lesson. Recall defaults to on, but only after `teach.enabled` is on. See [Use Teachable Moments](how-to/use-teachable-moments.md).
+
+## Where do lessons live?
+
+In `<state dir>/teach/`, for example `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink/teach` on Claude Code. That directory holds the lesson files, the outbox of pending Hindsight writes, the observe inbox and skill drafts. ultrathink never writes them into the repository and never into `.planning/`. `ULTRATHINK_STATE_DIR` moves the state directory, unless the path points into `.planning/`, in which case it is ignored. A confirmed lesson is also copied to the Hindsight bank (default `ultrathink`) when [Hindsight](how-to/connect-hindsight.md) is ready.
+
+## Can a project file turn lessons on?
+
+No. `<repo>/.claude/ultrathink.json` can turn `teach`, `hindsight` and `ragflow` off, turn `teach.recall` and `ragflow.ground` off, and lower `teach.capture` (`auto` to `observe` or `explicit`, `observe` to `explicit`). It cannot enable them, set a URL, a bank or a dataset, or turn `teach.autoPromote` on. Set those in your user file, `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`.
+
+## What if Hindsight is down?
+
+The lesson stays in `<state dir>/teach`. If the server was ready and the write failed, the retain waits in the outbox and `bin/ultrathink teach sync` retries it (`Sync: 0 done · 1 pending · <reason>` while it cannot, exit 1). If Hindsight was not ready, the lesson is local-only and the next sync sends it once Hindsight is ready. Recall uses this machine's store when the server does not answer. Planning is not blocked. See [When Hindsight is down](how-to/use-teachable-moments.md#6-when-hindsight-is-down).
+
+## Does Hermes install skills by itself?
+
+No. ultrathink never writes `~/.hermes/skills`. Promoting a lesson on Hermes only writes a draft under `<state dir>/teach/skill-drafts/` and tells you to install it through Hermes `skill_manage`, so `skills.write_approval` still applies. `/ultrathink-lessons promote <id>` stages that skill; with write approval on, review it with `/skills pending`, then `/skills approve <id>`. `teach.autoPromote` is user-file only and default off, and even then a Hermes host only gets a draft. See [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md).

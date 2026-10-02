@@ -17,6 +17,8 @@ python3 hosts/hermes/bridge_test.py    # Hermes bridge tests; prints "ok"
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10. The Bun 1.2.x jobs run the tests and the Hermes bridge tests without `bun install` and the type check, because they cannot read `bun.lock` and ultrathink has no runtime dependencies.
 
+The Teachable Moments, Hindsight, RAGFlow and Jev tests are `bun test src/teach src/hindsight src/ragflow src/decisions`. That is a narrower run of `bun test`, not an extra required check. The Hermes plugin tests stay `python3 hosts/hermes/bridge_test.py` (a plain script that prints `ok`; CI runs that, not `python3 -m unittest`).
+
 To try a change in a host, install it from your checkout as [docs/install.md](docs/install.md) shows. For Claude Code, `claude --plugin-dir <checkout>` loads the checkout for one session; disable an installed copy first (`claude plugin disable ultrathink@ultrathink`) so the prompt is not planned twice. TypeScript changes under `hooks/` and `src/` take effect on the next prompt, with these exceptions:
 
 - Muse copies the plugin when you install it, so install it again after a change.
@@ -43,11 +45,12 @@ hooks/             host hook entries: uplift.ts (plans the prompt), engine.ts (J
                    derives Grok's global hook file from it)
 hosts/grok/        rule that tells Grok to read the plan carrier (installed by scripts/setup.ts)
 hosts/hermes/      Hermes plugin: plugin.yaml, __init__.py, bridge.py (calls hooks/engine.ts),
-                   bridge_test.py
+                   bridge_test.py (plain script: python3 hosts/hermes/bridge_test.py), lesson tools
+                   ultrathink_lesson_save / ultrathink_lesson_recall and /ultrathink-learn / /ultrathink-lessons
 scripts/           setup.ts (apply, status, rollback) and mcp-register.ts (registers the MCP gateway
                    in every host)
-skills/            ultrathink-plan, ultrathink-kickoff, ultrathink-sync, ultrathink-ship: the
-                   agent-side half, shared by every host
+skills/            ultrathink-plan, ultrathink-kickoff, ultrathink-sync, ultrathink-ship,
+                   ultrathink-teach: the agent-side half, shared by every host
 src/claude/        Claude hook protocol, the default headless-Claude engine, session and control
                    state, transcripts
 src/host/          host ids and detection, state directories, planPrompt, the plan carrier, engine
@@ -63,7 +66,12 @@ src/grok/          optional Grok engine and its transports
 src/hitl/          HITL clarification questions and answers
 src/substrate/     optional Agent Substrate brief (only when substrate.url or SUBSTRATE_URL is set)
 src/decisions/     optional OpenRouter Decisions (Jev) client: config defaults and thresholds, the
-                   four questions and their state builders, fail-open runner, decisions check|probe
+                   six questions (including teachable and skillworthy) and their state builders,
+                   fail-open runner, decisions check|probe
+src/hindsight/     optional Hindsight client and `bin/ultrathink hindsight` (default off)
+src/ragflow/       optional RAGFlow client, grounding and `bin/ultrathink ragflow` (default off)
+src/teach/         Teachable Moments: local store, capture, recall, observe, promote,
+                   `bin/ultrathink teach` (default off)
 src/config.ts      config files, defaults and merging
 ```
 

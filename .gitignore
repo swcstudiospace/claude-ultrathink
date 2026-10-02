@@ -9,5 +9,3 @@ issues/
 .hermes/
 docs/superpowers/
 __pycache__/
-.planning/hindsight-retry-queue.json
-# Note (SPE-5105 n7): queue is always data-only; .planning/ ignored here but explicit entry + note for repos where .planning is tracked.

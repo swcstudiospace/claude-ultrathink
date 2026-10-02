@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import signal
 import stat
 import sys
@@ -210,7 +211,7 @@ SYNC_SKILL = HERE.parents[1] / "skills" / "ultrathink-sync" / "SKILL.md"
 def fake_ctx(accepts: bool | None = True) -> SimpleNamespace:
 	"""A Hermes PluginContext stand-in. accepts=False refuses to inject (the TUI, or a gateway
 	without allow_gateway_injection); accepts=None is a Hermes without inject_message."""
-	ctx = SimpleNamespace(hooks=[], callbacks={}, commands={}, injected=[], skills={})
+	ctx = SimpleNamespace(hooks=[], callbacks={}, commands={}, injected=[], skills={}, tools={})
 
 	def register_hook(name: str, callback: Callable[..., object]) -> None:
 		ctx.hooks.append(name)
@@ -219,6 +220,9 @@ def fake_ctx(accepts: bool | None = True) -> SimpleNamespace:
 	ctx.register_hook = register_hook
 	ctx.register_command = lambda name, handler, description="", args_hint="": ctx.commands.__setitem__(name, handler)
 	ctx.register_skill = lambda name, path, description="", frontmatter=None: ctx.skills.__setitem__(name, (path, description))
+	ctx.register_tool = lambda name, toolset, schema, handler, check_fn=None, **extra: ctx.tools.__setitem__(
+		name, SimpleNamespace(toolset=toolset, schema=schema, handler=handler, check_fn=check_fn)
+	)
 	if accepts is not None:
 
 		def inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool:
@@ -756,8 +760,18 @@ def test_pre_verify_hook_fails_open():
 def test_registers_every_ultrathink_command_next_to_the_hooks():
 	ctx = fake_ctx()
 	plugin.register(ctx)
-	assert sorted(ctx.commands) == [f"ultrathink-{verb}" for verb in ("off", "on", "quick", "skip", "status", "track")]
-	assert ctx.hooks == ["pre_llm_call", "pre_llm_call", "transform_tool_result", "post_tool_call", "pre_verify", "subagent_start"]
+	assert sorted(ctx.commands) == [f"ultrathink-{verb}" for verb in ("learn", "lessons", "off", "on", "quick", "skip", "status", "track")]
+	assert ctx.hooks == [
+		"pre_llm_call",
+		"pre_llm_call",
+		"transform_tool_result",
+		"post_tool_call",
+		"pre_verify",
+		"subagent_start",
+		"post_llm_call",
+		"on_session_finalize",
+	]
+	assert sorted(ctx.tools) == ["ultrathink_lesson_recall", "ultrathink_lesson_save"]
 
 	# A Hermes that rejects the commands still plans every prompt.
 	def reject(*_args: object, **_kwargs: object) -> None:
@@ -769,10 +783,10 @@ def test_registers_every_ultrathink_command_next_to_the_hooks():
 	assert older.hooks == ctx.hooks and older.commands == {}
 
 
-def test_registers_the_four_ultrathink_skills_with_their_descriptions():
+def test_registers_the_five_ultrathink_skills_with_their_descriptions():
 	ctx = fake_ctx()
 	plugin.register(ctx)
-	assert sorted(ctx.skills) == ["ultrathink-kickoff", "ultrathink-plan", "ultrathink-ship", "ultrathink-sync"]
+	assert sorted(ctx.skills) == ["ultrathink-kickoff", "ultrathink-plan", "ultrathink-ship", "ultrathink-sync", "ultrathink-teach"]
 	for name, (path, description) in ctx.skills.items():
 		assert path.is_absolute() and path.is_file() and path.as_posix().endswith(f"skills/{name}/SKILL.md"), path
 		frontmatter = path.read_text(encoding="utf-8").split("---")[1]
@@ -868,6 +882,558 @@ def test_quick_skips_the_next_message_where_hermes_cannot_send_it():
 			assert refused.commands["ultrathink-quick"]("fix the typo").startswith("Ultrathink skip: ")
 
 
+STATUS_ON = {"match": ["status", "--json"], "stdout": json.dumps({"enabled": True, "capture": "observe", "recall": True})}
+STATUS_EXPLICIT = {"match": ["status", "--json"], "stdout": json.dumps({"enabled": True, "capture": "explicit"})}
+STATUS_OFF = {"match": ["status", "--json"], "stdout": json.dumps({"enabled": False})}
+TEACH_STUB = """#!@PYTHON@
+import json, os, sys, time
+here = @HERE@
+args = sys.argv[1:]
+stdin = sys.stdin.read() if "--stdin" in args else ""
+with open(here + "/calls.jsonl", "a") as log:
+	log.write(json.dumps({"argv": args, "stdin": stdin, "host": os.environ.get("ULTRATHINK_HOST"), "state": os.environ.get("ULTRATHINK_STATE_DIR"), "cwd": os.getcwd(), "pid": os.getpid(), "sid": os.getsid(0)}) + "\\n")
+for rule in json.load(open(here + "/rules.json")):
+	if all(token in args for token in rule["match"]):
+		time.sleep(rule.get("sleep", 0))
+		sys.stdout.write(rule.get("stdout", ""))
+		sys.stderr.write(rule.get("stderr", ""))
+		sys.exit(rule.get("code", 0))
+sys.stderr.write("error: no rule\\n")
+sys.exit(1)
+"""
+
+
+def teach_cli(directory: Path, rules: list[dict]) -> Path:
+	"""A bin/ultrathink stand-in: logs argv, stdin, host, state dir, cwd, pid and session id of every run to
+	<directory>/calls.jsonl, then answers with the first rule whose `match` tokens are all in argv (stdout, stderr,
+	code, sleep seconds); no rule means exit 1."""
+	directory.mkdir(parents=True, exist_ok=True)
+	set_rules(directory, rules)
+	path = directory / "ultrathink"
+	path.write_text(TEACH_STUB.replace("@PYTHON@", sys.executable).replace("@HERE@", repr(str(directory))))
+	path.chmod(path.stat().st_mode | stat.S_IEXEC)
+	return path
+
+
+def set_rules(directory: Path, rules: list[dict]) -> None:
+	(directory / "rules.json").write_text(json.dumps(rules))
+
+
+def teach_calls(directory: Path, verb: str | None = None, count: int = 0) -> list[dict]:
+	"""The stub's logged runs (of `teach <verb>` only when given), waiting up to 10s for `count` of them: detached runs are asynchronous."""
+	give_up = time.monotonic() + 10
+	while True:
+		log = directory / "calls.jsonl"
+		calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+		calls = [call for call in calls if verb is None or call["argv"][1:2] == [verb]]
+		if len(calls) >= count or time.monotonic() > give_up:
+			return calls
+		time.sleep(0.05)
+
+
+def reset_teach_state() -> None:
+	with bridge._teach_lock:
+		bridge._teach_status_cache.clear()
+		bridge._observed_at.clear()
+		bridge._synced.clear()
+
+
+@contextmanager
+def teach_env(rules: list[dict]) -> Iterator[Path]:
+	"""A temporary HERMES_HOME and the stub CLI standing in for bin/ultrathink, with the bridge's
+	Teachable Moments state reset. Yields the stub's directory."""
+	saved = {key: os.environ.get(key) for key in ("HERMES_HOME", "ULTRATHINK_STATE_DIR")}
+	saved_cli = bridge.CLI
+	with tempfile.TemporaryDirectory() as tmp:
+		os.environ["HERMES_HOME"] = str(Path(tmp) / "home")
+		os.environ.pop("ULTRATHINK_STATE_DIR", None)
+		bridge.CLI = teach_cli(Path(tmp) / "bin", rules)
+		reset_teach_state()
+		try:
+			yield Path(tmp) / "bin"
+		finally:
+			bridge.CLI = saved_cli
+			reset_teach_state()
+			for key, value in saved.items():
+				if value is None:
+					os.environ.pop(key, None)
+				else:
+					os.environ[key] = value
+
+
+@contextmanager
+def fake_clock(start: float = 1000.0) -> Iterator[list[float]]:
+	"""The bridge's monotonic clock as a list holding the current time."""
+	now = [start]
+	saved = bridge._clock
+	bridge._clock = lambda: now[0]
+	try:
+		yield now
+	finally:
+		bridge._clock = saved
+
+
+def tool_history(tool_rows: int = 3) -> list[dict]:
+	rows: list[dict] = [{"role": "user", "content": "fix the build"}]
+	for index in range(tool_rows):
+		call = {"id": f"c{index}", "type": "function", "function": {"name": "terminal", "arguments": json.dumps({"command": f"step {index}"})}}
+		rows.append({"role": "assistant", "content": None, "tool_calls": [call]})
+		rows.append({"role": "tool", "tool_call_id": f"c{index}", "content": json.dumps({"output": "ok", "exit_code": 0})})
+	rows.append({"role": "assistant", "content": "Done."})
+	return rows
+
+
+def finished_turn(session: str = "s1", **extra: object) -> dict:
+	"""The kwargs Hermes passes post_llm_call after a turn with three tool calls."""
+	return {
+		"session_id": session,
+		"user_message": "fix the build",
+		"assistant_response": "Done.",
+		"conversation_history": tool_history(),
+		"platform": "cli",
+		**extra,
+	}
+
+
+def test_registers_the_teach_hooks_tools_commands_and_skill_next_to_the_old_ones():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+	assert {"post_llm_call", "on_session_finalize"} <= set(ctx.hooks) and "pre_llm_call" in ctx.hooks
+	assert "ultrathink-teach" in ctx.skills and {"ultrathink-learn", "ultrathink-lessons", "ultrathink-quick"} <= set(ctx.commands)
+	save, recall = ctx.tools["ultrathink_lesson_save"], ctx.tools["ultrathink_lesson_recall"]
+	assert save.toolset == recall.toolset == "ultrathink"
+	assert save.schema["name"] == "ultrathink_lesson_save" and save.schema["parameters"]["required"] == ["name", "body"]
+	assert save.schema["parameters"]["properties"]["kind"]["enum"] == ["bug", "pitfall", "pattern", "decision", "playbook"]
+	assert save.schema["parameters"]["properties"]["tags"]["type"] == "array"
+	assert recall.schema["parameters"]["required"] == ["query"] and "limit" in recall.schema["parameters"]["properties"]
+	assert callable(save.check_fn) and callable(recall.check_fn)
+
+
+def test_registration_tolerates_a_ctx_missing_teach_methods_and_warns_once_per_piece():
+	reference = fake_ctx()
+	plugin.register(reference)
+	records: list[logging.LogRecord] = []
+
+	class Collect(logging.Handler):
+		def emit(self, record: logging.LogRecord) -> None:
+			records.append(record)
+
+	handler = Collect(logging.WARNING)
+	plugin.logger.addHandler(handler)
+	try:
+		bare = fake_ctx()
+		for attribute in ("register_tool", "register_command", "dispatch_tool", "register_skill", "inject_message"):
+			if hasattr(bare, attribute):
+				delattr(bare, attribute)
+		plugin.register(bare)
+		assert bare.hooks == reference.hooks and bare.tools == {} and bare.commands == {} and bare.skills == {}
+		assert len(records) == 4, [record.getMessage() for record in records]  # two tools, learn and lessons: one warning each
+		assert sum("ultrathink_lesson" in record.getMessage() for record in records) == 2
+
+		records.clear()
+		partial = fake_ctx()
+		original = partial.register_hook
+
+		def no_post_llm_call(name: str, callback: Callable[..., object]) -> None:
+			if name == "post_llm_call":
+				raise ValueError("unknown hook")
+			original(name, callback)
+
+		partial.register_hook = no_post_llm_call
+		plugin.register(partial)
+		assert "post_llm_call" not in partial.hooks and "on_session_finalize" in partial.hooks
+		assert sorted(partial.tools) == sorted(reference.tools) and sorted(partial.commands) == sorted(reference.commands)
+		assert len(records) == 1 and "post_llm_call" in records[0].getMessage()
+	finally:
+		plugin.logger.removeHandler(handler)
+
+
+def test_init_has_none_of_the_marker_strings_hermes_scans_for_in_its_first_8192_chars():
+	head = (HERE / "__init__.py").read_text(encoding="utf-8")[:8192]
+	for marker in ("register_memory_provider", "MemoryProvider", "CronScheduler", "register_provider", "ProviderProfile"):
+		assert marker not in head, marker
+
+
+def test_teach_status_is_cached_for_ten_minutes_and_a_failure_for_one():
+	with teach_env([STATUS_ON]) as directory, fake_clock() as now:
+		first = bridge.teach_status()
+		assert first == {"enabled": True, "capture": "observe", "recall": True}
+		assert bridge.teach_status() == first
+		calls = teach_calls(directory, "status")
+		assert len(calls) == 1 and calls[0]["argv"] == ["teach", "status", "--json"]
+		# The CLI runs as Hermes against the engine's own state directory.
+		assert calls[0]["host"] == "hermes" and calls[0]["state"] == str(bridge.state_dir())
+		now[0] += 599
+		bridge.teach_status()
+		assert len(teach_calls(directory, "status")) == 1
+		now[0] += 2
+		bridge.teach_status()
+		assert len(teach_calls(directory, "status")) == 2
+
+	for rules in ([], [{"match": ["status"], "stdout": "not json"}], [{"match": ["status"], "stdout": "{\"hello\": 1}"}], [{"match": ["status"], "code": 1}]):
+		with teach_env(rules) as directory, fake_clock() as now:
+			assert bridge.teach_status() == {"enabled": False}
+			now[0] += 59
+			assert bridge.teach_status() == {"enabled": False}
+			assert len(teach_calls(directory, "status")) == 1
+			set_rules(directory, [STATUS_ON])
+			now[0] += 2
+			assert bridge.teach_status()["enabled"] is True
+			assert len(teach_calls(directory, "status")) == 2
+
+	with teach_env([]) as directory:
+		bridge.CLI = directory / "missing"
+		assert bridge.teach_status() == {"enabled": False}
+
+
+def test_build_digest_reads_hermes_history_rows_and_flags_failed_tool_results():
+	history = [
+		{"role": "system", "content": "be helpful"},
+		{"role": "user", "content": [{"type": "text", "text": "fix it"}, {"type": "text", "text": "now"}]},
+		{"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": '{"command": "make"}'}}]},
+		{"role": "tool", "tool_call_id": "c1", "content": '{"output": "boom", "exit_code": 2}'},
+		{"role": "tool", "name": "read_file", "content": "Error: no such file"},
+		{"role": "tool", "name": "web", "content": '{"success": false}'},
+		{"role": "tool", "name": "web", "content": '{"error": "timeout"}'},
+		{"role": "tool", "name": "fine1", "content": '{"error": null, "success": true, "exit_code": 0}'},
+		{"role": "tool", "name": "fine2", "content": "all good, Error handling docs"},
+		{"role": "tool", "name": "flagged", "content": "fine", "status": "error"},
+		{"role": "tool", "name": "empty", "content": None},
+		{"role": "assistant", "content": "Fixed."},
+	]
+	digest = bridge.build_digest({"session_id": "s9", "cwd": "/work/x", "conversation_history": history, "assistant_response": "Fixed."})
+	assert digest is not None
+	assert digest["host"] == "hermes" and digest["sessionId"] == "s9" and digest["cwd"] == "/work/x" and digest["outcome"] == "completed"
+	assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", digest["at"]), digest["at"]
+	turns = digest["turns"]
+	assert turns[0] == {"role": "user", "text": "fix it\nnow"}
+	assert turns[1] == {"role": "assistant", "text": 'terminal({"command": "make"})', "tool": "terminal"}
+	tools = turns[2:10]
+	assert [turn["role"] for turn in tools] == ["tool"] * 8 and digest["toolCalls"] == 8
+	assert [turn.get("tool") for turn in tools] == ["terminal", "read_file", "web", "web", "fine1", "fine2", "flagged", "empty"]
+	assert [turn.get("isError", False) for turn in tools] == [True, True, True, True, False, False, True, False]
+	assert tools[7]["text"] == "(no output)"
+	assert turns[10] == {"role": "assistant", "text": "Fixed."} and len(turns) == 11  # the system row and the duplicate reply are gone
+	# A reply the history lacks is appended; without a payload cwd it is the process cwd.
+	later = bridge.build_digest({"session_id": "s9", "conversation_history": history, "assistant_response": "All set."})
+	assert later is not None and later["turns"][-1] == {"role": "assistant", "text": "All set."} and later["cwd"] == os.getcwd()
+
+
+def test_build_digest_keeps_the_last_sixty_turns_cut_to_1500_chars_and_needs_two_tool_rows():
+	rows = [{"role": "user", "content": "go"}] + [{"role": "tool", "name": f"t{index}", "content": "x" * 5000} for index in range(100)]
+	digest = bridge.build_digest({"session_id": "s", "conversation_history": rows})
+	assert digest is not None and len(digest["turns"]) == 60 and digest["toolCalls"] == 60
+	assert all(turn["role"] == "tool" and len(turn["text"]) == 1500 for turn in digest["turns"])
+	assert digest["turns"][-1]["tool"] == "t99"
+
+	one_tool = [{"role": "user", "content": "go"}, {"role": "tool", "name": "t", "content": "ok"}, {"role": "assistant", "content": "Done."}]
+	assert bridge.build_digest({"session_id": "s", "conversation_history": one_tool, "assistant_response": "Done."}) is None
+	assert bridge.build_digest({"session_id": "s", "conversation_history": one_tool + [{"role": "tool", "content": "ok"}]}) is not None
+	for history in (None, [], "text", [None, 3, {"role": "tool"}]):
+		assert bridge.build_digest({"session_id": "s", "conversation_history": history}) is None
+
+
+def test_observe_turn_skips_subagents_cron_off_explicit_and_short_turns_without_spawning():
+	with teach_env([STATUS_ON, {"match": ["observe"]}]) as directory:
+		assert bridge.observe_turn(finished_turn(parent_session_id="parent")) == "subagent"
+		assert bridge.observe_turn(finished_turn(platform="cron")) == "cron"
+		assert teach_calls(directory) == []  # not even a status check
+		short = finished_turn()
+		short["conversation_history"] = tool_history(1)
+		assert bridge.observe_turn(short) == "short"
+
+		reset_teach_state()
+		set_rules(directory, [STATUS_OFF, {"match": ["observe"]}])
+		assert bridge.observe_turn(finished_turn()) == "off"
+		reset_teach_state()
+		set_rules(directory, [STATUS_EXPLICIT, {"match": ["observe"]}])
+		assert bridge.observe_turn(finished_turn()) == "explicit"
+		assert teach_calls(directory, "observe") == []
+		assert not (bridge.state_dir() / "teach").exists()  # no inbox file for a skipped turn
+
+
+def test_observe_turn_starts_one_observe_per_session_every_thirty_seconds():
+	with teach_env([STATUS_ON, {"match": ["observe"]}]) as directory, fake_clock() as now:
+		assert bridge.observe_turn(finished_turn("a")) == "spawned"
+		assert bridge.observe_turn(finished_turn("a")) == "throttled"
+		assert bridge.observe_turn(finished_turn("b")) == "spawned"
+		now[0] += 29
+		assert bridge.observe_turn(finished_turn("a")) == "throttled"
+		now[0] += 2
+		assert bridge.observe_turn(finished_turn("a")) == "spawned"
+		assert len(teach_calls(directory, "observe", 3)) == 3
+
+
+def test_observe_turn_writes_a_private_inbox_file_and_starts_the_cli_detached_without_waiting():
+	with teach_env([STATUS_ON, {"match": ["observe"], "sleep": 1.5}]) as directory:
+		started = time.monotonic()
+		assert bridge.observe_turn(finished_turn("detached"), env={"ULTRATHINK_TEST": "1"}) == "spawned"
+		assert time.monotonic() - started < 1.2  # the CLI sleeps 1.5s: nothing waited for it
+		(call,) = teach_calls(directory, "observe", 1)
+		assert call["argv"][:3] == ["teach", "observe", "--file"] and len(call["argv"]) == 4
+		path = Path(call["argv"][3])
+		inbox = bridge.state_dir() / "teach" / "inbox"
+		assert path.parent == inbox and re.fullmatch(r"\d+-[0-9a-f]{8}\.json", path.name), path
+		assert stat.S_IMODE(path.stat().st_mode) == 0o600
+		assert stat.S_IMODE(inbox.stat().st_mode) == 0o700 and stat.S_IMODE(inbox.parent.stat().st_mode) == 0o700
+		digest = json.loads(path.read_text(encoding="utf-8"))
+		assert digest["host"] == "hermes" and digest["sessionId"] == "detached" and digest["toolCalls"] == 3
+		assert call["host"] == "hermes" and call["state"] == str(bridge.state_dir())
+		assert call["sid"] == call["pid"]  # its own session: it outlives the hook
+		assert exited(call["pid"])
+
+	# A CLI that cannot start leaves no unredacted digest behind.
+	with teach_env([STATUS_ON]) as directory:
+		assert bridge.observe_turn(finished_turn("first")) == "spawned"  # the stub runs, so the first digest stays in the inbox
+		bridge.CLI = directory / "missing"
+		reset_teach_state()
+		bridge._teach_status_cache[bridge._cwd()] = (bridge._clock(), 600.0, {"enabled": True, "capture": "observe"})
+		leftovers = set((bridge.state_dir() / "teach" / "inbox").iterdir())
+		assert bridge.observe_turn(finished_turn("second")) == "error"
+		assert set((bridge.state_dir() / "teach" / "inbox").iterdir()) == leftovers
+		teach_calls(directory, "observe", 1)
+
+
+def test_sync_outbox_starts_one_detached_sync_per_session_when_enabled():
+	with teach_env([STATUS_ON, {"match": ["sync"]}]) as directory:
+		assert bridge.sync_outbox({"session_id": "a", "platform": "cli"}) == "spawned"
+		assert bridge.sync_outbox({"session_id": "a"}) == "done"
+		assert bridge.sync_outbox({"session_id": None}) == "spawned"
+		calls = teach_calls(directory, "sync", 2)
+		assert [call["argv"] for call in calls] == [["teach", "sync"]] * 2 and calls[0]["host"] == "hermes"
+		assert calls[0]["sid"] == calls[0]["pid"]
+	with teach_env([STATUS_OFF, {"match": ["sync"]}]) as directory:
+		assert bridge.sync_outbox({"session_id": "a"}) == "off"
+		assert teach_calls(directory, "sync") == []
+
+
+def test_the_post_llm_call_and_finalize_hooks_fail_open():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+
+	def explode(_payload: dict) -> None:
+		raise RuntimeError("disk full")
+
+	saved = plugin.observe_turn, plugin.sync_outbox
+	setattr(plugin, "observe_turn", explode)  # noqa: B010 - the hook looks the name up in the plugin module
+	setattr(plugin, "sync_outbox", explode)  # noqa: B010
+	try:
+		assert ctx.callbacks["post_llm_call"](**finished_turn()) is None
+		assert ctx.callbacks["on_session_finalize"](session_id=None, platform="cli") is None
+	finally:
+		setattr(plugin, "observe_turn", saved[0])  # noqa: B010
+		setattr(plugin, "sync_outbox", saved[1])  # noqa: B010
+	with teach_env([STATUS_ON, {"match": ["observe"]}, {"match": ["sync"]}]) as directory:
+		assert ctx.callbacks["post_llm_call"](**finished_turn("hooked"), model="m", telemetry_schema_version=1) is None
+		ctx.callbacks["on_session_finalize"](session_id="hooked", platform="cli")
+		assert len(teach_calls(directory, "observe", 1)) == 1 and len(teach_calls(directory, "sync", 1)) == 1
+
+
+def test_lesson_save_tool_sends_the_lesson_and_always_answers_with_json():
+	saved_ok = '{"ok": true, "id": "m1", "created": true, "retain": "queued"}'
+	with teach_env([STATUS_ON, {"match": ["capture"], "stdout": saved_ok}]) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		save = ctx.tools["ultrathink_lesson_save"]
+		assert save.check_fn() is True
+		args = {"name": " Run bun test from the root ", "body": "It fails in src/.", "kind": "pitfall", "description": "d", "tags": ["bun", " ", 3, "ci"]}
+		assert json.loads(save.handler(args, task_id="t1", session_id="s1")) == json.loads(saved_ok)
+		(call,) = teach_calls(directory, "capture")
+		assert call["argv"] == ["teach", "capture", "--stdin", "--json"]
+		assert json.loads(call["stdin"]) == {"name": "Run bun test from the root", "body": "It fails in src/.", "kind": "pitfall", "description": "d", "tags": ["bun", "ci"]}
+		# The kind defaults to pattern.
+		save.handler({"name": "n", "body": "b"})
+		assert json.loads(teach_calls(directory, "capture")[1]["stdin"])["kind"] == "pattern"
+
+		# Bad arguments never reach the CLI.
+		before = len(teach_calls(directory))
+		for bad in (None, "text", {}, {"name": "n"}, {"name": " ", "body": "b"}, {"name": "n", "body": 4}, {"name": "n", "body": "b", "kind": "weird"}):
+			reply = json.loads(save.handler(bad))
+			assert reply["ok"] is False and reply["error"], bad
+		assert len(teach_calls(directory)) == before
+
+		# The CLI's own refusal comes back as it printed it.
+		set_rules(directory, [{"match": ["capture"], "stdout": '{"ok": false, "error": "name is empty"}', "code": 2}])
+		assert json.loads(save.handler({"name": "n", "body": "b"})) == {"ok": False, "error": "name is empty"}
+		# Without bun the CLI prints a hint on stderr, and the body never appears in the error.
+		set_rules(directory, [{"match": ["capture"], "stderr": "ultrathink: bun not found\n", "code": 127}])
+		assert json.loads(save.handler({"name": "n", "body": "secret body"})) == {"ok": False, "error": "ultrathink: bun not found"}
+		bridge.CLI = directory / "missing"
+		reply = json.loads(save.handler({"name": "n", "body": "secret body"}))
+		assert reply["ok"] is False and "secret body" not in reply["error"]
+
+
+def test_lesson_recall_tool_passes_the_query_and_limit_and_answers_with_json():
+	found = {"status": "used", "source": "local", "count": 1, "lessons": [{"id": "m1", "name": "N", "description": "D", "body": "B", "kind": "bug"}]}
+	with teach_env([STATUS_ON, {"match": ["recall"], "stdout": json.dumps(found)}]) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		recall = ctx.tools["ultrathink_lesson_recall"]
+		assert json.loads(recall.handler({"query": "bun test", "limit": 3}, task_id="t")) == found
+		assert teach_calls(directory, "recall")[0]["argv"] == ["teach", "recall", "bun test", "--json", "--limit", "3"]
+		recall.handler({"query": "bun test", "limit": "abc"})
+		recall.handler({"query": "-rf cleanup", "limit": 99})
+		argvs = [call["argv"] for call in teach_calls(directory, "recall")]
+		assert argvs[1] == ["teach", "recall", "bun test", "--json"]
+		assert argvs[2] == ["teach", "recall", "rf cleanup", "--json", "--limit", "20"]
+
+		before = len(teach_calls(directory))
+		for bad in (None, {}, {"query": 7}, {"query": "  "}):
+			reply = json.loads(recall.handler(bad))
+			assert reply["status"] == "error" and reply["lessons"] == [] and reply["reason"], bad
+		assert len(teach_calls(directory)) == before
+
+		set_rules(directory, [{"match": ["recall"], "stderr": "error: hindsight is down\n", "code": 1}])
+		assert json.loads(recall.handler({"query": "q"}))["reason"] == "error: hindsight is down"
+		set_rules(directory, [{"match": ["recall"], "sleep": 10}])
+		saved_timeout = bridge.TEACH_RECALL_TIMEOUT_S
+		bridge.TEACH_RECALL_TIMEOUT_S = 1
+		try:
+			assert json.loads(recall.handler({"query": "q"}))["reason"] == "no answer after 1s"
+		finally:
+			bridge.TEACH_RECALL_TIMEOUT_S = saved_timeout
+		bridge.CLI = directory / "missing"
+		assert json.loads(recall.handler({"query": "q"}))["status"] == "error"
+
+
+def test_the_lesson_tools_are_hidden_while_teachable_moments_is_off():
+	ctx = fake_ctx()
+	plugin.register(ctx)
+	for rules in ([STATUS_OFF], []):
+		with teach_env(rules):
+			assert [tool.check_fn() for tool in ctx.tools.values()] == [False, False]
+	with teach_env([STATUS_ON]):
+		assert [tool.check_fn() for tool in ctx.tools.values()] == [True, True]
+
+
+def test_learn_saves_the_note_as_a_pattern_named_by_its_first_sentence():
+	saved_ok = '{"ok": true, "id": "m7", "created": true, "retain": "retained"}'
+	with teach_env([STATUS_ON, {"match": ["capture"], "stdout": saved_ok}]) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		learn = ctx.commands["ultrathink-learn"]
+		note = "Run bun test from the repo root. It fails from src/ because the preload is relative."
+		assert learn(note) == "Saved lesson m7 (retain: retained)."
+		sent = json.loads(teach_calls(directory, "capture")[0]["stdin"])
+		assert sent == {"name": "Run bun test from the repo root.", "body": note, "kind": "pattern"}
+		long_note = "word " * 40
+		learn(long_note)
+		second = json.loads(teach_calls(directory, "capture")[1]["stdin"])
+		assert len(second["name"]) <= 80 and second["name"] == long_note.strip()[:80].rstrip() and second["body"] == long_note.strip()
+		assert learn("   ") == "Usage: /ultrathink-learn <note>" and len(teach_calls(directory, "capture")) == 2
+		set_rules(directory, [{"match": ["capture"], "stdout": '{"ok": false, "error": "body too long"}', "code": 2}])
+		assert learn("x") == "Could not save the lesson: body too long"
+		bridge.CLI = directory / "missing"
+		assert learn("x").startswith("Could not save the lesson: ")
+
+
+def test_lessons_command_lists_recalls_and_shows_status():
+	listing = {"moments": [{"id": "m1", "name": "Run bun test from root", "kind": "pitfall", "status": "confirmed"}, {"id": "m2", "name": "Bare"}]}
+	found = {"status": "used", "count": 1, "lessons": [{"id": "m1", "name": "N", "description": "D", "kind": "bug"}]}
+	rules = [
+		STATUS_ON,
+		{"match": ["status"], "stdout": "Teach: on, capture observe\n"},
+		{"match": ["list"], "stdout": json.dumps(listing)},
+		{"match": ["recall"], "stdout": json.dumps(found)},
+	]
+	with teach_env(rules) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		lessons = ctx.commands["ultrathink-lessons"]
+		expected = "- m1 [pitfall, confirmed] Run bun test from root\n- m2 Bare"
+		assert lessons("") == expected and lessons("list") == expected
+		assert lessons("recall bun test") == "- m1 [bug] N: D"
+		assert teach_calls(directory, "recall")[0]["argv"] == ["teach", "recall", "bun test", "--json", "--limit", "5"]
+		assert lessons("status") == "Teach: on, capture observe"
+		assert lessons("recall") == "Usage: /ultrathink-lessons recall <query>"
+		assert lessons("frobnicate").startswith("Usage: /ultrathink-lessons ")
+		set_rules(directory, [{"match": ["list"], "stdout": "[]"}, {"match": ["recall"], "stdout": '{"status": "none", "count": 0, "lessons": [], "reason": "no match"}'}])
+		assert lessons("list") == "No lessons saved yet." and lessons("recall zzz") == "No matching lessons. (no match)"
+		set_rules(directory, [{"match": ["list"], "stderr": "error: store unreadable\n", "code": 1}])
+		assert lessons("list") == "Could not list lessons: error: store unreadable"
+
+
+PROMOTE_DRAFT = {
+	"name": "bun-test-root",
+	"description": "Run bun test from the repo root.",
+	"content": "---\nname: bun-test-root\ndescription: Run bun test from the repo root.\n---\nRun it from the root.\n",
+	"warnings": [],
+}
+PROMOTE_RULES = [
+	{"match": ["--mark-promoted"], "stdout": "Marked 1 moment promoted.\n"},
+	{"match": ["--install"], "stdout": json.dumps({"draft": PROMOTE_DRAFT, "outcome": {"target": "hermes", "path": "/tmp/drafts/bun-test-root.md", "action": "drafted"}})},
+	{"match": ["promote"], "stdout": json.dumps({"draft": PROMOTE_DRAFT, "outcome": None})},
+]
+
+
+def test_promote_stages_the_skill_through_skill_manage_then_marks_the_lesson_promoted():
+	with teach_env(PROMOTE_RULES) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		dispatched: list[tuple[str, dict]] = []
+
+		def dispatch_tool(tool_name: str, args: dict, **kwargs: object) -> str:
+			dispatched.append((tool_name, args))
+			return '{"success": true, "staged": true}'
+
+		ctx.dispatch_tool = dispatch_tool
+		reply = ctx.commands["ultrathink-lessons"]("promote m1")
+		assert dispatched == [
+			("skill_manage", {"action": "create", "name": "bun-test-root", "category": "ultrathink-lessons", "content": PROMOTE_DRAFT["content"]})
+		]
+		assert "bun-test-root" in reply and "/skills pending" in reply, reply
+		assert [call["argv"] for call in teach_calls(directory)] == [
+			["teach", "promote", "m1", "--target", "hermes", "--json"],
+			["teach", "promote", "m1", "--mark-promoted", "--skill", "bun-test-root", "--target", "hermes"],
+		]
+
+
+def test_promote_without_a_working_dispatch_returns_the_draft_path_and_marks_nothing():
+	def refuses(tool_name: str, args: dict, **kwargs: object) -> str:
+		return '{"success": false, "error": "a skill with that name exists"}'
+
+	def raises(tool_name: str, args: dict, **kwargs: object) -> str:
+		raise RuntimeError("no such tool")
+
+	for dispatch, reason in ((None, "no dispatch_tool"), (refuses, "a skill with that name exists"), (raises, "no such tool")):
+		with teach_env(PROMOTE_RULES) as directory:
+			ctx = fake_ctx()
+			plugin.register(ctx)
+			if dispatch is not None:
+				ctx.dispatch_tool = dispatch
+			reply = ctx.commands["ultrathink-lessons"]("promote m1")
+			assert "Could not stage the skill through Hermes" in reply and reason in reply, reply
+			assert "/tmp/drafts/bun-test-root.md" in reply and "ultrathink-lessons" in reply and "SKILL.md" in reply
+			argvs = [call["argv"] for call in teach_calls(directory)]
+			assert argvs[0] == ["teach", "promote", "m1", "--target", "hermes", "--json"]
+			assert argvs[1] == ["teach", "promote", "m1", "--target", "hermes", "--install", "--json"]
+			assert not any("--mark-promoted" in argv for argv in argvs)
+
+	with teach_env([{"match": ["promote"], "stdout": '{"error": "unknown moment"}', "code": 2}]) as directory:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		assert ctx.commands["ultrathink-lessons"]("promote nope").startswith("Could not draft a skill from nope: ")
+		assert ctx.commands["ultrathink-lessons"]("promote").startswith("Usage: /ultrathink-lessons promote")
+		assert ctx.commands["ultrathink-lessons"]("promote --target").startswith("Usage: ")
+		assert len(teach_calls(directory)) == 1
+
+
+def test_no_teach_path_creates_a_planning_directory_in_the_cwd():
+	saved = os.getcwd()
+	with tempfile.TemporaryDirectory() as work, teach_env([STATUS_ON, {"match": ["capture"], "stdout": '{"ok": true, "id": "m1", "retain": "local-only"}'}, {"match": ["observe"]}, {"match": ["sync"]}]) as directory:
+		os.chdir(work)
+		try:
+			reset_teach_state()
+			assert bridge.observe_turn(finished_turn("cwd")) == "spawned"
+			assert bridge.sync_outbox({"session_id": "cwd"}) == "spawned"
+			assert bridge.capture_lesson({"name": "n", "body": "b"})["ok"] is True
+			teach_calls(directory, "observe", 1)
+			teach_calls(directory, "sync", 1)
+		finally:
+			os.chdir(saved)
+		assert list(Path(work).iterdir()) == []
+
+
 if __name__ == "__main__":
 	test_message_text_reads_string_and_dict()
 	test_skips_child_cron_and_empty_without_spawning()
@@ -899,11 +1465,30 @@ if __name__ == "__main__":
 	test_tracking_refs_with_no_created_rows_do_not_use_up_the_nudge()
 	test_pre_verify_hook_fails_open()
 	test_registers_every_ultrathink_command_next_to_the_hooks()
-	test_registers_the_four_ultrathink_skills_with_their_descriptions()
+	test_registers_the_five_ultrathink_skills_with_their_descriptions()
 	test_skill_registration_failures_leave_hooks_and_commands_registered()
 	test_skill_description_is_empty_without_frontmatter()
 	test_control_commands_run_the_cli_as_hermes_and_return_its_text()
 	test_control_failures_come_back_as_one_line()
 	test_quick_sends_the_message_once_without_a_plan()
 	test_quick_skips_the_next_message_where_hermes_cannot_send_it()
+	test_registers_the_teach_hooks_tools_commands_and_skill_next_to_the_old_ones()
+	test_registration_tolerates_a_ctx_missing_teach_methods_and_warns_once_per_piece()
+	test_init_has_none_of_the_marker_strings_hermes_scans_for_in_its_first_8192_chars()
+	test_teach_status_is_cached_for_ten_minutes_and_a_failure_for_one()
+	test_build_digest_reads_hermes_history_rows_and_flags_failed_tool_results()
+	test_build_digest_keeps_the_last_sixty_turns_cut_to_1500_chars_and_needs_two_tool_rows()
+	test_observe_turn_skips_subagents_cron_off_explicit_and_short_turns_without_spawning()
+	test_observe_turn_starts_one_observe_per_session_every_thirty_seconds()
+	test_observe_turn_writes_a_private_inbox_file_and_starts_the_cli_detached_without_waiting()
+	test_sync_outbox_starts_one_detached_sync_per_session_when_enabled()
+	test_the_post_llm_call_and_finalize_hooks_fail_open()
+	test_lesson_save_tool_sends_the_lesson_and_always_answers_with_json()
+	test_lesson_recall_tool_passes_the_query_and_limit_and_answers_with_json()
+	test_the_lesson_tools_are_hidden_while_teachable_moments_is_off()
+	test_learn_saves_the_note_as_a_pattern_named_by_its_first_sentence()
+	test_lessons_command_lists_recalls_and_shows_status()
+	test_promote_stages_the_skill_through_skill_manage_then_marks_the_lesson_promoted()
+	test_promote_without_a_working_dispatch_returns_the_draft_path_and_marks_nothing()
+	test_no_teach_path_creates_a_planning_directory_in_the_cwd()
 	print("ok")

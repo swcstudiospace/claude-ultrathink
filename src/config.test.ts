@@ -306,7 +306,7 @@ describe("substrate config", () => {
 const DECISIONS_DEFAULTS: DecisionsConfig = {
 	enabled: false,
 	model: "~typesafe/jev-latest",
-	points: ["plan", "ship", "knowledge", "blocking"],
+	points: ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"],
 	timeoutMs: 3000,
 	zdr: true,
 	planSkipBelow: 0.2,
@@ -314,6 +314,9 @@ const DECISIONS_DEFAULTS: DecisionsConfig = {
 	shipApproveAt: 0.7,
 	groundedAt: 0.8,
 	blockingAt: 0.5,
+	teachableBelow: 0.3,
+	teachableAutoAt: 0.8,
+	skillworthyAt: 0.5,
 };
 
 describe("decisions config", () => {
@@ -353,7 +356,7 @@ describe("decisions config", () => {
 
 	test("each defaultConfig() owns its points list, so mutating one never changes the next default", () => {
 		defaultConfig().decisions.points.splice(0);
-		expect(defaultConfig().decisions.points).toEqual(["plan", "ship", "knowledge", "blocking"]);
+		expect(defaultConfig().decisions.points).toEqual(["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"]);
 	});
 
 	test("enabled adopts only a boolean; \"yes\" and 1 keep the earlier layer's value (AC-10.5)", () => {
@@ -410,7 +413,16 @@ describe("decisions config", () => {
 	});
 
 	test("every threshold adopts a finite number in [0, 1] and only its own key; out-of-range and strings keep the earlier layer (AC-10.10)", () => {
-		const thresholds = ["planSkipBelow", "shipVetoAtOrBelow", "shipApproveAt", "groundedAt", "blockingAt"] as const;
+		const thresholds = [
+			"planSkipBelow",
+			"shipVetoAtOrBelow",
+			"shipApproveAt",
+			"groundedAt",
+			"blockingAt",
+			"teachableBelow",
+			"teachableAutoAt",
+			"skillworthyAt",
+		] as const;
 		const previous = 0.45;
 		for (const key of thresholds) {
 			const user = { decisions: { [key]: previous } };
@@ -486,6 +498,24 @@ describe("decisions config", () => {
 			]);
 		});
 
+		test("a project file cannot add teachable or skillworthy, but can drop them and move their thresholds", () => {
+			const user = { decisions: { enabled: true, points: ["plan", "teachable"], teachableBelow: 0.2 } };
+			expect(loadLayers(user, undefined, { decisions: { points: ["plan", "teachable", "skillworthy"] } }).decisions.points).toEqual([
+				"plan",
+				"teachable",
+			]);
+			expect(loadLayers(user, undefined, { decisions: { points: ["plan"] } }).decisions.points).toEqual(["plan"]);
+			expect(loadLayers({ decisions: { enabled: true, points: ["plan"] } }, undefined, { decisions: { points: ["skillworthy"] } }).decisions.points).toEqual(
+				[],
+			);
+			const tightened = loadLayers(user, undefined, { decisions: { teachableBelow: 0.5, teachableAutoAt: 0.9, skillworthyAt: 0.7 } }).decisions;
+			expect(tightened).toMatchObject({ teachableBelow: 0.5, teachableAutoAt: 0.9, skillworthyAt: 0.7 });
+			expect(loadLayers(user, undefined, { decisions: { teachableBelow: 2, skillworthyAt: "0.9" } }).decisions).toMatchObject({
+				teachableBelow: 0.2,
+				skillworthyAt: 0.5,
+			});
+		});
+
 		test("model, thresholds and timeoutMs from a project file still merge as usual", () => {
 			const config = loadLayers(
 				{ decisions: { enabled: true, model: "typesafe/jev-user", planSkipBelow: 0.3, timeoutMs: 4000 } },
@@ -516,5 +546,311 @@ describe("decisions config", () => {
 				file.cleanup();
 			}
 		});
+	});
+});
+
+/** Runs the real loader over user config.json, the Claude home file and the project file (`undefined` = no file). */
+function loadLayerFiles(roots: string[], user: unknown, claude?: unknown, project?: unknown): UltrathinkConfig {
+	const root = mkdtempSync(join(tmpdir(), "ut-teach-config-"));
+	roots.push(root);
+	const env = { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") };
+	const sources = claudeConfigPaths(join(root, "repo"), env);
+	for (const [source, content] of [
+		[sources[0], user],
+		[sources[1], claude],
+		[sources[2], project],
+	] as const) {
+		if (content === undefined || source === undefined) continue;
+		const path = typeof source === "string" ? source : source.path;
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(path, JSON.stringify(content));
+	}
+	return loadConfig(sources);
+}
+
+describe("hindsight config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("defaults are off with no URL, and each defaultConfig() is independent", () => {
+		expect(base.hindsight).toEqual({ enabled: false, url: "", bank: "ultrathink", timeoutMs: 5_000, retainTimeoutMs: 15_000 });
+		expect(loadLayerFiles(roots, undefined).hindsight).toEqual(base.hindsight);
+		const mutated = defaultConfig();
+		mutated.hindsight.enabled = true;
+		expect(defaultConfig().hindsight.enabled).toBe(false);
+	});
+
+	test("enabled adopts only a boolean", () => {
+		expect(mergeConfig({ hindsight: { enabled: true } }, base).hindsight.enabled).toBe(true);
+		for (const enabled of ["yes", 1, null]) {
+			expect(mergeConfig({ hindsight: { enabled } }, mergeConfig({ hindsight: { enabled: true } }, base)).hindsight.enabled).toBe(true);
+		}
+	});
+
+	test("url is trimmed and kept as written, so the resolver can report a bad one", () => {
+		expect(mergeConfig({ hindsight: { url: "  http://10.0.0.5:8888/  " } }, base).hindsight.url).toBe("http://10.0.0.5:8888/");
+		expect(mergeConfig({ hindsight: { url: "not a url" } }, base).hindsight.url).toBe("not a url");
+		const set = mergeConfig({ hindsight: { url: "http://hs.lan" } }, base);
+		for (const url of ["", "   ", 5, null]) expect(mergeConfig({ hindsight: { url } }, set).hindsight.url).toBe("http://hs.lan");
+	});
+
+	test("bank must be a safe identifier of at most 64 characters", () => {
+		expect(mergeConfig({ hindsight: { bank: "team.a-1_b" } }, base).hindsight.bank).toBe("team.a-1_b");
+		expect(mergeConfig({ hindsight: { bank: "a".repeat(64) } }, base).hindsight.bank).toBe("a".repeat(64));
+		for (const bank of ["a".repeat(65), "-lead", "has space", "a/b", "", 3]) {
+			expect(mergeConfig({ hindsight: { bank } }, base).hindsight.bank).toBe("ultrathink");
+		}
+	});
+
+	test("timeouts are positive integers of at most 120000", () => {
+		expect(mergeConfig({ hindsight: { timeoutMs: 1, retainTimeoutMs: 120_000 } }, base).hindsight).toMatchObject({
+			timeoutMs: 1,
+			retainTimeoutMs: 120_000,
+		});
+		for (const value of [0, -5, 1.5, 120_001, "9", Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(mergeConfig({ hindsight: { timeoutMs: value, retainTimeoutMs: value } }, base).hindsight).toMatchObject({
+				timeoutMs: 5_000,
+				retainTimeoutMs: 15_000,
+			});
+		}
+	});
+
+	test("unknown keys are ignored and a non-object section changes nothing", () => {
+		expect(mergeConfig({ hindsight: { apiKey: "secret", extra: 1 } }, base).hindsight).toEqual(base.hindsight);
+		expect(mergeConfig({ hindsight: "on" }, base).hindsight).toEqual(base.hindsight);
+	});
+
+	test("user and Claude layers stack, the later one winning per key", () => {
+		const config = loadLayerFiles(roots, { hindsight: { enabled: true, url: "http://a.lan", bank: "one" } }, { hindsight: { bank: "two" } });
+		expect(config.hindsight).toMatchObject({ enabled: true, url: "http://a.lan", bank: "two" });
+	});
+
+	test("a project file cannot turn it on or change the url, bank or timeouts", () => {
+		const config = loadLayerFiles(roots, undefined, undefined, {
+			hindsight: { enabled: true, url: "https://evil.example", bank: "evil", timeoutMs: 10, retainTimeoutMs: 10 },
+		});
+		expect(config.hindsight).toEqual(base.hindsight);
+		expect(JSON.stringify(config)).not.toContain("evil");
+	});
+
+	test("a project file can turn it off but keeps the user's url and bank", () => {
+		const user = { hindsight: { enabled: true, url: "http://hs.lan", bank: "mine" } };
+		expect(loadLayerFiles(roots, user, undefined, { hindsight: { enabled: false, url: "https://evil.example" } }).hindsight).toEqual({
+			...base.hindsight,
+			enabled: false,
+			url: "http://hs.lan",
+			bank: "mine",
+		});
+		expect(loadLayerFiles(roots, user, undefined, { hindsight: { enabled: true, bank: "evil" } }).hindsight).toMatchObject({
+			enabled: true,
+			bank: "mine",
+		});
+	});
+});
+
+describe("ragflow config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("defaults are off with no URL, and each defaultConfig() owns its dataset list", () => {
+		expect(base.ragflow).toEqual({
+			enabled: false,
+			url: "",
+			datasetIds: [],
+			topK: 5,
+			similarityThreshold: 0.2,
+			timeoutMs: 8_000,
+			ground: false,
+			groundChars: 3_000,
+		});
+		defaultConfig().ragflow.datasetIds.push("x");
+		expect(defaultConfig().ragflow.datasetIds).toEqual([]);
+	});
+
+	test("enabled and ground adopt only booleans", () => {
+		const on = mergeConfig({ ragflow: { enabled: true, ground: true } }, base);
+		expect(on.ragflow).toMatchObject({ enabled: true, ground: true });
+		for (const value of ["yes", 1, null]) {
+			expect(mergeConfig({ ragflow: { enabled: value, ground: value } }, on).ragflow).toMatchObject({ enabled: true, ground: true });
+		}
+	});
+
+	test("url is trimmed and kept as written; blank or non-string keeps the earlier value", () => {
+		const set = mergeConfig({ ragflow: { url: " https://rag.lan/ " } }, base);
+		expect(set.ragflow.url).toBe("https://rag.lan/");
+		for (const url of ["", "  ", 7]) expect(mergeConfig({ ragflow: { url } }, set).ragflow.url).toBe("https://rag.lan/");
+		expect(mergeConfig({ ragflow: { url: "ftp//bad" } }, base).ragflow.url).toBe("ftp//bad");
+	});
+
+	test("datasetIds are trimmed and deduplicated, at most 20, strings only", () => {
+		expect(mergeConfig({ ragflow: { datasetIds: [" a ", "b", "a"] } }, base).ragflow.datasetIds).toEqual(["a", "b"]);
+		const twenty = Array.from({ length: 20 }, (_, i) => `d${i}`);
+		expect(mergeConfig({ ragflow: { datasetIds: twenty } }, base).ragflow.datasetIds).toEqual(twenty);
+		const set = mergeConfig({ ragflow: { datasetIds: ["keep"] } }, base);
+		for (const datasetIds of [[...twenty, "d20"], ["ok", ""], ["ok", "  "], ["ok", 3], "a", null]) {
+			expect(mergeConfig({ ragflow: { datasetIds } }, set).ragflow.datasetIds).toEqual(["keep"]);
+		}
+		expect(mergeConfig({ ragflow: { datasetIds: [] } }, set).ragflow.datasetIds).toEqual([]);
+	});
+
+	test("topK, similarityThreshold, timeoutMs and groundChars enforce their ranges", () => {
+		expect(
+			mergeConfig({ ragflow: { topK: 20, similarityThreshold: 1, timeoutMs: 120_000, groundChars: 8_000 } }, base).ragflow,
+		).toMatchObject({ topK: 20, similarityThreshold: 1, timeoutMs: 120_000, groundChars: 8_000 });
+		expect(
+			mergeConfig({ ragflow: { topK: 1, similarityThreshold: 0, timeoutMs: 1, groundChars: 500 } }, base).ragflow,
+		).toMatchObject({ topK: 1, similarityThreshold: 0, timeoutMs: 1, groundChars: 500 });
+		for (const bad of [{ topK: 0 }, { topK: 21 }, { topK: 2.5 }, { topK: "3" }]) expect(mergeConfig({ ragflow: bad }, base).ragflow.topK).toBe(5);
+		for (const similarityThreshold of [-0.1, 1.1, "0.5", Number.NaN]) {
+			expect(mergeConfig({ ragflow: { similarityThreshold } }, base).ragflow.similarityThreshold).toBe(0.2);
+		}
+		for (const timeoutMs of [0, -1, 120_001, 1.5, "5"]) expect(mergeConfig({ ragflow: { timeoutMs } }, base).ragflow.timeoutMs).toBe(8_000);
+		for (const groundChars of [499, 8_001, 1000.5, "900"]) expect(mergeConfig({ ragflow: { groundChars } }, base).ragflow.groundChars).toBe(3_000);
+	});
+
+	test("user and Claude layers stack, the later one winning per key", () => {
+		const config = loadLayerFiles(roots, { ragflow: { enabled: true, topK: 3, url: "http://a.lan" } }, { ragflow: { topK: 7 } });
+		expect(config.ragflow).toMatchObject({ enabled: true, topK: 7, url: "http://a.lan" });
+	});
+
+	test("a project file cannot turn anything on or set the url, datasets or tuning", () => {
+		const config = loadLayerFiles(roots, undefined, undefined, {
+			ragflow: { enabled: true, ground: true, url: "https://evil.example", datasetIds: ["evil"], topK: 1, timeoutMs: 10, groundChars: 900 },
+		});
+		expect(config.ragflow).toEqual(base.ragflow);
+		expect(JSON.stringify(config)).not.toContain("evil");
+	});
+
+	test("a project file can turn enabled and ground off but nothing else changes", () => {
+		const user = { ragflow: { enabled: true, ground: true, url: "http://rag.lan", datasetIds: ["mine"], topK: 9 } };
+		expect(loadLayerFiles(roots, user, undefined, { ragflow: { ground: false, url: "https://evil.example", topK: 1 } }).ragflow).toMatchObject({
+			enabled: true,
+			ground: false,
+			url: "http://rag.lan",
+			datasetIds: ["mine"],
+			topK: 9,
+		});
+		expect(loadLayerFiles(roots, user, undefined, { ragflow: { enabled: false } }).ragflow).toMatchObject({ enabled: false, ground: true });
+		expect(loadLayerFiles(roots, { ragflow: { enabled: true } }, undefined, { ragflow: { ground: true } }).ragflow.ground).toBe(false);
+	});
+});
+
+describe("teach config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("defaults are off, explicit capture, and each defaultConfig() is independent", () => {
+		expect(base.teach).toEqual({
+			enabled: false,
+			capture: "explicit",
+			recall: true,
+			recallLimit: 5,
+			recallChars: 3_000,
+			promoteAfter: 3,
+			autoPromote: false,
+			observeMinToolCalls: 4,
+			timeoutMs: 2_500,
+		});
+		defaultConfig().teach.enabled = true;
+		expect(defaultConfig().teach.enabled).toBe(false);
+	});
+
+	test("booleans adopt only booleans", () => {
+		const on = mergeConfig({ teach: { enabled: true, recall: false, autoPromote: true } }, base);
+		expect(on.teach).toMatchObject({ enabled: true, recall: false, autoPromote: true });
+		for (const value of ["yes", 1, null]) {
+			expect(mergeConfig({ teach: { enabled: value, recall: value, autoPromote: value } }, on).teach).toMatchObject({
+				enabled: true,
+				recall: false,
+				autoPromote: true,
+			});
+		}
+	});
+
+	test("capture accepts only the three modes", () => {
+		for (const capture of ["explicit", "observe", "auto"] as const) expect(mergeConfig({ teach: { capture } }, base).teach.capture).toBe(capture);
+		const observe = mergeConfig({ teach: { capture: "observe" } }, base);
+		for (const capture of ["Auto", "always", "", 2, null]) expect(mergeConfig({ teach: { capture } }, observe).teach.capture).toBe("observe");
+	});
+
+	test("numeric keys enforce their ranges and integers", () => {
+		expect(
+			mergeConfig(
+				{ teach: { recallLimit: 10, recallChars: 8_000, promoteAfter: 20, observeMinToolCalls: 50, timeoutMs: 30_000 } },
+				base,
+			).teach,
+		).toMatchObject({ recallLimit: 10, recallChars: 8_000, promoteAfter: 20, observeMinToolCalls: 50, timeoutMs: 30_000 });
+		expect(
+			mergeConfig({ teach: { recallLimit: 1, recallChars: 500, promoteAfter: 2, observeMinToolCalls: 0, timeoutMs: 500 } }, base).teach,
+		).toMatchObject({ recallLimit: 1, recallChars: 500, promoteAfter: 2, observeMinToolCalls: 0, timeoutMs: 500 });
+		for (const recallLimit of [0, 11, 2.5, "3"]) expect(mergeConfig({ teach: { recallLimit } }, base).teach.recallLimit).toBe(5);
+		for (const recallChars of [499, 8_001, 600.5]) expect(mergeConfig({ teach: { recallChars } }, base).teach.recallChars).toBe(3_000);
+		for (const promoteAfter of [1, 21, 3.5, Number.NaN]) expect(mergeConfig({ teach: { promoteAfter } }, base).teach.promoteAfter).toBe(3);
+		for (const observeMinToolCalls of [-1, 51, 1.5, "2"]) {
+			expect(mergeConfig({ teach: { observeMinToolCalls } }, base).teach.observeMinToolCalls).toBe(4);
+		}
+		for (const timeoutMs of [499, 30_001, 900.5, Number.POSITIVE_INFINITY]) expect(mergeConfig({ teach: { timeoutMs } }, base).teach.timeoutMs).toBe(2_500);
+	});
+
+	test("unknown keys are ignored and a non-object section changes nothing", () => {
+		expect(mergeConfig({ teach: { mode: "auto", url: "https://x.example" } }, base).teach).toEqual(base.teach);
+		expect(mergeConfig({ teach: true }, base).teach).toEqual(base.teach);
+	});
+
+	test("user and Claude layers stack, the later one winning per key", () => {
+		const config = loadLayerFiles(roots, { teach: { enabled: true, capture: "auto", recallLimit: 3 } }, { teach: { capture: "observe" } });
+		expect(config.teach).toMatchObject({ enabled: true, capture: "observe", recallLimit: 3 });
+	});
+
+	test("a project file cannot turn anything on, raise the mode or tune a number", () => {
+		const config = loadLayerFiles(roots, undefined, undefined, {
+			teach: { enabled: true, capture: "auto", recall: true, autoPromote: true, recallLimit: 1, promoteAfter: 2, timeoutMs: 600 },
+		});
+		expect(config.teach).toEqual(base.teach);
+	});
+
+	test("a project file cannot raise capture above the user's level", () => {
+		const user = { teach: { enabled: true, capture: "observe" } };
+		expect(loadLayerFiles(roots, user, undefined, { teach: { capture: "auto" } }).teach.capture).toBe("observe");
+		expect(loadLayerFiles(roots, user, undefined, { teach: { capture: "observe" } }).teach.capture).toBe("observe");
+	});
+
+	test("a project file can lower capture auto -> observe -> explicit", () => {
+		const auto = { teach: { enabled: true, capture: "auto" } };
+		expect(loadLayerFiles(roots, auto, undefined, { teach: { capture: "observe" } }).teach.capture).toBe("observe");
+		expect(loadLayerFiles(roots, auto, undefined, { teach: { capture: "explicit" } }).teach.capture).toBe("explicit");
+		expect(loadLayerFiles(roots, auto, undefined, { teach: { capture: "bogus" } }).teach.capture).toBe("auto");
+	});
+
+	test("a project file can turn enabled, recall and autoPromote off, never on", () => {
+		const user = { teach: { enabled: true, recall: true, autoPromote: true, recallLimit: 8 } };
+		expect(
+			loadLayerFiles(roots, user, undefined, { teach: { enabled: false, recall: false, autoPromote: false, recallLimit: 1 } }).teach,
+		).toMatchObject({ enabled: false, recall: false, autoPromote: false, recallLimit: 8 });
+		const off = { teach: { enabled: true, recall: false } };
+		expect(loadLayerFiles(roots, off, undefined, { teach: { recall: true, autoPromote: true } }).teach).toMatchObject({
+			recall: false,
+			autoPromote: false,
+		});
+	});
+
+	test("a user file combined with a project file that turns things off keeps the rest", () => {
+		const config = loadLayerFiles(
+			roots,
+			{ hindsight: { enabled: true, url: "http://hs.lan" }, teach: { enabled: true, capture: "auto", recall: true } },
+			undefined,
+			{ hindsight: { enabled: false }, teach: { capture: "explicit", recall: false } },
+		);
+		expect(config.hindsight).toMatchObject({ enabled: false, url: "http://hs.lan" });
+		expect(config.teach).toMatchObject({ enabled: true, capture: "explicit", recall: false });
 	});
 });

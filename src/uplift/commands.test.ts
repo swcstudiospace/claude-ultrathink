@@ -117,6 +117,14 @@ describe("runControl", () => {
 		"SUBSTRATE_URL",
 		"SUBSTRATE_DISABLED",
 		"ULTRATHINK_MCP_STORE",
+		"ULTRATHINK_HINDSIGHT",
+		"ULTRATHINK_RAGFLOW",
+		"ULTRATHINK_TEACH",
+		"HINDSIGHT_API_URL",
+		"HINDSIGHT_API_KEY",
+		"HINDSIGHT_API_TOKEN",
+		"RAGFLOW_URL",
+		"RAGFLOW_API_KEY",
 		"OPENROUTER_API_KEY",
 		"ULTRATHINK_DECISIONS_URL",
 		"ULTRATHINK_DECISIONS",
@@ -142,6 +150,18 @@ describe("runControl", () => {
 		for (const key of ["ULTRATHINK_TRACK", "ULTRATHINK_SHIP", "SUBSTRATE_URL", "SUBSTRATE_DISABLED"] as const) delete process.env[key];
 		// Neither the machine's OpenRouter key nor its endpoint override may reach a test.
 		for (const key of ["OPENROUTER_API_KEY", "ULTRATHINK_DECISIONS_URL", "ULTRATHINK_DECISIONS", "ULTRATHINK_DEBUG"] as const) {
+			delete process.env[key];
+		}
+		for (const key of [
+			"ULTRATHINK_HINDSIGHT",
+			"ULTRATHINK_RAGFLOW",
+			"ULTRATHINK_TEACH",
+			"HINDSIGHT_API_URL",
+			"HINDSIGHT_API_KEY",
+			"HINDSIGHT_API_TOKEN",
+			"RAGFLOW_URL",
+			"RAGFLOW_API_KEY",
+		] as const) {
 			delete process.env[key];
 		}
 		// The credential store must never be the real one.
@@ -286,7 +306,7 @@ describe("runControl", () => {
 	describe("Decisions status line", () => {
 		const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
 		const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
-		const ON_DEFAULTS = "Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking";
+		const ON_DEFAULTS = "Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy";
 
 		/** User-layer config (`~/.config/ultrathink/config.json`); undefined leaves no decisions key in any layer. */
 		function userConfig(decisions: Record<string, unknown> | undefined): void {
@@ -404,10 +424,45 @@ describe("runControl", () => {
 			[
 				"  grok [engine grok|claude]",
 				"  decisions check        one live Jev decision: resolved model, latency, cost",
-				"  decisions probe <plan|ship|knowledge|blocking> <cases.json>",
-				"In an agent:",
+				"  decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>",
+				"  hindsight check",
 			].join("\n"),
 		);
+	});
+
+	test("usage lists the hindsight, ragflow and teach commands after the decisions commands", async () => {
+		const usage = (await runControl(["bogus"], io)).split("\n");
+		const probe = usage.findIndex((line) => line.startsWith("  decisions probe"));
+		expect(usage[probe + 1]).toStartWith("  hindsight check");
+		expect(usage[probe + 2]).toStartWith("  ragflow check|datasets|search");
+		expect(usage[probe + 3]).toStartWith("  teach status|list|show|capture|recall|confirm|forget|sync|observe|promote|export");
+		expect(usage[probe + 4]).toStartWith("In an agent:");
+	});
+
+	test("status shows Hindsight, RAGFlow and Teach as opt-in right after the Decisions line on a fresh install", async () => {
+		const lines = (await runControl(["status"], io)).split("\n");
+		const decisions = lines.findIndex((line) => line.startsWith("Decisions:"));
+		expect(decisions).toBeGreaterThan(-1);
+		expect(lines[decisions + 1]).toStartWith("Hindsight: off (opt-in");
+		expect(lines[decisions + 2]).toStartWith("RAGFlow: off (opt-in");
+		expect(lines[decisions + 3]).toStartWith("Teach: off (opt-in");
+		expect(lines[decisions + 4]).toStartWith("Model:");
+	});
+
+	test("status reflects the config sections for Hindsight, RAGFlow and Teach", async () => {
+		projectConfig({ hindsight: { enabled: true }, ragflow: { enabled: true }, teach: { enabled: true } });
+		// A project file can only turn things off, so the lines stay off.
+		expect(await statusLine("Hindsight:")).toStartWith("Hindsight: off (opt-in");
+		mkdirSync(join(dir, "xdg", "ultrathink"), { recursive: true });
+		writeFileSync(
+			join(dir, "xdg", "ultrathink", "config.json"),
+			JSON.stringify({ hindsight: { enabled: true }, ragflow: { enabled: true }, teach: { enabled: true } }),
+		);
+		for (const prefix of ["Hindsight:", "RAGFlow:", "Teach:"]) {
+			const line = await statusLine(prefix);
+			expect(line).toStartWith(prefix);
+			expect(line).not.toStartWith(`${prefix} off (opt-in`);
+		}
 	});
 
 	test("bin/ultrathink decisions goes to the decisions command, not the control verbs", () => {
@@ -421,7 +476,25 @@ describe("runControl", () => {
 		});
 		expect(proc.exitCode).toBe(2);
 		expect(proc.stdout.toString()).toBe(
-			"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>\n",
+			"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>\n",
 		);
+	});
+
+	test.each(["hindsight", "ragflow", "teach"])("bin/ultrathink %s goes to its own command, not the control verbs", (name) => {
+		const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "commands.ts"), name, "--no-such-flag"], {
+			cwd: io.cwd,
+			env: {
+				...process.env,
+				HOME: join(dir, "home"),
+				ULTRATHINK_STATE_DIR: join(dir, "state"),
+				ULTRATHINK_MCP_STORE: join(dir, "mcp-credentials.json"),
+			},
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		// Not runControl's usage text, and a usage failure (2) rather than a success (0).
+		expect(proc.stdout.toString()).not.toStartWith("Usage: ultrathink <command>");
+		expect(proc.exitCode).not.toBe(0);
 	});
 });

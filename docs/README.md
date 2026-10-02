@@ -18,6 +18,10 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to the pull request, Greptile review and merge flow.
 - [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md): opt in to reading the repository's Greptile knowledge base before the clarifying questions.
 - [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model at the plan, ship, knowledge and blocking points, check it, tune its thresholds and pin the model.
+- [Connect Hindsight](how-to/connect-hindsight.md): opt in to the Hindsight memory server, store the key, check it and prove a round trip.
+- [Connect RAGFlow](how-to/connect-ragflow.md): opt in to RAGFlow document search, check it without the healthz probe, and turn grounding on.
+- [Use Teachable Moments](how-to/use-teachable-moments.md): capture, confirm, recall and promote lessons. Off until you turn it on.
+- [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md): the observe hook, the lesson tools and commands, and why Hermes only gets a skill draft.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer engine calls per prompt, or none for small messages.
 - [Headless and CI](how-to/headless-and-ci.md): run hosts in scripts without planning or tracking.
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository and layer them with your own.
@@ -31,6 +35,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Tracking](tracking.md): the rows ultrathink creates in Notion and Linear, and when.
 - [Ship](ship.md): the done check, pull request, review loop and merge gate.
 - [Troubleshooting](troubleshooting.md): symptoms, causes and fixes.
+- [Teachable Moment schema](teachable-moment-schema.md): the A2A-DRAFT Agent Card mapping for a lesson record. The operator steps are in [Use Teachable Moments](how-to/use-teachable-moments.md).
 
 ## Explanation
 

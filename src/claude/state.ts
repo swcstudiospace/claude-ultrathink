@@ -15,6 +15,8 @@ import type { SkillInvocation } from "../uplift/skill.ts";
 import { resolveStateDir } from "../host/paths.ts";
 import type { ShipState } from "../ship/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
+import type { DocsLookup } from "../ragflow/types.ts";
+import type { LessonsLookup } from "../teach/types.ts";
 
 export interface ControlState {
 	enabled?: boolean;
@@ -52,6 +54,10 @@ export interface SessionRecord {
 	ship?: ShipState;
 	/** Greptile knowledge-base lookup the planner ran before the HITL clarify step. */
 	knowledge?: KnowledgeLookup;
+	/** Teachable Moments lessons lookup the planner ran (no lesson text). Absent on older records and when none ran. */
+	lessons?: LessonsLookup;
+	/** RAGFlow grounding lookup the planner ran (no document text). Absent on older records and when none ran. */
+	docs?: DocsLookup;
 	/** Jev decisions made while planning this prompt (plan, knowledge, blocking), in call order. Absent on older records and when none ran. */
 	decisions?: DecisionRecord[];
 }

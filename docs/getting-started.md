@@ -97,11 +97,14 @@ Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Decisions: off (opt-in: set decisions.enabled)
+Hindsight: off (opt-in: set hindsight.enabled)
+RAGFlow: off (opt-in: set ragflow.enabled)
+Teach: off (opt-in: set teach.enabled)
 Model: sonnet · concurrency 3
 State: /home/<you>/.claude/ultrathink
 ```
 
-The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base and no Jev decisions.
+The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight, no RAGFlow and no Teachable Moments.
 
 ## 5. Send your first prompt
 
@@ -243,12 +246,25 @@ After the agent opens a pull request, the `ultrathink-sync` skill writes the PR 
 
 Rows and their properties in full: [tracking.md](tracking.md).
 
+## 8. Optional: lessons and document search
+
+Teachable Moments, Hindsight and RAGFlow stay off until you turn them on in your user config (`${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`). A project file cannot turn them on, and none of them is required for planning. The how-tos have the commands and the exact output:
+
+- [Use Teachable Moments](how-to/use-teachable-moments.md): save a lesson, recall it into a later plan, and promote one to a skill.
+- [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md): the extra hook, tools and commands on a machine where the Hermes plugin is already enabled.
+- [Connect Hindsight](how-to/connect-hindsight.md): the memory server a confirmed lesson is copied to.
+- [Connect RAGFlow](how-to/connect-ragflow.md): document excerpts added to a plan, as untrusted evidence.
+
+On a fresh install, `bin/ultrathink status` already shows the three off lines from [step 4](#4-check-the-install).
+
 ## Next steps
 
 - [Choose the engine](how-to/choose-engine.md): plan with Grok instead of Claude.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer nodes, no questions, skipping planning for small messages.
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to opening, reviewing and merging pull requests.
 - [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model, which skips planning for messages that are not new work and double-checks ship's done verdict.
+- [Use Teachable Moments](how-to/use-teachable-moments.md): opt in to lessons, recall and promotion.
+- [Connect Hindsight](how-to/connect-hindsight.md) and [Connect RAGFlow](how-to/connect-ragflow.md): the optional memory server and document search.
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository.
 - [Headless and CI](how-to/headless-and-ci.md): turn planning off for scripts.
 - [What leaves your machine](privacy.md) and [Configuration](configuration.md).

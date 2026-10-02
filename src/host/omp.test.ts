@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { writeSession } from "../claude/state.ts";
 import type { TrackPlan } from "../track/types.ts";
 import { DEFAULT_SHIP_CONFIG, type ShipConfig } from "../ship/types.ts";
+import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
+import { DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachDigest } from "../teach/types.ts";
 import { createOmpExtension, type ExtensionAPI, NO_PLAN, type OmpPlan, type OmpPlanner, QUICK_USAGE, type ShipPrecheck } from "./omp.ts";
 import type { ProgressEvent } from "./progress.ts";
 import type { PlanView } from "./view.ts";
@@ -31,10 +33,20 @@ const wrap =
 		return typeof result === "string" ? { context: result } : result;
 	};
 
+type OmpOptions = NonNullable<Parameters<typeof createOmpExtension>[0]>;
+
 function setup(
 	plan: (...args: Parameters<OmpPlanner>) => Promise<string | OmpPlan>,
 	raceMs = 1_000,
-	extra: { now?: () => number; exists?: (path: string) => boolean; stateDir?: string; shipPrecheck?: (cwd: string) => ShipPrecheck; shipConfig?: (cwd: string) => ShipConfig } = {},
+	extra: {
+		now?: () => number;
+		exists?: (path: string) => boolean;
+		stateDir?: string;
+		shipPrecheck?: (cwd: string) => ShipPrecheck;
+		shipConfig?: (cwd: string) => ShipConfig;
+		teachContext?: OmpOptions["teachContext"];
+		spawnObserve?: OmpOptions["spawnObserve"];
+	} = {},
 	ctxExtra: Record<string, unknown> = {},
 ) {
 	const handlers = new Map<string, AnyHandler>();
@@ -760,5 +772,116 @@ describe("ship nudge", () => {
 		const { emit, sent } = ship(OK, { hasUI: false, sessionManager: { getSessionId: () => "s1", getSessionFile: () => "/tmp/omp-task-1/Worker.jsonl" } }, () => false);
 		emit("agent_end");
 		expect(sent).toHaveLength(0);
+	});
+});
+
+describe("teach capture", () => {
+	let dir = "";
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ut-omp-teach-"));
+	});
+	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+	const MESSAGES = [
+		{ role: "user", content: [{ type: "text", text: "fix the failing build" }] },
+		{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Running the build." },
+				{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "bun run build" } },
+			],
+			stopReason: "toolUse",
+		},
+		{ role: "toolResult", toolCallId: "t1", toolName: "bash", isError: true, content: [{ type: "text", text: "error TS2307" }] },
+		{ role: "assistant", content: [{ type: "text", text: "Fixed the import." }], stopReason: "stop" },
+	];
+	const ABORTED = [...MESSAGES.slice(0, -1), { role: "assistant", content: [{ type: "text", text: "stopp" }], stopReason: "aborted" }];
+
+	const teach = (enabled: boolean, capture: CaptureMode, ctxExtra: Record<string, unknown> = {}) => {
+		const spawned: { digest: TeachDigest; options: { repoRoot: string; stateDir: string; host: string; env: NodeJS.ProcessEnv } }[] = [];
+		const contexts: unknown[] = [];
+		const harness = setup(
+			async () => "",
+			1_000,
+			{
+				stateDir: dir,
+				exists: () => false,
+				teachContext: (options) => {
+					contexts.push({ host: options.host, cwd: options.cwd, sessionId: options.sessionId, stateDir: options.stateDir });
+					return {
+						host: "omp",
+						cwd: options.cwd ?? "",
+						env: options.env ?? {},
+						stateDir: join(dir, "teach-state"),
+						config: { teach: { ...DEFAULT_TEACH_CONFIG, enabled, capture }, hindsight: DEFAULT_HINDSIGHT_CONFIG },
+					};
+				},
+				spawnObserve: (digest, options) => {
+					spawned.push({ digest, options });
+					return { spawned: true };
+				},
+			},
+			ctxExtra,
+		);
+		return { ...harness, spawned, contexts };
+	};
+
+	test.each<CaptureMode>(["observe", "auto"])("agent_end spawns one detached observe in %s mode", (capture) => {
+		const { emit, spawned, contexts, sent } = teach(true, capture);
+		emit("agent_end", { messages: MESSAGES });
+		expect(spawned).toHaveLength(1);
+		const [{ digest, options }] = spawned;
+		expect(digest).toMatchObject({ host: "omp", sessionId: "s1", cwd: "/repo", outcome: "completed" });
+		expect(options).toMatchObject({ stateDir: join(dir, "teach-state"), host: "omp" });
+		expect(options.env.ULTRATHINK_HOST).toBe("omp");
+		expect(contexts).toEqual([{ host: "omp", cwd: "/repo", sessionId: "s1", stateDir: dir }]);
+		expect(sent).toHaveLength(0);
+	});
+
+	test.each<[string, boolean, CaptureMode, Record<string, unknown>]>([
+		["explicit mode", true, "explicit", {}],
+		["Teachable Moments disabled", false, "auto", {}],
+		["a subagent session", true, "observe", { hasUI: false, sessionManager: { getSessionId: () => "s1", getSessionFile: () => "/tmp/omp-task-1/Worker.jsonl" } }],
+	])("agent_end does not spawn for %s", (_name, enabled, capture, ctxExtra) => {
+		const { emit, spawned } = teach(enabled, capture, ctxExtra);
+		emit("agent_end", { messages: MESSAGES });
+		expect(spawned).toHaveLength(0);
+	});
+
+	test("agent_end does not spawn for an aborted run, without messages, or without a session id", () => {
+		const { emit, spawned } = teach(true, "observe");
+		emit("agent_end", { messages: ABORTED });
+		emit("agent_end");
+		expect(spawned).toHaveLength(0);
+		const anonymous = teach(true, "observe", { sessionManager: { getSessionId: () => "" } });
+		anonymous.emit("agent_end", { messages: MESSAGES });
+		expect(anonymous.spawned).toHaveLength(0);
+	});
+
+	test("a failing capture does not stop the ship nudge", () => {
+		writeSession(dir, {
+			sessionId: "s1",
+			at: 1,
+			result: { xml: "", original: "", root: "BUILD_PROMPT", source: "llm" },
+			plan: { graphId: "g-9" } as TrackPlan,
+			skill: { name: "gsd-execute-phase", source: "omp" },
+		} as unknown as Parameters<typeof writeSession>[1]);
+		const { emit, sent } = setup(
+			async () => "",
+			1_000,
+			{
+				stateDir: dir,
+				now: () => 777,
+				exists: () => false,
+				shipConfig: () => ({ ...DEFAULT_SHIP_CONFIG, enabled: true, skills: ["gsd-"] }),
+				shipPrecheck: () => ({ ok: true, reason: "ok", branch: "feat/x", base: "master", ahead: 2 }),
+				teachContext: () => {
+					throw new Error("boom");
+				},
+			},
+		);
+		emit("agent_end", { messages: MESSAGES });
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.message).toMatchObject({ customType: "ultrathink-ship" });
 	});
 });

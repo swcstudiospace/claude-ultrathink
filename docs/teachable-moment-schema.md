@@ -1,157 +1,112 @@
-# Teachable Moment Schema
+# Teachable Moment schema
 
-> **Status**: New (A2A-DRAFT). Schema and A2A mapping defined; no runtime hooks/wiring yet.
-> **Refs**: Graph of Thought node n5 (UPLIFTED_PROMPT spec); [SPE-5104](https://linear.app/swcstudio/issue/SPE-5104) + subissues.
-> **Related**: Hindsight client (mock) — `src/integrations/hindsight-client.ts`, `docs/hindsight-client.md`
+Schema version 2, as stored by `src/teach/types.ts`. One moment is one lesson. The local store is the source of truth; Hindsight is a copy of confirmed lessons. `teach export --a2a` prints an A2A-DRAFT Agent Card and nothing sends it.
 
-Teachable Moments capture reusable "lessons" or bug patterns discovered during autonomous agent runs (e.g. Claude-Ultrathink / OMP phases). They are designed to be:
-
-- Stored via Hindsight (content type `teachable`).
-- Mapped to A2A Agent Cards for cross-agent / cross-system sharing.
-- Queryable for future "teach" moments without re-deriving the same insight.
-
-## Schema (exact per n5 conclusion)
+## Record
 
 ```ts
 export interface TeachableMoment {
 	id: string;
-	name: string; // teachable e.g. "Claude-Ultrathink has 2 Bugs when integrating Jev"
+	name: string;
 	description: string;
 	body: string;
 	sourcePhase: string;
 	sourceArtifacts: string[];
-	createdAt: string; // ISO 8601
+	createdAt: string; // ISO 8601 UTC
 	tags: string[];
 	relatedIds: string[];
-}
-
-export type TeachableMomentType = TeachableMoment;
-
-export interface TeachableMomentInput { /* ... */ }
-
-export function normalizeTeachableMoment(input: ...): TeachableMoment;
-```
-
-### Field Details
-
-| Field            | Type     | Required | Notes / Example |
-|------------------|----------|----------|-----------------|
-| `id`             | string   | yes      | Stable identifier (UUID or hindsight record id) |
-| `name`           | string   | yes      | Human title. Teachable form: "Claude-Ultrathink has 2 Bugs when integrating Jev" |
-| `description`    | string   | yes      | Short summary (1-2 sentences) |
-| `body`           | string   | yes      | Full detail, reproduction, root cause, fix guidance. This becomes the A2A `description` in skills entry. |
-| `sourcePhase`    | string   | yes      | Originating node/phase e.g. `"n5"`, `"SPE-5104/n3"` |
-| `sourceArtifacts`| string[] | no       | Files, issues, transcripts that contributed evidence. e.g. `["claude-ultrathink/src/integrations/hindsight-client.ts", "issues/xxx.md"]` |
-| `createdAt`      | string   | yes      | ISO timestamp of capture |
-| `tags`           | string[] | no       | e.g. `["bug", "integration", "jev", "hindsight"]` |
-| `relatedIds`     | string[] | no       | Other teachable ids or hindsight record ids for graph edges |
-
-See `normalizeTeachableMoment` for defaults and sanitization (trims, array guards, id/createdAt synthesis).
-
-### Hindsight Content Shape (A2A-DRAFT)
-
-When writing via Hindsight:
-
-```ts
-{
-  type: "teachable",
-  moment: TeachableMoment
+	schema: 2;
+	kind: "bug" | "pitfall" | "pattern" | "decision" | "playbook";
+	status: "candidate" | "confirmed" | "promoted" | "superseded";
+	origin: "explicit" | "observe" | "import";
+	project: string;
+	host: string;
+	confidence: number; // 0..1; explicit captures are 1
+	occurrences: number; // at least 1
+	lastSeenAt: string;
+	dedupeKey: string;
+	recalled: number;
+	supersedes?: string;
+	retained?: { at: string; bank: string; documentId: string };
+	promoted?: { at: string; skill: string; target: "hermes" | "omp" | "claude" | "drafts"; path?: string };
 }
 ```
 
-(See smoke test usage pattern in `scripts/hindsight-smoke-test.ts` which used `{ type: "teachable", name, detail }` — this schema supersedes the ad-hoc shape.)
+| Field | Required | What the code stores |
+|---|---|---|
+| `id` | yes | File name under the moments directory. `[A-Za-z0-9_.-]`, 1 to 80 characters, not `.` or `..`. |
+| `name` | yes | One line, at most 120 characters, redacted before it is stored. |
+| `description` | yes | One line, at most 300 characters. Empty is allowed. |
+| `body` | yes | At most 2 400 characters. |
+| `sourcePhase` | yes | Phase, graph node or issue. One line, at most 120 characters. Empty is allowed. |
+| `sourceArtifacts` | yes | String array. Each item is one line, at most 300 characters. |
+| `createdAt` | yes | ISO 8601 UTC of the first capture. A later capture of the same lesson does not replace it. |
+| `tags` | yes | The moment's own tags, at most 40, each one line of at most 80 characters. Not the Hindsight tag list. |
+| `relatedIds` | yes | Other moment ids. |
+| `schema` | yes | Always `2`. A file whose `schema` is not `2`, or whose `id` is not the file name, is skipped. |
+| `kind` | yes | `bug`, `pitfall`, `pattern`, `decision` or `playbook`. Capture defaults a missing kind to `pitfall`. |
+| `status` | yes | `candidate` (found by `observe`, local only), `confirmed` (explicit capture, `teach confirm`, or auto mode), `promoted` (a skill was made), `superseded` (replaced). Status only moves up. |
+| `origin` | yes | `explicit`, `observe` or `import`. |
+| `project` | yes | Lowercase basename of the repository's primary checkout. Linked worktrees collapse onto that checkout. Outside a repository, the basename of the working directory, or `"unknown"`. |
+| `host` | yes | Host that captured it first (`claude-code`, `grok-build`, `muse`, `hermes`, `omp`, or another string). |
+| `confidence` | yes | `0..1`. Explicit captures are `1`. Observe defaults to `0.5` when the distiller omits it. |
+| `occurrences` | yes | Times this lesson was captured under the same `dedupeKey`. At least 1. |
+| `lastSeenAt` | yes | ISO 8601 UTC of the latest capture of this lesson. |
+| `dedupeKey` | yes | First 32 hex characters of sha256 of `project\|kind\|normalized name`. The same key merges into one moment. |
+| `recalled` | yes | Times this machine injected the lesson into a plan. The planner increments it; `teach recall` does not. |
+| `supersedes` | no | Id of a moment this one replaces. |
+| `retained` | no | Set once Hindsight confirmed the write: `at`, `bank`, `documentId` (`tm:<id>`). |
+| `promoted` | no | Set when a skill was made: `at`, `skill`, `target`, optional `path`. |
 
-## A2A Agent Card Mapping (A2A-DRAFT)
+Capture rejects an empty name or body (`TeachInputError`; the CLI exits 2). Every string is redacted before it is hashed, written or sent (`src/teach/redact.ts`).
 
-Per n5:
+## Local store
 
-> wrap as skills[] entry `{id, name, description: body, tags}`; top-level card for authoring agent.
+`openStore` (`src/teach/store.ts`) keeps one JSON file per moment at `<stateDir>/teach/moments/<id>.json`, and one JSON file per pending Hindsight write at `<stateDir>/teach/outbox/<id>.json`. `<stateDir>` is the host state directory (`resolveStateDir`), never `<cwd>/.planning` and never a repository working tree. `openStore` throws if its directory is under `.planning`.
 
-```ts
-export function toAgentCard(
-	tm: TeachableMoment,
-	authoringAgent?: { id?: string; name?: string }
-): A2AAgentCard;
+Files are written to a temp file in the same directory and renamed, mode `0600`. The moments and outbox directories are created mode `0700`. Several processes can share the store without a lock; the worst case is one writer's update winning. A corrupt or foreign file is skipped.
 
-export interface A2AAgentCard {
-	id: string;
-	name: string;
-	// ...
-	skills?: Array<{
-		id: string;
-		name: string;
-		description: string; // = TeachableMoment.body
-		tags: string[];
-	}>;
-	metadata?: { sourcePhase, createdAt, ... };
-}
-```
+A failed retain, delete or tag update is queued. Backoff starts at 1 minute and doubles, capped at 6 hours. `teach sync` drains due entries (at most 20 per call) and also retains confirmed or promoted moments that never reached Hindsight.
 
-- One moment → one skill entry.
-- Multiple moments → multiple skills in one card.
-- Top level `id`/`name` identify the authoring agent (default `"claude-ultrathink"`).
-- All A2A fields and extensions are **A2A-DRAFT**.
+Skill drafts, when promotion writes one, go to `<stateDir>/teach/skill-drafts/<name>/SKILL.md` (file `0600`, directories `0700`). That file is a draft, not the moment record.
 
-**A2A-DRAFT ambiguities flagged** (do not treat as stable):
+## Hindsight document
 
-- Is `skills` the correct top-level key, or `teachables`, `memories`, `capabilities`?
-- Should `body` be under `description` or a nested `content` / `markdown`?
-- Are `sourcePhase`, `relatedIds`, `sourceArtifacts` projected into the skill object, the card metadata, or omitted until confirmed?
-- Versioning / card schema version field?
-- How relations (via `relate()`) translate to A2A edges?
-- Does the card wrap a single teachable or always represent the full agent profile?
-- Exact serialization for transport (JSON, with frontmatter, etc.)?
+One document per moment. The id is `tm:<id>` (`documentIdFor`). Retain sends `update_mode: "replace"` and `async: false`, so the same id replaces the document. `ensureBank` sets the bank's `retain_extraction_mode` to `chunks` before the first retain. The key is sent only on `/v1/**`.
 
-Until the A2A spec lands, all mappings carry `// A2A-DRAFT` and `metadata._a2aDraft: true`.
+`contentFor` is `# <name>\n\n<description>\n\n<body>`, hard-capped at 3 000 characters. The description slot stays even when empty, so the text parses back. `chunks` mode stores that as one unit.
 
-## Example (Jev bug)
+`tagsFor` always emits, after sanitizing:
 
-```ts
-import { normalizeTeachableMoment } from "./src/teachable-moments/schema.ts";
-import { toAgentCard } from "./src/teachable-moments/agent-card.ts";
+- `ultrathink`
+- `teachable`
+- `project:<project>`
+- `host:<host>`
+- `kind:<kind>`
+- `status:<status>`
 
-const moment = normalizeTeachableMoment({
-	name: "Claude-Ultrathink has 2 Bugs when integrating Jev",
-	description: "Two distinct integration bugs surfaced when wiring Jev into Ultrathink flows.",
-	body: "Bug 1: ... (detail). Bug 2: ... Root cause was missing ... in the mock path. See hindsight record X.",
-	sourcePhase: "n5",
-	sourceArtifacts: ["claude-ultrathink/src/integrations/hindsight-client.ts", "issues/mtdr51sm-[n5].md"],
-	tags: ["bug", "integration", "jev", "ultrathink", "a2a-draft"],
-	relatedIds: [],
-});
+then the moment's own tags. A tag is lowercased, characters outside `[a-z0-9:_.-]` become `-`, and it is cut at 40 characters. An own tag that starts with `project:`, `host:`, `kind:` or `status:` is dropped, so a moment cannot hide itself with `status:superseded`.
 
-const card = toAgentCard(moment, { name: "claude-ultrathink" });
-// card.skills[0].description === moment.body
-// card.metadata._a2aDraft === true
-```
+`metadataFor` is string metadata only:
 
-After normalize + write to (mock) Hindsight the record id can be stored in `relatedIds` of later moments or used for `client.relate()`.
+| Key | Value |
+|---|---|
+| `tm_id` | moment id |
+| `schema` | `tm/2` |
+| `name`, `kind`, `status`, `origin`, `project`, `host` | those fields |
+| `confidence`, `occurrences` | decimal strings |
+| `created_at`, `last_seen_at` | ISO timestamps |
+| `source_phase` | `sourcePhase` |
+| `source_artifacts`, `related_ids` | JSON arrays |
 
-## Usage (current, mock-only)
+Recall asks Hindsight for tags `ultrathink`, `teachable` and `project:<project>` (`project:*` omits the project tag), `tags_match: "all_strict"`. A hit tagged `status:superseded`, or whose metadata `status` is `superseded`, is not returned as a lesson. Candidates are not retained: they stay in the local file until confirmed.
 
-```ts
-import { createMockHindsightClient } from "../src/integrations/hindsight-client.ts";
-import { normalizeTeachableMoment } from "./schema.ts";
-// (future: import { retainTeachableMoment } or similar — not wired yet)
+The retain call's `context` is the fixed string `ultrathink teachable moment`.
 
-const client = createMockHindsightClient();
-const tm = normalizeTeachableMoment({ name: "...", ... });
-const rec = await client.write({ content: { type: "teachable", moment: tm } });
-```
+## A2A export
 
-## Open / Ambiguous (A2A-DRAFT + SPE-5104)
+Still a draft. `teach export --a2a [<id>...]` prints one Agent Card JSON (`src/teach/agent-card.ts`, `toAgentCardFromMoments`) and returns. Nothing posts it, and nothing discovers it.
 
-- Exact persistence contract between TeachableMoment and HindsightRecord.content (currently opaque `unknown`).
-- Whether `normalize` should also validate (e.g. non-empty body) or stay permissive.
-- How teachables participate in recall/reflect vs. being a distinct memory type.
-- Cross-agent card exchange format and discovery (A2A protocol surface).
-- Lifecycle: mutable? supersede via relate? TTL?
-- UI / inspection surface for moments (future wave).
+With no ids, the card covers confirmed and promoted moments, newest first. Each moment becomes one `skills[]` entry: `id`, `name`, `description` set to `body`, and `tags` (the moment's own tags, or `["teachable", "a2a-draft"]` when it has none). The card's `metadata._a2aDraft` is `true`. The export passes the authoring name `ultrathink`; the card id defaults to `claude-ultrathink` inside `toAgentCard`. Empty input prints a placeholder skill `No teachable moments`.
 
-See also:
-- `src/teachable-moments/schema.ts`
-- `src/teachable-moments/agent-card.ts`
-- hindsight-client docs and smoke test (uses mock exclusively for now)
-- SPE-5104 workstream for full integration plan
-
-**Do not implement wiring, real client, or production usage of A2A cards until ambiguities are resolved.**
+The mapping is marked A2A-DRAFT in that module: top-level shape, whether `skills` is the right key, and which moment fields belong on the skill are not a stable protocol. Do not treat the printed card as something another system will accept.

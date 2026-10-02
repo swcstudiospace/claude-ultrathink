@@ -12,8 +12,8 @@ import {
 	resolveOpenRouterKey,
 	type RunDecisionOptions,
 } from "./gate.ts";
-import { buildPlanState, QUESTIONS } from "./questions.ts";
-import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionsConfig, formatP } from "./types.ts";
+import { buildPlanState, buildSkillworthyState, buildTeachableState, QUESTIONS } from "./questions.ts";
+import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionsConfig, type DecisionsErrorKind, formatP } from "./types.ts";
 
 const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
 const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
@@ -137,6 +137,8 @@ describe("Decisions.active and inactive runs (AC-2.9)", () => {
 		ship: { request: "r", acceptance_criteria: [], patch: "" },
 		knowledge: { question: "q", answer: "a", document: "d" },
 		blocking: { task: "t", question: "q", default: "d" },
+		teachable: { name: "n", description: "d", body: "b", kind: "pitfall" },
+		skillworthy: { name: "n", description: "d", body: "b", kind: "playbook", occurrences: 3 },
 	};
 
 	test("enabled without any key: every point is inactive and makes zero requests", async () => {
@@ -407,6 +409,76 @@ describe("buildDecisionsRequest", () => {
 		expect(ship.trace).toEqual({ trace_name: "ultrathink", span_name: "ship" });
 		const check = buildDecisionsRequest("plan", PLAN_STATE, { model: "m", zdr: true, spanName: "check" });
 		expect(check.trace).toEqual({ trace_name: "ultrathink", span_name: "check" });
+	});
+});
+
+describe("teachable and skillworthy points", () => {
+	const LESSON = { name: "Run bun test per file", description: "The whole suite hides the failing file", body: "b".repeat(2000), kind: "pitfall" };
+	const TEACHABLE_OPTS: RunDecisionOptions = { threshold: 0.3, action: (p) => (p < 0.3 ? "drop" : "keep") };
+
+	test("teachable sends its state, its question and the span name under the key `teachable`", async () => {
+		const r = recordingFetch([JEV(0.9, "teachable")]);
+		const outcome = await runtime(r.fetch).decisions.run("teachable", buildTeachableState(LESSON), TEACHABLE_OPTS);
+		expect(r.calls[0]?.body).toEqual({
+			model: "~typesafe/jev-latest",
+			state: { name: LESSON.name, description: LESSON.description, body: "b".repeat(800), kind: "pitfall" },
+			questions: { teachable: QUESTIONS.teachable },
+			provider: { zdr: true, data_collection: "deny" },
+			trace: { trace_name: "ultrathink", span_name: "teachable" },
+		});
+		expect(outcome.status === "ok" && outcome.record).toMatchObject({ point: "teachable", p: 0.9, action: "keep", threshold: 0.3 });
+	});
+
+	test("skillworthy sends the occurrence count and its own question", async () => {
+		const r = recordingFetch([JEV(0.2, "skillworthy")]);
+		const opts: RunDecisionOptions = { threshold: 0.5, action: (p) => (p < 0.5 ? "skip" : "keep") };
+		const outcome = await runtime(r.fetch).decisions.run("skillworthy", buildSkillworthyState({ ...LESSON, occurrences: 4 }), opts);
+		const body = r.calls[0]?.body as { state: Record<string, unknown>; questions: Record<string, unknown> };
+		expect(body.state).toEqual({ ...LESSON, body: "b".repeat(800), occurrences: 4 });
+		expect(body.questions).toEqual({ skillworthy: QUESTIONS.skillworthy });
+		expect(outcome.status === "ok" && outcome.record).toMatchObject({ point: "skillworthy", p: 0.2, action: "skip", probabilities: { skillworthy: 0.2 } });
+	});
+
+	test("each is active only when listed, and the default list names both", () => {
+		expect(DEFAULT_DECISIONS_CONFIG.points).toEqual(["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"]);
+		const r = recordingFetch([JEV(0.5)]);
+		const onlyTeachable = runtime(r.fetch, { config: { ...ON, points: ["teachable"] } }).decisions;
+		expect(DECISION_POINTS.filter((point) => onlyTeachable.active(point))).toEqual(["teachable"]);
+		const planOnly = runtime(r.fetch, { config: { ...ON, points: ["plan"] } }).decisions;
+		expect(planOnly.active("teachable")).toBe(false);
+		expect(planOnly.active("skillworthy")).toBe(false);
+	});
+
+	test("the kill switch makes both inactive without a request", async () => {
+		const r = recordingFetch([JEV(0.5, "teachable")]);
+		const { decisions } = runtime(r.fetch, { env: { OPENROUTER_API_KEY: K, ULTRATHINK_DECISIONS: "0" } });
+		expect(await decisions.run("teachable", buildTeachableState(LESSON), TEACHABLE_OPTS)).toEqual({ status: "inactive" });
+		expect(await decisions.run("skillworthy", buildSkillworthyState({ ...LESSON, occurrences: 1 }), TEACHABLE_OPTS)).toEqual({ status: "inactive" });
+		expect(r.calls).toHaveLength(0);
+	});
+
+	test("every failure kind returns a fail-open error record", async () => {
+		const invalid = () => Response.json({ model: "m", answers: { teachable: { type: "noul", noul: 7 } }, usage: { input_tokens: 1, output_tokens: 0 } });
+		const throwing = (async () => {
+			throw new Error("connection refused");
+		}) as unknown as typeof fetch;
+		const cases: Array<[DecisionsErrorKind, typeof fetch]> = [
+			["auth", recordingFetch([ERR(401)]).fetch],
+			["credits", recordingFetch([ERR(402)]).fetch],
+			["bad-request", recordingFetch([ERR(400)]).fetch],
+			["too-large", recordingFetch([ERR(413)]).fetch],
+			["rate-limit", recordingFetch([ERR(429)]).fetch],
+			["upstream", recordingFetch([ERR(500)]).fetch],
+			["timeout", recordingFetch([ERR(408)]).fetch],
+			["invalid-response", recordingFetch([invalid]).fetch],
+			["network", throwing],
+		];
+		for (const [kind, fetchImpl] of cases) {
+			const outcome = await runtime(fetchImpl).decisions.run("teachable", buildTeachableState(LESSON), TEACHABLE_OPTS);
+			if (outcome.status !== "error") throw new Error(`expected an error for ${kind}`);
+			expect(outcome.error.kind).toBe(kind);
+			expect(outcome.record).toMatchObject({ point: "teachable", action: "fail-open", error: kind });
+		}
 	});
 });
 

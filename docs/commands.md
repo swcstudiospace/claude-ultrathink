@@ -18,7 +18,7 @@ ultrathink plans every non-trivial prompt by default. The commands on this page 
 | `/ultrathink-on` | Planning back on for this host. |
 | `/ultrathink-track off` | Planning continues, but no Linear/Notion rows are created. |
 | `/ultrathink-track on` | Row creation back on. `/ultrathink-track` with no argument (or `status`) shows the tracking state. `on` and `off` are per-host settings that beat `track.enabled` in the config until you change them again. |
-| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship, knowledge-base and Jev Decisions state, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
+| `/ultrathink-status` | Shows planning, engine, Graph of Thought, HITL and tracking state, the configured Notion data source and Linear team, the Agent Substrate, ship, knowledge-base and Jev Decisions state, the Hindsight, RAGFlow and Teachable Moments lines, and the state directory. The output is the same as [`bin/ultrathink status`](#binultrathink). |
 
 Some details:
 
@@ -81,6 +81,7 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - `/ultrathink-quick <message>` hands the message to Hermes through `inject_message` as the next user turn, which `pre_llm_call` then leaves unplanned. This works in the Hermes CLI.
 - In gateways (Telegram, Discord, Slack and so on), `inject_message` needs `plugins.entries.ultrathink.allow_gateway_injection: true` in the Hermes config. Without it, or wherever Hermes cannot inject (the TUI, an older Hermes), `quick` arms a skip for your next message and replies: `Ultrathink will not plan your next message. Send it now (or prefix any message with raw:).` `/ultrathink-quick` with no message does the same.
 - The names use hyphens, not colons. Chat command menus accept only a restricted character set, and a single colon name stops Discord from listing the plugin commands that follow it. Telegram menus show the commands with underscores: `ultrathink_status`, `ultrathink_quick` and so on.
+- `/ultrathink-learn <note>` saves the note as a `pattern` lesson (the name is its first sentence). It does nothing useful while `teach.enabled` is off. `/ultrathink-lessons` with no argument lists lessons. `recall <query>`, `promote <id>` and `status` are the other verbs. `promote` stages a draft through Hermes `skill_manage`; ultrathink does not write `~/.hermes/skills`. See [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
 - In a shared multi-user gateway session, Hermes puts a sender tag such as `[Alice] ` in front of each message. The plugin strips a leading tag that names the current sender before its checks (a label you type, such as `[backend]`, stays), so the tag stops neither a `quick` message from matching nor the `raw:` prefix and the [automatic skips](#prompt-prefixes-and-automatic-skips) from applying, and the engine plans the untagged text.
 
 ## Prompt prefixes and automatic skips
@@ -111,6 +112,9 @@ Set these in the environment of the host process. They override config and the c
 | `ULTRATHINK_TRACK=0` | The planner creates no Linear/Notion rows. Planning continues, and `ultrathink-kickoff` creates the rows in the agent's turn instead. With a tracker configured, `/ultrathink-status` shows `Tracking: kickoff`. `track.enabled: false` in config does the same, unless `/ultrathink-track on` was run on that host (the per-host setting beats `track.enabled`; this variable beats both). |
 | `ULTRATHINK_SHIP=0` | No ship nudge and no `## Ship` section in the plan, even with `ship.enabled: true`. See [Ship](ship.md). |
 | `ULTRATHINK_DECISIONS=0` | No Jev decision at any point, even with `decisions.enabled: true`: no request, no decision record, no plan-skip notice. `/ultrathink-status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` refuse with exit 1. See [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again). |
+| `ULTRATHINK_HINDSIGHT=0` | No Hindsight request, even with `hindsight.enabled: true`. `/ultrathink-status` shows `Hindsight: off (ULTRATHINK_HINDSIGHT=0)`. |
+| `ULTRATHINK_RAGFLOW=0` | No RAGFlow request, even with `ragflow.enabled: true`. `/ultrathink-status` shows `RAGFlow: off (ULTRATHINK_RAGFLOW=0)`. |
+| `ULTRATHINK_TEACH=0` | No lesson capture, recall or promote while Teachable Moments would otherwise be on. See [Configuration](configuration.md#teach-teachable-moments). |
 | `ULTRATHINK_DEBUG=1` | `hooks/uplift.ts` (Claude Code, Grok, Muse) logs every skip reason and failure to stderr as `[ultrathink] …`. With Jev decisions on, every decision also logs one `[ultrathink] decisions <point> · …` line (P or the error kind, model, latency, attempts, cost; never the message or the key). |
 | `ULTRATHINK_HOST` | Forces the host id: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. This selects the state directory, which matters for `bin/ultrathink` run from a plain terminal. |
 | `ULTRATHINK_STATE_DIR` | Overrides the state directory. Use an absolute path (a relative one resolves differently per host; see [Configuration](configuration.md#environment-variables)). It is ignored if it points into a `.planning/` directory. |
@@ -138,8 +142,13 @@ Usage: ultrathink <command>
   hitl on|off|last       HITL clarifications
   grok [engine grok|claude]
   decisions check        one live Jev decision: resolved model, latency, cost
-  decisions probe <plan|ship|knowledge|blocking> <cases.json>
+  decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>
+  hindsight check        Hindsight memory server: readiness, health, optional round trip
+  ragflow check|datasets|search "<query>"   RAGFlow document search
+  teach status|list|show|capture|recall|confirm|forget|sync|observe|promote|export   Teachable Moments
 ```
+
+The top-level help and the `decisions` subcommand both list all six probe points. A bad `decisions` argument prints the decisions usage and exits 2. `hindsight`, `ragflow` and `teach` have their own usage text, also exit 2. See the sections below.
 
 | Verb | Effect |
 |---|---|
@@ -154,7 +163,10 @@ Usage: ultrathink <command>
 | `grok` or `grok status` | Engine label, Grok model, effort and transport, and Grok login state. |
 | `grok engine grok`, `grok engine claude` | Switches the planning engine for this host. |
 | `decisions check` | One live Jev decision to prove the integration end to end. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
-| `decisions probe <plan\|ship\|knowledge\|blocking> <cases.json>` | Runs your own cases through one decision point and prints P and the action under the current thresholds. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
+| `decisions probe <plan\|ship\|knowledge\|blocking\|teachable\|skillworthy> <cases.json>` | Runs your own cases through one decision point and prints P and the action under the current thresholds. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
+| `hindsight check [--roundtrip] [--json]` | Readiness, `/health` and `/version`, and an optional throwaway-bank round trip. Exit 0, 1 or 2. See [`bin/ultrathink hindsight`](#binultrathink-hindsight). |
+| `ragflow check\|datasets\|search` | Dataset probe, dataset list, or a search. Exit 0, 1 or 2. See [`bin/ultrathink ragflow`](#binultrathink-ragflow). |
+| `teach …` | Teachable Moments. Exit 0, 1 or 2. See [`bin/ultrathink teach`](#binultrathink-teach). |
 
 The state directory comes from `ULTRATHINK_HOST`, or else from the detected host. A plain terminal is detected as Claude Code. To change another host's state from a terminal, set the host explicitly:
 
@@ -181,6 +193,9 @@ Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Decisions: off (opt-in: set decisions.enabled)
+Hindsight: off (opt-in: set hindsight.enabled)
+RAGFlow: off (opt-in: set ragflow.enabled)
+Teach: off (opt-in: set teach.enabled)
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -201,6 +216,9 @@ What the lines can say:
 | `Decisions` | Jev decisions through the OpenRouter Decisions API (see [`decisions`](configuration.md#decisions-jev-decisions-openrouter-decisions-api)): `off (ULTRATHINK_DECISIONS=0)` when that variable is set, whatever the config says; `off (opt-in: set decisions.enabled)`; `on · no OpenRouter key (…)` when no key is stored and `OPENROUTER_API_KEY` is unset; or `on · <model> · <points> · key from <source> · zdr on\|off`, where `<points>` is the `decisions.points` list joined by `, ` (or `no points`), `<source>` is `store` or `OPENROUTER_API_KEY` (never the key), and ` · url <url>` (origin and path only) is added while `ULTRATHINK_DECISIONS_URL` is in effect, or ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted. |
 | `Model` | `claude.model` and `claude.concurrency`. |
 | `State` | The state directory in use. |
+| `Hindsight` | Starts with `Hindsight: `. `off (ULTRATHINK_HINDSIGHT=0)`; `off (opt-in: set hindsight.enabled)`; `on · no URL (set hindsight.url or HINDSIGHT_API_URL)`; `on · bad URL (<reason>)`; `on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`; or `on · <origin> · bank <bank> · key from <store|HINDSIGHT_API_KEY|HINDSIGHT_API_TOKEN>`. Never the key, never a URL path. |
+| `RAGFlow` | Starts with `RAGFlow: `. `off (ULTRATHINK_RAGFLOW=0)`; `off (opt-in: set ragflow.enabled)`; `on · no URL (set ragflow.url or RAGFLOW_URL)`; `on · bad URL (<reason>)`; `on · no key (run bin/ultrathink-mcp auth set-key ragflow --stdin, or set RAGFLOW_API_KEY)`; or `on · <origin> · key from <store|RAGFLOW_API_KEY> · grounding on|off · <n> dataset(s) pinned` (or `all datasets`). |
+| `Teach` | Starts with `Teach: `. `off (opt-in: set teach.enabled)` while `teach.enabled` is false, even if `ULTRATHINK_TEACH=0` is set; `off (ULTRATHINK_TEACH=0)` when enabled and that variable is `0`; or `on · capture <mode> · recall on|off · <n> confirmed, <m> candidate · Hindsight <ready|off|no URL|bad URL|no key> · outbox <k>`. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
 
 The `Decisions:` line in full, in its four forms:
@@ -208,7 +226,7 @@ The `Decisions:` line in full, in its four forms:
 - `Decisions: off (ULTRATHINK_DECISIONS=0)`: `ULTRATHINK_DECISIONS=0` is set in the environment. It is checked before `decisions.enabled`, and no point sends a request.
 - `Decisions: off (opt-in: set decisions.enabled)`: `decisions.enabled` is `false`, the default. No point sends a request.
 - `Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`: turned on, but there is no key, so no point sends a request.
-- `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking · key from store · zdr on`: turned on with the defaults and a stored key. With no stored key and the key in the environment it reads `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking · key from OPENROUTER_API_KEY · zdr on`.
+- `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · key from store · zdr on`: turned on with the defaults and a stored key. With no stored key and the key in the environment it reads `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · key from OPENROUTER_API_KEY · zdr on`.
 
 The ready form ends with ` · url <url>` while an accepted `ULTRATHINK_DECISIONS_URL` is in effect, showing only its origin and path, or with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted; requests then go to the default endpoint. See [Configuration: Environment variables](configuration.md#environment-variables).
 
@@ -217,7 +235,7 @@ The ready form ends with ` · url <url>` while an accepted `ULTRATHINK_DECISIONS
 Operator tools for [Jev decisions](how-to/use-jev-decisions.md). Both read the `decisions` config for the current directory (`model`, `zdr`, `timeoutMs` and the thresholds) and ignore `decisions.enabled` and `decisions.points`, so you can try them before you turn Decisions on. `ULTRATHINK_DECISIONS=0` still applies: with it set, both refuse without a request. Both need an OpenRouter key (stored with `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) and send real requests to the Decisions API; one decision costs about $0.000019.
 
 ```text
-Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>
+Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>
 ```
 
 Any other arguments print that usage line and exit 2.
@@ -237,7 +255,7 @@ Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-lates
 
 While `ULTRATHINK_DECISIONS_URL` is in effect, the ok and error lines end with ` · url <url>`, its origin and path only. When it is set but not accepted, they end with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` instead, and the check used the default endpoint. The key is never printed.
 
-`decisions probe <plan|ship|knowledge|blocking> <cases.json>` runs your own cases through one decision point, one request after another, and shows what that point would do with each under the current thresholds. `<cases.json>` is resolved against the current directory and holds a JSON array of 1 to 200 case objects. Each case has the state fields of its point, plus an optional `label`: `true` when the right answer is yes (plan it, the patch is complete, the claim is supported, the default is risky), `false` when it is no.
+`decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>` runs your own cases through one decision point, one request after another, and shows what that point would do with each under the current thresholds. `<cases.json>` is resolved against the current directory and holds a JSON array of 1 to 200 case objects. Each case has the state fields of its point, plus an optional `label`: `true` when the right answer is yes, `false` when it is no. For `teachable` and `skillworthy`, yes means the candidate should stand.
 
 | Point | Fields | Actions printed |
 |---|---|---|
@@ -245,6 +263,8 @@ While `ULTRATHINK_DECISIONS_URL` is in effect, the ok and error lines end with `
 | `ship` | `request` (non-empty string), `acceptance_criteria` (array of strings, optional), `patch` (string) | `veto` when P is at or below `shipVetoAtOrBelow`, `approve` when P is at or above `shipApproveAt`, else `pass` |
 | `knowledge` | `question`, `answer`, `document` (non-empty strings) | `reject-claim` when P is below `groundedAt`, else `keep` |
 | `blocking` | `task`, `question`, `default` (non-empty strings) | `promote` when P is at or above `blockingAt`, else `keep` |
+| `teachable` | `candidate` object with non-empty `name`, `description`, `body` and `kind`, plus optional `label` | `drop` when P is below `teachableBelow`, `auto-confirm` when P is at or above `teachableAutoAt`, else `keep` |
+| `skillworthy` | the same `candidate`, plus `occurrences` (integer of at least 1) | `skip` when P is below `skillworthyAt`, else `keep` |
 
 The fields go through the same caps as the live points (see [Privacy: Jev decisions](privacy.md#jev-decisions-openrouter)). Every case is checked before the first request. For example, `plan-cases.json`:
 
@@ -264,20 +284,106 @@ Decisions probe: plan · typesafe/jev-1.13-20260917 · cases 2 · labelled 2 · 
 ```
 
 - A case line is `#<n> P <P> · <action>`, plus ` · label <true|false> · agree` (or `DISAGREE`) when the case has a label. P is printed with two decimals, cut rather than rounded, so a printed value never crosses a threshold. A case whose decision failed prints `#<n> error (<kind>)`.
-- For `plan`, `knowledge` and `blocking`, a case agrees when `label: true` meets `plan`, `keep` or `promote` and `label: false` meets the other action. For `ship`, `label: true` agrees unless the action is `veto`, and `label: false` agrees unless it is `approve`.
+- For `plan`, `knowledge` and `blocking`, a case agrees when `label: true` meets `plan`, `keep` or `promote` and `label: false` meets the other action. For `ship`, `label: true` agrees unless the action is `veto`, and `label: false` agrees unless it is `approve`. For `skillworthy`, `label: true` agrees with `keep` and `label: false` agrees with `skip`. For `teachable`, the label agrees unless the action is `drop`: `keep` and `auto-confirm` both count as yes.
 - The summary is `Decisions probe: <point> · <model> · cases <n> · labelled <m> · agree <a>/<m> · errors <e>`, with the resolved model of the first answered case.
 - Exit 0 when every case was answered, 1 when any case failed, when `ULTRATHINK_DECISIONS=0` is set (`Decisions probe: off (ULTRATHINK_DECISIONS=0)`, printed once the file is checked; no request is sent) or when there is no key (`Decisions probe: no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`). An unreadable or invalid file exits 2 before any request, with `Decisions probe: <reason>`, for example `Decisions probe: case #3: "message" must be a non-empty string` or `Decisions probe: plan-cases.json is not a JSON array of 1 to 200 cases`.
 
+### `bin/ultrathink hindsight`
+
+Operator probe for the Hindsight server. It reads the merged `hindsight` config for the current directory. See [Connect Hindsight](how-to/connect-hindsight.md) (`docs/how-to/connect-hindsight.md`).
+
+```text
+Usage: ultrathink hindsight check [--roundtrip] [--json]
+```
+
+Any other arguments print that line and exit 2. Exit 0 is ok. Exit 1 is not ready or a runtime failure. The key is never printed.
+
+| Result | Output | Exit |
+|---|---|---|
+| Not ready | `Hindsight check: <reason>`, where `<reason>` is the status line without the `Hindsight: ` prefix (for example `off (opt-in: set hindsight.enabled)` or `on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`). `--json` prints `{"ok":false,"state":"<off|unready>","reason":"<reason>"}`. No request is made. | 1 |
+| Health failed | `Hindsight check: error (<kind>) · <message>`. `--json` includes `ok`, `state`, `origin`, `bank`, `error` and `ms`. | 1 |
+| Ok | `Hindsight check: ok · Hindsight <version> · database connected · bank <bank> · <ms> ms`, then `Features: <name> on|off · …` (or `Features: none reported`). Version is `unknown` when the server reports none. | 0 |
+| Round trip failed | The ok lines, then `Hindsight roundtrip: failed · throwaway bank ultrathink-smoke-<hex>`, then one line per step. | 1 |
+
+`--roundtrip` retains, recalls and deletes a probe in a throwaway `ultrathink-smoke-*` bank. It does not read or write the configured bank. Steps, in order, are `ensure bank`, `retain`, `recall`, `delete document` and `delete bank`. A step line is `  <name>: ok · <ms> ms`, `  <name>: failed (<kind>) · <message> · <ms> ms`, or `  <name>: skipped`. Cleanup runs even when an earlier step failed. The client sets the throwaway bank to `chunks` extraction mode; do not enable verbatim or reflect on a server that has no LLM.
+
+`check` without `--roundtrip` asks `/health` and `/version`. Those two routes need no key, but the command uses the same readiness check as the status line, so it does not call them while the integration is off, the URL is missing or refused, or the key is missing.
+
+### `bin/ultrathink ragflow`
+
+Operator tools for RAGFlow. They honor the kill switch, `ragflow.enabled`, the URL policy and the key lookup, and they ignore `ragflow.ground`, so the connection can be proven before grounding is on. See [Connect RAGFlow](how-to/connect-ragflow.md) (`docs/how-to/connect-ragflow.md`).
+
+```text
+Usage: ultrathink ragflow check [--json] | datasets [--json] | search "<question>" [--dataset <id>]... [--limit N] [--json]
+```
+
+Any other arguments print that line and exit 2. `search` needs exactly one non-empty question. `--limit` is an integer from 1 to 100; omitted, it uses `ragflow.topK`. `--dataset` may be repeated; omitted, the command uses `ragflow.datasetIds`, or every dataset the key can see when that list is empty. Exit 0 is ok, including no datasets and no matches. Exit 1 is not ready or a runtime failure. The key is never printed.
+
+Health is `GET /api/v1/datasets?page=1&page_size=1`. Do not probe `/system/healthz`, `/v1/system/healthz` or `/api/v1/system/healthz`: that route can block the API worker while object storage is down.
+
+| Result | Output | Exit |
+|---|---|---|
+| Not ready | `RAGFlow <check|datasets|search>: <reason>`, where `<reason>` is the status line without the `RAGFlow: ` prefix. `--json` is `{"ok":false,"error":{"kind":"not-ready","message":"<reason>"}}`. No request is made. | 1 |
+| Request failed | `RAGFlow <command>: error (<kind>) · <message>`. `--json` is `{"ok":false,"error":{"kind","message"}}`. | 1 |
+| `check` ok | `RAGFlow check: ok · <n> dataset(s) · <ms> ms`. `--json`: `{"ok":true,"datasets":<n>,"ms":<ms>}`. | 0 |
+| `datasets` empty | `RAGFlow datasets: none visible to this key` | 0 |
+| `datasets` ok | A padded table with columns `id`, `name`, `documents`, `chunks`. `--json`: `{"ok":true,"datasets":[...]}`. | 0 |
+| `search` empty | `RAGFlow search: no matches` | 0 |
+| `search` ok | One line per chunk: `<similarity>  <document>: <excerpt>`. Similarity is two decimals, or `n/a `. `--json`: `{"ok":true,"count":<n>,"chunks":[...]}`. | 0 |
+| `search`, no datasets | `RAGFlow search: no datasets to search` | 1 |
+
+### `bin/ultrathink teach`
+
+Teachable Moments. State is `<stateDir>/teach/`, from `ULTRATHINK_HOST` and `ULTRATHINK_STATE_DIR`, never `<cwd>/.planning`. See [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`).
+
+```text
+usage:
+  teach status [--json]
+  teach list [--status S] [--project P] [--json]
+  teach show <id> [--json]
+  teach capture (--stdin | --name N --body B [--description D] [--kind K] [--tag T]... [--phase P] [--artifact A]...) [--json]
+  teach recall "<query>" [--limit N] [--project P|*] [--json]
+  teach confirm <id> [--json]
+  teach forget <id> [--json]
+  teach sync [--json]
+  teach observe (--stdin | --file <path>) [--json]
+  teach promote --due [--json]
+  teach promote <id>... [--target hermes|omp|claude|drafts] [--install] [--json]
+  teach promote <id>... --mark-promoted --skill <name> --target <t> [--path P] [--json]
+  teach export --a2a [<id>...]
+```
+
+`teach help`, `teach --help` and `teach -h` print that text and exit 0. Bare `teach` is a usage error and exits 2 (`teach: missing subcommand (...)`). A usage error or invalid input exits 2, as `teach: <reason>` (with `--json`, `{"ok":false,"error":"teach: <reason>"}`). A missing moment, a refused install, or Teachable Moments being off for a command that changes state exits 1. Exit 0 is ok.
+
+While Teachable Moments is off, `capture`, `confirm`, `forget`, `sync` and `promote` print `Teachable Moments is off (opt-in: set teach.enabled)` or `Teachable Moments is off (ULTRATHINK_TEACH=0)` and exit 1. `status`, `list`, `show`, `recall` and `export` still run. `observe` exits 1 with the same off message.
+
+| Subcommand | What it prints |
+|---|---|
+| `status` | The `Teach: ` line, then `Moments: <n> candidate, <n> confirmed, <n> promoted, <n> superseded · outbox <n>`. `--json`: `{"enabled","capture","recall","hindsight":"ready|off|unready","moments":{"candidate","confirmed","promoted","superseded"},"outbox"}`. |
+| `list` | One line per moment, newest first: `<id prefix> <status> <kind> x<occurrences> <project> <name>`, or `No moments.`. `--status` is `candidate`, `confirmed`, `promoted` or `superseded`. |
+| `show <id>` | The moment. `<id>` may be a unique prefix of at least four characters. Unknown id exits 1: `no moment <id>`. |
+| `capture` | `Captured <id> (created|merged) · retain <retained|queued|local-only|off>`. `--kind` is `bug`, `pitfall`, `pattern`, `decision` or `playbook`. `--stdin` is one JSON object and cannot be combined with the flags. Invalid input exits 2. |
+| `recall "<query>"` | `<source> · <n> lesson(s)`, and the `## Lessons from earlier work` section when lessons were used. `--limit` is 1 to 10. `--project *` drops the project tag. A lookup error exits 1; off exits 0 with `status` `off`. |
+| `confirm <id>` | `Confirmed <id> · retain <state>`. Unknown id exits 1. |
+| `forget <id>` | `Forgot <id> · remote <deleted|queued|none>`. Removes the local file and deletes, or queues the delete of, the Hindsight document. |
+| `sync` | `Sync: <done> done · <pending> pending`. Exits 1 when a reason is set and work is still pending. `--json`: `{"done","pending","reason"?}`. |
+| `observe` | One of `--stdin` or `--file <path>`, not both. `--file` must be an existing file under `<stateDir>/teach/inbox/`; it is deleted afterwards, and only then. A skipped turn prints `Observe skipped: <reason>`. Otherwise `Observed · <n> captured`, plus `· <n> dropped by Jev` when `teachable` dropped candidates. |
+| `promote --due` | Lists moments that are due (confirmed, not promoted, and `occurrences` at least `teach.promoteAfter`, or kind `playbook`). With Decisions on, a moment whose P(`skillworthy`) is below `skillworthyAt` is left out, and the last line is `Jev skipped <n> moment(s): not worth a standing skill.`. `--due` takes no ids and no other promote flags. |
+| `promote <id>…` | Renders a `SKILL.md` draft and prints it. `--target` is `hermes`, `omp`, `claude` or `drafts`; omitted, the target follows the host (`omp` to `omp`, `claude-code` and `grok-build` to `claude`, `hermes` to `hermes`, anything else to `drafts`). |
+| `promote <id>… --install` | Writes the draft for `omp` (`<omp agent dir>/managed-skills`) or `claude` (`~/.claude/skills`, or `$CLAUDE_CONFIG_DIR/skills`). `hermes` and `drafts` only write `<stateDir>/teach/skill-drafts/<name>/SKILL.md`. Hermes prints `install through Hermes skill_manage so skills.write_approval applies; ultrathink never writes ~/.hermes/skills`. A refused install (name taken by a skill ultrathink did not write, or a symlink) exits 1 and marks nothing. A created or updated skill marks the moments promoted. |
+| `promote <id>… --mark-promoted --skill <name> --target <t> [--path P]` | Marks the moments promoted after Hermes staged the skill through `skill_manage`. `--skill` must match `[a-z0-9][a-z0-9-]{0,63}`. Cannot be combined with `--install`. |
+| `export --a2a [<id>…]` | Prints an A2A-DRAFT Agent Card JSON for the given moments, or for confirmed and promoted moments when no id is given. Nothing is sent. |
+
 ### `bin/ultrathink-mcp`
 
-The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md). It also keeps the OpenRouter API key for [Jev decisions](how-to/use-jev-decisions.md) in the same credential store; `openrouter` is an API-key provider, not an MCP server, so it is never served, checked or registered.
+The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md). It also keeps API keys for OpenRouter, Hindsight and RAGFlow in the same credential store. `openrouter`, `hindsight` and `ragflow` are API-key providers, not MCP servers, so they are never served, checked or registered.
 
 ```text
 usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
-  (openrouter is API-key only: set-key, status and logout; never serve, check or login)
+  (openrouter, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)
   ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]
@@ -289,16 +395,16 @@ usage:
 | Command | Effect |
 |---|---|
 | `serve <provider>` | Stdio MCP server that relays to the hosted provider and adds credentials from the store. Hosts run this; `bun scripts/mcp-register.ts` registers it. `ULTRATHINK_MCP_DEBUG=1` logs relay events to stderr. When a credential is missing, the error says how to add one: for Notion `ultrathink-mcp auth login notion`; for Linear and Greptile either `auth login <provider>` (OAuth) or `auth set-key <provider> --stdin` (an API key from that account's settings). |
-| `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. The `openrouter` row reads `openrouter  api_key  ready  api key set (<n> chars)` or `openrouter  none  not ready  not configured`; the key itself is never printed. |
-| `auth set-key <provider>` | Stores an API key for `linear`, `greptile` or `openrouter`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. It prints only the key's length, for example `openrouter: api key stored (<n> chars)`. Notion has no API-key route. For Jev decisions: `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `bin/ultrathink-mcp auth set-key openrouter --env-file <file> --var OPENROUTER_API_KEY`. A stored `openrouter` key wins over `OPENROUTER_API_KEY`. |
+| `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. A key-provider row reads `<id>  api_key  ready  api key set (<n> chars)` or `<id>  none  not ready  not configured`. The key itself is never printed. |
+| `auth set-key <provider>` | Stores an API key for `linear`, `greptile`, `openrouter`, `hindsight` or `ragflow`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. It prints only the key's length, for example `hindsight: api key stored (<n> chars)`. Notion has no API-key route. A stored key wins over the provider's environment variable (`OPENROUTER_API_KEY`, `HINDSIGHT_API_KEY`, `RAGFLOW_API_KEY`). |
 | `auth login <provider>` | OAuth login (Notion needs it; Linear and Greptile can use it instead of a key). See [OAuth login options](#oauth-login-options). |
 | `auth logout <provider>` | Removes that provider's credentials. |
-| `check [provider...]` | Runs `initialize` and `tools/list` against each provider (`notion`, `linear` and `greptile` by default; never `openrouter`) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
+| `check [provider...]` | Runs `initialize` and `tools/list` against each MCP provider (`notion`, `linear` and `greptile` by default; never `openrouter`, `hindsight` or `ragflow`) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
 | `track complete --state <file>` | Creates the rows still missing for a planned session, rewrites its spec and state file, and prints the linked TODO lines. `ultrathink-kickoff` runs this. Run it from the project directory: it reads the config files, including `<project>/.claude/ultrathink.json`, from the current directory. Does nothing (exit 0) when `/ultrathink-track off` is set or no tracker is configured. Exits 1 when the record cannot be read, has no plan, there are no tracker credentials, or tracking failed. |
 | `session mark --state <file> <kicked-off\|synced>` | Sets `kickedOff` or `synced` to `true` in the session record and prints nothing. `ultrathink-kickoff` runs it with `kicked-off` as its last step. The marks describe the plan now in the record: the session's next planned prompt writes a new graph with both back at `false`. A missing or unreadable record exits 1 and is left untouched. |
 | `notion init --parent <page>` | Creates the Agent Task Graph database under a Notion page. `--title` sets its name. `--write-config` saves `notion.dataSourceUrl` to `~/.config/ultrathink/config.json` (under `$XDG_CONFIG_HOME` when set). Exits 1 when Notion is not logged in, or when the database was created but its `Parent Item` self-relation could not be added. |
 
-`serve openrouter`, `check openrouter` and `auth login openrouter` exit 2 without any network call, printing `ultrathink-mcp: openrouter is an API-key provider, not an MCP server: store its key with ultrathink-mcp auth set-key openrouter --stdin` and then the usage text to stderr. `auth logout openrouter` removes the stored key.
+`serve`, `check` and `auth login` for `openrouter`, `hindsight` or `ragflow` exit 2 without any network call, printing `ultrathink-mcp: <id> is an API-key provider, not an MCP server: store its key with ultrathink-mcp auth set-key <id> --stdin` and then the usage text to stderr. `auth logout <id>` removes the stored key. A missing Hindsight or RAGFlow key is named by the status line: `bin/ultrathink-mcp auth set-key hindsight --stdin` or `bin/ultrathink-mcp auth set-key ragflow --stdin`.
 
 #### OAuth login options
 
@@ -396,7 +502,7 @@ It prints one line per host and provider, `<host>: <provider> <action>`, where t
 
 | Program | Exit codes |
 |---|---|
-| `bin/ultrathink` | 0, including for unknown verbs (which print the usage text). `decisions check` and `decisions probe`: 0 on success, 1 on a failed decision, a missing OpenRouter key or `ULTRATHINK_DECISIONS=0`, 2 on a usage error or an invalid cases file. |
+| `bin/ultrathink` | 0 for planner verbs, including unknown verbs (which print the usage text). `decisions check` and `decisions probe`: 0 on success, 1 on a failed decision, a missing OpenRouter key or `ULTRATHINK_DECISIONS=0`, 2 on a usage error or an invalid cases file. `hindsight` and `ragflow`: 0 ok, 1 not ready or a runtime failure, 2 usage. `teach`: 0 ok (including `help`), 1 a runtime failure or not ready, 2 usage or invalid input. |
 | `bin/ultrathink-mcp` | 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr). During an `auth login` that set up a Tailscale route, Ctrl-C removes the route and exits 130 (143 on `SIGTERM`). |
 | `bin/ultrathink-ship` | 0, even when a step refuses (`ok: false` with a `reason`); 2 on a usage error. |
 | All three CLIs above | 127 when Bun is not found. When Bun is found but cannot start, the shell's own status (for example 126). |

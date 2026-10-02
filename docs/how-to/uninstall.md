@@ -13,6 +13,7 @@ In the commands below, `<clone>` is the absolute path of your checkout. Paths wr
 7. [Delete the clone](#7-delete-the-clone)
 
 Rows ultrathink created in Notion and Linear are not touched. See [What stays in Notion and Linear](#what-stays-in-notion-and-linear).
+A Hindsight bank and any RAGFlow datasets are not touched either. See [What stays on Hindsight and RAGFlow](#what-stays-on-hindsight-and-ragflow).
 
 ## 1. Remove the plugin from each host
 
@@ -115,17 +116,21 @@ Every file the script changed, now or when you registered, has a backup next to 
 
 ## 4. Delete stored credentials
 
-The gateway keeps every Notion, Linear and Greptile credential in one file. Remove them per provider:
+The credential store holds one entry per provider. Remove the ones you stored:
 
 ```sh
 <clone>/bin/ultrathink-mcp auth logout notion
 <clone>/bin/ultrathink-mcp auth logout linear
 <clone>/bin/ultrathink-mcp auth logout greptile
+<clone>/bin/ultrathink-mcp auth logout hindsight
+<clone>/bin/ultrathink-mcp auth logout ragflow
 ```
+
+Each prints `<provider>: logged out`, for example `hindsight: logged out`. There is no flag that drops every provider at once: the usage line is `ultrathink-mcp auth logout <provider>`. OpenRouter, if you stored a key for Jev decisions, is the same command with `openrouter`.
 
 or delete the file itself: `$ULTRATHINK_MCP_STORE` if you set it, otherwise `${XDG_CONFIG_HOME:-~/.config}/ultrathink/mcp-credentials.json`. A `mcp-credentials.json.lock` directory next to it, if one is left, can go too.
 
-`auth logout` only deletes the local copy. To revoke the access you granted, remove the ultrathink connection or API key in your Notion, Linear or Greptile account settings.
+`auth logout` only deletes the local copy. To revoke the access you granted, remove the ultrathink connection or API key in your Notion, Linear, Greptile, Hindsight or RAGFlow account settings.
 
 If you used `auth login --tailscale` and a login was interrupted before it finished, the temporary `tailscale serve` handler may still be there. Remove it with:
 
@@ -155,6 +160,8 @@ Each host keeps its own state directory: control state, planned sessions, specs 
 
 If you set `ULTRATHINK_STATE_DIR`, the state is in that directory instead. Unset the variable too.
 
+Each of those directories may contain a `teach` subdirectory: local lessons (`moments/`), pending Hindsight writes (`outbox/`), an observe inbox (`inbox/`) and skill drafts (`skill-drafts/`). Deleting the state directory removes it. To drop lessons without removing the rest of that host's state, delete only `<state dir>/teach`. ultrathink never writes lessons into a repository or into `.planning/`.
+
 ## 7. Delete the clone
 
 ```sh
@@ -166,6 +173,10 @@ A Claude Code install from the GitHub marketplace has no clone. Step 1 removed i
 ## What stays in Notion and Linear
 
 Rows ultrathink created stay where they are: Notion Task, Issue and Sub-Issue rows, the Notion database that `ultrathink-mcp notion init` created, and Linear issues and sub-issues. Delete them in Notion and Linear if you no longer want them. Pull requests and branches that ship opened on GitHub also stay.
+
+## What stays on Hindsight and RAGFlow
+
+Logout deletes the local key only. The Hindsight bank (default name `ultrathink`, or the `hindsight.bank` you set) and the documents ultrathink retained in it stay on the Hindsight server. RAGFlow datasets are not touched. There is no ultrathink command that deletes the configured bank. Delete the bank in Hindsight, and revoke the API key in the Hindsight or RAGFlow account, if you no longer want them. A `hindsight check --roundtrip` throwaway bank (`ultrathink-smoke-…`) is deleted by that command itself; uninstall does not look for one.
 
 ## Reinstalling later
 

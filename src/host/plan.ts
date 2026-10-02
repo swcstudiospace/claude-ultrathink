@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
-import { runPromptSubmit } from "../claude/hook.ts";
+import { type HookDeps, runPromptSubmit } from "../claude/hook.ts";
 import { type ControlState, readControl, sessionPath, writeControl } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
@@ -55,6 +55,9 @@ export interface PlanOptions {
 	selectEngine?: typeof selectEngine;
 	/** Test seam for the hook-side tracker; defaults to `createGatewayTracker`. */
 	createTracker?: (config: UltrathinkConfig) => Tracker | undefined;
+	/** Test seams for the lessons and RAGFlow lookups (see HookDeps); default to the configured Teachable Moments and RAGFlow. */
+	recall?: HookDeps["recall"];
+	ground?: HookDeps["ground"];
 }
 
 function skipReason(request: PlanRequest, env: Record<string, string | undefined>): string | undefined {
@@ -162,6 +165,8 @@ export async function planPrompt(
 				progress: options.progress,
 				// The plan gate itself runs in runPromptSubmit (AD-P1); the host's env holds its key and URL override.
 				decisionsDeps: { env },
+				...(options.recall ? { recall: options.recall } : {}),
+				...(options.ground ? { ground: options.ground } : {}),
 			},
 		);
 		if (result.skipped || !result.output) return { ...skip(result.skipped), ...(result.notice ? { summary: result.notice } : {}) };

@@ -20,6 +20,9 @@ import { shipApplies } from "../ship/policy.ts";
 import { shipPrecheck } from "../ship/precheck.ts";
 import { writeShip } from "../ship/state.ts";
 import type { ShipConfig } from "../ship/types.ts";
+import { teachContext, teachEnabled } from "../teach/context.ts";
+import { digestFromAgentMessages } from "../teach/digest.ts";
+import { spawnObserveDetached } from "../teach/spawn.ts";
 import { status as authStatus } from "../mcp/oauth.ts";
 import { storePath } from "../mcp/store.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
@@ -309,6 +312,10 @@ export function createOmpExtension(
 		stateDir?: string;
 		/** Local ship precheck (`git` only); defaults to `shipPrecheck`. */
 		shipPrecheck?: (cwd: string) => ShipPrecheck;
+		/** Teachable Moments context source; defaults to the merged config for the session cwd. */
+		teachContext?: typeof teachContext;
+		/** Detached `teach observe` launcher; defaults to `spawnObserveDetached`. */
+		spawnObserve?: typeof spawnObserveDetached;
 		/** Ship config source; defaults to the merged Claude config files for the session cwd. */
 		shipConfig?: (cwd: string) => ShipConfig;
 	} = {},
@@ -471,7 +478,26 @@ export function createOmpExtension(
 		// Ship parity with hooks/stop.ts: when a planned gsd-* skill run ends with committed work on a
 		// feature branch, nudge the agent once per graph to run ultrathink-ship (PR, Greptile 5/5, merge).
 		const nudgedGraphs = new Set<string>();
-		pi.on("agent_end", (_event, ctx) => {
+
+		// Teachable Moments `observe`/`auto` capture: hand the finished run to a detached `teach observe`.
+		// Shares this handler (and its guard) with the ship nudge, whose early returns must not skip it.
+		const observeAgentEnd = (event: unknown, ctx: ExtensionContext): void => {
+			if (isSubagentSession(ctx, exists)) return;
+			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			const messages = event && typeof event === "object" && "messages" in event ? event.messages : undefined;
+			if (!sessionId || !Array.isArray(messages)) return;
+			const lastAssistant: unknown = messages.findLast((m: unknown) => typeof m === "object" && m !== null && "role" in m && m.role === "assistant");
+			if (typeof lastAssistant === "object" && lastAssistant !== null && "stopReason" in lastAssistant && lastAssistant.stopReason === "aborted") return;
+			const cwd = ctx?.cwd || process.cwd();
+			const env = { ...process.env, ULTRATHINK_HOST: "omp" };
+			const teach = (options.teachContext ?? teachContext)({ host: "omp", cwd, env, sessionId, stateDir: stateDir(cwd) });
+			if (!teachEnabled(teach) || teach.config.teach.capture === "explicit") return;
+			const digest = digestFromAgentMessages(messages, { host: "omp", sessionId, cwd, outcome: "completed" });
+			if (!digest) return;
+			(options.spawnObserve ?? spawnObserveDetached)(digest, { repoRoot: ROOT, env, stateDir: teach.stateDir, host: "omp" });
+		};
+		pi.on("agent_end", (event, ctx) => {
+			guard(() => observeAgentEnd(event, ctx));
 			guard(() => {
 				if (isSubagentSession(ctx, exists)) return;
 				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";

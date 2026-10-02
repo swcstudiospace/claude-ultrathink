@@ -12,12 +12,15 @@ import {
 	formatSummary,
 	HANDOFF_MAX_CHARS,
 	SKILL_CONTEXT_HEADER,
+	SUBSTRATE_CONTEXT_HEADER,
 	TRACKING_OFF_NOTE,
 	truncateXml,
 	UPLIFT_CONTEXT_HEADER,
 } from "./output.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
+import type { DocsLookup } from "../ragflow/types.ts";
+import type { LessonsLookup } from "../teach/types.ts";
 
 const result = { xml: "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>", original: "x", root: "BUILD_PROMPT", source: "llm" as const };
 
@@ -198,7 +201,7 @@ describe("formatSummary", () => {
 });
 
 describe("Decisions summary bit and plan-skip notice", () => {
-	const KEYS: Record<DecisionPoint, string> = { plan: "plan_worthy", ship: "complete", knowledge: "supported", blocking: "risky" };
+	const KEYS: Record<DecisionPoint, string> = { plan: "plan_worthy", ship: "complete", knowledge: "supported", blocking: "risky", teachable: "teachable", skillworthy: "skillworthy" };
 	const ok = (point: DecisionPoint, p: number, action: DecisionRecord["action"]): DecisionRecord => ({
 		point,
 		outcome: "ok",
@@ -580,5 +583,180 @@ describe("handoff", () => {
 		expect(both.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
 		expect(both).toContain(mediumBrief);
 		expect(both).toContain("copy them from the ISSUES block of the specification file");
+	});
+});
+
+describe("lessons and documents", () => {
+	const lessons = `## Lessons from earlier work\n\n${"Always run the migration before the seed script. ".repeat(20).trim()}`;
+	const docs = `## Documents (RAGFlow)\n\n${"Widgets are stored in the widgets table. ".repeat(20).trim()}`;
+	const bigXml = `<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n${"<N>node rationale</N>\n".repeat(3_000)}</BUILD_PROMPT>`;
+
+	test("both sections sit after the Substrate brief and before the specification", () => {
+		const out = formatPromptContext({ result, brief: "observed line", lessons, docs, statePath: "/s/x.json" });
+		const at = (needle: string) => out.indexOf(needle);
+		expect(at(SUBSTRATE_CONTEXT_HEADER)).toBeGreaterThan(-1);
+		expect(at(SUBSTRATE_CONTEXT_HEADER)).toBeLessThan(at("## Lessons from earlier work"));
+		expect(at("## Lessons from earlier work")).toBeLessThan(at("## Documents (RAGFlow)"));
+		expect(at("## Documents (RAGFlow)")).toBeLessThan(at("<BUILD_PROMPT>"));
+		expect(at("<BUILD_PROMPT>")).toBeLessThan(at("## Ultrathink tracking"));
+		expect(out).toContain(lessons);
+		expect(out).toContain(docs);
+	});
+
+	test("absent, empty and whitespace-only sections change nothing", () => {
+		const plain = formatPromptContext({ result, brief: "observed line", statePath: "/s/x.json" });
+		for (const empty of [{}, { lessons: "", docs: "" }, { lessons: "  \n", docs: "\n " }]) {
+			expect(formatPromptContext({ result, brief: "observed line", statePath: "/s/x.json", ...empty })).toBe(plain);
+		}
+	});
+
+	test("a plain prompt keeps its cap: the specification gives way, the sections do not", () => {
+		const small = { lessons: lessons.slice(0, 400), docs: docs.slice(0, 350) };
+		const out = formatPromptContext({ result: { ...result, xml: bigXml }, ...small, maxChars: 4_000 });
+		expect(out.length).toBeLessThanOrEqual(4_000);
+		expect(out).toContain(small.lessons);
+		expect(out).toContain(small.docs);
+		expect(out).toContain("<!-- truncated by Prompt Uplift");
+	});
+
+	describe("handoff budget", () => {
+		const spec = { result, specPath: "/s/spec.xml", statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", handoff: true };
+		const brief = "b".repeat(1_000);
+		const longLessons = `## Lessons from earlier work\n\n${"l".repeat(1_500)}`;
+		const longDocs = `## Documents (RAGFlow)\n\n${"d".repeat(1_500)}`;
+		/** Length of the handoff when nothing needs to give way. */
+		const natural = (extra: Partial<Parameters<typeof formatPromptContext>[0]>): number =>
+			formatPromptContext({ ...spec, ...extra, maxChars: 1_000_000 }).length;
+		const fit = (limit: number, extra: Partial<Parameters<typeof formatPromptContext>[0]>): string =>
+			formatPromptContext({ ...spec, ...extra, maxChars: limit });
+
+		test("everything fits: all sections, brief first, untouched", () => {
+			const out = fit(natural({ brief, lessons: longLessons, docs: longDocs }), { brief, lessons: longLessons, docs: longDocs });
+			expect(out).toContain(brief);
+			expect(out).toContain(longLessons);
+			expect(out).toContain(longDocs);
+			expect(out.indexOf(SUBSTRATE_CONTEXT_HEADER)).toBeLessThan(out.indexOf("## Lessons from earlier work"));
+			expect(out.indexOf("## Lessons from earlier work")).toBeLessThan(out.indexOf("## Documents (RAGFlow)"));
+			expect(out.indexOf("## Documents (RAGFlow)")).toBeLessThan(out.indexOf("## Ultrathink tracking"));
+		});
+
+		test("the documents shrink first and nothing else moves", () => {
+			const limit = natural({ brief, lessons: longLessons }) + 2 + 500;
+			const out = fit(limit, { brief, lessons: longLessons, docs: longDocs });
+			expect(out.length).toBe(limit);
+			expect(out).toContain(brief);
+			expect(out).toContain(longLessons);
+			expect(out).toContain("## Documents (RAGFlow)");
+			expect(out).toContain("(documents truncated)");
+			expect(out).not.toContain(longDocs);
+		});
+
+		test("documents that cannot keep 300 characters are dropped before the lessons are touched", () => {
+			const limit = natural({ brief, lessons: longLessons }) + 2 + 299;
+			const out = fit(limit, { brief, lessons: longLessons, docs: longDocs });
+			expect(out.length).toBeLessThanOrEqual(limit);
+			expect(out).not.toContain("## Documents (RAGFlow)");
+			expect(out).toContain(brief);
+			expect(out).toContain(longLessons);
+		});
+
+		test("then the lessons shrink, never below 600 characters, with the brief whole", () => {
+			const limit = natural({ brief }) + 2 + 700;
+			const out = fit(limit, { brief, lessons: longLessons, docs: longDocs });
+			expect(out.length).toBe(limit);
+			expect(out).not.toContain("## Documents (RAGFlow)");
+			expect(out).toContain(brief);
+			expect(out).toContain("## Lessons from earlier work");
+			expect(out).toContain("(lessons truncated)");
+			expect(out).not.toContain(longLessons);
+		});
+
+		test("lessons that cannot keep 600 characters are dropped, and the brief stays whole", () => {
+			const limit = natural({ brief }) + 2 + 599;
+			const out = fit(limit, { brief, lessons: longLessons, docs: longDocs });
+			expect(out.length).toBeLessThanOrEqual(limit);
+			expect(out).not.toContain("## Lessons from earlier work");
+			expect(out).not.toContain("## Documents (RAGFlow)");
+			expect(out).toContain(brief);
+		});
+
+		test("the brief is cut last, after both sections are gone", () => {
+			const longBrief = "b".repeat(5_000);
+			const limit = natural({}) + SUBSTRATE_CONTEXT_HEADER.length + 500;
+			const out = fit(limit, { brief: longBrief, lessons: longLessons, docs: longDocs });
+			expect(out.length).toBeLessThanOrEqual(limit);
+			expect(out).toContain("(brief truncated)");
+			expect(out).not.toContain("## Lessons from earlier work");
+			expect(out).not.toContain("## Documents (RAGFlow)");
+		});
+
+		test("the Linked issues pointer gives way before any section does", () => {
+			const nodes = Array.from({ length: 8 }, (_, i) => `n${i + 1}`);
+			const bigPlan = {
+				...plan,
+				graphId: "g1",
+				issues: nodes.map((nodeId) => ({ graphId: "g1", nodeId, item: `Item ${nodeId} ${"x".repeat(80)}`, thought: "t" })),
+				subIssues: nodes.flatMap((nodeId) => Array.from({ length: 8 }, (_, s) => ({ graphId: "g1", nodeId, item: `Step ${s + 1} ${"y".repeat(80)}`, step: s + 1, thought: "t" }))),
+			};
+			const ref = (id: string) => ({ id, identifier: id, url: `https://linear.app/o/issue/${id}/${"slug-".repeat(12)}`, title: id });
+			const bigTracking: TrackingRefs = {
+				...complete,
+				linear: {
+					nodes: Object.fromEntries(nodes.map((n) => [n, ref(`ENG-${n}`)])),
+					steps: Object.fromEntries(bigPlan.subIssues.map((s) => [`${s.nodeId}.${s.step}`, ref(`ENG-${s.nodeId}-${s.step}`)])),
+				},
+			};
+			const out = formatPromptContext({ ...spec, plan: bigPlan, tracking: bigTracking, brief, lessons: longLessons, docs: longDocs } as Parameters<typeof formatPromptContext>[0]);
+			expect(out.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+			expect(out).toContain("copy them from the ISSUES block of the specification file");
+			expect(out).toContain(brief);
+			expect(out).toContain(longLessons);
+		});
+
+		test("long lessons, documents, brief and Linked issues together stay inside the 9,000-character handoff", () => {
+			const extra = { brief: "observed history line\n".repeat(1_000), lessons: `## Lessons from earlier work\n\n${"l".repeat(3_000)}`, docs: `## Documents (RAGFlow)\n\n${"d".repeat(3_000)}` };
+			const out = formatPromptContext({ ...spec, graph: FALLBACK_GRAPH, plan, tracking: complete, ship: true, ...extra });
+			expect(out.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+			expect(out).toContain('skill_view name="ultrathink:ultrathink-kickoff"');
+			expect(out).toContain("## Ship");
+		});
+	});
+
+	describe("summary segments", () => {
+		const lessonsLookup = (over: Partial<LessonsLookup>): LessonsLookup => ({ outcome: "used", count: 3, ids: ["a", "b", "c"], chars: 900, ms: 20, source: "hindsight", ...over });
+		const docsLookup = (over: Partial<DocsLookup>): DocsLookup => ({ status: "used", count: 4, chars: 1_200, ms: 30, datasets: 1, ...over });
+
+		test("lessons: count and source, or the error reason; nothing for off or none", () => {
+			const summary = (lookup: LessonsLookup) => formatSummary({ result, lessons: lookup });
+			expect(summary(lessonsLookup({}))).toBe("Prompt Uplift · BUILD_PROMPT · llm · Lessons · 3 recalled (hindsight)");
+			expect(summary(lessonsLookup({ count: 2, source: "local" }))).toContain("· Lessons · 2 recalled (local)");
+			expect(summary(lessonsLookup({ outcome: "error", count: 0, source: "none", reason: "timeout" }))).toContain("· Lessons · error (timeout)");
+			for (const outcome of ["off", "none"] as const) {
+				expect(summary(lessonsLookup({ outcome, count: 0, source: "none" }))).not.toContain("Lessons");
+			}
+			expect(formatSummary({ result })).not.toContain("Lessons");
+		});
+
+		test("docs: excerpt count, or the error reason; nothing for off or none", () => {
+			const summary = (lookup: DocsLookup) => formatSummary({ result, docs: lookup });
+			expect(summary(docsLookup({}))).toBe("Prompt Uplift · BUILD_PROMPT · llm · Docs · 4 excerpts (RAGFlow)");
+			expect(summary(docsLookup({ count: 1 }))).toContain("· Docs · 1 excerpt (RAGFlow)");
+			expect(summary(docsLookup({ status: "error", count: 0, reason: "auth" }))).toContain("· Docs · error (auth)");
+			for (const status of ["off", "none"] as const) {
+				expect(summary(docsLookup({ status, count: 0 }))).not.toContain("Docs");
+			}
+			expect(formatSummary({ result })).not.toContain("Docs");
+		});
+
+		test("both follow the Knowledge bit, in lessons then docs order", () => {
+			const out = formatSummary({
+				result,
+				brief: "a\nb",
+				knowledge: { outcome: "used", repo: "acme/widgets", docs: ["index.md"], chars: 10, ms: 1, settled: 0 },
+				lessons: lessonsLookup({}),
+				docs: docsLookup({}),
+			});
+			expect(out).toBe("Prompt Uplift · BUILD_PROMPT · llm · Substrate · brief 2 lines · Knowledge · 1 docs · Lessons · 3 recalled (hindsight) · Docs · 4 excerpts (RAGFlow)");
+		});
 	});
 });

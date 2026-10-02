@@ -5,8 +5,8 @@
  * thresholds, error kinds and the per-call `DecisionRecord`. Imports nothing, so every layer can depend on it.
  */
 
-export type DecisionPoint = "plan" | "ship" | "knowledge" | "blocking";
-export const DECISION_POINTS: readonly DecisionPoint[] = ["plan", "ship", "knowledge", "blocking"];
+export type DecisionPoint = "plan" | "ship" | "knowledge" | "blocking" | "teachable" | "skillworthy";
+export const DECISION_POINTS: readonly DecisionPoint[] = ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"];
 
 export const DEFAULT_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
 export const DEFAULT_DECISIONS_MODEL = "~typesafe/jev-latest";
@@ -27,6 +27,12 @@ export const SHIP_APPROVE_AT = 0.7;
 export const GROUNDED_AT = 0.8;
 /** Promote to blocking when P(risky) >= this. False promote → one extra question before work; missed promote → today's behaviour. */
 export const BLOCKING_AT = 0.5;
+/** Teachable lesson: dropped before it is stored when P(teachable) < this. False drop → a lesson is lost (the next session can rediscover it); false keep → one more candidate to review. */
+export const TEACHABLE_BELOW = 0.3;
+/** Auto capture confirms a candidate only when P(teachable) >= this as well as confidence >= 0.8. False hold → a human confirms it; false confirm → today's auto behaviour. */
+export const TEACHABLE_AUTO_AT = 0.8;
+/** Promote a lesson to a skill (`promote --due`, `promoteDue`) only when P(skillworthy) >= this. False skip → promoted by hand later; false keep → today's behaviour. */
+export const SKILLWORTHY_AT = 0.5;
 
 export interface DecisionsConfig {
 	enabled: boolean;
@@ -39,12 +45,15 @@ export interface DecisionsConfig {
 	shipApproveAt: number;
 	groundedAt: number;
 	blockingAt: number;
+	teachableBelow: number;
+	teachableAutoAt: number;
+	skillworthyAt: number;
 }
 
 export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
 	enabled: false,
 	model: DEFAULT_DECISIONS_MODEL,
-	points: ["plan", "ship", "knowledge", "blocking"],
+	points: ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"],
 	timeoutMs: 3000,
 	zdr: true,
 	planSkipBelow: PLAN_SKIP_BELOW,
@@ -52,6 +61,9 @@ export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
 	shipApproveAt: SHIP_APPROVE_AT,
 	groundedAt: GROUNDED_AT,
 	blockingAt: BLOCKING_AT,
+	teachableBelow: TEACHABLE_BELOW,
+	teachableAutoAt: TEACHABLE_AUTO_AT,
+	skillworthyAt: SKILLWORTHY_AT,
 };
 
 // Wire types (brief §1)
@@ -167,6 +179,10 @@ export type DecisionAction =
 	| "keep"
 	| "reject-claim" // knowledge (keep also = blocking unchanged)
 	| "promote" // blocking
+	| "drop"
+	| "hold"
+	| "auto-confirm" // teachable (keep also = unchanged)
+	| "skip" // skillworthy (keep also = unchanged)
 	| "fail-open"; // any point, any error
 
 /** One Jev call. Never holds state content or the key. */

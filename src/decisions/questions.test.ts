@@ -13,11 +13,20 @@ import {
 	lastAssistantTurn,
 	QUESTION_KEYS,
 	QUESTIONS,
+	buildSkillworthyState,
+	buildTeachableState,
 } from "./questions.ts";
 
 describe("QUESTIONS (brief §2, verbatim)", () => {
 	test("each point asks one noul question under its pinned key", () => {
-		expect(QUESTION_KEYS).toEqual({ plan: "plan_worthy", ship: "complete", knowledge: "supported", blocking: "risky" });
+		expect(QUESTION_KEYS).toEqual({
+			plan: "plan_worthy",
+			ship: "complete",
+			knowledge: "supported",
+			blocking: "risky",
+			teachable: "teachable",
+			skillworthy: "skillworthy",
+		});
 		for (const question of Object.values(QUESTIONS)) expect(question.type).toBe("noul");
 	});
 
@@ -66,6 +75,15 @@ describe("QUESTIONS (brief §2, verbatim)", () => {
 				false: "Acting on a wrong `default` only produces code or settings that are easy to change in a later edit.",
 			},
 		});
+	});
+
+	test("the lesson questions ask the specified instructions about the candidate", () => {
+		expect(QUESTIONS.teachable.instructions).toBe(
+			"Is this candidate a reusable lesson that a future agent on this repository would otherwise have to rediscover?",
+		);
+		expect(QUESTIONS.skillworthy.instructions).toBe("Does this lesson describe a repeatable procedure or rule worth a standing skill?");
+		expect(QUESTIONS.teachable.criteria?.true).toBeTruthy();
+		expect(QUESTIONS.skillworthy.criteria?.false).toBeTruthy();
 	});
 });
 
@@ -195,5 +213,29 @@ describe("blocking state", () => {
 	test("buildBlockingState caps the task at 4000 chars", () => {
 		const state = buildBlockingState({ task: "t".repeat(10_000), question: "Drop it?", defaultText: "Drop the column: removes legacy_email" });
 		expect(state).toEqual({ task: "t".repeat(4000), question: "Drop it?", default: "Drop the column: removes legacy_email" });
+	});
+});
+
+describe("lesson states", () => {
+	const lesson = { name: "Use import type", description: "tsc rejects value imports of types", body: "b".repeat(2000), kind: "pitfall" };
+
+	test("buildTeachableState sends name, description, kind and the body cut to 800 chars, nothing else", () => {
+		expect(buildTeachableState({ ...lesson, extra: "x" } as typeof lesson)).toEqual({
+			name: lesson.name,
+			description: lesson.description,
+			body: "b".repeat(800),
+			kind: "pitfall",
+		});
+		expect(buildTeachableState({ ...lesson, body: "short" }).body).toBe("short");
+	});
+
+	test("buildSkillworthyState adds the occurrence count", () => {
+		expect(buildSkillworthyState({ ...lesson, occurrences: 4 })).toEqual({
+			name: lesson.name,
+			description: lesson.description,
+			body: "b".repeat(800),
+			kind: "pitfall",
+			occurrences: 4,
+		});
 	});
 });

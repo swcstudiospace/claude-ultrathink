@@ -3,10 +3,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_HINDSIGHT_CONFIG, type HindsightConfig } from "./hindsight/types.ts";
+import { DEFAULT_RAGFLOW_CONFIG, type RagflowConfig } from "./ragflow/types.ts";
 import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type DecisionsConfig } from "./decisions/types.ts";
 import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
 import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
+import { CAPTURE_MODES, DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachConfig } from "./teach/types.ts";
 import { MAX_NODES, MIN_NODES, type ThinkConfig } from "./think/types.ts";
 
 export interface ClaudeConfig {
@@ -101,6 +104,12 @@ export interface UltrathinkConfig {
 	substrate: SubstrateConfig;
 	/** Jev decision points (OpenRouter Decisions API). Opt-in; no URL key by design (D1). */
 	decisions: DecisionsConfig;
+	/** Hindsight memory server (Teachable Moments storage). Opt-in; a project file can only turn it off. */
+	hindsight: HindsightConfig;
+	/** RAGFlow document search (planner grounding). Opt-in; a project file can only turn it off. */
+	ragflow: RagflowConfig;
+	/** Teachable Moments capture, recall and promotion. Opt-in; a project file can only lower it. */
+	teach: TeachConfig;
 }
 
 export function defaultConfig(): UltrathinkConfig {
@@ -126,6 +135,9 @@ export function defaultConfig(): UltrathinkConfig {
 		ship: { ...DEFAULT_SHIP_CONFIG, skills: [...DEFAULT_SHIP_CONFIG.skills] },
 		substrate: { ...DEFAULT_SUBSTRATE_CONFIG },
 		decisions: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
+		hindsight: { ...DEFAULT_HINDSIGHT_CONFIG },
+		ragflow: { ...DEFAULT_RAGFLOW_CONFIG, datasetIds: [...DEFAULT_RAGFLOW_CONFIG.datasetIds] },
+		teach: { ...DEFAULT_TEACH_CONFIG },
 	};
 }
 
@@ -333,7 +345,7 @@ function unitInterval(value: unknown, fallback: number): number {
 const MAX_DECISIONS_TIMEOUT_MS = 30_000;
 
 /**
- * Per-field merge; only the ten known keys are read, so a layer can never add a URL (D1). A project layer (a file a cloned
+ * Per-field merge; only the thirteen known keys are read, so a layer can never add a URL (D1). A project layer (a file a cloned
  * repository controls) may only tighten consent (K5): `enabled` true→false, `zdr` false→true, `points` narrowed to the
  * intersection with the lower layers; the remaining keys merge as usual.
  */
@@ -362,6 +374,102 @@ function mergeDecisions(decisions: Record<string, unknown> | undefined, defaults
 		shipApproveAt: unitInterval(decisions.shipApproveAt, defaults.shipApproveAt),
 		groundedAt: unitInterval(decisions.groundedAt, defaults.groundedAt),
 		blockingAt: unitInterval(decisions.blockingAt, defaults.blockingAt),
+		teachableBelow: unitInterval(decisions.teachableBelow, defaults.teachableBelow),
+		teachableAutoAt: unitInterval(decisions.teachableAutoAt, defaults.teachableAutoAt),
+		skillworthyAt: unitInterval(decisions.skillworthyAt, defaults.skillworthyAt),
+	};
+}
+
+/** An integer in [min, max]; anything else falls back. */
+function intInRange(value: unknown, min: number, max: number, fallback: number): number {
+	return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+/** A URL is kept as written (trimmed): the resolver validates it and reports a bad one, so a typo is visible, not silent. */
+function urlAsWritten(value: unknown, fallback: string): string {
+	return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function booleanOr(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+/** Upper bound for the Hindsight and RAGFlow request budgets. */
+const MAX_SERVICE_TIMEOUT_MS = 120_000;
+const HINDSIGHT_BANK = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MAX_DATASET_IDS = 20;
+
+/**
+ * A project layer (a file a cloned repository controls) never reaches the service target or turns anything on: it is
+ * ignored apart from `enabled`, which can only go true -> false, so a repository cannot point memory traffic at its own host.
+ */
+function mergeHindsight(hindsight: Record<string, unknown> | undefined, defaults: HindsightConfig, project: boolean): HindsightConfig {
+	if (!hindsight) return defaults;
+	const enabled = booleanOr(hindsight.enabled, defaults.enabled);
+	if (project) return { ...defaults, enabled: defaults.enabled && enabled };
+	return {
+		enabled,
+		url: urlAsWritten(hindsight.url, defaults.url),
+		bank: typeof hindsight.bank === "string" && HINDSIGHT_BANK.test(hindsight.bank) ? hindsight.bank : defaults.bank,
+		timeoutMs: intInRange(hindsight.timeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.timeoutMs),
+		retainTimeoutMs: intInRange(hindsight.retainTimeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.retainTimeoutMs),
+	};
+}
+
+/** Same trust rule as `mergeHindsight`; `ground` (sends the prompt to RAGFlow) can only be turned off by a project file. */
+function mergeRagflow(ragflow: Record<string, unknown> | undefined, defaults: RagflowConfig, project: boolean): RagflowConfig {
+	if (!ragflow) return defaults;
+	const enabled = booleanOr(ragflow.enabled, defaults.enabled);
+	const ground = booleanOr(ragflow.ground, defaults.ground);
+	if (project) return { ...defaults, enabled: defaults.enabled && enabled, ground: defaults.ground && ground };
+	let datasetIds = defaults.datasetIds;
+	if (Array.isArray(ragflow.datasetIds)) {
+		const ids = ragflow.datasetIds.filter((id): id is string => typeof id === "string" && id.trim() !== "").map((id) => id.trim());
+		if (ids.length === ragflow.datasetIds.length && ids.length <= MAX_DATASET_IDS) datasetIds = [...new Set(ids)];
+	}
+	return {
+		enabled,
+		url: urlAsWritten(ragflow.url, defaults.url),
+		datasetIds,
+		topK: intInRange(ragflow.topK, 1, 20, defaults.topK),
+		similarityThreshold: unitInterval(ragflow.similarityThreshold, defaults.similarityThreshold),
+		timeoutMs: intInRange(ragflow.timeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.timeoutMs),
+		ground,
+		groundChars: intInRange(ragflow.groundChars, 500, 8_000, defaults.groundChars),
+	};
+}
+
+/**
+ * A project layer can only turn `enabled`, `recall` and `autoPromote` off and lower `capture` (auto -> observe -> explicit);
+ * every other key is ignored there. `CAPTURE_MODES` is ordered lowest first.
+ */
+function mergeTeach(teach: Record<string, unknown> | undefined, defaults: TeachConfig, project: boolean): TeachConfig {
+	if (!teach) return defaults;
+	const enabled = booleanOr(teach.enabled, defaults.enabled);
+	const recall = booleanOr(teach.recall, defaults.recall);
+	const autoPromote = booleanOr(teach.autoPromote, defaults.autoPromote);
+	const requested = CAPTURE_MODES.find((mode) => mode === teach.capture);
+	if (project) {
+		const capture: CaptureMode =
+			requested !== undefined && CAPTURE_MODES.indexOf(requested) < CAPTURE_MODES.indexOf(defaults.capture) ? requested : defaults.capture;
+		return {
+			...defaults,
+			enabled: defaults.enabled && enabled,
+			capture,
+			recall: defaults.recall && recall,
+			autoPromote: defaults.autoPromote && autoPromote,
+		};
+	}
+	return {
+		enabled,
+		capture: requested ?? defaults.capture,
+		recall,
+		recallLimit: intInRange(teach.recallLimit, 1, 10, defaults.recallLimit),
+		recallChars: intInRange(teach.recallChars, 500, 8_000, defaults.recallChars),
+		promoteAfter: intInRange(teach.promoteAfter, 2, 20, defaults.promoteAfter),
+		autoPromote,
+		observeMinToolCalls: intInRange(teach.observeMinToolCalls, 0, 50, defaults.observeMinToolCalls),
+		timeoutMs: intInRange(teach.timeoutMs, 500, 30_000, defaults.timeoutMs),
 	};
 }
 
@@ -384,6 +492,9 @@ export function mergeConfig(
 		ship: mergeShip(asRecord(file.ship), base.ship),
 		substrate: mergeSubstrate(asRecord(file.substrate), base.substrate),
 		decisions: mergeDecisions(asRecord(file.decisions), base.decisions, options.project === true),
+		hindsight: mergeHindsight(asRecord(file.hindsight), base.hindsight, options.project === true),
+		ragflow: mergeRagflow(asRecord(file.ragflow), base.ragflow, options.project === true),
+		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
 	};
 }
 

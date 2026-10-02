@@ -16,6 +16,8 @@ import {
 	buildKnowledgeState,
 	buildPlanState,
 	buildShipState,
+	buildSkillworthyState,
+	buildTeachableState,
 	type DecisionStates,
 	QUESTION_KEYS,
 } from "./questions.ts";
@@ -27,7 +29,8 @@ export interface DecisionsCommandDeps extends Omit<DecisionsDeps, "debug"> {
 	readFile?: (path: string) => string;
 }
 
-const USAGE = "Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>";
+const USAGE =
+	"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>";
 const NO_KEY = "no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
 const KILLED = "off (ULTRATHINK_DECISIONS=0)";
 const CHECK_MESSAGE = "Add a --verbose flag to the export command";
@@ -127,6 +130,26 @@ function probeState(point: DecisionPoint, c: Record<string, unknown>): DecisionS
 			if (missing) return `"${missing}" must be a non-empty string`;
 			return buildBlockingState({ task: c.task as string, question: c.question as string, defaultText: c.default as string });
 		}
+		case "teachable":
+		case "skillworthy": {
+			const candidate = c.candidate;
+			if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) return `"candidate" must be a JSON object`;
+			const fields = candidate as Record<string, unknown>;
+			const missing = ["name", "description", "body", "kind"].find((field) => !isNonEmpty(fields[field]));
+			if (missing) return `"candidate.${missing}" must be a non-empty string`;
+			const lesson = {
+				name: fields.name as string,
+				description: fields.description as string,
+				body: fields.body as string,
+				kind: fields.kind as string,
+			};
+			if (point === "teachable") return buildTeachableState(lesson);
+			const occurrences = fields.occurrences;
+			if (typeof occurrences !== "number" || !Number.isInteger(occurrences) || occurrences < 1) {
+				return `"candidate.occurrences" must be an integer of at least 1`;
+			}
+			return buildSkillworthyState({ ...lesson, occurrences });
+		}
 	}
 }
 
@@ -165,13 +188,25 @@ function probeAction(point: DecisionPoint, p: number, config: DecisionsConfig): 
 			return p >= config.blockingAt ? "promote" : "keep";
 		case "ship":
 			return p <= config.shipVetoAtOrBelow ? "veto" : p >= config.shipApproveAt ? "approve" : "pass";
+		case "teachable":
+			return p < config.teachableBelow ? "drop" : p >= config.teachableAutoAt ? "auto-confirm" : "keep";
+		case "skillworthy":
+			return p < config.skillworthyAt ? "skip" : "keep";
 	}
 }
 
-const POSITIVE: Record<Exclude<DecisionPoint, "ship">, string> = { plan: "plan", knowledge: "keep", blocking: "promote" };
+/** The action that counts as Jev answering "yes" for the points whose label is a yes/no on one action. */
+const POSITIVE: Record<"plan" | "knowledge" | "blocking" | "skillworthy", string> = {
+	plan: "plan",
+	knowledge: "keep",
+	blocking: "promote",
+	skillworthy: "keep",
+};
 
 function agrees(point: DecisionPoint, action: string, label: boolean): boolean {
 	if (point === "ship") return (label && action !== "veto") || (!label && action !== "approve");
+	// A teachable lesson is "yes" unless it is dropped; keep and auto-confirm both let it stand.
+	if (point === "teachable") return (action !== "drop") === label;
 	return (action === POSITIVE[point]) === label;
 }
 

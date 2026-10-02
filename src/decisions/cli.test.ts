@@ -54,7 +54,8 @@ const JEV =
 const ERR = (s: number, headers?: Record<string, string>) => () =>
 	Response.json({ error: { code: s, message: `upstream said no for ${K}` } }, { status: s, headers });
 
-const USAGE = "Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking> <cases.json>";
+const USAGE =
+	"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>";
 const NO_KEY = "no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
 
 /** Temp project, config layers and credential store; the env holds K unless overridden. */
@@ -249,6 +250,40 @@ describe("decisions probe (A11, §5.7)", () => {
 		expect((r.calls[0]?.body as { questions: unknown }).questions).toEqual({ complete: QUESTIONS.ship });
 	});
 
+	test("teachable and skillworthy: the candidate is the whole state, actions follow the thresholds, labels agree by the veto rule", async () => {
+		const teachable = recordingFetch([JEV(0.1, "teachable"), JEV(0.5, "teachable"), JEV(0.9, "teachable")]);
+		const tDeps = setup(teachable);
+		const candidate = { name: "Use import type", description: "tsc rejects value imports", body: "b".repeat(2000), kind: "pitfall" };
+		const tFile = writeCases(tDeps, [
+			{ candidate, label: false },
+			{ candidate, label: true },
+			{ candidate, label: false },
+		]);
+		const tOut = await runDecisionsCommand(["probe", "teachable", tFile], tDeps);
+		expect(tOut.text.split("\n")).toEqual([
+			"#1 P 0.10 · drop · label false · agree",
+			"#2 P 0.50 · keep · label true · agree",
+			"#3 P 0.90 · auto-confirm · label false · DISAGREE",
+			"Decisions probe: teachable · typesafe/jev-1.13-20260917 · cases 3 · labelled 3 · agree 2/3 · errors 0",
+		]);
+		expect(teachable.calls[0]?.body).toMatchObject({
+			state: { ...candidate, body: "b".repeat(800) },
+			questions: { teachable: QUESTIONS.teachable },
+			trace: { span_name: "teachable" },
+		});
+
+		const skill = recordingFetch([JEV(0.49, "skillworthy"), JEV(0.5, "skillworthy")]);
+		const sDeps = setup(skill);
+		const sFile = writeCases(sDeps, [
+			{ candidate: { ...candidate, occurrences: 3 }, label: false },
+			{ candidate: { ...candidate, occurrences: 3 }, label: true },
+		]);
+		const sOut = await runDecisionsCommand(["probe", "skillworthy", sFile], sDeps);
+		expect(sOut.text.split("\n").slice(0, 2)).toEqual(["#1 P 0.49 · skip · label false · agree", "#2 P 0.50 · keep · label true · agree"]);
+		expect(skill.calls[0]?.body).toMatchObject({ state: { ...candidate, body: "b".repeat(800), occurrences: 3 }, questions: { skillworthy: QUESTIONS.skillworthy } });
+		expectNoKey(tOut.text);
+	});
+
 	test("knowledge and blocking use their thresholds and positive actions", async () => {
 		const knowledge = recordingFetch([JEV(0.95, "supported"), JEV(0.79, "supported")]);
 		const kDeps = setup(knowledge);
@@ -335,6 +370,12 @@ describe("decisions probe (A11, §5.7)", () => {
 		["ship", [{ request: "r", patch: "", acceptance_criteria: [1] }], `case #1: "acceptance_criteria" must be an array of strings`],
 		["knowledge", [{ question: "q", answer: "a" }], `case #1: "document" must be a non-empty string`],
 		["blocking", [{ task: "t", question: "q", default: "" }], `case #1: "default" must be a non-empty string`],
+		["teachable", [{ label: true }], `case #1: "candidate" must be a JSON object`],
+		["teachable", [{ candidate: ["x"] }], `case #1: "candidate" must be a JSON object`],
+		["teachable", [{ candidate: { name: "n", description: "d", body: " ", kind: "bug" } }], `case #1: "candidate.body" must be a non-empty string`],
+		["teachable", [{ candidate: { name: "n", description: "d", body: "b" } }], `case #1: "candidate.kind" must be a non-empty string`],
+		["skillworthy", [{ candidate: { name: "n", description: "d", body: "b", kind: "bug" } }], `case #1: "candidate.occurrences" must be an integer of at least 1`],
+		["skillworthy", [{ candidate: { name: "n", description: "d", body: "b", kind: "bug", occurrences: 0 } }], `case #1: "candidate.occurrences" must be an integer of at least 1`],
 	])("an invalid %s case exits 2 before any request", async (point, cases, reason) => {
 		const r = recordingFetch([JEV(0.9)]);
 		const deps = setup(r);

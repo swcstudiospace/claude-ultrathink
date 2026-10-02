@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 /**
- * The four Jev questions, verbatim as probed (brief §2), and the pure builders of each point's minimal state.
+ * The six Jev questions (the first four verbatim as probed, brief §2) and the pure builders of each point's minimal state.
  * Every state field is read by its question; nothing else (no GSD/git signals, no diff stat) is ever sent.
  */
 import type { DecisionPoint, NoulQuestion } from "./types.ts";
@@ -11,6 +11,8 @@ export const QUESTION_KEYS: { readonly [P in DecisionPoint]: string } = {
 	ship: "complete",
 	knowledge: "supported",
 	blocking: "risky",
+	teachable: "teachable",
+	skillworthy: "skillworthy",
 };
 
 /** Brief §2 texts, verbatim (instructions, criteria.true, criteria.false), type "noul". */
@@ -50,6 +52,23 @@ export const QUESTIONS: { readonly [P in DecisionPoint]: NoulQuestion } = {
 			false: "Acting on a wrong `default` only produces code or settings that are easy to change in a later edit.",
 		},
 	},
+	teachable: {
+		type: "noul",
+		instructions:
+			"Is this candidate a reusable lesson that a future agent on this repository would otherwise have to rediscover?",
+		criteria: {
+			true: "The candidate states a specific pitfall, bug and its fix, convention, decision and its reason, or repeatable procedure about this repository, its tooling or its workflow, and a future agent could act on it.",
+			false: "The candidate restates the task, summarizes a session, describes a one-off event, gives generic advice that holds for any project, or is too vague to act on.",
+		},
+	},
+	skillworthy: {
+		type: "noul",
+		instructions: "Does this lesson describe a repeatable procedure or rule worth a standing skill?",
+		criteria: {
+			true: "The lesson gives steps or a rule that an agent would follow again and again on this repository, and its `occurrences` show it keeps coming up.",
+			false: "The lesson records a one-time fix, a fact that is not a procedure or rule, or advice too narrow or too vague to be worth a skill.",
+		},
+	},
 };
 
 export const PLAN_MESSAGE_MAX = 4000;
@@ -59,6 +78,7 @@ export const SHIP_CRITERION_MAX_CHARS = 500;
 export const SHIP_PATCH_MAX = 24_000;
 export const KNOWLEDGE_DOCUMENT_MAX = 12_000;
 export const BLOCKING_TASK_MAX = 4000;
+export const LESSON_BODY_MAX = 800;
 /** Same list as src/ship/signals.ts LOCKFILES. */
 export const LOCKFILE_PATTERNS: readonly RegExp[] = [
 	/\.lock$/,
@@ -88,11 +108,22 @@ export type BlockingDecisionState = {
 	question: string;
 	default: string;
 };
+export type TeachableDecisionState = {
+	name: string;
+	description: string;
+	body: string;
+	kind: string;
+};
+export type SkillworthyDecisionState = TeachableDecisionState & {
+	occurrences: number;
+};
 export interface DecisionStates {
 	plan: PlanDecisionState;
 	ship: ShipDecisionState;
 	knowledge: KnowledgeDecisionState;
 	blocking: BlockingDecisionState;
+	teachable: TeachableDecisionState;
+	skillworthy: SkillworthyDecisionState;
 }
 
 /** The message head and the conversation tail (the proposal a "go ahead" answers is at the end). */
@@ -220,4 +251,19 @@ export function formatDefaultOption(
 
 export function buildBlockingState(input: { task: string; question: string; defaultText: string }): BlockingDecisionState {
 	return { task: input.task.slice(0, BLOCKING_TASK_MAX), question: input.question, default: input.defaultText };
+}
+
+/** Name, description, the first 800 characters of the body and the kind; no ids, paths or project names. */
+export function buildTeachableState(input: { name: string; description: string; body: string; kind: string }): TeachableDecisionState {
+	return { name: input.name, description: input.description, body: input.body.slice(0, LESSON_BODY_MAX), kind: input.kind };
+}
+
+export function buildSkillworthyState(input: {
+	name: string;
+	description: string;
+	body: string;
+	kind: string;
+	occurrences: number;
+}): SkillworthyDecisionState {
+	return { ...buildTeachableState(input), occurrences: input.occurrences };
 }

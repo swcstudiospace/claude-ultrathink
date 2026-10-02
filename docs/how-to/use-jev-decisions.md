@@ -1,6 +1,6 @@
 # Use Jev decisions
 
-**Jev** is a decision model from TypeSafe, served through OpenRouter's Decisions API. It does not write text: it reads a small state, answers one typed yes/no question with a probability P, and ultrathink turns P into an action with a threshold you can tune. With Jev decisions on, ultrathink asks it at up to four points, always after its own deterministic rules have run and left the action open:
+**Jev** is a decision model from TypeSafe, served through OpenRouter's Decisions API. It does not write text: it reads a small state, answers one typed yes/no question with a probability P, and ultrathink turns P into an action with a threshold you can tune. With Jev decisions on, ultrathink asks it at up to six points, always after its own deterministic rules have run and left the action open:
 
 | Point | Question | What Jev can change |
 |---|---|---|
@@ -8,6 +8,8 @@
 | `ship` | Does the patch fully deliver the request and every acceptance criterion? | Veto an LLM "done" in the ship flow, or, with `ship.autoMerge` off, decide when there is no usable LLM verdict. |
 | `knowledge` | Does the cited knowledge-base document support the answer the clarifier settled? | Ask a settled question after all when the document does not support the answer, if a question slot is free. |
 | `blocking` | Would going ahead with the default answer cause damage that is hard to undo if it is wrong? | Make a non-blocking clarifying question blocking. |
+| `teachable` | Is this candidate a reusable lesson that a future agent on this repository would otherwise have to rediscover? | Drop a candidate before it is stored, when P is below `teachableBelow`. It cannot add a lesson. A failure behaves as with Decisions off. |
+| `skillworthy` | Does this lesson describe a repeatable procedure or rule worth a standing skill? | Skip a due promotion (`teach promote --due`, and automatic promotion) when P is below `skillworthyAt`. It cannot block an explicit `teach promote <id>`. A failure behaves as with Decisions off. |
 
 Decisions are **off by default**: a fresh install never contacts OpenRouter, and a repository's project file cannot turn them on. When anything goes wrong (no key, an HTTP error, a timeout, an invalid answer), the point behaves exactly as it does with Decisions off.
 
@@ -33,7 +35,7 @@ The Decisions API endpoint (`https://openrouter.ai/api/alpha/decisions`) is mark
 | For the `knowledge` point: the Greptile knowledge base on (`hitl.knowledgeBase: true`) | it checks answers the knowledge base settled; without them there is nothing to check | [Use the Greptile knowledge base](use-greptile-knowledge-base.md) |
 | For the `ship` point: ship on (`ship.enabled: true`) | it checks the done assessment of a ship run | [Ship with Greptile](ship-with-greptile.md) |
 
-`<clone>` is the directory you cloned ultrathink into. The `plan` and `blocking` points need nothing else.
+`<clone>` is the directory you cloned ultrathink into. The `plan` and `blocking` points need nothing else. `teachable` is asked only while `teach observe` is storing candidates (`teach.enabled`, capture `observe` or `auto`). `skillworthy` is asked only by `teach promote --due` and by automatic promotion (`teach.autoPromote`). An explicit `teach promote <id>` does not ask it.
 
 ## 2. Store the OpenRouter key
 
@@ -61,7 +63,7 @@ Add a `decisions` section to your user config file, `~/.config/ultrathink/config
 { "decisions": { "enabled": true } }
 ```
 
-That asks Jev at all four points with the default thresholds. To ask it at some points only, list them:
+That asks Jev at all six points with the default thresholds. To ask it at some points only, list them:
 
 ```json
 { "decisions": { "enabled": true, "points": ["plan", "ship"] } }
@@ -81,7 +83,7 @@ The line after `Knowledge base:` shows the state:
 
 | Line | Meaning |
 |---|---|
-| `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking · key from store · zdr on` | Ready, with the stored key. `key from OPENROUTER_API_KEY` means the key comes from the environment. The key itself is never shown. |
+| `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · key from store · zdr on` | Ready, with the stored key. `key from OPENROUTER_API_KEY` means the key comes from the environment. The key itself is never shown. |
 | `Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)` | Turned on, but no key; no point sends a request. Do [step 2](#2-store-the-openrouter-key). |
 | `Decisions: off (opt-in: set decisions.enabled)` | Not turned on. A project file's `"enabled": true` does not count; set it in your user file. |
 | `Decisions: off (ULTRATHINK_DECISIONS=0)` | `ULTRATHINK_DECISIONS=0` is set in this environment and turns every point off, whatever the config says. Unset it to use Decisions. |
@@ -123,6 +125,14 @@ The default thresholds were set from live probes on `typesafe/jev-1.13-20260917`
 | `knowledge`, keep at or above `groundedAt` `0.8` | supported answer 0.94 to 0.96 | contradicted 0.03 to 0.04; not covered 0.01; an extra unsupported claim 0.05 | |
 | `blocking`, promote at or above `blockingAt` `0.5` | drop a column 0.68; remove a public endpoint 0.67; force-push a shared branch 0.63 | icon library, log level, test runner 0.07; an option name 0.13 | public versus admin surface 0.18 |
 
+The `teachable` and `skillworthy` defaults were not part of that probe table. They come from `src/decisions/types.ts`. A failure at either point behaves as with Decisions off: the candidate is still stored, and a due moment stays on the list.
+
+| Point, threshold | What P does |
+|---|---|
+| `teachable`, drop below `teachableBelow` `0.3` | P below 0.3 drops the candidate before it is stored. P equal to 0.3 keeps it. |
+| `teachable`, auto-confirm at or above `teachableAutoAt` `0.8` | In `auto` capture, a kept candidate is confirmed only when its confidence is at least 0.8 and P is at least 0.8. Below that, Jev holds it as a local candidate. Jev never confirms a lesson the capture mode would not. |
+| `skillworthy`, skip below `skillworthyAt` `0.5` | `teach promote --due` and automatic promotion leave the moment out when P is below 0.5. P equal to 0.5 keeps it. `teach promote <id>` does not ask. |
+
 Each threshold trades one mistake for another:
 
 | Threshold | Set it higher and | Set it lower and |
@@ -132,11 +142,14 @@ Each threshold trades one mistake for another:
 | `shipApproveAt` (no LLM verdict and `ship.autoMerge` off only) | fewer Jev-only approvals; a wrong reject means not done, and you run it again | more approvals; a wrong approve opens a PR that still faces the unchanged Greptile merge gate |
 | `groundedAt` | more settled answers are taken back; a wrong reject costs one extra question, or drops that answer when no question slot is free | fewer; a wrong keep is today's behaviour |
 | `blockingAt` | fewer promotions; a missed one is today's behaviour | more questions asked before work starts; a wrong promote costs one extra question |
+| `teachableBelow` | more candidates are dropped before they are stored; a wrong drop loses a lesson the next session can rediscover | fewer drops; a wrong keep is one more candidate to review |
+| `teachableAutoAt` | fewer automatic confirms; a wrong hold means a person confirms the candidate | more automatic confirms; a wrong confirm is today's auto behaviour |
+| `skillworthyAt` | more due promotions are skipped; a wrong skip means you promote it by hand later | fewer skips; a wrong keep is today's behaviour |
 
 To tune a threshold for your own work:
 
-1. Collect 20 to 50 real cases for one point, and label each with the right answer (`true` = plan it, the patch is complete, the answer is supported, the default is risky). Include the close calls, not only the easy ones.
-2. Save them as a JSON array. The fields per point: `plan` takes `message` and optionally `recent_conversation`; `ship` takes `request`, `patch` and optionally `acceptance_criteria` (an array of strings); `knowledge` takes `question`, `answer` and `document`; `blocking` takes `task`, `question` and `default`. For example `plan-cases.json`:
+1. Collect 20 to 50 real cases for one point, and label each with the right answer (`true` = plan it, the patch is complete, the answer is supported, the default is risky). For `teachable`, `true` means the candidate should be kept. For `skillworthy`, `true` means it is worth a skill. Include the close calls, not only the easy ones.
+2. Save them as a JSON array. The fields per point: `plan` takes `message` and optionally `recent_conversation`; `ship` takes `request`, `patch` and optionally `acceptance_criteria` (an array of strings); `knowledge` takes `question`, `answer` and `document`; `blocking` takes `task`, `question` and `default`. `teachable` takes `candidate`, an object with non-empty strings `name`, `description`, `body` and `kind`. `skillworthy` takes the same `candidate` plus `occurrences`, an integer of at least 1. The body is cut to 800 characters before it is sent. For `teachable`, a label of `true` means the lesson should stand (probe actions `keep` and `auto-confirm` both agree; `drop` agrees with `false`). For `skillworthy`, `true` agrees with `keep` and `false` agrees with `skip`. For example `plan-cases.json`:
 
    ```json
    [
@@ -145,6 +158,24 @@ To tune a threshold for your own work:
      { "message": "rename getUser to fetchUser in api.ts and its test", "label": false }
    ]
    ```
+
+   A `teachable` file is the same shape with a `candidate` object instead of `message`:
+
+   ```json
+   [
+     {
+       "candidate": {
+         "name": "Use import type for type-only imports",
+         "description": "tsc rejects a value import of a type.",
+         "body": "When a file only needs a type, write import type. A value import fails under verbatimModuleSyntax.",
+         "kind": "pitfall"
+       },
+       "label": true
+     }
+   ]
+   ```
+
+   `skillworthy` adds `"occurrences": 3` inside `candidate`. A missing `candidate`, an empty `name`, `description`, `body` or `kind`, or (for `skillworthy`) an `occurrences` that is not an integer of at least 1, exits 2 before any request, for example `Decisions probe: case #1: "candidate" must be a JSON object`.
 
 3. Run them against the current thresholds:
 
@@ -174,6 +205,8 @@ Whichever you choose, every decision records the model that actually answered (f
 
 - **Price.** At the time of writing, Jev costs $0.042 per million input tokens, and output is free. A typical plan-gate decision is about 450 tokens, about $0.000019. A ship check with a full 24 000-character patch is roughly 6 500 tokens, well under $0.001. A request estimated at over 28 000 tokens is never sent.
 - **Requests per prompt.** At most one `plan` decision, one `knowledge` decision per settled question (up to 4) and one `blocking` decision per non-blocking question (up to 4). A knowledge answer that Jev rejects is added as an open question after the clarifier's own questions, only while fewer than `hitl.maxQuestions` are open, and then gets its own `blocking` check in a second round; with no slot left it is dropped and checked no further. Skill invocations (every `/gsd-*` run) and `uplift:` prompts make no `plan` decision, but their clarifying questions can still get `knowledge` and `blocking` decisions. A message the rules skip makes none. Each ship `assess` whose rule checks pass makes one `ship` decision.
+
+- `teachable` and `skillworthy` are not asked while planning a prompt. `observe` asks `teachable` once per distilled candidate (at most 3). `teach promote --due` and automatic promotion ask `skillworthy` once per due moment. A failure at either point behaves as with Decisions off.
 - **Latency.** About 500 ms per decision (median, measured from a Linux server). The plan gate runs before planning starts, so it adds that to each prompt the rules would plan (except skill invocations and `uplift:` prompts), and saves the whole planning pass when it skips. The knowledge and blocking checks of one round run at the same time. The ship check runs alongside the LLM judge and adds no wait of its own.
 - **Budget.** `decisions.timeoutMs` (default 3000 ms, at most 30000) bounds one decision, its single retry included. Past it, the point goes on as without Jev.
 
@@ -183,6 +216,7 @@ Decision models can be pushed to confident wrong answers by adversarial or unusu
 
 - **Jev never merges.** The merge gate stays Greptile's: a completed review of the exact PR head at 5/5 with no open threads, and CI neither pending nor failing. A PR that Jev approved faces the same gate. With `ship.autoMerge` on, Jev never stands in for a missing or failed LLM judge, so a Jev verdict alone never leads to a merge.
 - **Everything Jev can do is recoverable.** A wrong skip is resent with `uplift:`. A wrong veto hands the work back. A wrong knowledge reject costs one extra question, or leaves that answer out when no question slot is free; it never pushes out one of the clarifier's own questions. A wrong blocking promote costs one extra question. Jev never demotes a blocking question, never turns an LLM "not done" into done and never overrides a rule gap.
+- **Jev cannot add a lesson, and it cannot block an explicit promote.** `teachable` only drops or holds a candidate `observe` already produced. `skillworthy` only skips a due listing. `teach promote <id>` does not ask Jev. A failure at either point behaves as with Decisions off.
 - **Deterministic rules come first.** Jev is asked only when the rules have left the action open. GSD roadmap and verification signals stay rules and never enter Jev's state.
 - **The key stays yours.** It is sent only to `https://openrouter.ai/api/alpha/decisions`, or to `ULTRATHINK_DECISIONS_URL` when you set that in the environment, which is accepted only as an `https://openrouter.ai/…` URL or a loopback URL (`localhost`, `127.0.0.1`, `[::1]`) with no user name or password in it. Requests never follow a redirect. No config file can change the endpoint, so a cloned repository cannot redirect the key; and because ultrathink starts Bun with `--no-env-file`, the repository's `.env*` files cannot set the variable either on Bun 1.3.3 and later (Bun 1.2.x still loads them). The key never appears in output, records or error messages.
 - **A repository cannot opt you in.** Its project file can turn Decisions off, drop points and turn `zdr` on, never the reverse, so opening a repository never sends your prompt, patch or knowledge-base text to OpenRouter unless you turned Jev on in your own config.

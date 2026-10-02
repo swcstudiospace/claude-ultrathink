@@ -14,6 +14,8 @@ import { isSubagentEnvelope, normalizeEnvelope, parseEnvelope } from "./envelope
 import { isPlanningPath, resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanOptions, type PlanResponse } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
+import type { GroundOutcome } from "../ragflow/types.ts";
+import type { RecallOutcome } from "../teach/types.ts";
 
 describe("detectHost", () => {
 	test("Grok markers win over Claude aliases, and an explicit host wins over both", () => {
@@ -653,4 +655,91 @@ describe("planPrompt with the Jev plan gate", () => {
 		},
 		60_000,
 	);
+});
+
+describe("planPrompt lessons and documents", () => {
+	const recalled: RecallOutcome = {
+		status: "used",
+		lessons: [
+			{
+				id: "l1",
+				name: "Run migrations first MARKER_L1",
+				description: "Seeding before migrating fails",
+				body: `MARKER_L1 ${"run the migration before the seed script. ".repeat(60)}`,
+				kind: "pitfall",
+				project: "widgets",
+				host: "hermes",
+				occurrences: 2,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				source: "local",
+			},
+		],
+		source: "local",
+		chars: 2_000,
+		ms: 5,
+	};
+	const grounded: GroundOutcome = {
+		status: "used",
+		chunks: [{ id: "c1", content: "MARKER_D1 widgets are stored in the widgets table", documentName: "storage.md" }],
+		chars: 120,
+		ms: 7,
+		datasets: 1,
+	};
+
+	test("Hermes, Muse, Omp and Claude plans all carry both sections, built from the prompt alone", async () => {
+		for (const host of ["hermes", "muse", "omp", "claude-code"] as const) {
+			const { root, env, options } = planHarness();
+			const queries: string[] = [];
+			try {
+				const response = await planPrompt(
+					{ host, session_id: "s1", prompt: "add a widget", cwd: root },
+					{ ...env, PI_CODING_AGENT_DIR: join(root, "omp") },
+					{
+						...options,
+						recall: async ({ query }) => {
+							queries.push(query);
+							return recalled;
+						},
+						ground: async ({ query }) => {
+							queries.push(query);
+							return grounded;
+						},
+					},
+				);
+				expect(response.skipped).toBeUndefined();
+				expect(response.context).toContain("## Lessons from earlier work");
+				expect(response.context).toContain("MARKER_L1");
+				expect(response.context).toContain("## Documents (RAGFlow)");
+				expect(response.context).toContain("MARKER_D1");
+				expect(response.summary).toContain("Lessons · 1 recalled (local)");
+				expect(response.summary).toContain("Docs · 1 excerpt (RAGFlow)");
+				expect(queries).toEqual(["add a widget", "add a widget"]);
+				// The handoff is budgeted; the carrier and the response carry the same context.
+				if (host === "hermes") expect(response.context.length).toBeLessThanOrEqual(9_000);
+				const record = JSON.parse(readFileSync(response.statePath ?? "", "utf8")) as { lessons?: { count: number }; docs?: { count: number } };
+				expect(record.lessons?.count).toBe(1);
+				expect(record.docs?.count).toBe(1);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("a prompt that is skipped before planning never reaches either lookup", async () => {
+		const { root, env, options } = planHarness();
+		let calls = 0;
+		try {
+			const count = async (): Promise<never> => {
+				calls++;
+				throw new Error("must not run");
+			};
+			for (const prompt of ["ok", "raw: add a widget", "/help"]) {
+				const response = await planPrompt({ host: "hermes", session_id: "s1", prompt, cwd: root }, env, { ...options, recall: count, ground: count });
+				expect(response.context).toBe("");
+			}
+			expect(calls).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

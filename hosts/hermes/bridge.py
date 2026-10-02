@@ -22,6 +22,12 @@ starts. Each case logs one warning naming the fix.
 The /ultrathink-<verb> slash commands run bin/ultrathink against the engine's
 state directory; /ultrathink-quick sends one message that pre_llm_call leaves
 unplanned.
+
+Teachable Moments (TS side: src/teach). post_llm_call hands a finished turn to
+`bin/ultrathink teach observe` as a detached process, on_session_finalize starts
+`teach sync`, and the ultrathink_lesson_save / ultrathink_lesson_recall tools and the
+/ultrathink-learn and /ultrathink-lessons commands call the same CLI. Nothing runs
+unless `teach status` reports enabled, and every failure here is swallowed.
 """
 
 from __future__ import annotations
@@ -33,7 +39,9 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +55,20 @@ MIN_PLAN_S = 90  # below this a plan cannot finish, so Bun is not started at all
 HERMES_DEFAULT_CAP_S = 30.0  # Hermes' plugins.hook_callback_timeout when its config sets none
 HERMES_MAX_CAP_S = 600.0  # Hermes clamps a larger plugins.hook_callback_timeout to this
 CONTROL_TIMEOUT_S = 20
+TEACH_STATUS_TIMEOUT_S = 10  # a status check also gates tool visibility, so it must not hang a hook
+TEACH_CAPTURE_TIMEOUT_S = 25
+TEACH_RECALL_TIMEOUT_S = 15
+TEACH_STATUS_TTL_S = 600.0
+TEACH_STATUS_FAILED_TTL_S = 60.0
+TEACH_OBSERVE_INTERVAL_S = 30.0  # at most one observe process per session in this window
+TEACH_KINDS = ("bug", "pitfall", "pattern", "decision", "playbook")
+# src/teach/types.ts DIGEST_MAX_TURNS and DIGEST_TURN_CHARS; the TS side applies its own minimum of tool calls.
+DIGEST_MAX_TURNS = 60
+DIGEST_TURN_CHARS = 1500
+DIGEST_MIN_TOOL_ROWS = 2
+TOOL_CALL_ARGS_CHARS = 300
+LEARN_NAME_CHARS = 80
+TEACH_MAX_TAGS = 20
 QUICK_FALLBACK = "Ultrathink will not plan your next message. Send it now (or prefix any message with raw:)."
 # A shared multi-user gateway session attributes each message: "[Alice] fix the typo".
 SENDER_TAG_RE = re.compile(r"\[([^\]\n]*)\]\s+")
@@ -100,6 +122,13 @@ _sync_nudged: set[tuple[str, str]] = set()  # (session_id, graphId) pre_verify a
 # that exact message, so a message queued behind a running turn still goes out unplanned.
 _quick_lock = threading.Lock()
 _quick_pending: dict[str, int] = {}  # stripped message -> injected copies pre_llm_call has not seen
+
+# Teachable Moments state. The lock guards the dicts only and is never held across I/O.
+_teach_lock = threading.Lock()
+_teach_status_cache: dict[str, tuple[float, float, dict[str, Any]]] = {}  # cwd -> (cached at, ttl seconds, `teach status --json`)
+_observed_at: dict[str, float] = {}  # session_id -> clock time of its last observe spawn
+_synced: set[str] = set()  # session_ids whose outbox sync was already started
+_clock = time.monotonic
 
 
 def timeout_seconds() -> int:
@@ -603,7 +632,7 @@ def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, s
 	(True, its text), or (False, one line saying what failed). Never raises."""
 	label = " ".join(["Ultrathink", *args[:1]])
 	try:
-		child_env = {**os.environ, **(env or {}), "ULTRATHINK_HOST": "hermes", "ULTRATHINK_STATE_DIR": str(state_dir(env))}
+		child_env = _child_env(env)
 		completed = subprocess.run(
 			[str(CLI), *args],
 			encoding="utf-8",
@@ -657,3 +686,410 @@ def quick(message: str, inject: Callable[[str], bool], env: dict[str, str] | Non
 		_take_quick(text)
 	ok, reply = control(["skip"], env)
 	return QUICK_FALLBACK if ok else reply
+
+
+def _child_env(env: dict[str, str] | None = None) -> dict[str, str]:
+	"""The environment every bin/ultrathink child gets: Hermes as the host, the engine's state directory."""
+	return {**os.environ, **(env or {}), "ULTRATHINK_HOST": "hermes", "ULTRATHINK_STATE_DIR": str(state_dir(env))}
+
+
+def _one_line(text: object, limit: int = 300) -> str:
+	line = " ".join(str(text).split())
+	return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _failure_detail(completed: subprocess.CompletedProcess[str]) -> str:
+	"""One line saying why a CLI run failed, the way control() words it."""
+	lines = [line.strip() for line in f"{completed.stderr}\n{completed.stdout}".splitlines() if line.strip()]
+	detail = next((line for line in lines if line.startswith("error:")), lines[0] if lines else "")
+	return _one_line(detail or f"exit code {completed.returncode}")
+
+
+def _teach_json(args: list[str], timeout: float, env: dict[str, str] | None = None, stdin: str | None = None) -> tuple[Any, str]:
+	"""Run `bin/ultrathink teach <args>` and parse its stdout as JSON: (value, "") or (None, one line
+	saying what failed). A CLI that exits non-zero but still prints JSON ({"ok": false, ...}) counts as an answer.
+	Never raises, and the error text never carries the input."""
+	try:
+		completed = subprocess.run(
+			[str(CLI), "teach", *args],
+			input=stdin,
+			encoding="utf-8",
+			errors="replace",
+			capture_output=True,
+			timeout=timeout,
+			env=_child_env(env),
+			check=False,
+		)
+	except subprocess.TimeoutExpired:
+		return None, f"no answer after {timeout}s"
+	except Exception as error:
+		return None, _one_line(error)
+	try:
+		value = json.loads(completed.stdout)
+	except ValueError:
+		return None, _failure_detail(completed)
+	return (value, "") if isinstance(value, (dict, list)) else (None, _failure_detail(completed))
+
+
+def _cwd() -> str:
+	try:
+		return os.getcwd()
+	except OSError:
+		return ""
+
+
+def teach_status(env: dict[str, str] | None = None) -> dict[str, Any]:
+	"""`teach status --json` for the current directory, cached per process for 10 minutes (a failed
+	run caches {"enabled": False} for one). Never raises."""
+	key = _cwd()
+	with _teach_lock:
+		entry = _teach_status_cache.get(key)
+	if entry is not None and _clock() - entry[0] < entry[1]:
+		return dict(entry[2])
+	try:
+		data, _ = _teach_json(["status", "--json"], TEACH_STATUS_TIMEOUT_S, env)
+	except Exception:
+		data = None
+	if isinstance(data, dict) and "enabled" in data:
+		status, ttl = data, TEACH_STATUS_TTL_S
+	else:
+		status, ttl = {"enabled": False}, TEACH_STATUS_FAILED_TTL_S
+	with _teach_lock:
+		_teach_status_cache[key] = (_clock(), ttl, status)
+	return dict(status)
+
+
+def _content_text(content: Any) -> str:
+	if isinstance(content, str):
+		return content
+	if isinstance(content, list):
+		parts = [part if isinstance(part, str) else part.get("text") for part in content if isinstance(part, (str, dict))]
+		return "\n".join(part for part in parts if isinstance(part, str))
+	return ""
+
+
+def _tool_row_failed(row: dict[str, Any], text: str) -> bool:
+	"""Whether a Hermes tool row reports a failure: its own status, text that starts with Error, or a JSON
+	result with an error, success false or a non-zero exit_code."""
+	if row.get("is_error") is True or str(row.get("status", "")).lower() in ("error", "failed", "failure"):
+		return True
+	stripped = text.lstrip()
+	if stripped.startswith("Error"):
+		return True
+	if not stripped.startswith("{"):
+		return False
+	try:
+		data = json.loads(stripped)
+	except ValueError:
+		return False
+	if not isinstance(data, dict):
+		return False
+	code = data.get("exit_code")
+	return (
+		data.get("error") not in (None, "", False, [], {})
+		or data.get("success") is False
+		or (isinstance(code, int) and not isinstance(code, bool) and code != 0)
+	)
+
+
+def build_digest(payload: dict[str, Any]) -> dict[str, Any] | None:
+	"""The TeachDigest (src/teach/types.ts) for a post_llm_call payload, or None when its history has
+	fewer than two tool rows. The last 60 turns, each cut to 1500 characters; redaction is observe's job."""
+	history = payload.get("conversation_history")
+	rows = history if isinstance(history, list) else []
+	call_names: dict[str, str] = {}
+	turns: list[dict[str, Any]] = []
+	for row in rows:
+		if not isinstance(row, dict):
+			continue
+		role = row.get("role")
+		text = _content_text(row.get("content")).strip()
+		if role == "user":
+			if text:
+				turns.append({"role": "user", "text": text})
+		elif role == "assistant":
+			calls = []
+			for call in row.get("tool_calls") or []:
+				function = call.get("function") if isinstance(call, dict) else None
+				if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+					continue
+				arguments = function.get("arguments")
+				arguments = arguments if isinstance(arguments, str) else json.dumps(arguments, default=str)
+				calls.append((function["name"], arguments))
+				if isinstance(call.get("id"), str):
+					call_names[call["id"]] = function["name"]
+			if text:
+				turns.append({"role": "assistant", "text": text})
+			elif calls:
+				summary = "; ".join(f"{name}({arguments[:TOOL_CALL_ARGS_CHARS]})" for name, arguments in calls)
+				turns.append({"role": "assistant", "text": summary, "tool": calls[0][0]})
+		elif role == "tool":
+			turn: dict[str, Any] = {"role": "tool", "text": text or "(no output)"}
+			name = row.get("name") if isinstance(row.get("name"), str) else call_names.get(str(row.get("tool_call_id")))
+			if name:
+				turn["tool"] = name
+			if _tool_row_failed(row, text):
+				turn["isError"] = True
+			turns.append(turn)
+	response = payload.get("assistant_response")
+	if isinstance(response, str) and response.strip():
+		last = next((turn for turn in reversed(turns) if turn["role"] == "assistant"), None)
+		if last is None or last["text"] != response.strip():
+			turns.append({"role": "assistant", "text": response.strip()})
+	turns = turns[-DIGEST_MAX_TURNS:]
+	for turn in turns:
+		turn["text"] = turn["text"][:DIGEST_TURN_CHARS]
+	tool_rows = sum(1 for turn in turns if turn["role"] == "tool")
+	if tool_rows < DIGEST_MIN_TOOL_ROWS:
+		return None
+	session_id = payload.get("session_id")
+	cwd = payload.get("cwd")
+	return {
+		"host": "hermes",
+		"sessionId": session_id if isinstance(session_id, str) and session_id else "unknown",
+		"cwd": cwd if isinstance(cwd, str) and cwd else _cwd(),
+		"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+		"turns": turns,
+		"toolCalls": tool_rows,
+		"outcome": "completed",
+	}
+
+
+def _write_inbox(digest: dict[str, Any], env: dict[str, str] | None) -> Path:
+	"""<state dir>/teach/inbox/<epoch>-<8 hex>.json, the directory src/teach/spawn.ts writes to: dirs 0700, file 0600."""
+	base = state_dir(env) / "teach"
+	inbox = base / "inbox"
+	inbox.mkdir(parents=True, exist_ok=True)
+	for directory in (base, inbox):
+		os.chmod(directory, 0o700)
+	path = inbox / f"{int(time.time())}-{os.urandom(4).hex()}.json"
+	descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+	with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+		json.dump(digest, handle, ensure_ascii=False)
+	return path
+
+
+def _spawn_detached(args: list[str], env: dict[str, str] | None = None, cwd: str | None = None) -> bool:
+	"""Start `bin/ultrathink teach <args>` in its own session with stdio closed, and do not wait for it."""
+	try:
+		subprocess.Popen(
+			[str(CLI), "teach", *args],
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			start_new_session=True,
+			env=_child_env(env),
+			cwd=cwd if cwd and os.path.isdir(cwd) else None,
+		)
+	except Exception:
+		return False
+	return True
+
+
+def observe_turn(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
+	"""post_llm_call: hand the finished turn to a detached `teach observe`. "spawned", or the reason
+	nothing ran ("subagent", "cron", "off", "explicit", "short", "throttled", "error"). Never raises."""
+	try:
+		if payload.get("parent_session_id"):
+			return "subagent"
+		if payload.get("platform") == "cron":
+			return "cron"
+		status = teach_status(env)
+		if not status.get("enabled"):
+			return "off"
+		if status.get("capture") == "explicit":
+			return "explicit"
+		digest = build_digest(payload)
+		if digest is None:
+			return "short"
+		session_id = digest["sessionId"]
+		now = _clock()
+		with _teach_lock:
+			last = _observed_at.get(session_id)
+			if last is not None and now - last < TEACH_OBSERVE_INTERVAL_S:
+				return "throttled"
+			for stale in [key for key, at in _observed_at.items() if now - at >= TEACH_OBSERVE_INTERVAL_S]:
+				del _observed_at[stale]
+			_observed_at[session_id] = now
+		path = _write_inbox(digest, env)
+		if not _spawn_detached(["observe", "--file", str(path)], env, digest["cwd"]):
+			path.unlink(missing_ok=True)  # the digest holds unredacted turns: do not leave it behind
+			return "error"
+		return "spawned"
+	except Exception:
+		return "error"
+
+
+def sync_outbox(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
+	"""on_session_finalize: start a detached `teach sync`, once per session, when Teachable Moments is on.
+	"spawned" or the reason nothing ran. Never raises."""
+	try:
+		session_id = payload.get("session_id")
+		key = session_id if isinstance(session_id, str) else ""
+		with _teach_lock:
+			if key in _synced:
+				return "done"
+		if not teach_status(env).get("enabled"):
+			return "off"
+		with _teach_lock:
+			if key in _synced:
+				return "done"
+			_synced.add(key)
+		return "spawned" if _spawn_detached(["sync"], env, _cwd()) else "error"
+	except Exception:
+		return "error"
+
+
+def capture_lesson(args: Any, env: dict[str, str] | None = None) -> dict[str, Any]:
+	"""Save one lesson through `teach capture --stdin --json`: the CLI's JSON ({"ok": true, "id", "created",
+	"retain", "reason"}) or {"ok": False, "error": ...}. Never raises."""
+	try:
+		if not isinstance(args, dict):
+			return {"ok": False, "error": "arguments must be an object with name and body"}
+		name, body = args.get("name"), args.get("body")
+		if not isinstance(name, str) or not name.strip() or not isinstance(body, str) or not body.strip():
+			return {"ok": False, "error": "name and body are required non-empty strings"}
+		kind = args.get("kind") or "pattern"
+		if kind not in TEACH_KINDS:
+			return {"ok": False, "error": f"kind must be one of {', '.join(TEACH_KINDS)}"}
+		lesson: dict[str, Any] = {"name": name.strip(), "body": body.strip(), "kind": kind}
+		description = args.get("description")
+		if isinstance(description, str) and description.strip():
+			lesson["description"] = description.strip()
+		tags = args.get("tags")
+		if isinstance(tags, list):
+			lesson["tags"] = [tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()][:TEACH_MAX_TAGS]
+		data, detail = _teach_json(["capture", "--stdin", "--json"], TEACH_CAPTURE_TIMEOUT_S, env, json.dumps(lesson))
+		if isinstance(data, dict):
+			return data
+		return {"ok": False, "error": detail or "teach capture gave no answer"}
+	except Exception as error:
+		return {"ok": False, "error": _one_line(error)}
+
+
+def recall_lessons(query: str, limit: int | None = None, env: dict[str, str] | None = None) -> dict[str, Any]:
+	"""Search saved lessons through `teach recall <query> --json`: the CLI's JSON ({"status", "count", "lessons", ...})
+	or {"status": "error", "count": 0, "lessons": [], "reason": ...}. Never raises."""
+	failed: dict[str, Any] = {"status": "error", "count": 0, "lessons": []}
+	try:
+		# A leading dash would read as a CLI flag.
+		text = query.strip().lstrip("-").strip() if isinstance(query, str) else ""
+		if not text:
+			return {**failed, "reason": "query is a required non-empty string"}
+		args = ["recall", text, "--json"]
+		if isinstance(limit, int) and not isinstance(limit, bool):
+			args += ["--limit", str(max(1, min(limit, 20)))]
+		data, detail = _teach_json(args, TEACH_RECALL_TIMEOUT_S, env)
+		if isinstance(data, dict):
+			return data
+		return {**failed, "reason": detail or "teach recall gave no answer"}
+	except Exception as error:
+		return {**failed, "reason": _one_line(error)}
+
+
+def learn(note: str, env: dict[str, str] | None = None) -> str:
+	"""/ultrathink-learn <note>: save the note as a "pattern" lesson named by its first sentence."""
+	body = (note or "").strip()
+	if not body:
+		return "Usage: /ultrathink-learn <note>"
+	collapsed = " ".join(body.split())
+	sentence = re.match(r"(.+?[.!?])(?:\s|$)", collapsed)
+	name = (sentence.group(1) if sentence else collapsed)[:LEARN_NAME_CHARS].rstrip()
+	result = capture_lesson({"name": name, "body": body, "kind": "pattern"}, env)
+	if result.get("ok") is True:
+		return f"Saved lesson {result.get('id', '?')} (retain: {result.get('retain', 'unknown')})."
+	return f"Could not save the lesson: {_one_line(result.get('error') or 'unknown error')}"
+
+
+def _lesson_items(data: Any) -> list[dict[str, Any]] | None:
+	if isinstance(data, dict):
+		data = next((data[key] for key in ("moments", "lessons", "items") if isinstance(data.get(key), list)), None)
+	return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else None
+
+
+def _lesson_line(item: dict[str, Any]) -> str:
+	tags = ", ".join(str(item[key]) for key in ("kind", "status") if item.get(key))
+	line = f"- {item.get('id', '?')}" + (f" [{tags}]" if tags else "") + f" {item.get('name', '')}"
+	description = item.get("description")
+	return _one_line(f"{line}: {description}" if description else line, 240)
+
+
+def _dispatch_failure(result: Any) -> str | None:
+	"""Why Hermes' skill_manage refused the skill, or None when its answer reports no failure."""
+	if isinstance(result, str):
+		try:
+			result = json.loads(result)
+		except ValueError:
+			return None
+	if isinstance(result, dict):
+		if result.get("success") is False or result.get("error"):
+			return _one_line(result.get("error") or result.get("message") or "skill_manage refused the skill")
+	return None
+
+
+def _promote(moment_id: str, dispatch: Callable[..., Any] | None, env: dict[str, str] | None) -> str:
+	if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*", moment_id):
+		return "Usage: /ultrathink-lessons promote <id>"
+	data, detail = _teach_json(["promote", moment_id, "--target", "hermes", "--json"], CONTROL_TIMEOUT_S, env)
+	draft = data.get("draft") if isinstance(data, dict) else None
+	if not isinstance(draft, dict) or not isinstance(draft.get("name"), str) or not isinstance(draft.get("content"), str):
+		return f"Could not draft a skill from {moment_id}: {detail or _one_line(data.get('error') if isinstance(data, dict) and data.get('error') else 'no draft')}"
+	name = draft["name"]
+	outcome = data.get("outcome") if isinstance(data, dict) else None
+	failure = "this Hermes has no dispatch_tool"
+	if callable(dispatch):
+		try:
+			result = dispatch(
+				"skill_manage",
+				{"action": "create", "name": name, "category": "ultrathink-lessons", "content": draft["content"]},
+			)
+			failure = _dispatch_failure(result) or ""
+		except Exception as error:
+			failure = _one_line(error)
+		if not failure:
+			marked, mark_reply = control(["teach", "promote", moment_id, "--mark-promoted", "--skill", name, "--target", "hermes"], env)
+			note = "" if marked else f" The lesson is not marked promoted yet ({mark_reply})."
+			return (
+				f"Sent the skill {name} for lesson {moment_id} to Hermes. With skills.write_approval on it is staged: "
+				f"review it with /skills pending, then /skills approve <id>.{note}"
+			)
+	path = outcome.get("path") if isinstance(outcome, dict) else None
+	if not isinstance(path, str) or not path:
+		installed, _ = _teach_json(["promote", moment_id, "--target", "hermes", "--install", "--json"], CONTROL_TIMEOUT_S, env)
+		outcome = installed.get("outcome") if isinstance(installed, dict) else None
+		path = outcome.get("path") if isinstance(outcome, dict) else None
+	home = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes")
+	where = f"Draft: {path}." if isinstance(path, str) and path else "No draft file was written."
+	return (
+		f"Could not stage the skill through Hermes ({failure}). {where} Install it by hand: create the skill {name} "
+		f"(category ultrathink-lessons) with skill_manage, or copy the draft to {home / 'skills' / 'ultrathink-lessons' / name / 'SKILL.md'}, "
+		f"then run `bin/ultrathink teach promote {moment_id} --mark-promoted --skill {name} --target hermes`."
+	)
+
+
+def lessons_command(raw_args: str, dispatch: Callable[..., Any] | None = None, env: dict[str, str] | None = None) -> str:
+	"""/ultrathink-lessons [list|recall <query>|promote <id>|status]: one reply text. `dispatch` is ctx.dispatch_tool."""
+	verb, _, rest = (raw_args or "").strip().partition(" ")
+	verb, rest = (verb or "list").lower(), rest.strip()
+	if verb == "status":
+		return control(["teach", "status"], env)[1]
+	if verb == "list":
+		data, detail = _teach_json(["list", "--json"], CONTROL_TIMEOUT_S, env)
+		if data is None:
+			return f"Could not list lessons: {detail}"
+		items = _lesson_items(data)
+		if items is None:
+			return _one_line(json.dumps(data), 1500)
+		return "\n".join(_lesson_line(item) for item in items[:30]) or "No lessons saved yet."
+	if verb == "recall":
+		if not rest:
+			return "Usage: /ultrathink-lessons recall <query>"
+		result = recall_lessons(rest, 5, env)
+		lessons = _lesson_items(result.get("lessons")) or []
+		if not lessons:
+			reason = result.get("reason")
+			return "No matching lessons." + (f" ({_one_line(reason)})" if reason else "")
+		return "\n".join(_lesson_line({**lesson, "status": None}) for lesson in lessons)
+	if verb == "promote":
+		return _promote(rest.split()[0] if rest else "", dispatch, env)
+	return "Usage: /ultrathink-lessons [list|recall <query>|promote <id>|status]"

@@ -2,10 +2,11 @@
 // Copyright (C) 2026 SWC Studio
 /**
  * Credential providers. MCP providers are remote MCP servers (relay, check, OAuth login); key providers only hold an
- * API key in the same store for a non-MCP client (OpenRouter's Decisions API) and are never served or connected.
+ * API key in the same store for a non-MCP client (OpenRouter's Decisions API, the Hindsight and RAGFlow HTTP APIs) and are
+ * never served or connected.
  */
 export type McpProviderId = "notion" | "linear" | "greptile";
-export type KeyProviderId = "openrouter";
+export type KeyProviderId = "openrouter" | "hindsight" | "ragflow";
 export type ProviderId = McpProviderId | KeyProviderId;
 
 export interface McpProvider {
@@ -70,6 +71,8 @@ export const MCP_PROVIDERS: Record<McpProviderId, McpProvider> = {
 
 export const KEY_PROVIDERS: Record<KeyProviderId, KeyProvider> = {
 	openrouter: { kind: "key", id: "openrouter", label: "OpenRouter", apiKey: true, oauth: false, envVar: "OPENROUTER_API_KEY" },
+	hindsight: { kind: "key", id: "hindsight", label: "Hindsight", apiKey: true, oauth: false, envVar: "HINDSIGHT_API_KEY" },
+	ragflow: { kind: "key", id: "ragflow", label: "RAGFlow", apiKey: true, oauth: false, envVar: "RAGFLOW_API_KEY" },
 };
 
 /** Every provider in table order: the MCP servers first, then the API-key-only providers. */

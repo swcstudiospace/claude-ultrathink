@@ -11,3 +11,8 @@ hooks:
   - post_tool_call
   - pre_verify
   - subagent_start
+  - post_llm_call
+  - on_session_finalize
+provides_tools:
+  - ultrathink_lesson_save
+  - ultrathink_lesson_recall

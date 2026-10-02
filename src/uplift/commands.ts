@@ -14,9 +14,15 @@ import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
 import { resolveStateDir } from "../host/paths.ts";
+import { hindsightStatusLine } from "../hindsight/settings.ts";
+import { runHindsightCommand } from "../hindsight/cli.ts";
 import { hasUsableCredential } from "../mcp/client.ts";
 import { storePath } from "../mcp/store.ts";
+import { runRagflowCommand } from "../ragflow/cli.ts";
+import { ragflowStatusLine } from "../ragflow/settings.ts";
 import { resolveSubstrate } from "../substrate/brief.ts";
+import { runTeachCommand } from "../teach/cli.ts";
+import { teachStatusLine } from "../teach/status.ts";
 import { graphSketch } from "../think/graph.ts";
 import { grokUserQuery, parseSlashCommand } from "./skill.ts";
 
@@ -40,7 +46,10 @@ const USAGE = [
 	"  hitl on|off|last       HITL clarifications",
 	"  grok [engine grok|claude]",
 	"  decisions check        one live Jev decision: resolved model, latency, cost",
-	"  decisions probe <plan|ship|knowledge|blocking> <cases.json>",
+	"  decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>",
+	"  hindsight check        Hindsight memory server: readiness, health, optional round trip",
+	"  ragflow check|datasets|search \"<query>\"   RAGFlow document search",
+	"  teach status|list|show|capture|recall|confirm|forget|sync|observe|promote|export   Teachable Moments",
 	"In an agent: /ultrathink-status, /ultrathink-off, /ultrathink-on, /ultrathink-skip, /ultrathink-track off|on,",
 	"and /ultrathink-quick <message> sends one message as typed (no planning, no Linear/Notion rows).",
 ].join("\n");
@@ -177,6 +186,9 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		shipLine(config, process.env),
 		knowledgeLine(config, state, process.env),
 		decisionsLine(config, process.env),
+		hindsightStatusLine(config.hindsight, process.env, storePath(process.env)),
+		ragflowStatusLine(config.ragflow, process.env, storePath(process.env)),
+		teachStatusLine({ teach: config.teach, hindsight: config.hindsight }, process.env, storePath(process.env), stateDir),
 		`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
 		`State: ${stateDir}`,
 	];
@@ -268,11 +280,22 @@ export async function runControl(args: string[], input: { stateDir: string; cwd:
 }
 
 // `bin/ultrathink <verb> [args…]`: the host state dir comes from ULTRATHINK_HOST, else the detected host.
-// `decisions …` bypasses runControl, which lower-cases its args (probe takes a file path).
+// `decisions`, `hindsight`, `ragflow` and `teach` bypass runControl, which lower-cases its args (probe takes a file path).
 if (import.meta.main) {
 	const argv = process.argv.slice(2);
-	if (argv[0]?.trim().toLowerCase() === "decisions") {
-		runDecisionsCommand(argv.slice(1), { cwd: process.cwd() }).then(({ code, text }) => {
+	const service = argv[0]?.trim().toLowerCase();
+	const command =
+		service === "decisions"
+			? runDecisionsCommand(argv.slice(1), { cwd: process.cwd() })
+			: service === "hindsight"
+				? runHindsightCommand(argv.slice(1), { cwd: process.cwd(), env: process.env })
+				: service === "ragflow"
+					? runRagflowCommand(argv.slice(1), { cwd: process.cwd(), env: process.env })
+					: service === "teach"
+						? runTeachCommand(argv.slice(1), { cwd: process.cwd(), env: process.env })
+						: undefined;
+	if (command) {
+		command.then(({ code, text }) => {
 			process.stdout.write(`${text}\n`, () => process.exit(code));
 		});
 	} else {

@@ -6,16 +6,18 @@
  *
  * Module: src/hooks/a01-orchestrator-hook.ts
  * Implements: Promise.race( orchestratorFn, timeout ) with ORCHESTRATOR_TIMEOUT_MS default 120s.
- * On timeout/failure: log `[gsd-autonomous][a01-orchestrator] FAILED`, mark STATE, continue (no hang).
+ * On timeout/failure: log `[gsd-autonomous][a01-orchestrator] FAILED`, append the redacted failure to
+ * `<stateDir>/a01-failures.log` (host state dir, never the working tree or `.planning/`), continue (no hang).
  * Controlled by flag A01_ORCHESTRATOR_ENABLED (default true).
- * Hindsight usage is mocked (no real creds, per spec).
+ * This hook does not contact Hindsight. Failures go only to the state-dir log.
  *
  * Refs: SPE-5105, UPLIFTED_PROMPT Graph n7 graceful-degradation.
  * No breaking changes to existing hooks, config, or call sites.
  */
 
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { resolveStateDir } from "../host/paths.ts";
 
 export const ORCHESTRATOR_TIMEOUT_MS = 120_000;
 export const A01_ORCHESTRATOR_ENABLED =
@@ -23,7 +25,7 @@ export const A01_ORCHESTRATOR_ENABLED =
 
 export interface A01HookOptions {
   timeoutMs?: number;
-  stateDir?: string; // for marking STATE (defaults to .planning or cwd)
+  stateDir?: string; // failure log location (defaults to the host state dir)
   logPrefix?: string;
 }
 
@@ -39,7 +41,7 @@ export function redactForLog(input: string): string {
   let s = String(input);
   s = s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-REDACTED");
   s = s.replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer REDACTED");
-  // $HOME paths outside repo get redacted (see teachable-moments/hooks.ts for full)
+  // Home paths outside the working tree are redacted; paths inside it stay.
   const home = process.env.HOME || "/root";
   const repo = process.cwd();
   const homeEsc = home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -49,19 +51,13 @@ export function redactForLog(input: string): string {
   return s;
 }
 
-/** Mark failure in STATE (append to .planning/STATE.md if present, or create marker; fail-open). */
+/** Append a redacted failure line to `<stateDir>/a01-failures.log` (dir 0700, file 0600; best effort, never throws). */
 function markA01FailureInState(logMsg: string, stateDir?: string): void {
   try {
-    const base = stateDir || join(process.cwd(), ".planning");
-    const stateMd = join(base, "STATE.md");
-    const marker = `\n\n<!-- a01-hook-failure ${new Date().toISOString()} -->\n[gsd-autonomous][a01-orchestrator] FAILED: ${redactForLog(logMsg)}\n`;
-    if (existsSync(stateMd)) {
-      appendFileSync(stateMd, marker, "utf8");
-    } else {
-      mkdirSync(base, { recursive: true });
-      // Do not overwrite full STATE; append note or write minimal if absent
-      writeFileSync(stateMd, `# STATE (graceful a01 marker)\n${marker}`, "utf8");
-    }
+    const base = stateDir || resolveStateDir(process.env);
+    mkdirSync(base, { recursive: true, mode: 0o700 });
+    const line = `${new Date().toISOString()} ${redactForLog(logMsg)}\n`;
+    appendFileSync(join(base, "a01-failures.log"), line, { encoding: "utf8", mode: 0o600 });
   } catch {
     // fail-open: never block caller
   }
@@ -69,7 +65,7 @@ function markA01FailureInState(logMsg: string, stateDir?: string): void {
 
 /**
  * Run fn under Promise.race timeout. Returns result or {timedOut:true}.
- * Always continues; logs and marks STATE on timeout or rejection.
+ * Always continues; logs and records the failure in the state-dir log on timeout or rejection.
  */
 export async function withA01OrchestratorTimeout<T>(
   fn: () => Promise<T>,
@@ -114,8 +110,8 @@ export async function withA01OrchestratorTimeout<T>(
 /**
  * Convenience wrapper for invoking a01-orchestrator task/brief with graceful degradation.
  * The `run` fn is expected to perform the actual spawn/task call (e.g. to a01).
- * On any failure/timeout: log, mark STATE, return control to caller (continue flow).
- * Mock Hindsight: no persistence side-effect here; redaction applied to logs/state.
+ * On any failure/timeout: log, record in the state-dir failure log, return control to caller (continue flow).
+ * This wrapper does not contact Hindsight. Log lines are redacted before they are stored.
  */
 export async function invokeA01OrchestratorWithGraceful<T = unknown>(
   briefOrTask: string,

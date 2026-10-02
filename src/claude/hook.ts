@@ -26,10 +26,16 @@ import { injectTrackingXml } from "../track/render.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { ProgressEvent, ProgressSink, StageName } from "../host/progress.ts";
 import type { UpliftResult, UpliftState } from "../types.ts";
+import { docsLookup, formatDocsSection, groundDocs } from "../ragflow/ground.ts";
+import { teachContext, teachEnabled } from "../teach/context.ts";
+import { formatLessonsSection, lessonsLookup, recallLessons } from "../teach/recall.ts";
+import type { GroundOutcome, DocsLookup } from "../ragflow/types.ts";
+import type { LessonsLookup, RecallOutcome } from "../teach/types.ts";
+import { isSubagentEnvelope } from "../host/envelope.ts";
 import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
-import type { ClaudeCompleter } from "./complete.ts";
+import { type ClaudeCompleter, isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
 import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
@@ -83,6 +89,13 @@ export interface HookDeps {
 	signal?: AbortSignal;
 	/** Seams for the Decisions runtime (env, storePath, fetch, now, sleep, random, debug); config comes from config.decisions. */
 	decisionsDeps?: DecisionsDeps;
+	/**
+	 * Lessons lookup (Teachable Moments). Defaults to `recallLessons` when `config.teach.enabled && config.teach.recall`;
+	 * an injected seam always runs. Gets only the user's original prompt (truncated), never the spec or history.
+	 */
+	recall?: (input: { query: string; cwd: string; signal: AbortSignal }) => Promise<RecallOutcome>;
+	/** RAGFlow document grounding. Defaults to `groundDocs` when `config.ragflow.enabled && config.ragflow.ground`; same query rule. */
+	ground?: (input: { query: string; signal: AbortSignal }) => Promise<GroundOutcome>;
 }
 
 export interface PromptSubmitResult {
@@ -121,6 +134,99 @@ async function readKnowledge(session: KnowledgeSession, topic: string): Promise<
 		const reason = (error instanceof Error ? error.message : String(error)).split("\n")[0]?.slice(0, 200) ?? "error";
 		return { lookup: { outcome: "error", docs: [], chars: 0, ms: 0, reason }, digest: "" };
 	}
+}
+
+const LOOKUP_QUERY_CHARS = 1_500;
+/** How long a seam may overrun its own signal before the plan stops waiting for it. */
+const LOOKUP_GRACE_MS = 150;
+
+interface LookupInput {
+	query: string;
+	env: NodeJS.ProcessEnv;
+	parent: AbortSignal;
+	now: () => number;
+}
+
+/**
+ * Runs one evidence lookup with a hard deadline: the signal aborts at `timeoutMs` and the plan stops waiting shortly
+ * after, so a seam that ignores its signal still cannot hold the prompt. A rejection becomes `fallback(reason)`; the
+ * reason is an error name, never a message that could carry the prompt.
+ */
+async function bounded<T>(
+	run: (signal: AbortSignal) => Promise<T>,
+	timeoutMs: number,
+	parent: AbortSignal,
+	fallback: (reason: string) => T,
+): Promise<T> {
+	const local = new AbortController();
+	const abort = (): void => local.abort();
+	if (parent.aborted) local.abort();
+	else parent.addEventListener("abort", abort, { once: true });
+	const abortTimer = setTimeout(abort, timeoutMs);
+	const { promise: deadline, resolve } = Promise.withResolvers<T>();
+	const deadlineTimer = setTimeout(() => resolve(fallback("timeout")), timeoutMs + LOOKUP_GRACE_MS);
+	try {
+		return await Promise.race([run(local.signal), deadline]);
+	} catch (error) {
+		return fallback(error instanceof Error && error.name !== "Error" ? error.name : "error");
+	} finally {
+		clearTimeout(abortTimer);
+		clearTimeout(deadlineTimer);
+		parent.removeEventListener("abort", abort);
+	}
+}
+
+/** Lessons lookup; undefined when nothing is configured to run. Never rejects. */
+function startRecall(
+	deps: HookDeps,
+	input: LookupInput & { cwd: string; sessionId: string; host: string; log: (message: string) => void },
+): Promise<RecallOutcome> | undefined {
+	const seam = deps.recall;
+	const teach = deps.config.teach;
+	if (!seam && !(teach.enabled && teach.recall)) return undefined;
+	const started = input.now();
+	const run =
+		seam ??
+		(async (arg: { query: string; cwd: string; signal: AbortSignal }): Promise<RecallOutcome> => {
+			const ctx = teachContext({
+				host: input.host,
+				cwd: arg.cwd,
+				env: input.env,
+				sessionId: input.sessionId,
+				stateDir: deps.stateDir,
+				config: { teach, hindsight: deps.config.hindsight },
+				signal: arg.signal,
+				now: input.now,
+				log: input.log,
+			});
+			if (!teachEnabled(ctx)) return { status: "off", lessons: [], source: "none", chars: 0, ms: 0, reason: "disabled" };
+			return recallLessons({ query: arg.query }, ctx, { countUse: true });
+		});
+	return bounded(
+		(signal) => run({ query: input.query, cwd: input.cwd, signal }),
+		teach.timeoutMs,
+		input.parent,
+		(reason) => ({ status: "error", lessons: [], source: "none", chars: 0, ms: input.now() - started, reason }),
+	);
+}
+
+/** RAGFlow grounding lookup; undefined when nothing is configured to run. Never rejects. */
+function startGround(deps: HookDeps, input: LookupInput): Promise<GroundOutcome> | undefined {
+	const seam = deps.ground;
+	const ragflow = deps.config.ragflow;
+	if (!seam && !(ragflow.enabled && ragflow.ground)) return undefined;
+	const started = input.now();
+	const run =
+		seam ??
+		(async (arg: { query: string; signal: AbortSignal }): Promise<GroundOutcome> => {
+			return groundDocs({ query: arg.query, config: ragflow, env: input.env, signal: arg.signal, now: input.now });
+		});
+	return bounded(
+		(signal) => run({ query: input.query, signal }),
+		ragflow.timeoutMs,
+		input.parent,
+		(reason) => ({ status: "error", chunks: [], chars: 0, ms: input.now() - started, datasets: 0, reason }),
+	);
 }
 
 export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps): Promise<PromptSubmitResult> {
@@ -217,6 +323,20 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			surface: deps.surface ?? "claude-code",
 		}).catch(() => "");
 
+		// The two evidence lookups start next to the brief and use only the user's own words: never the spec XML, the
+		// conversation history, or anything the engine produced.
+		const lookupQuery = original.trim().slice(0, LOOKUP_QUERY_CHARS);
+		const lookups =
+			lookupQuery !== "" && !isChildInvocation() && !isSubagentEnvelope(input as Record<string, unknown>);
+		const lookupEnv = deps.decisionsDeps?.env ?? process.env;
+		const surfaceId = deps.surface ?? "claude-code";
+		const recallPromise = lookups
+			? startRecall(deps, { query: lookupQuery, cwd, sessionId, host: surfaceId, env: lookupEnv, parent: controller.signal, now, log })
+			: undefined;
+		const groundPromise = lookups
+			? startGround(deps, { query: lookupQuery, env: lookupEnv, parent: controller.signal, now })
+			: undefined;
+
 		// The knowledge-base prefetch (find the repo, list documents, read index.md) overlaps the uplift and the
 		// Graph of Thought; the topic-specific documents are read right before clarify.
 		const reader = hitlOn ? (deps.knowledge ?? createGreptileKnowledge(deps.config)) : undefined;
@@ -251,6 +371,33 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		const brief = await briefPromise;
 		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
 		stage("brief", "end", true, brief ? `${brief.split("\n").length} lines` : "none");
+
+		// Settled before anything is formatted so the record says what happened; both are bounded and never reject.
+		const [recalled, grounded] = await Promise.all([recallPromise, groundPromise]);
+		let lessons: LessonsLookup | undefined;
+		let lessonsText = "";
+		if (recalled) {
+			try {
+				lessons = lessonsLookup(recalled);
+				lessonsText = formatLessonsSection(recalled, deps.config.teach.recallChars);
+			} catch (error) {
+				log(`lessons: format failed: ${error instanceof Error ? error.name : "error"}`);
+				lessons = { outcome: "error", count: 0, ids: [], chars: 0, ms: recalled.ms, source: "none", reason: "format" };
+			}
+			log(`lessons: ${lessons.outcome} · ${lessons.count} · ${lessons.source} · ${lessons.ms}ms${lessons.reason ? ` · ${lessons.reason}` : ""}`);
+		}
+		let docs: DocsLookup | undefined;
+		let docsText = "";
+		if (grounded) {
+			try {
+				docs = docsLookup(grounded);
+				docsText = formatDocsSection(grounded, deps.config.ragflow.groundChars);
+			} catch (error) {
+				log(`docs: format failed: ${error instanceof Error ? error.name : "error"}`);
+				docs = { status: "error", count: 0, chars: 0, ms: grounded.ms, datasets: grounded.datasets, reason: "format" };
+			}
+			log(`docs (RAGFlow): ${docs.status} · ${docs.count} excerpts · ${docs.datasets} datasets · ${docs.ms}ms${docs.reason ? ` · ${docs.reason}` : ""}`);
+		}
 
 		let graph: ThoughtGraph | undefined;
 		const thinkOn = deps.control.thinkEnabled ?? deps.config.think.enabled;
@@ -378,6 +525,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			kickedOff: false,
 			synced: false,
 			...(knowledge ? { knowledge } : {}),
+			...(lessons ? { lessons } : {}),
+			...(docs ? { docs } : {}),
 			...(records.length ? { decisions: records } : {}),
 		};
 		let specPath: string | undefined;
@@ -416,6 +565,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					trackingOff: deps.trackingOff,
 					providers,
 					knowledge,
+					lessons: lessonsText,
+					docs: docsText,
 					skillHints: deps.surface === "hermes",
 					// No spec file (the write failed) means nothing to point at: fall back to the inline spec.
 					handoff: deps.surface === "hermes" && specPath !== undefined,
@@ -436,6 +587,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				trackingOff: deps.trackingOff,
 				providers,
 				knowledge,
+				lessons,
+				docs,
 				engineError: deps.engineError?.(),
 				elapsedMs: now() - started,
 				decisions: records,

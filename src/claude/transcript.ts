@@ -24,7 +24,7 @@ function textParts(content: unknown): string {
 	return parts.join("\n").trim();
 }
 
-function isNoise(text: string): boolean {
+export function isNoise(text: string): boolean {
 	// Skip injected system/hook context and the plugin's own uplift blocks.
 	return /^<(?:system-reminder|command-name|local-command|UPLIFTED_PROMPT|BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT)/i.test(text);
 }

@@ -346,10 +346,10 @@ describe("openrouter API-key provider", () => {
 		expect(readFileSync(store(), "utf8")).toBe(before);
 	});
 
-	test("the usage text says openrouter is API-key only", () => {
+	test("the usage text says openrouter, hindsight and ragflow are API-key only", () => {
 		const { stderr } = run("auth", "set-key");
 		expect(stderr).toContain(
-			"  ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)\n  (openrouter is API-key only: set-key, status and logout; never serve, check or login)\n",
+			"  ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)\n  (openrouter, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)\n",
 		);
 	});
 
@@ -406,5 +406,74 @@ describe("openrouter API-key provider", () => {
 				noLeak(result.stdout, result.stderr);
 			}
 		});
+	});
+});
+
+describe.each([
+	{ id: "hindsight", envVar: "HINDSIGHT_API_KEY", key: "hs-UTTESTKEY-0123456789abcdef" },
+	{ id: "ragflow", envVar: "RAGFLOW_API_KEY", key: "ragflow-UTTESTKEY-0123456789abcdef" },
+] as const)("$id API-key provider", ({ id, envVar, key }) => {
+	const refusal = `ultrathink-mcp: ${id} is an API-key provider, not an MCP server: store its key with ultrathink-mcp auth set-key ${id} --stdin`;
+	const store = (): string => join(root, "credentials.json");
+	const storeKey = (): void => writeStore(store(), { version: 1, providers: { [id]: { kind: "api_key", apiKey: key, updatedAt: 1 } } });
+	const noLeak = (...outputs: string[]): void => {
+		for (const output of outputs) expect(output).not.toContain(key);
+	};
+
+	test("set-key --stdin stores the key 0600 and prints only its length", () => {
+		const { code, stdout, stderr } = runWith({ stdin: `${key}\n` }, "auth", "set-key", id, "--stdin");
+		expect(code).toBe(0);
+		expect(stdout).toBe(`${id}: api key stored (${key.length} chars)\n`);
+		noLeak(stdout, stderr);
+		expect(statSync(store()).mode & 0o777).toBe(0o600);
+		expect(readStore(store()).providers[id]).toMatchObject({ kind: "api_key", apiKey: key });
+	});
+
+	test("set-key --env-file --var stores the key from an env file", () => {
+		const file = join(root, `${id}.env`);
+		writeFileSync(file, `# keys\nexport ${envVar}="${key}"\n`);
+		const { code, stdout, stderr } = run("auth", "set-key", id, "--env-file", file, "--var", envVar);
+		expect(code).toBe(0);
+		expect(stdout).toBe(`${id}: api key stored (${key.length} chars)\n`);
+		noLeak(stdout, stderr);
+		expect(readStore(store()).providers[id]).toMatchObject({ kind: "api_key", apiKey: key });
+	});
+
+	test("auth status lists it by key length, or as not configured, never the key", () => {
+		const empty = run("auth", "status");
+		expect(empty.code).toBe(0);
+		expect(empty.stdout.split("\n")).toContain(`${id}  none  not ready  not configured`);
+		storeKey();
+		const stored = run("auth", "status");
+		expect(stored.code).toBe(0);
+		expect(stored.stdout.split("\n")).toContain(`${id}  api_key  ready  api key set (${key.length} chars)`);
+		noLeak(stored.stdout, stored.stderr);
+	});
+
+	test("auth logout removes only its key", () => {
+		writeStore(store(), {
+			version: 1,
+			providers: {
+				[id]: { kind: "api_key", apiKey: key, updatedAt: 1 },
+				linear: { kind: "api_key", apiKey: "lin_api_x", updatedAt: 1 },
+			},
+		});
+		const { code, stdout } = run("auth", "logout", id);
+		expect(code).toBe(0);
+		expect(stdout).toBe(`${id}: logged out\n`);
+		expect(Object.keys(readStore(store()).providers)).toEqual(["linear"]);
+	});
+
+	test.each<string[]>([["serve"], ["check"], ["auth", "login"]])("%s is a usage error that names set-key, with no relay, connection or login", (...head) => {
+		storeKey();
+		const before = readFileSync(store(), "utf8");
+		const args = head.length === 1 ? [head[0] as string, id] : [...head, id];
+		const { code, stdout, stderr } = run(...args);
+		expect(code).toBe(2);
+		expect(stderr.split("\n")[0]).toBe(refusal);
+		expect(stderr).toContain("usage:\n");
+		expect(stdout).toBe("");
+		noLeak(stdout, stderr);
+		expect(readFileSync(store(), "utf8")).toBe(before);
 	});
 });
