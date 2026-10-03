@@ -131,8 +131,8 @@ The Muse engine runs the `muse` CLI headless (`muse exec --json`). It uses your 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `bin` | string | `"muse"` | The `muse` binary. |
-| `model` | string | `"muse-spark-1.3-contributor"` | Model id passed as `--model`. |
-| `reasoningEffort` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"` | `"medium"` | Reasoning effort passed as `--reasoning-effort`. |
+| `model` | string | `"muse-spark-1.3-contributor"` | Model id passed as `--model`. `""` omits the flag and the CLI's session default answers. |
+| `reasoningEffort` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"` | `"high"` | Reasoning effort passed as `--reasoning-effort`. |
 | `callTimeoutMs` | integer, >= 0 | `0` | Timeout for one call. `0` means no timer. |
 
 ### Host defaults
@@ -370,7 +370,7 @@ All keys are optional; write only the ones you change. This file shows every key
   "muse": {
     "bin": "muse",
     "model": "muse-spark-1.3-contributor",
-    "reasoningEffort": "medium",
+    "reasoningEffort": "high",
     "callTimeoutMs": 0
   },
   "notion": { "dataSourceUrl": "collection://<data source id>" },

@@ -84,7 +84,7 @@ The engine label is `<model>@<effort>` for `http` and `cli` (for example `grok-4
 
 ## Muse
 
-Muse Code plans with Muse by default (`muse-spark-1.3-contributor` at `medium` reasoning effort). Set `think.engine` to `"muse"` to plan with Muse on every host.
+Muse Code plans with Muse by default (`muse-spark-1.3-contributor` at `high` reasoning effort). Set `think.engine` to `"muse"` to plan with Muse on every host.
 
 ultrathink runs the `muse` CLI headless (`muse exec --json`) for one agent turn per planning call, with the shell, file writes and web tools disabled, and with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
 
@@ -96,7 +96,7 @@ You need:
 | Key | Default | Meaning |
 |---|---|---|
 | `muse.model` | `"muse-spark-1.3-contributor"` | Model id passed as `--model`. `""` omits the flag and the CLI's session default answers. |
-| `muse.reasoningEffort` | `"medium"` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"`, passed as `--reasoning-effort`. |
+| `muse.reasoningEffort` | `"high"` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"`, passed as `--reasoning-effort`. |
 | `muse.bin` | `"muse"` | Binary to run. |
 | `muse.callTimeoutMs` | `0` | Timeout for one call. `0` means no timer. |
 
