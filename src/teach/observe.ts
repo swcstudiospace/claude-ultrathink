@@ -11,6 +11,7 @@ import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { buildTeachableState } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG } from "../decisions/types.ts";
 import { selectEngine } from "../host/engine.ts";
+import { HOSTS, type HostId } from "../host/types.ts";
 import { captureMoment } from "./capture.ts";
 import { askLesson, type DecisionSummary, lessonDecisions, summarizeDecision, teachEnabled } from "./context.ts";
 import { redactText } from "./redact.ts";
@@ -155,7 +156,8 @@ export function parseLessons(text: string): Lesson[] {
 /** The configured planning engine, as the planner selects it. `claudeComplete` marks its child with ULTRATHINK_CHILD=1. */
 async function engineComplete(ctx: TeachContext): Promise<NonNullable<TeachContext["complete"]> | string> {
 	const config = loadConfig(claudeConfigPaths(ctx.cwd, ctx.env));
-	const engine = await selectEngine(config, readControl(ctx.stateDir), ctx.cwd);
+	const host = (HOSTS as readonly string[]).includes(ctx.host) ? (ctx.host as HostId) : undefined;
+	const engine = await selectEngine(config, readControl(ctx.stateDir), ctx.cwd, host);
 	return "skipped" in engine ? engine.skipped : engine.complete;
 }
 

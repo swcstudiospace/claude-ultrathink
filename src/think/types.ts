@@ -45,11 +45,15 @@ export interface ThoughtGraph {
 	nodes: ThoughtNode[];
 }
 
+export const THINK_ENGINES = ["auto", "claude", "grok", "muse"] as const;
+
+export type ThinkEngine = (typeof THINK_ENGINES)[number];
+
 export interface ThinkConfig {
 	enabled: boolean;
 	minNodes: number;
 	maxNodes: number;
-	engine: "grok" | "claude";
+	engine: ThinkEngine;
 }
 
 export const FALLBACK_GRAPH: ThoughtGraph = {

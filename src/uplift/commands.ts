@@ -13,6 +13,7 @@ import { decisionsKilled, resolveOpenRouterKey } from "../decisions/gate.ts";
 import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
+import { THINK_ENGINES, type ThinkEngine } from "../think/types.ts";
 import { resolveStateDir } from "../host/paths.ts";
 import { hindsightStatusLine } from "../hindsight/settings.ts";
 import { runHindsightCommand } from "../hindsight/cli.ts";
@@ -44,7 +45,7 @@ const USAGE = [
 	"  last                   the last uplifted spec",
 	"  think on|off|last      Graph of Thought",
 	"  hitl on|off|last       HITL clarifications",
-	"  grok [engine grok|claude]",
+	"  grok [engine auto|claude|grok|muse]",
 	"  decisions check        one live Jev decision: resolved model, latency, cost",
 	"  decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>",
 	"  hindsight check        Hindsight memory server: readiness, health, optional round trip",
@@ -262,14 +263,14 @@ export async function runControl(args: string[], input: { stateDir: string; cwd:
 			case "grok":
 				switch (verb) {
 					case "engine": {
-						if (value !== "grok" && value !== "claude") return "Usage: grok engine grok|claude";
-						writeControl(stateDir, { engine: value });
-						return `Thinking engine set to ${engineLabel(config, { ...state, engine: value })}`;
+						if (!THINK_ENGINES.includes(value as ThinkEngine)) return "Usage: grok engine auto|claude|grok|muse";
+						writeControl(stateDir, { engine: value as ThinkEngine });
+						return `Thinking engine set to ${engineLabel(config, { ...state, engine: value as ThinkEngine })}`;
 					}
 					case "status":
 						return [`Engine: ${engineLabel(config, state)}`, grokTransportLine(config), await grokOauthLine(config)].join("\n");
 					default:
-						return "Usage: grok [status | engine grok|claude]";
+						return "Usage: grok [status | engine auto|claude|grok|muse]";
 				}
 			default:
 				return USAGE;

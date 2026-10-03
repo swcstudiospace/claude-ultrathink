@@ -11,7 +11,7 @@ import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
 import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
 import { DEFAULT_MUSE_CONFIG, MUSE_EFFORTS, type MuseConfig, type MuseEffort } from "./muse/types.ts";
 import { CAPTURE_MODES, DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachConfig } from "./teach/types.ts";
-import { MAX_NODES, MIN_NODES, type ThinkConfig } from "./think/types.ts";
+import { MAX_NODES, MIN_NODES, THINK_ENGINES, type ThinkConfig, type ThinkEngine } from "./think/types.ts";
 
 export interface ClaudeConfig {
 	/** `claude` binary used for headless completions. */
@@ -126,7 +126,7 @@ export function defaultConfig(): UltrathinkConfig {
 			enabled: true,
 			minNodes: MIN_NODES,
 			maxNodes: MAX_NODES,
-			engine: "claude",
+			engine: "auto",
 		},
 		claude: { ...DEFAULT_CLAUDE_CONFIG },
 		grok: { ...DEFAULT_GROK_CONFIG },
@@ -188,7 +188,7 @@ function mergeThink(think: Record<string, unknown> | undefined, defaults: ThinkC
 		enabled: typeof think.enabled === "boolean" ? think.enabled : defaults.enabled,
 		minNodes: Math.min(minNodes, maxNodes),
 		maxNodes,
-		engine: think.engine === "grok" || think.engine === "claude" ? think.engine : defaults.engine,
+		engine: THINK_ENGINES.includes(think.engine as ThinkEngine) ? (think.engine as ThinkEngine) : defaults.engine,
 	};
 }
 

@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
-import type { ThoughtGraph } from "../think/types.ts";
+import { THINK_ENGINES, type ThinkEngine, type ThoughtGraph } from "../think/types.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
@@ -25,7 +25,7 @@ export interface ControlState {
 	hitlEnabled?: boolean;
 	/** Create Linear/Notion rows; overrides `track.enabled` from config. `false` also stops kickoff from creating them. */
 	trackEnabled?: boolean;
-	engine?: "grok" | "claude";
+	engine?: ThinkEngine;
 }
 
 export interface SessionRecord {
@@ -94,7 +94,7 @@ export function readControl(dir: string): ControlState {
 	if (typeof rec.thinkEnabled === "boolean") out.thinkEnabled = rec.thinkEnabled;
 	if (typeof rec.hitlEnabled === "boolean") out.hitlEnabled = rec.hitlEnabled;
 	if (typeof rec.trackEnabled === "boolean") out.trackEnabled = rec.trackEnabled;
-	if (rec.engine === "grok" || rec.engine === "claude") out.engine = rec.engine;
+	if (THINK_ENGINES.includes(rec.engine as ThinkEngine)) out.engine = rec.engine as ThinkEngine;
 	return out;
 }
 
