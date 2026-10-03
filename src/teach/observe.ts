@@ -14,6 +14,7 @@ import { selectEngine } from "../host/engine.ts";
 import { HOSTS, type HostId } from "../host/types.ts";
 import { captureMoment } from "./capture.ts";
 import { askLesson, type DecisionSummary, lessonDecisions, summarizeDecision, teachEnabled } from "./context.ts";
+import { promoteDue } from "./promote.ts";
 import { redactText } from "./redact.ts";
 import {
 	type CaptureFn,
@@ -257,6 +258,11 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 			} catch {
 				ctx.log?.("teach observe: a lesson could not be captured");
 			}
+		}
+		try {
+			await promoteDue(ctx);
+		} catch {
+			ctx.log?.("teach observe: due promotions failed");
 		}
 		return done(captured);
 	} catch {
