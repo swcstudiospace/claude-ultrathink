@@ -38,7 +38,7 @@ ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL;
 | [Bun](https://bun.sh) | 1.2 or later | Every host. The hooks, the engine and the CLIs run on Bun. |
 | Python | 3.10 or later | Hermes Agent only, which runs the plugin in its own Python. |
 | `git` | any | Cloning the repository. |
-| `claude` CLI, logged in | 2.1.278 or later (the tested version) | The default Claude engine, on every host (see [Engine selection](#engine-selection)). The engine passes `claude -p` flags that older CLIs reject, and then every plan falls back. |
+| `claude` CLI, logged in | 2.1.278 or later (the tested version) | The Claude engine, the default on Claude Code, Hermes and Omp and the fallback everywhere (see [Engine selection](#engine-selection)). The engine passes `claude -p` flags that older CLIs reject, and then every plan falls back. |
 
 1. **Bun.** Hosts often start hooks with a short `PATH`, so they launch Bun through `bin/run-bun`. It looks for Bun in this order and uses the first it finds:
 
@@ -64,8 +64,9 @@ ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL;
    ultrathink has no runtime dependencies, so `bun install` is not needed to run it. It only installs type definitions for development. (If you plan to use Muse, see the note on symlinks in [Muse Code](#muse-code).) A Claude Code install from the GitHub marketplace does not need a clone. The other hosts and the MCP gateway do. Keep the clone where it is: several hosts store its path. If you move it later, follow [Upgrade and move](how-to/upgrade-and-move.md#move-the-clone-to-another-directory).
 
 3. **An engine login.** Planning runs on a separate model call, independent of the host you type into.
-   - Claude (the default): the `claude` CLI must be on `PATH` and logged in. The engine runs `claude -p` headless.
-   - Grok (optional): run `grok login`, unless you use the `shunt` transport. See [Engine selection](#engine-selection).
+   - Claude (the default on Claude Code, Hermes and Omp): the `claude` CLI must be on `PATH` and logged in. The engine runs `claude -p` headless.
+   - Grok (the default on Grok Build): run `grok login`, unless you use the `shunt` transport. See [Engine selection](#engine-selection).
+   - Muse (the default on Muse Code): the `muse` CLI must be on `PATH` and logged in. The engine runs `muse exec` headless.
 
 Optional:
 
@@ -349,14 +350,14 @@ Credentials alone create no rows. The planner creates rows only for providers co
 
 The engine is the model that writes the spec, the Graph of Thought and the clarifying questions. It is chosen per host state directory, in this order:
 
-1. The engine set with `bin/ultrathink grok engine grok|claude` for that host, stored in its state directory.
-2. `think.engine` in config: `"claude"` (the default) or `"grok"`.
-3. Grok is used only when that setting is `grok` and `grok.enabled` is `true` (the default). Otherwise the engine is Claude.
+1. The engine set with `bin/ultrathink grok engine auto|claude|grok|muse` for that host, stored in its state directory. `auto` follows the config.
+2. `think.engine` in config: a named engine, or `"auto"` (the default), which resolves to the host's own engine below.
+3. The host's own engine: Claude on Claude Code, Hermes and Omp, Grok on Grok Build, Muse on Muse Code. Grok is used only when `grok.enabled` is `true` (the default); Grok Build without a usable Grok login plans on Claude instead.
 
 ```sh
 <clone>/bin/ultrathink grok                       # engine label, Grok model/effort/transport, Grok login status
 <clone>/bin/ultrathink grok engine grok           # switch Claude Code's engine to Grok
-ULTRATHINK_HOST=omp <clone>/bin/ultrathink grok engine claude
+ULTRATHINK_HOST=omp <clone>/bin/ultrathink grok engine auto    # Omp follows the config again
 ```
 
 To switch every host, set it in config, for example in `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`:
@@ -365,9 +366,10 @@ To switch every host, set it in config, for example in `${XDG_CONFIG_HOME:-~/.co
 { "think": { "engine": "grok" } }
 ```
 
-- **Claude** (default) runs the `claude` CLI headless (`claude -p`) with your existing Claude Code login. Its label is `claude:<model>`, for example `claude:sonnet`.
-- **Grok** has three transports. `http` (default) and `cli` use your `grok login` session; if it is missing or expired, the prompt goes through unplanned with ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, unless `grok.fallbackToClaude` is `true`. `shunt` posts to an Anthropic-compatible gateway that you run and name in `grok.shuntBaseUrl`. There is no built-in gateway: with `shunt` selected and `grok.shuntBaseUrl` empty, every planning call fails with an error naming `grok.shuntBaseUrl`.
+- **Claude** runs the `claude` CLI headless (`claude -p`) with your existing Claude Code login. Its label is `claude:<model>`, for example `claude:sonnet`.
+- **Grok** has three transports. `http` (default) and `cli` use your `grok login` session; if it is missing or expired, the prompt goes through unplanned with ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, unless `grok.fallbackToClaude` is `true`. On Grok Build with the default `auto` engine, a missing login plans on Claude instead without that flag. `shunt` posts to an Anthropic-compatible gateway that you run and name in `grok.shuntBaseUrl`. There is no built-in gateway: with `shunt` selected and `grok.shuntBaseUrl` empty, every planning call fails with an error naming `grok.shuntBaseUrl`.
+- **Muse** runs the `muse` CLI headless (`muse exec --json`) for one agent turn per call, with the shell, file writes and web tools disabled. Its label is `muse:<model>`, for example `muse:muse-spark-1.3-contributor`.
 
-[Choose an engine](how-to/choose-engine.md) compares them, and [Configuration](configuration.md#grok-the-grok-engine) lists every `claude.*` and `grok.*` key with its default.
+[Choose an engine](how-to/choose-engine.md) compares them, and [Configuration](configuration.md#key-reference) lists every `claude.*`, `grok.*` and `muse.*` key with its default.
 
 Whichever engine you choose, a failed or timed-out planning call never blocks your prompt. The turn continues with a minimal fallback spec, creates no tracking rows, and the summary line reports `Engine error · …`. See [Troubleshooting](troubleshooting.md).

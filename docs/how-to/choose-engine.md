@@ -1,16 +1,17 @@
 # Choose the planning engine
 
-The **engine** is the model ultrathink calls to plan a prompt. It writes the spec, the Graph of Thought (a small graph of reasoning steps that ends in an execution plan) and the clarifying questions. When ship is on, it is also the judge that decides whether a task is done. The **host** is the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code or Omp). The host keeps its own model for the actual work. The engine is separate, and it can be Claude or Grok on any host.
+The **engine** is the model ultrathink calls to plan a prompt. It writes the spec, the Graph of Thought (a small graph of reasoning steps that ends in an execution plan) and the clarifying questions. When ship is on, it is also the judge that decides whether a task is done. The **host** is the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code or Omp). The host keeps its own model for the actual work. The engine is separate, and it can be Claude, Grok or Muse on any host. By default each host plans with its own engine: Claude Code, Hermes and Omp with Claude, Grok Build with Grok, and Muse Code with Muse.
 
-- [Claude (the default)](#claude-the-default)
+- [Claude](#claude)
 - [Grok](#grok)
+- [Muse](#muse)
 - [Switch engines](#switch-engines)
 - [Check which engine is active](#check-which-engine-is-active)
 - [When the engine fails](#when-the-engine-fails)
 
-## Claude (the default)
+## Claude
 
-ultrathink runs the Claude Code CLI headless (`claude -p`) for every planning call, whichever host you use. Each call is a plain completion: no tools, no MCP servers and no settings sources, and it runs with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
+ultrathink runs the Claude Code CLI headless (`claude -p`) for every planning call on the hosts whose engine resolves to Muse: Claude Code, Hermes and Omp by default, any host with `think.engine` set to `"claude"`. Each call is a plain completion: no tools, no MCP servers and no settings sources, and it runs with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
 
 You need:
 
@@ -29,7 +30,7 @@ The engine label is `claude:<model>`, for example `claude:sonnet`, or `claude:se
 
 ## Grok
 
-Set `think.engine` to `"grok"` to plan with Grok (`grok-4.7` at `xhigh` reasoning effort by default). `grok.enabled` (default `true`) must stay `true`; `false` forces Claude even when Grok is selected.
+Grok Build plans with Grok by default (`grok-4.7` at `xhigh` reasoning effort). Set `think.engine` to `"grok"` to plan with Grok on every host. `grok.enabled` (default `true`) must stay `true`; `false` forces Claude even when Grok is selected.
 
 Grok has three **transports**, the ways ultrathink reaches the model:
 
@@ -44,7 +45,7 @@ For `http` and `cli`:
 - The Grok home is `grok.home`, else `$GROK_HOME`, else `~/.grok`.
 - `bin/ultrathink status` calls this session "SuperGrok OAuth". You need a Grok account that can sign in to the Grok Build CLI.
 - When the session has expired and has a refresh token, ultrathink runs `grok models` once so the CLI refreshes it. ultrathink never calls the token endpoint itself.
-- Before planning, ultrathink checks the login. If it is missing or expired, the prompt goes through unplanned with the reason ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, which the Claude Code, Grok Build and Muse Code hook shows for a plain prompt. Set `grok.fallbackToClaude: true` to plan on Claude instead; the engine label then ends in `(grok fallback)`.
+- Before planning, ultrathink checks the login. If it is missing or expired, the prompt goes through unplanned with the reason ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, which the Claude Code, Grok Build and Muse Code hook shows for a plain prompt. Set `grok.fallbackToClaude: true` to plan on Claude instead; the engine label then ends in `(grok fallback)`. On Grok Build with the default `auto` engine, a missing or expired login already plans on Claude without that flag; the label then ends in `(grok unavailable)`.
 
 For `shunt`:
 
@@ -81,6 +82,26 @@ Example: Grok over your own gateway.
 
 The engine label is `<model>@<effort>` for `http` and `cli` (for example `grok-4.7@xhigh`) and `<shuntModel or model>@shunt` for `shunt`.
 
+## Muse
+
+Muse Code plans with Muse by default (`muse-spark-1.3-contributor` at `medium` reasoning effort). Set `think.engine` to `"muse"` to plan with Muse on every host.
+
+ultrathink runs the `muse` CLI headless (`muse exec --json`) for one agent turn per planning call, with the shell, file writes and web tools disabled, and with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
+
+You need:
+
+- the `muse` CLI on `PATH` (or its path in `muse.bin`);
+- a working login for it. ultrathink uses whatever login the CLI already has. The calls count against that account.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `muse.model` | `"muse-spark-1.3-contributor"` | Model id passed as `--model`. `""` omits the flag and the CLI's session default answers. |
+| `muse.reasoningEffort` | `"medium"` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"`, passed as `--reasoning-effort`. |
+| `muse.bin` | `"muse"` | Binary to run. |
+| `muse.callTimeoutMs` | `0` | Timeout for one call. `0` means no timer. |
+
+The engine label is `muse:<model>`, for example `muse:muse-spark-1.3-contributor`, or `muse:session default` when `muse.model` is `""`.
+
 ## Switch engines
 
 There are two layers, and the first beats the second:
@@ -89,7 +110,8 @@ There are two layers, and the first beats the second:
 
    ```sh
    <clone>/bin/ultrathink grok engine grok     # this host now plans with Grok
-   <clone>/bin/ultrathink grok engine claude   # back to Claude
+   <clone>/bin/ultrathink grok engine muse     # this host now plans with Muse
+   <clone>/bin/ultrathink grok engine auto     # back to this host's own engine
    ULTRATHINK_HOST=omp <clone>/bin/ultrathink grok engine grok   # another host's setting
    ```
 
@@ -101,7 +123,7 @@ There are two layers, and the first beats the second:
    { "think": { "engine": "grok" } }
    ```
 
-A host that has never run `grok engine` follows the config.
+A host whose control engine is `auto` (or that has never run `grok engine`) follows `think.engine`, or its own engine when that is also `auto`: Claude on Claude Code, Hermes and Omp, Grok on Grok Build, Muse on Muse Code.
 
 ## Check which engine is active
 

@@ -1,6 +1,6 @@
 # Reduce cost and latency
 
-Planning makes several model calls before your agent starts, and the agent waits for them. This guide counts those calls and lists every setting that makes planning cheaper or faster. The **engine** is the model that plans (see [Choose the engine](choose-engine.md)). With the default Claude engine, each call is one headless `claude -p` run on the account the `claude` CLI is logged in with.
+Planning makes several model calls before your agent starts, and the agent waits for them. This guide counts those calls and lists every setting that makes planning cheaper or faster. The **engine** is the model that plans (see [Choose the engine](choose-engine.md)). With the Claude engine, each call is one headless `claude -p` run on the account the `claude` CLI is logged in with.
 
 - [What one plan costs](#what-one-plan-costs)
 - [Plan fewer prompts](#plan-fewer-prompts)

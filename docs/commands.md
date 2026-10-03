@@ -140,7 +140,7 @@ Usage: ultrathink <command>
   last                   the last uplifted spec
   think on|off|last      Graph of Thought
   hitl on|off|last       HITL clarifications
-  grok [engine grok|claude]
+  grok [engine auto|claude|grok|muse]
   decisions check        one live Jev decision: resolved model, latency, cost
   decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>
   hindsight check        Hindsight memory server: readiness, health, optional round trip
@@ -161,7 +161,7 @@ The top-level help and the `decisions` subcommand both list all six probe points
 | `hitl on`, `hitl off`, `hitl status` | HITL clarifications on or off for this host. |
 | `hitl last` | The clarifications of the last plan, with answers. |
 | `grok` or `grok status` | Engine label, Grok model, effort and transport, and Grok login state. |
-| `grok engine grok`, `grok engine claude` | Switches the planning engine for this host. |
+| `grok engine auto`, `grok engine claude`, `grok engine grok`, `grok engine muse` | Switches the planning engine for this host (`auto` follows `think.engine`). |
 | `decisions check` | One live Jev decision to prove the integration end to end. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
 | `decisions probe <plan\|ship\|knowledge\|blocking\|teachable\|skillworthy> <cases.json>` | Runs your own cases through one decision point and prints P and the action under the current thresholds. See [`bin/ultrathink decisions`](#binultrathink-decisions). |
 | `hindsight check [--roundtrip] [--json]` | Readiness, `/health` and `/version`, and an optional throwaway-bank round trip. Exit 0, 1 or 2. See [`bin/ultrathink hindsight`](#binultrathink-hindsight). |
@@ -205,7 +205,7 @@ What the lines can say:
 | Line | Values |
 |---|---|
 | `Prompt Uplift` | `on` or `off`, plus `(skipping next prompt)` while a `/ultrathink-skip` is armed. |
-| `Engine` | `claude:<model>` (`claude:session default` when `claude.model` is `""`), or the Grok engine label when `think.engine` is `grok`. |
+| `Engine` | The resolved engine label: `claude:<model>` (`claude:session default` when `claude.model` is `""`), the Grok label (`<model>@<effort>`, or `<model>@shunt`), or `muse:<model>`. |
 | `Grok` | Model, effort and transport. With `transport: "shunt"` it adds `<shuntBaseUrl>/v1/messages`, or `shunt gateway not configured (set grok.shuntBaseUrl)`, then the wire model and `max_tokens`. |
 | `SuperGrok OAuth` | The `grok login` state: the account and expiry, `not logged in (run grok login)`, `expired (run grok login)`, or `not used (shunt gateway owns upstream auth)`. |
 | `Tracking` | `on (Linear/Notion rows)`, `off (Linear/Notion rows)` after `/ultrathink-track off`, `on (not configured: …)` when neither tracker is set, or `kickoff (…)` when only the planner's own row creation is off. |

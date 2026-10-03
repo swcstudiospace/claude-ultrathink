@@ -66,7 +66,7 @@ ultrathink runs on **Linux** and **macOS**. On Windows, use it inside **WSL**; n
 Requirements:
 
 - **Bun 1.2 or newer** (tested with 1.4.0). `bin/run-bun` finds Bun even when a host's PATH does not include it. Without Bun the hooks exit quietly and prompts go through unplanned; the `bin/` CLIs print `ultrathink: bun not found` and exit with status 127.
-- **An engine:** the default Claude engine runs the `claude` CLI (Claude Code 2.1.278 or later) on every host, so it must be installed and logged in. It passes `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`; an older CLI rejects these and every plan falls back to the minimal spec. The optional Grok engine needs `grok login` instead.
+- **An engine:** each host plans with its own engine by default — Claude on Claude Code, Hermes and Omp (the `claude` CLI, Claude Code 2.1.278 or later, installed and logged in), Grok on Grok Build (`grok login`), Muse on Muse Code (the `muse` CLI, logged in). The Claude engine passes `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`; an older CLI rejects these and every plan falls back to the minimal spec.
 - **Hermes Agent only:** Python 3.10 or newer.
 - **For ship (optional):** `gh`, authenticated, and Greptile: a Greptile key in the gateway, or the Greptile CLI (tested with 3.4.1) after `greptile login`.
 
@@ -74,7 +74,7 @@ State is kept per host: `~/.claude/ultrathink`, `$GROK_PLUGIN_DATA/ultrathink` i
 
 ## Cost and latency
 
-Planning is not free. For each prompt it plans, the engine makes one model call to write the spec, one to build the Graph of Thought, one per node to fill it in (5 to 8 nodes by default) and one for the clarifying questions: **8 to 11 headless model calls** on the configured engine. With the default Claude engine they run through your `claude` login, with model `sonnet` unless you set `claude.model`. Node fills run up to `claude.concurrency` (default 3) at a time within a dependency level; the other calls run one after another, and creating tracker rows can add up to `track.budgetMs` (60 s by default). The agent starts only when the plan is ready (on Omp, after 25 s at most; a slower plan arrives as an aside).
+Planning is not free. For each prompt it plans, the engine makes one model call to write the spec, one to build the Graph of Thought, one per node to fill it in (5 to 8 nodes by default) and one for the clarifying questions: **8 to 11 headless model calls** on the configured engine. With the Claude engine they run through your `claude` login, with model `sonnet` unless you set `claude.model`. Node fills run up to `claude.concurrency` (default 3) at a time within a dependency level; the other calls run one after another, and creating tracker rows can add up to `track.budgetMs` (60 s by default). The agent starts only when the plan is ready (on Omp, after 25 s at most; a slower plan arrives as an aside).
 
 To spend less: send small messages with `/ultrathink-quick` or a `raw:` prefix, lower `think.maxNodes`, turn clarifying questions off with `hitl.enabled: false`, or turn the graph off with `think.enabled: false`. Short replies such as `ok` are not planned. See [Reduce cost and latency](docs/how-to/reduce-cost-and-latency.md).
 

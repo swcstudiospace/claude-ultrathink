@@ -67,7 +67,7 @@ Types: "integer" means a whole JSON number; "number" allows fractions. Ranges ar
 | `enabled` | boolean | `true` | Build the Graph of Thought. `bin/ultrathink think on\|off` overrides this per host. |
 | `minNodes` | integer, >= 1 | `5` | Fewest graph nodes. Clamped to `maxNodes`. |
 | `maxNodes` | integer, >= `minNodes` | `8` | Most graph nodes. Values above 8 are capped at 8. |
-| `engine` | `"claude"` or `"grok"` | `"claude"` | Engine for the uplift, the graph, the per-node fills, the HITL questions and the ship judge. `bin/ultrathink grok engine grok\|claude` overrides this per host. |
+| `engine` | `"auto"`, `"claude"`, `"grok"` or `"muse"` | `"auto"` | Engine for the uplift, the graph, the per-node fills, the HITL questions and the ship judge. `"auto"` uses each host's own engine (see the matrix below). A named engine plans on every host. `bin/ultrathink grok engine auto\|claude\|grok\|muse` overrides this per host. |
 
 Each node gets 4 to 8 numbered rationale steps. That range is fixed in code, not configurable. Each step becomes one sub-issue when tracking is on.
 
@@ -105,7 +105,7 @@ The Claude engine runs the `claude` CLI headless. It uses your existing Claude C
 
 ### `grok`: the Grok engine
 
-Used only when `think.engine` is `"grok"` (or `bin/ultrathink grok engine grok` was run on that host). See [Choose an engine](how-to/choose-engine.md).
+Used when the engine resolves to Grok: on Grok Build by default, or anywhere with `think.engine` set to `"grok"` (or `bin/ultrathink grok engine grok` on that host). See [Choose an engine](how-to/choose-engine.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -123,6 +123,31 @@ Used only when `think.engine` is `"grok"` (or `bin/ultrathink grok engine grok` 
 | `shuntMaxTokens` | integer, > 0 | `8192` | `max_tokens` for `shunt` calls. |
 
 The `http` and `cli` transports need `grok login`. `shunt` does not; the gateway owns the upstream credentials.
+
+### `muse`: the Muse engine
+
+The Muse engine runs the `muse` CLI headless (`muse exec --json`). It uses your existing Muse login. Each call is one agent turn with the shell, file writes and web tools disabled. Used when the engine resolves to Muse: on Muse Code by default, or anywhere with `think.engine` set to `"muse"` (or `bin/ultrathink grok engine muse` on that host). See [Choose an engine](how-to/choose-engine.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `bin` | string | `"muse"` | The `muse` binary. |
+| `model` | string | `"muse-spark-1.3-contributor"` | Model id passed as `--model`. |
+| `reasoningEffort` | `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` or `"ultra"` | `"medium"` | Reasoning effort passed as `--reasoning-effort`. |
+| `callTimeoutMs` | integer, >= 0 | `0` | Timeout for one call. `0` means no timer. |
+
+### Host defaults
+
+With `think.engine` set to `"auto"` (the default), each host plans with its own engine:
+
+| Host | Engine | Model |
+|---|---|---|
+| Claude Code | Claude | `claude.model` (`"sonnet"`) |
+| Hermes Agent | Claude | `claude.model` (`"sonnet"`) |
+| Omp | Claude | `claude.model` (`"sonnet"`) |
+| Grok Build | Grok | `grok.model` (`"grok-4.7"`) |
+| Muse Code | Muse | `muse.model` (`"muse-spark-1.3-contributor"`) |
+
+On Grok Build without a usable Grok login, planning falls back to Claude and the engine label ends in `(grok unavailable)`; `grok.fallbackToClaude` is not needed for this. Set `think.engine` to a named engine to plan with one engine on every host. Teachable Moments are stored per host (see [`teach`](#teach-teachable-moments)), so every host keeps its own lessons whichever engine it plans with.
 
 ### `notion`: Notion tracking
 
@@ -315,7 +340,7 @@ All keys are optional; write only the ones you change. This file shows every key
 ```json
 {
   "uplift": { "enabled": true, "skipTrivial": true, "maxChars": 20000, "echo": true },
-  "think": { "enabled": true, "minNodes": 5, "maxNodes": 8, "engine": "claude" },
+  "think": { "enabled": true, "minNodes": 5, "maxNodes": 8, "engine": "auto" },
   "hitl": { "enabled": true, "maxQuestions": 4, "knowledgeBase": false },
   "claude": {
     "bin": "claude",
@@ -340,6 +365,12 @@ All keys are optional; write only the ones you change. This file shows every key
     "shuntBaseUrl": "",
     "shuntModel": "",
     "shuntMaxTokens": 8192
+  },
+  "muse": {
+    "bin": "muse",
+    "model": "muse-spark-1.3-contributor",
+    "reasoningEffort": "medium",
+    "callTimeoutMs": 0
   },
   "notion": { "dataSourceUrl": "collection://<data source id>" },
   "linear": { "team": "<your Linear team>" },
@@ -593,7 +624,7 @@ A value in the control state beats the config value until you change it again:
 | `/ultrathink-track off`, `/ultrathink-track on`, `bin/ultrathink track off`, `bin/ultrathink track on` | `trackEnabled` | `track.enabled`. `off` also stops the kickoff skill and `track complete` from creating rows. |
 | `bin/ultrathink think on`, `bin/ultrathink think off` | `thinkEnabled` | `think.enabled` |
 | `bin/ultrathink hitl on`, `bin/ultrathink hitl off` | `hitlEnabled` | `hitl.enabled` |
-| `bin/ultrathink grok engine grok`, `bin/ultrathink grok engine claude` | `engine` | `think.engine` |
+| `bin/ultrathink grok engine auto`, `… engine claude`, `… engine grok`, `… engine muse` | `engine` | `think.engine` (`auto` follows the config) |
 
 `ULTRATHINK_TRACK=0` beats both the control state and the config, for the planner's own row creation. `ULTRATHINK_UPLIFT=0` and `ULTRATHINK_SHIP=0` likewise beat both for planning and ship.
 
