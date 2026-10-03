@@ -82,6 +82,24 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ grok: { reasoningEffort: "extreme" } }, base).grok.reasoningEffort).toBe(base.grok.reasoningEffort);
 	});
 
+	test("muse defaults are muse-spark-1.3-contributor @ high with no timer", () => {
+		const muse = defaultConfig().muse;
+		expect(muse.bin).toBe("muse");
+		expect(muse.model).toBe("muse-spark-1.3-contributor");
+		expect(muse.reasoningEffort).toBe("high");
+		expect(muse.callTimeoutMs).toBe(0);
+	});
+
+	test("muse model accepts empty (inherit the CLI default); bin and effort fall back on bad input", () => {
+		const base = defaultConfig();
+		expect(mergeConfig({ muse: { model: "" } }, base).muse.model).toBe("");
+		expect(mergeConfig({ muse: { model: " other " } }, base).muse.model).toBe("other");
+		expect(mergeConfig({ muse: { bin: "  " } }, base).muse.bin).toBe("muse");
+		expect(mergeConfig({ muse: { reasoningEffort: "ultra" } }, base).muse.reasoningEffort).toBe("ultra");
+		expect(mergeConfig({ muse: { reasoningEffort: "extreme" } }, base).muse.reasoningEffort).toBe("high");
+		expect(mergeConfig({ muse: { callTimeoutMs: -5 } }, base).muse.callTimeoutMs).toBe(0);
+	});
+
 	test("grok defaults are grok-4.7 @ xhigh over the http transport, with no shunt gateway configured", () => {
 		const grok = defaultConfig().grok;
 		expect(grok.model).toBe("grok-4.7");
