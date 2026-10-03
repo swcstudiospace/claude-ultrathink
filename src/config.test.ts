@@ -15,8 +15,8 @@ function tempConfigFile(content: unknown): { path: string; cleanup: () => void }
 }
 
 describe("defaultConfig", () => {
-	test("defaults to the Claude engine, not Grok", () => {
-		expect(defaultConfig().think.engine).toBe("claude");
+	test("defaults to auto engine selection (host decides; claude-code still resolves to Muse)", () => {
+		expect(defaultConfig().think.engine).toBe("auto");
 	});
 
 	test("tracks nowhere until the user configures a Linear team or Notion data source", () => {
@@ -52,10 +52,11 @@ describe("mergeConfig", () => {
 		expect(merged.uplift).toEqual(base.uplift);
 	});
 
-	test("think engine only accepts grok or claude", () => {
+	test("think engine only accepts auto, claude, grok or muse", () => {
 		const base = defaultConfig();
 		expect(mergeConfig({ think: { engine: "grok" } }, base).think.engine).toBe("grok");
-		expect(mergeConfig({ think: { engine: "bogus" } }, base).think.engine).toBe("claude");
+		expect(mergeConfig({ think: { engine: "muse" } }, base).think.engine).toBe("muse");
+		expect(mergeConfig({ think: { engine: "bogus" } }, base).think.engine).toBe("auto");
 	});
 
 	test("think maxNodes is clamped to MAX_NODES, and an invalid maxNodes (below the given minNodes) falls back to the default maxNodes instead of minNodes", () => {

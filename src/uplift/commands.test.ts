@@ -306,7 +306,7 @@ describe("runControl", () => {
 		expect(await runControl(["track", "maybe"], io)).toBe("Usage: track on|off|status");
 		expect(await runControl(["think", "sideways"], io)).toBe("Usage: think on|off|last|status");
 		expect(await runControl(["hitl", "maybe"], io)).toBe("Usage: hitl on|off|last|status");
-		expect(await runControl(["grok", "engine", "gpt"], io)).toBe("Usage: grok engine grok|claude");
+		expect(await runControl(["grok", "engine", "gpt"], io)).toBe("Usage: grok engine auto|claude|grok|muse");
 		expect(readControl(io.stateDir)).toEqual({});
 
 		const blocker = join(dir, "blocker");
@@ -433,7 +433,7 @@ describe("runControl", () => {
 	test("usage lists the decisions commands right after the grok line", async () => {
 		expect(await runControl(["bogus"], io)).toContain(
 			[
-				"  grok [engine grok|claude]",
+				"  grok [engine auto|claude|grok|muse]",
 				"  decisions check        one live Jev decision: resolved model, latency, cost",
 				"  decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>",
 				"  hindsight check",

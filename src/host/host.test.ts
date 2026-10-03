@@ -259,6 +259,34 @@ describe("planPrompt", () => {
 		}
 	});
 
+	test("uplift and every node fill share the one selected engine on every host", async () => {
+		for (const host of ["claude-code", "grok-build", "hermes", "muse", "omp"] as const) {
+			const { root, env, options, calls } = planHarness();
+			const phases: string[] = [];
+			options.selectEngine = async () => {
+				calls.engine++;
+				return {
+					label: `stub:${host}`,
+					complete: async (system: string, user: string) => {
+						phases.push(user.includes("<user_request>") ? "uplift" : user.includes("current_node") ? "fill" : "graph");
+						return stubComplete(system, user);
+					},
+					error: () => undefined,
+				};
+			};
+			try {
+				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
+				expect(response.skipped).toBeUndefined();
+				expect(calls.engine).toBe(1);
+				expect(phases[0]).toBe("uplift");
+				expect(phases).toContain("graph");
+				expect(phases.filter((phase) => phase === "fill").length).toBeGreaterThanOrEqual(5);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	});
+
 	test("stateless skips return before an engine is selected", async () => {
 		const { root, env, options, calls } = planHarness();
 		try {
