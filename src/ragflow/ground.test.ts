@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRagflowClient } from "./client.ts";
 import { docsLookup, formatDocsSection, groundDocs } from "./ground.ts";
 import { DEFAULT_RAGFLOW_CONFIG, type GroundOutcome, type RagflowChunk, type RagflowConfig } from "./types.ts";
 
@@ -271,5 +272,43 @@ describe("docsLookup", () => {
 			reason: "ragflow auth: nope",
 		});
 		expect(docsLookup({ status: "none", chunks: [chunk("c1", "x")], chars: 0, ms: 1, datasets: 1 }).count).toBe(0);
+	});
+});
+
+describe("retrieval boundary", () => {
+	test("the client surface stays retrieval-only: health, listDatasets, retrieve", async () => {
+		const { fetch, calls } = fakeFetch(() => Response.json({ code: 0, data: [], total: 0 }));
+		const client = createRagflowClient({ url: "https://rag.example.com", apiKey: KEY, timeoutMs: 1_000, fetch });
+		expect(Object.keys(client).sort()).toEqual(["health", "listDatasets", "retrieve"]);
+		for (const write of ["upload", "delete", "deleteDocument", "install", "createDataset", "skill"]) expect(write in client).toBe(false);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("successful excerpts are capped by groundChars and framed as untrusted evidence", async () => {
+		const hits = [chunk("c1", "a".repeat(2_000), "a.md", 0.9), chunk("c2", "b".repeat(2_000), "b.md", 0.8)];
+		const { fetch } = fakeFetch(() => Response.json({ code: 0, data: { chunks: hits.map(wire) } }));
+		const outcome = await ground(config({ datasetIds: ["d"], groundChars: 500 }), fetch);
+		expect(outcome.status).toBe("used");
+		expect(outcome.chars).toBeLessThanOrEqual(500);
+		const text = formatDocsSection(outcome, 500);
+		expect(text.length).toBeLessThanOrEqual(500);
+		expect(text).toContain("Untrusted evidence");
+		expect(text).not.toContain(KEY);
+	});
+
+	test("off and error outcomes record status without document text", async () => {
+		const off = await ground(config({ ground: false }), fakeFetch(() => Response.json({ code: 0, data: [] })).fetch);
+		expect(off.status).toBe("off");
+		const offLookup = docsLookup(off);
+		expect(offLookup.count).toBe(0);
+		expect(JSON.stringify(offLookup)).not.toContain("secret");
+
+		const failing = fakeFetch(() => Response.json({ code: 109, message: "bad key" }));
+		const error = await ground(config({ datasetIds: ["d"] }), failing.fetch);
+		expect(error.status).toBe("error");
+		const errorLookup = docsLookup(error);
+		expect(errorLookup.count).toBe(0);
+		expect(JSON.stringify(errorLookup)).not.toContain("content");
+		expect(formatDocsSection(error, 3_000)).toBe("");
 	});
 });
