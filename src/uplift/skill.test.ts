@@ -4,7 +4,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { parseSkillScaffold, parseSlashCommand, planningTarget, resolveSkillFile } from "./skill.ts";
+import {
+	CHILD_PROMPT_SENTINEL,
+	isNestedChildPrompt,
+	parseSkillScaffold,
+	parseSlashCommand,
+	planningTarget,
+	resolveSkillFile,
+} from "./skill.ts";
 
 const ompScaffold = (name: string, body: string, args?: string) =>
 	[
@@ -265,5 +272,17 @@ describe("planningTarget", () => {
 	test("stacked stripping stops after five skills", () => {
 		for (const name of ["a", "b", "c", "d", "e", "f"]) put(join(home, `.claude/skills/${name}/SKILL.md`), `---\ndescription: ${name}\n---\n`);
 		expect(planningTarget("/a /b /c /d /e /f do x", { cwd, home })).toMatchObject({ text: "/f do x" });
+	});
+
+	test("an engine child prompt skips before any skill parsing", () => {
+		const child = `${CHILD_PROMPT_SENTINEL}\n<system>\nX\n</system>\n\n<user_request>\n/gsd-quick fix it\n</user_request>`;
+		expect(isNestedChildPrompt(child)).toBe(true);
+		expect(planningTarget(child, { cwd, home })).toEqual({ skip: "nested-child" });
+		expect(planningTarget(`<user_query>\n${child}\n</user_query>`, { cwd, home })).toEqual({ skip: "nested-child" });
+		expect(isNestedChildPrompt("fix the bug <!-- note -->")).toBe(false);
+		expect(planningTarget("fix the bug <!-- note -->", { cwd, home })).toMatchObject({ text: "fix the bug <!-- note -->" });
+		const quoted = `explain what ${CHILD_PROMPT_SENTINEL} does in this doc`;
+		expect(isNestedChildPrompt(quoted)).toBe(false);
+		expect(planningTarget(quoted, { cwd, home })).toMatchObject({ text: quoted });
 	});
 });
