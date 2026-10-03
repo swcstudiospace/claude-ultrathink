@@ -106,6 +106,14 @@ describe("readOmpSessionModelFile", () => {
 		expect(readOmpSessionModelFile(path)).toBe("xai-oauth/grok-4.6");
 	});
 
+	test("a malformed marker on the first line terminates without a model", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			'"model_change" not json at byte zero',
+			JSON.stringify({ type: "session", version: 3, id: "s1" }),
+		]);
+		expect(readOmpSessionModelFile(path)).toBeUndefined();
+	});
+
 	test("malformed lines and entries without a model are skipped", () => {
 		const path = writeJsonl("-proj/2026_s1.jsonl", [
 			change("xai-oauth/grok-4.6"),

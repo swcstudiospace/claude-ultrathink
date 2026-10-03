@@ -65,6 +65,7 @@ export function readOmpSessionModelFile(path: string | undefined): string | unde
 			} catch {
 				// malformed lines are skipped
 			}
+			if (start === 0) return undefined; // first line rejected: nothing before it
 			index = start;
 		}
 	} catch {
