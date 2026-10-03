@@ -294,6 +294,94 @@ def test_engine_failure_returns_empty():
 	assert context == ""
 
 
+def _plan_cwd(platform: str | None, terminal_cwd: str | None, launch: Path, fake: Path) -> str:
+	"""Run plan() from `launch` and return the cwd the engine request carried."""
+	env: dict[str, str] = {"BUN": str(fake)}
+	if terminal_cwd is not None:
+		env["TERMINAL_CWD"] = terminal_cwd
+	payload: dict[str, object] = {"user_message": "add a widget", "session_id": "s1"}
+	if platform is not None:
+		payload["platform"] = platform
+	previous = os.getcwd()
+	saved_terminal = os.environ.pop("TERMINAL_CWD", None)
+	os.chdir(launch)
+	try:
+		assert plan(payload, env=env) == "planned:add a widget"
+	finally:
+		os.chdir(previous)
+		if saved_terminal is not None:
+			os.environ["TERMINAL_CWD"] = saved_terminal
+	return bun_requests(fake)[-1]["cwd"]
+
+
+def _cwd_dirs(tmp: str) -> tuple[Path, Path, Path]:
+	launched = Path(tmp) / "launched"
+	launched.mkdir()
+	configured = Path(tmp) / "configured"
+	configured.mkdir()
+	return launched, configured, fake_bun(Path(tmp) / "bun")
+
+
+def test_cli_turn_plans_with_the_process_directory():
+	with tempfile.TemporaryDirectory() as tmp:
+		launched, configured, fake = _cwd_dirs(tmp)
+		assert _plan_cwd("cli", str(configured), launched, fake) == str(launched)
+
+
+def test_gateway_turn_keeps_terminal_cwd_first():
+	with tempfile.TemporaryDirectory() as tmp:
+		launched, configured, fake = _cwd_dirs(tmp)
+		assert _plan_cwd("telegram", str(configured), launched, fake) == str(configured)
+
+
+def test_unknown_platform_keeps_terminal_cwd_first():
+	with tempfile.TemporaryDirectory() as tmp:
+		launched, configured, fake = _cwd_dirs(tmp)
+		assert _plan_cwd(None, str(configured), launched, fake) == str(configured)
+
+
+def test_cli_turn_without_terminal_cwd_uses_the_process_directory():
+	with tempfile.TemporaryDirectory() as tmp:
+		launched, _configured, fake = _cwd_dirs(tmp)
+		assert _plan_cwd("cli", None, launched, fake) == str(launched)
+
+
+def test_cli_turn_falls_back_when_the_process_directory_is_gone():
+	with tempfile.TemporaryDirectory() as tmp:
+		launched, configured, fake = _cwd_dirs(tmp)
+		previous = os.getcwd()
+		real_getcwd = os.getcwd
+
+		def gone() -> str:
+			raise OSError("deleted")
+
+		saved_terminal = os.environ.pop("TERMINAL_CWD", None)
+		os.chdir(launched)
+		os.getcwd = gone  # type: ignore[assignment]
+		try:
+			assert (
+				plan(
+					{"user_message": "add a widget", "session_id": "s1", "platform": "cli"},
+					env={"BUN": str(fake), "TERMINAL_CWD": str(configured)},
+				)
+				== "planned:add a widget"
+			)
+			assert bun_requests(fake)[-1]["cwd"] == str(configured)
+			assert (
+				plan(
+					{"user_message": "add a widget", "session_id": "s1", "platform": "cli"},
+					env={"BUN": str(fake)},
+				)
+				== "planned:add a widget"
+			)
+			assert bun_requests(fake)[-1]["cwd"] == ""
+		finally:
+			os.getcwd = real_getcwd
+			os.chdir(previous)
+			if saved_terminal is not None:
+				os.environ["TERMINAL_CWD"] = saved_terminal
+
+
 def test_a_jev_skip_from_the_engine_returns_empty():
 	# A Jev plan skip: no context, the skip reason, and the notice in summary. The bridge reads only context.
 	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):
@@ -1501,6 +1589,11 @@ if __name__ == "__main__":
 	test_skill_scaffold_reaches_the_engine()
 	test_engine_is_found_off_path_when_bun_is_unset()
 	test_engine_failure_returns_empty()
+	test_cli_turn_plans_with_the_process_directory()
+	test_gateway_turn_keeps_terminal_cwd_first()
+	test_unknown_platform_keeps_terminal_cwd_first()
+	test_cli_turn_without_terminal_cwd_uses_the_process_directory()
+	test_cli_turn_falls_back_when_the_process_directory_is_gone()
 	test_a_jev_skip_from_the_engine_returns_empty()
 	test_slash_commands_and_uplifted_xml_never_start_bun()
 	test_only_the_senders_own_tag_is_stripped_and_it_never_defeats_the_skips()
