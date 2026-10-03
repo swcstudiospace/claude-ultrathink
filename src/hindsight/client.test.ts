@@ -449,6 +449,19 @@ describe("errors", () => {
 		expect(error(await client(f.fetch).recall({ query: "q" })).kind).toBe("invalid-response");
 	});
 
+	test("a redirect is not followed: one request, a classified error, no key leak", async () => {
+		const inits: (RequestInit | undefined)[] = [];
+		const redirecting = (async (input: string | URL | Request, init?: RequestInit) => {
+			inits.push(init);
+			return new Response(JSON.stringify({ detail: "moved" }), { status: 302, headers: { Location: "https://evil.example.test/x" } });
+		}) as unknown as typeof fetch;
+		const failure = error(await client(redirecting).recall({ query: "q" }));
+		expect(failure.kind).toBe("invalid-response");
+		expect(inits).toHaveLength(1);
+		expect(inits[0]?.redirect).toBe("error");
+		expect(failure.message).not.toContain(KEY);
+	});
+
 	test("an aborted caller signal rejects instead of returning an error", async () => {
 		const controller = new AbortController();
 		controller.abort();
