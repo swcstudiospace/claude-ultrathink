@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isOmpSubagentSessionId } from "./omp-session.ts";
+import { isOmpSubagentSessionId, readOmpSessionModelFile } from "./omp-session.ts";
 import { planPrompt } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
 
@@ -74,5 +74,62 @@ describe("planPrompt omp subagent guard", () => {
 		);
 		expect(response).toEqual({ context: "", skipped: "subagent" });
 		expect(events).toEqual([expect.objectContaining({ type: "end", outcome: "skipped", detail: "subagent" })]);
+	});
+});
+
+describe("readOmpSessionModelFile", () => {
+	function writeJsonl(rel: string, lines: string[]): string {
+		const path = join(root, rel);
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(path, `${lines.join("\n")}\n`);
+		return path;
+	}
+
+	const change = (model: string) =>
+		JSON.stringify({ type: "model_change", id: "e1", parentId: null, timestamp: "2026-10-03T00:00:00.000Z", model });
+
+	test("the last model_change wins", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			JSON.stringify({ type: "session", version: 3, id: "s1" }),
+			change("xai-oauth/grok-4.6"),
+			JSON.stringify({ type: "message", message: { role: "user" } }),
+			change("anthropic/claude-sonnet-4-5"),
+		]);
+		expect(readOmpSessionModelFile(path)).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	test("a message body quoting model_change does not shadow the entry", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			change("xai-oauth/grok-4.6"),
+			JSON.stringify({ type: "message", message: { role: "user", content: 'what does "model_change" mean?' } }),
+		]);
+		expect(readOmpSessionModelFile(path)).toBe("xai-oauth/grok-4.6");
+	});
+
+	test("a malformed marker on the first line terminates without a model", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			'"model_change" not json at byte zero',
+			JSON.stringify({ type: "session", version: 3, id: "s1" }),
+		]);
+		expect(readOmpSessionModelFile(path)).toBeUndefined();
+	});
+
+	test("malformed lines and entries without a model are skipped", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			change("xai-oauth/grok-4.6"),
+			'{"type":"model_change","model":',
+			JSON.stringify({ type: "model_change", model: 42 }),
+			JSON.stringify({ type: "model_change" }),
+		]);
+		expect(readOmpSessionModelFile(path)).toBe("xai-oauth/grok-4.6");
+	});
+
+	test("missing, unreadable or model-less inputs mean unknown", () => {
+		expect(readOmpSessionModelFile(undefined)).toBeUndefined();
+		expect(readOmpSessionModelFile("")).toBeUndefined();
+		expect(readOmpSessionModelFile(join(root, "missing.jsonl"))).toBeUndefined();
+		expect(readOmpSessionModelFile(root)).toBeUndefined();
+		const path = writeJsonl("-proj/2026_s1.jsonl", [JSON.stringify({ type: "session", version: 3, id: "s1" })]);
+		expect(readOmpSessionModelFile(path)).toBeUndefined();
 	});
 });

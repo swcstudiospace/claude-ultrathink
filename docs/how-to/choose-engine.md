@@ -1,6 +1,6 @@
 # Choose the planning engine
 
-The **engine** is the model ultrathink calls to plan a prompt. It writes the spec, the Graph of Thought (a small graph of reasoning steps that ends in an execution plan) and the clarifying questions. When ship is on, it is also the judge that decides whether a task is done. The **host** is the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code or Omp). The host keeps its own model for the actual work. The engine is separate, and it can be Claude, Grok or Muse on any host. By default each host plans with its own engine: Claude Code, Hermes and Omp with Claude, Grok Build with Grok, and Muse Code with Muse.
+The **engine** is the model ultrathink calls to plan a prompt. It writes the spec, the Graph of Thought (a small graph of reasoning steps that ends in an execution plan) and the clarifying questions. When ship is on, it is also the judge that decides whether a task is done. The **host** is the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code or Omp). The host keeps its own model for the actual work. The engine is separate, and it can be Claude, Grok or Muse on any host. By default Claude Code plans with Claude, Grok Build with Grok, Muse Code with Muse, and Hermes and Omp with whatever model the session is using (Claude when it cannot be read).
 
 - [Claude](#claude)
 - [Grok](#grok)
@@ -11,7 +11,7 @@ The **engine** is the model ultrathink calls to plan a prompt. It writes the spe
 
 ## Claude
 
-ultrathink runs the Claude Code CLI headless (`claude -p`) for every planning call on the hosts whose engine resolves to Muse: Claude Code, Hermes and Omp by default, any host with `think.engine` set to `"claude"`. Each call is a plain completion: no tools, no MCP servers and no settings sources, and it runs with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
+ultrathink runs the Claude Code CLI headless (`claude -p`) for every planning call on the hosts whose engine resolves to Muse: Claude Code by default, Hermes and Omp when the session model is a Claude model or cannot be read, any host with `think.engine` set to `"claude"`. Each call is a plain completion: no tools, no MCP servers and no settings sources, and it runs with `ULTRATHINK_CHILD=1` so the prompt hook never plans ultrathink's own calls.
 
 You need:
 
@@ -123,7 +123,7 @@ There are two layers, and the first beats the second:
    { "think": { "engine": "grok" } }
    ```
 
-A host whose control engine is `auto` (or that has never run `grok engine`) follows `think.engine`, or its own engine when that is also `auto`: Claude on Claude Code, Hermes and Omp, Grok on Grok Build, Muse on Muse Code.
+A host whose control engine is `auto` (or that has never run `grok engine`) follows `think.engine`, or its own engine when that is also `auto`: Claude on Claude Code, Grok on Grok Build, Muse on Muse Code, and the session's model on Hermes and Omp (Claude when it cannot be read).
 
 ## Check which engine is active
 

@@ -26,6 +26,22 @@ export interface SkillLookup {
 /** Ultrathink's own skills; a user typing one of them must never re-plan (duplicate tracker rows). */
 export const ULTRATHINK_SKILLS: readonly string[] = ["ultrathink-kickoff", "ultrathink-sync", "ultrathink-plan", "ultrathink-ship", "ultrathink-teach"];
 
+/**
+ * First line of every engine child prompt. Hosts that fire hooks for headless runs with a sanitized
+ * environment (Muse) never deliver ULTRATHINK_CHILD, so nesting is detected in the prompt text instead:
+ * a hook whose prompt carries this marker is planning an engine call, not a user request.
+ */
+export const CHILD_PROMPT_SENTINEL = "<!-- ultrathink-child-prompt -->";
+
+/**
+ * True when the prompt IS an engine child call: the marker opens the typed text (inside Grok's
+ * `<user_query>` wrapper when present). A user message that merely quotes the marker still plans.
+ */
+export function isNestedChildPrompt(prompt: string): boolean {
+	const typed = grokUserQuery(prompt) ?? prompt;
+	return typed.trimStart().startsWith(CHILD_PROMPT_SENTINEL);
+}
+
 const SUMMARY_MAX = 600;
 const OMP_PREFIX_RE = /^\[IMPORTANT: User invoked the "([^"]+)" skill; follow its instructions\. Full skill below\.\]/;
 const HERMES_PREFIX = '[IMPORTANT: The user has invoked the "';
@@ -253,7 +269,10 @@ function targetFor(skill: SkillInvocation): { text: string; skill: SkillInvocati
 export function planningTarget(
 	prompt: string,
 	lookup: SkillLookup,
-): { text: string; skill?: SkillInvocation } | { skip: "slash-command" | "ultrathink-skill" | "ultrathink-command" } {
+):
+	| { text: string; skill?: SkillInvocation }
+	| { skip: "slash-command" | "ultrathink-skill" | "ultrathink-command" | "nested-child" } {
+	if (isNestedChildPrompt(prompt)) return { skip: "nested-child" };
 	const scaffold = parseSkillScaffold(prompt);
 	if (scaffold) {
 		if (scaffold.name.split(/\s+/).some((part) => isUltrathinkSkill(normalizeName(part)))) {

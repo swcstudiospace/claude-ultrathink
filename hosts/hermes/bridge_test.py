@@ -137,9 +137,17 @@ def hermes(resolver: Callable[[], float] | None = None, config: str | None = Non
 
 
 def exited(pid: int) -> bool:
-	"""Whether pid is gone (or a zombie its new parent has yet to reap), polling up to 2s."""
+	"""Whether pid is gone, polling up to 2s. Detached children stay ours (start_new_session without
+	a double fork), so waitpid reaps our zombies; the rest are liveness-probed, with a /proc state
+	check on Linux. os.kill alone cannot see zombies, and macOS has no /proc."""
 	give_up = time.monotonic() + 2
 	while True:
+		try:
+			done, _status = os.waitpid(pid, os.WNOHANG)
+			if done:
+				return True
+		except ChildProcessError:
+			pass  # not our child: probe liveness below
 		try:
 			os.kill(pid, 0)
 		except ProcessLookupError:
@@ -148,7 +156,7 @@ def exited(pid: int) -> bool:
 			if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
 				return True
 		except OSError:
-			pass
+			pass  # no /proc on macOS
 		if time.monotonic() > give_up:
 			return False
 		time.sleep(0.05)
@@ -325,7 +333,8 @@ def _cwd_dirs(tmp: str) -> tuple[Path, Path, Path]:
 def test_cli_turn_plans_with_the_process_directory():
 	with tempfile.TemporaryDirectory() as tmp:
 		launched, configured, fake = _cwd_dirs(tmp)
-		assert _plan_cwd("cli", str(configured), launched, fake) == str(launched)
+		# macOS resolves the symlinked tmpdir in getcwd; compare canonical paths.
+		assert os.path.realpath(_plan_cwd("cli", str(configured), launched, fake)) == os.path.realpath(str(launched))
 
 
 def test_gateway_turn_keeps_terminal_cwd_first():
@@ -343,7 +352,8 @@ def test_unknown_platform_keeps_terminal_cwd_first():
 def test_cli_turn_without_terminal_cwd_uses_the_process_directory():
 	with tempfile.TemporaryDirectory() as tmp:
 		launched, _configured, fake = _cwd_dirs(tmp)
-		assert _plan_cwd("cli", None, launched, fake) == str(launched)
+		# macOS resolves the symlinked tmpdir in getcwd; compare canonical paths.
+		assert os.path.realpath(_plan_cwd("cli", None, launched, fake)) == os.path.realpath(str(launched))
 
 
 def test_cli_turn_falls_back_when_the_process_directory_is_gone():
@@ -380,6 +390,24 @@ def test_cli_turn_falls_back_when_the_process_directory_is_gone():
 			os.chdir(previous)
 			if saved_terminal is not None:
 				os.environ["TERMINAL_CWD"] = saved_terminal
+
+
+def test_session_model_reaches_the_engine_request():
+	with tempfile.TemporaryDirectory() as tmp:
+		fake = fake_bun(Path(tmp) / "bun")
+		assert (
+			plan(
+				{"user_message": "add a widget", "session_id": "s1", "model": "grok-4.7"},
+				env={"BUN": str(fake)},
+			)
+			== "planned:add a widget"
+		)
+		assert bun_requests(fake)[-1]["model"] == "grok-4.7"
+		assert (
+			plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)})
+			== "planned:add a widget"
+		)
+		assert bun_requests(fake)[-1]["model"] == ""
 
 
 def test_a_jev_skip_from_the_engine_returns_empty():

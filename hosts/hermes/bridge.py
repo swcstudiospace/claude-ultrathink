@@ -360,6 +360,7 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 		"cwd": cwd,
 		"platform": payload.get("platform") or "",
 		"parent_session_id": parent or "",
+		"model": payload.get("model") or "",
 	}
 	child_env["ULTRATHINK_HOST"] = "hermes"
 	bun = child_env.get("BUN")

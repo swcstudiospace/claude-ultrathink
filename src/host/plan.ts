@@ -35,6 +35,8 @@ export interface PlanRequest {
 	transcript_path?: string;
 	parent_session_id?: string;
 	platform?: string;
+	/** Active session model id (Hermes forwards the hook payload's, Omp reads its session file). */
+	model?: string;
 }
 
 export interface PlanResponse {
@@ -134,7 +136,7 @@ export async function planPrompt(
 			}
 		}
 		if (decision.action !== "uplift") return skip(`precheck-${decision.action}`);
-		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd, host);
+		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd, host, request.model);
 		if ("skipped" in engine) return skip(engine.skipped);
 		const sessionId = request.session_id?.trim() || "unknown";
 		const result = await runPromptSubmit(

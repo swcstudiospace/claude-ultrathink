@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { redactSecrets } from "../grok/auth.ts";
 import { CHILD_ENV } from "../claude/complete.ts";
+import { CHILD_PROMPT_SENTINEL } from "../uplift/skill.ts";
 import type { MuseEffort } from "./types.ts";
 
 export type MuseProvider = "meta" | "echo";
@@ -52,7 +53,7 @@ export function buildMuseArgs(
 }
 
 export function buildMusePrompt(system: string, user: string): string {
-	return `<system>\n${system}\n</system>\n\n<user_request>\n${user}\n</user_request>`;
+	return `${CHILD_PROMPT_SENTINEL}\n<system>\n${system}\n</system>\n\n<user_request>\n${user}\n</user_request>`;
 }
 
 function abortError(): Error {

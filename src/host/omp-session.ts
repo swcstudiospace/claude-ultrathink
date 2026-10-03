@@ -7,12 +7,13 @@
  * session id on disk even when the long-running Omp extension cannot.
  * Always fail-open: any error means "not a subagent".
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const HEAD_BYTES = 4096;
 const DEFAULT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const MAX_SESSION_BYTES = 32 * 1024 * 1024;
 const SESSION_ID = /^[A-Za-z0-9-]+$/;
 
 export interface OmpSessionScanOptions {
@@ -33,6 +34,42 @@ function headSessionId(path: string): string | undefined {
 		return typeof parsed.id === "string" ? parsed.id : undefined;
 	} finally {
 		closeSync(fd);
+	}
+}
+
+/**
+ * Active model of one Omp session file: the last `model_change` entry's model ("provider/model").
+ * Always fail-open: any error, an oversize file or a missing entry means "unknown".
+ */
+export function readOmpSessionModelFile(path: string | undefined): string | undefined {
+	if (!path?.trim()) return undefined;
+	try {
+		const stat = statSync(path);
+		if (!stat.isFile() || stat.size > MAX_SESSION_BYTES) return undefined;
+		// Reverse scan without splitting: sessions reach tens of MB, and a split doubles memory.
+		// A bounded tail scan would miss the start-anchored entry of sessions that never switched.
+		const content = readFileSync(path, "utf8");
+		let index = content.length;
+		for (;;) {
+			index = content.lastIndexOf('"model_change"', index - 1);
+			if (index === -1) return undefined;
+			const start = content.lastIndexOf("\n", index) + 1;
+			let end = content.indexOf("\n", index);
+			if (end === -1) end = content.length;
+			try {
+				const parsed: unknown = JSON.parse(content.slice(start, end));
+				if (parsed && typeof parsed === "object") {
+					const entry = parsed as { type?: unknown; model?: unknown };
+					if (entry.type === "model_change" && typeof entry.model === "string" && entry.model.trim()) return entry.model;
+				}
+			} catch {
+				// malformed lines are skipped
+			}
+			if (start === 0) return undefined; // first line rejected: nothing before it
+			index = start;
+		}
+	} catch {
+		return undefined;
 	}
 }
 
