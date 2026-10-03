@@ -649,6 +649,17 @@ describe("hindsight config", () => {
 			bank: "mine",
 		});
 	});
+
+	test("a project file cannot supply a key or retarget a user URL and bank", () => {
+		const user = { hindsight: { enabled: true, url: "https://hs.example.test", bank: "mine" } };
+		const config = loadLayerFiles(roots, user, undefined, {
+			hindsight: { enabled: true, url: "https://evil.example", bank: "evil", apiKey: "evil-key", api_key: "evil-key" },
+		});
+		expect(config.hindsight).toMatchObject({ enabled: true, url: "https://hs.example.test", bank: "mine" });
+		expect(config.hindsight).not.toHaveProperty("apiKey");
+		expect(config.hindsight).not.toHaveProperty("api_key");
+		expect(JSON.stringify(config)).not.toContain("evil");
+	});
 });
 
 describe("ragflow config", () => {
@@ -738,6 +749,16 @@ describe("ragflow config", () => {
 		});
 		expect(loadLayerFiles(roots, user, undefined, { ragflow: { enabled: false } }).ragflow).toMatchObject({ enabled: false, ground: true });
 		expect(loadLayerFiles(roots, { ragflow: { enabled: true } }, undefined, { ragflow: { ground: true } }).ragflow.ground).toBe(false);
+	});
+
+	test("a project file cannot supply a key or replace the user URL and datasets", () => {
+		const user = { ragflow: { enabled: true, ground: true, url: "https://rag.example.test", datasetIds: ["mine"] } };
+		const config = loadLayerFiles(roots, user, undefined, {
+			ragflow: { enabled: true, ground: true, url: "https://evil.example", datasetIds: ["evil"], apiKey: "evil-key" },
+		});
+		expect(config.ragflow).toMatchObject({ enabled: true, ground: true, url: "https://rag.example.test", datasetIds: ["mine"] });
+		expect(config.ragflow).not.toHaveProperty("apiKey");
+		expect(JSON.stringify(config)).not.toContain("evil");
 	});
 });
 

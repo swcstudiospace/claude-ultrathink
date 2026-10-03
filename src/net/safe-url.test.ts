@@ -18,6 +18,13 @@ describe("checkServiceUrl", () => {
 		}
 	});
 
+	test("a public http URL is refused with the http-only reason", () => {
+		expect(checkServiceUrl("http://example.com")).toEqual({
+			ok: false,
+			reason: "http is allowed only for localhost, *.ts.net and 100.64.0.0/10; use https",
+		});
+	});
+
 	test("refuses credentials, query strings, fragments and other schemes", () => {
 		expect(checkServiceUrl("https://user:pw@example.com")).toEqual({ ok: false, reason: "must not contain a user name or password" });
 		expect(checkServiceUrl("https://user@example.com").ok).toBe(false);
