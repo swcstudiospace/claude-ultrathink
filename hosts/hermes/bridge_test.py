@@ -325,7 +325,8 @@ def _cwd_dirs(tmp: str) -> tuple[Path, Path, Path]:
 def test_cli_turn_plans_with_the_process_directory():
 	with tempfile.TemporaryDirectory() as tmp:
 		launched, configured, fake = _cwd_dirs(tmp)
-		assert _plan_cwd("cli", str(configured), launched, fake) == str(launched)
+		# macOS resolves the symlinked tmpdir in getcwd; compare canonical paths.
+		assert os.path.realpath(_plan_cwd("cli", str(configured), launched, fake)) == os.path.realpath(str(launched))
 
 
 def test_gateway_turn_keeps_terminal_cwd_first():
@@ -343,7 +344,8 @@ def test_unknown_platform_keeps_terminal_cwd_first():
 def test_cli_turn_without_terminal_cwd_uses_the_process_directory():
 	with tempfile.TemporaryDirectory() as tmp:
 		launched, _configured, fake = _cwd_dirs(tmp)
-		assert _plan_cwd("cli", None, launched, fake) == str(launched)
+		# macOS resolves the symlinked tmpdir in getcwd; compare canonical paths.
+		assert os.path.realpath(_plan_cwd("cli", None, launched, fake)) == os.path.realpath(str(launched))
 
 
 def test_cli_turn_falls_back_when_the_process_directory_is_gone():
