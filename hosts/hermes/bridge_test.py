@@ -392,6 +392,24 @@ def test_cli_turn_falls_back_when_the_process_directory_is_gone():
 				os.environ["TERMINAL_CWD"] = saved_terminal
 
 
+def test_session_model_reaches_the_engine_request():
+	with tempfile.TemporaryDirectory() as tmp:
+		fake = fake_bun(Path(tmp) / "bun")
+		assert (
+			plan(
+				{"user_message": "add a widget", "session_id": "s1", "model": "grok-4.7"},
+				env={"BUN": str(fake)},
+			)
+			== "planned:add a widget"
+		)
+		assert bun_requests(fake)[-1]["model"] == "grok-4.7"
+		assert (
+			plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)})
+			== "planned:add a widget"
+		)
+		assert bun_requests(fake)[-1]["model"] == ""
+
+
 def test_a_jev_skip_from_the_engine_returns_empty():
 	# A Jev plan skip: no context, the skip reason, and the notice in summary. The bridge reads only context.
 	with tempfile.TemporaryDirectory() as tmp, hook_cap(None):

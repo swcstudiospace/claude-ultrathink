@@ -287,6 +287,24 @@ describe("planPrompt", () => {
 		}
 	});
 
+	test("the request model reaches engine selection", async () => {
+		const { root, env, options } = planHarness();
+		let seen: unknown = "unset";
+		const inner = options.selectEngine;
+		options.selectEngine = (async (...args: Parameters<NonNullable<typeof inner>>) => {
+			seen = args[4];
+			return inner!(...args);
+		}) as typeof inner;
+		try {
+			await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root, model: "grok-4.7" }, env, options);
+			expect(seen).toBe("grok-4.7");
+			await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
+			expect(seen).toBeUndefined();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("an engine child prompt skips before an engine is selected", async () => {
 		const { root, env, options, calls } = planHarness();
 		try {
