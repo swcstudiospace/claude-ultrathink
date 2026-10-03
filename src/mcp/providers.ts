@@ -2,11 +2,11 @@
 // Copyright (C) 2026 SWC Studio
 /**
  * Credential providers. MCP providers are remote MCP servers (relay, check, OAuth login); key providers only hold an
- * API key in the same store for a non-MCP client (OpenRouter's Decisions API, the Hindsight and RAGFlow HTTP APIs) and are
- * never served or connected.
+ * API key in the same store for a non-MCP client (OpenRouter's Decisions API and the Vercel AI Gateway's
+ * evaluation-model endpoint, the Hindsight and RAGFlow HTTP APIs) and are never served or connected.
  */
 export type McpProviderId = "notion" | "linear" | "greptile";
-export type KeyProviderId = "openrouter" | "hindsight" | "ragflow";
+export type KeyProviderId = "openrouter" | "vercel" | "hindsight" | "ragflow";
 export type ProviderId = McpProviderId | KeyProviderId;
 
 export interface McpProvider {
@@ -71,6 +71,7 @@ export const MCP_PROVIDERS: Record<McpProviderId, McpProvider> = {
 
 export const KEY_PROVIDERS: Record<KeyProviderId, KeyProvider> = {
 	openrouter: { kind: "key", id: "openrouter", label: "OpenRouter", apiKey: true, oauth: false, envVar: "OPENROUTER_API_KEY" },
+	vercel: { kind: "key", id: "vercel", label: "Vercel AI Gateway", apiKey: true, oauth: false, envVar: "AI_GATEWAY_API_KEY" },
 	hindsight: { kind: "key", id: "hindsight", label: "Hindsight", apiKey: true, oauth: false, envVar: "HINDSIGHT_API_KEY" },
 	ragflow: { kind: "key", id: "ragflow", label: "RAGFlow", apiKey: true, oauth: false, envVar: "RAGFLOW_API_KEY" },
 };

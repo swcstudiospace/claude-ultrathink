@@ -9,7 +9,7 @@ import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.
 import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
 import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
 import { runDecisionsCommand } from "../decisions/cli.ts";
-import { decisionsKilled, resolveOpenRouterKey } from "../decisions/gate.ts";
+import { decisionsKilled, resolveDecisionsKeys } from "../decisions/gate.ts";
 import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
 import { engineLabel } from "../host/engine.ts";
@@ -148,21 +148,26 @@ function knowledgeLine(config: UltrathinkConfig, state: ControlState, env: Recor
 	return `Knowledge base: on · Greptile${org ? ` · organization ${org}` : ""}`;
 }
 
-/** Jev Decisions are opt-in and need an OpenRouter key; the key's source is shown, never the key. `ULTRATHINK_DECISIONS=0`
+/** Jev Decisions are always on and need a key; the key's source is shown, never the key. `ULTRATHINK_DECISIONS=0`
  *  turns them off for this shell whatever the config says. */
 function decisionsLine(config: UltrathinkConfig, env: Record<string, string | undefined>): string {
 	const { decisions } = config;
 	if (decisionsKilled(env)) return "Decisions: off (ULTRATHINK_DECISIONS=0)";
-	if (!decisions.enabled) return "Decisions: off (opt-in: set decisions.enabled)";
-	const key = resolveOpenRouterKey(storePath(env), env);
-	if (!key) {
-		return "Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
+	const picked = resolveDecisionsKeys(decisions, storePath(env), env);
+	if (!picked.key) {
+		return "Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)";
 	}
 	const points = decisions.points.length ? decisions.points.join(", ") : "no points";
 	const endpoint = resolveDecisionsUrl(env);
 	const url =
-		endpoint.source === "ULTRATHINK_DECISIONS_URL" ? ` · url ${endpoint.url}` : endpoint.ignored ? DECISIONS_URL_IGNORED : "";
-	return `Decisions: on · ${decisions.model} · ${points} · key from ${key.source} · zdr ${decisions.zdr ? "on" : "off"}${url}`;
+		picked.provider === "openrouter"
+			? endpoint.source === "ULTRATHINK_DECISIONS_URL"
+				? ` · url ${endpoint.url}`
+				: endpoint.ignored
+					? DECISIONS_URL_IGNORED
+					: ""
+			: "";
+	return `Decisions: on · ${decisions.model} · ${points} · provider ${picked.provider} · key from ${picked.key.source} · zdr ${decisions.zdr ? "on" : "off"}${url}`;
 }
 
 async function grokOauthLine(config: UltrathinkConfig): Promise<string> {

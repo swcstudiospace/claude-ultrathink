@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_HINDSIGHT_CONFIG, type HindsightConfig } from "./hindsight/types.ts";
 import { DEFAULT_RAGFLOW_CONFIG, type RagflowConfig } from "./ragflow/types.ts";
-import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type DecisionsConfig } from "./decisions/types.ts";
+import { DECISION_POINTS, DECISIONS_PROVIDERS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type DecisionsConfig, type DecisionsProvider } from "./decisions/types.ts";
 import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
 import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
@@ -371,10 +371,13 @@ function mergeDecisions(decisions: Record<string, unknown> | undefined, defaults
 		? [...new Set(decisions.points.filter((p): p is DecisionPoint => DECISION_POINTS.includes(p as DecisionPoint)))]
 		: defaults.points;
 	if (project && points !== defaults.points) points = defaults.points.filter((p) => points.includes(p));
-	const enabled = typeof decisions.enabled === "boolean" ? decisions.enabled : defaults.enabled;
 	const zdr = typeof decisions.zdr === "boolean" ? decisions.zdr : defaults.zdr;
 	return {
-		enabled: project ? defaults.enabled && enabled : enabled,
+		// Jev is always on: the file value is ignored in every layer; only ULTRATHINK_DECISIONS=0 disables.
+		enabled: true,
+		provider: DECISIONS_PROVIDERS.includes(decisions.provider as DecisionsProvider)
+			? (decisions.provider as DecisionsProvider)
+			: defaults.provider,
 		model: nonEmpty(decisions.model, defaults.model),
 		points,
 		timeoutMs:

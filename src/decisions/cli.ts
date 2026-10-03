@@ -10,7 +10,15 @@ import { resolve } from "node:path";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { storePath as defaultStorePath } from "../mcp/store.ts";
 import { type DecideOptions, type DecisionsUrl, DECISIONS_URL_IGNORED, decide, redact, resolveDecisionsUrl } from "./client.ts";
-import { type DecisionsDeps, buildDecisionsRequest, decisionsKilled, resolveOpenRouterKey, type KeySource } from "./gate.ts";
+import {
+	type DecisionsDeps,
+	type KeySource,
+	type ResolvedProvider,
+	buildDecisionsRequest,
+	decisionsKilled,
+	resolveDecisionsKeys,
+} from "./gate.ts";
+import { decideVercel } from "./vercel.ts";
 import {
 	buildBlockingState,
 	buildKnowledgeState,
@@ -31,7 +39,8 @@ export interface DecisionsCommandDeps extends Omit<DecisionsDeps, "debug"> {
 
 const USAGE =
 	"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>";
-const NO_KEY = "no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
+const NO_KEY =
+	"no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)";
 const KILLED = "off (ULTRATHINK_DECISIONS=0)";
 const CHECK_MESSAGE = "Add a --verbose flag to the export command";
 const MAX_CASES = 200;
@@ -40,36 +49,48 @@ interface Runtime {
 	config: DecisionsConfig;
 	/** ULTRATHINK_DECISIONS=0: no request is ever sent. */
 	killed: boolean;
+	provider: ResolvedProvider;
 	key?: { key: string; source: KeySource };
 	url: DecisionsUrl;
 	decideOptions: (apiKey: string) => DecideOptions;
+	rail: typeof decide;
 }
 
 function runtime(deps: DecisionsCommandDeps): Runtime {
 	const env = deps.env ?? process.env;
 	const config = loadConfig(claudeConfigPaths(deps.cwd, env)).decisions;
 	const url = resolveDecisionsUrl(env);
+	const picked = resolveDecisionsKeys(config, deps.storePath ?? defaultStorePath(env), env);
 	return {
 		config,
 		killed: decisionsKilled(env),
-		key: resolveOpenRouterKey(deps.storePath ?? defaultStorePath(env), env),
+		provider: picked.provider,
+		key: picked.key,
 		url,
 		decideOptions: (apiKey) => ({
 			apiKey,
 			timeoutMs: config.timeoutMs,
-			url: url.url,
+			...(picked.provider === "openrouter" ? { url: url.url } : {}),
 			fetch: deps.fetch,
 			now: deps.now,
 			sleep: deps.sleep,
 			random: deps.random,
 		}),
+		rail: picked.provider === "vercel" ? decideVercel : decide,
 	};
 }
 
-/** ` · zdr <on|off> · key from <source>` + ` · url <url>` when the env override is in effect, or the ignored notice when it was rejected. */
+/** ` · provider <rail> · zdr <on|off> · key from <source>` + ` · url <url>` when the env override is in effect on the OpenRouter rail, or the ignored notice when it was rejected. */
 function footer(rt: Runtime, source: KeySource): string {
-	const url = rt.url.source === "ULTRATHINK_DECISIONS_URL" ? ` · url ${rt.url.url}` : rt.url.ignored ? DECISIONS_URL_IGNORED : "";
-	return ` · zdr ${rt.config.zdr ? "on" : "off"} · key from ${source}${url}`;
+	const url =
+		rt.provider === "openrouter"
+			? rt.url.source === "ULTRATHINK_DECISIONS_URL"
+				? ` · url ${rt.url.url}`
+				: rt.url.ignored
+					? DECISIONS_URL_IGNORED
+					: ""
+			: "";
+	return ` · provider ${rt.provider} · zdr ${rt.config.zdr ? "on" : "off"} · key from ${source}${url}`;
 }
 
 async function check(rt: Runtime): Promise<{ code: number; text: string }> {
@@ -80,7 +101,7 @@ async function check(rt: Runtime): Promise<{ code: number; text: string }> {
 		zdr: rt.config.zdr,
 		spanName: "check",
 	});
-	const outcome = await decide(request, rt.decideOptions(rt.key.key));
+	const outcome = await rt.rail(request, rt.decideOptions(rt.key.key));
 	const timing = `${Math.round(outcome.latencyMs)} ms · attempts ${outcome.attempts}`;
 	const tail = footer(rt, rt.key.source);
 	if (!outcome.ok) {
@@ -235,7 +256,7 @@ async function probe(rt: Runtime, argv: readonly string[], deps: DecisionsComman
 	for (const [index, c] of cases.entries()) {
 		if (c.label !== undefined) labelled++;
 		const request = buildDecisionsRequest(point, c.state, { model: rt.config.model, zdr: rt.config.zdr, spanName: point });
-		const outcome = await decide(request, rt.decideOptions(rt.key.key));
+		const outcome = await rt.rail(request, rt.decideOptions(rt.key.key));
 		if (!outcome.ok) {
 			errors++;
 			lines.push(`#${index + 1} error (${outcome.error.kind})`);

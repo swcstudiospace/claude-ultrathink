@@ -31,7 +31,7 @@ const USAGE = `usage:
   ultrathink-mcp serve <notion|linear|greptile>
   ultrathink-mcp auth status
   ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)
-  (openrouter, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)
+  (openrouter, vercel, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)
   ultrathink-mcp auth login <provider> [--port <n>] [--redirect <url>] [--tailscale] [--no-listen]
   ultrathink-mcp auth logout <provider>
   ultrathink-mcp check [provider...]

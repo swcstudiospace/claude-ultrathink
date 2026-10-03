@@ -3,7 +3,8 @@
 /**
  * Hand-written client for OpenRouter's Decisions API (D1, D6, D7): local request checks, one POST inside a total
  * time budget, at most one retry for transient failures, strict response parsing and redacted, classified errors.
- * Never rejects except with an AbortError when the caller aborts.
+ * Never rejects except with an AbortError when the caller aborts. `postDecision` is the shared POST core the Vercel
+ * rail (`./vercel.ts`) reuses, so both rails share timeout/retry/redaction discipline structurally.
  */
 import { redactSecrets } from "../grok/auth.ts";
 import { USER_AGENT } from "../mcp/providers.ts";
@@ -27,7 +28,7 @@ export interface DecideOptions {
 	apiKey: string;
 	/** Total budget for the decision, retries included (D6). */
 	timeoutMs: number;
-	/** Default DEFAULT_DECISIONS_URL. Callers pass resolveDecisionsUrl(env).url. */
+	/** Default per rail (OpenRouter default / Vercel endpoint). OpenRouter callers pass resolveDecisionsUrl(env).url. */
 	url?: string;
 	/** Default: globalThis.fetch looked up at call time (tests may replace globalThis.fetch). */
 	fetch?: typeof fetch;
@@ -83,13 +84,15 @@ export function resolveDecisionsUrl(env: Env): DecisionsUrl {
 	return { url: DEFAULT_DECISIONS_URL, source: "default", ignored: true };
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+/** Shared with the Vercel rail: plain-object check for strict response parsing. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const proto = Object.getPrototypeOf(value);
 	return proto === Object.prototype || proto === null;
 }
 
-function isUnit(value: unknown): value is number {
+/** Shared with the Vercel rail: a finite number in [0, 1]. */
+export function isUnit(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
@@ -208,7 +211,8 @@ function checkAnswer(value: unknown, question: DecisionQuestion, at: string): De
 	return { type: "score", score, ...optionalFields(value, levels, at), ...(value.legend !== undefined ? { legend: value.legend } : {}) };
 }
 
-function isCount(value: unknown): value is number {
+/** Shared with the Vercel rail: a finite number >= 0. */
+export function isCount(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
@@ -268,7 +272,8 @@ function statusKind(status: number): DecisionsErrorKind {
 
 const TRANSIENT_STATUSES: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 524, 529]);
 
-function abortError(signal: AbortSignal): Error {
+/** Shared with the Vercel rail: the caller's abort reason, or an AbortError. */
+export function abortError(signal: AbortSignal): Error {
 	const reason: unknown = signal.reason;
 	if ((reason instanceof Error || reason instanceof DOMException) && reason.name === "AbortError") return reason;
 	return new DOMException("The operation was aborted.", "AbortError");
@@ -322,8 +327,34 @@ type Attempt =
 	| { ok: true; response: DecisionsResponse }
 	| { ok: false; error: DecisionsError; transient: boolean; retryAfter?: string | null };
 
-/** Never rejects except with an AbortError when opts.signal aborts. */
-export async function decide(request: DecisionsRequest, opts: DecideOptions): Promise<DecideOutcome> {
+export interface PostDecisionOptions {
+	apiKey: string;
+	/** Total budget for the decision, retries included (D6). */
+	timeoutMs: number;
+	/** Default: globalThis.fetch looked up at call time (tests may replace globalThis.fetch). */
+	fetch?: typeof fetch;
+	/** Caller abort: rejects with an AbortError. */
+	signal?: AbortSignal;
+	/** Default Date.now. Used for the budget, the ≥500 ms retry rule, latency and Retry-After dates. */
+	now?: () => number;
+	/** Default ms => Bun.sleep(ms). Raced with the caller signal. */
+	sleep?: (ms: number) => Promise<void>;
+	/** Default Math.random (jitter). */
+	random?: () => number;
+}
+
+/**
+ * One POST inside a total time budget, at most one retry for transient failures, strict `parse` of a 2xx JSON
+ * body, redacted classified errors. Shared by the OpenRouter rail (`decide`) and the Vercel rail (`./vercel.ts`).
+ * Never rejects except with an AbortError when opts.signal aborts.
+ */
+export async function postDecision(
+	url: string,
+	headers: Record<string, string>,
+	bodyText: string,
+	parse: (json: unknown) => DecisionsResponse,
+	opts: PostDecisionOptions,
+): Promise<DecideOutcome> {
 	const now = opts.now ?? Date.now;
 	const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const random = opts.random ?? Math.random;
@@ -333,14 +364,7 @@ export async function decide(request: DecisionsRequest, opts: DecideOptions): Pr
 	const settle = <T extends object>(result: T) => ({ ...result, latencyMs: Math.max(0, now() - start) });
 	if (caller?.aborted) throw abortError(caller);
 
-	const local = validateRequest(request);
-	if (local) {
-		return settle({ ok: false as const, error: new DecisionsError(local.kind, redact(local.message, opts.apiKey)), attempts: 0 });
-	}
-
 	const fetchImpl = opts.fetch ?? globalThis.fetch;
-	const url = opts.url ?? DEFAULT_DECISIONS_URL;
-	const body = JSON.stringify(request);
 	const fail = (kind: DecisionsErrorKind, detail: string, status?: number) =>
 		new DecisionsError(kind, redact(`decisions ${kind}: ${redact(detail, opts.apiKey)}`, opts.apiKey), status);
 
@@ -362,12 +386,8 @@ export async function decide(request: DecisionsRequest, opts: DecideOptions): Pr
 			const response = await raceAbort(
 				fetchImpl(url, {
 					method: "POST",
-					headers: {
-						Authorization: `Bearer ${opts.apiKey}`,
-						"Content-Type": "application/json",
-						"User-Agent": USER_AGENT,
-					},
-					body,
+					headers,
+					body: bodyText,
 					signal,
 					// The key must never follow a redirect to another host.
 					redirect: "error",
@@ -392,7 +412,7 @@ export async function decide(request: DecisionsRequest, opts: DecideOptions): Pr
 				return { ok: false, error: fail("invalid-response", "response body is not JSON"), transient: false };
 			}
 			try {
-				return { ok: true, response: parseDecisionsResponse(json, request.questions) };
+				return { ok: true, response: parse(json) };
 			} catch (error) {
 				const message = error instanceof DecisionsError ? error.message : "response could not be parsed";
 				return { ok: false, error: new DecisionsError("invalid-response", redact(message, opts.apiKey)), transient: false };
@@ -423,4 +443,31 @@ export async function decide(request: DecisionsRequest, opts: DecideOptions): Pr
 	const second = await attempt();
 	if (second.ok) return settle({ ok: true as const, response: second.response, attempts: 2 });
 	return settle({ ok: false as const, error: second.error, attempts: 2 });
+}
+
+/** OpenRouter rail: local D7 checks, then the shared POST core. Never rejects except with an AbortError when opts.signal aborts. */
+export async function decide(request: DecisionsRequest, opts: DecideOptions): Promise<DecideOutcome> {
+	const now = opts.now ?? Date.now;
+	const start = now();
+	if (opts.signal?.aborted) throw abortError(opts.signal);
+	const local = validateRequest(request);
+	if (local) {
+		return {
+			ok: false as const,
+			error: new DecisionsError(local.kind, redact(local.message, opts.apiKey)),
+			attempts: 0,
+			latencyMs: Math.max(0, now() - start),
+		};
+	}
+	return postDecision(
+		opts.url ?? DEFAULT_DECISIONS_URL,
+		{
+			Authorization: `Bearer ${opts.apiKey}`,
+			"Content-Type": "application/json",
+			"User-Agent": USER_AGENT,
+		},
+		JSON.stringify(request),
+		(json) => parseDecisionsResponse(json, request.questions),
+		opts,
+	);
 }

@@ -10,6 +10,15 @@ export const DECISION_POINTS: readonly DecisionPoint[] = ["plan", "ship", "knowl
 
 export const DEFAULT_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
 export const DEFAULT_DECISIONS_MODEL = "~typesafe/jev-latest";
+/** Vercel AI Gateway rails for the same judge: the v4 evaluation-model endpoint, model in the `ai-model-id` header. */
+export const VERCEL_DECISIONS_URL = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
+export const VERCEL_JEV_MODEL = "typesafe-ai/jev";
+export const VERCEL_PROTOCOL_VERSION = "0.0.1";
+export const VERCEL_SPEC_VERSION = "4";
+
+/** Which rails Jev calls take. `auto` uses Vercel when its key is present, else OpenRouter. */
+export type DecisionsProvider = "auto" | "openrouter" | "vercel";
+export const DECISIONS_PROVIDERS: readonly DecisionsProvider[] = ["auto", "openrouter", "vercel"];
 /** D7: estimated tokens (chars / 4 of JSON {state, questions}) above this fail locally as too-large. */
 export const MAX_ESTIMATED_TOKENS = 28_000;
 /** D6: a retry needs at least this much of the budget left. */
@@ -35,7 +44,9 @@ export const TEACHABLE_AUTO_AT = 0.8;
 export const SKILLWORTHY_AT = 0.5;
 
 export interface DecisionsConfig {
+	/** Always true: Jev is always on. Kept for config compatibility; the value in files is ignored. */
 	enabled: boolean;
+	provider: DecisionsProvider;
 	model: string;
 	points: DecisionPoint[];
 	timeoutMs: number;
@@ -51,7 +62,8 @@ export interface DecisionsConfig {
 }
 
 export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
-	enabled: false,
+	enabled: true,
+	provider: "auto",
 	model: DEFAULT_DECISIONS_MODEL,
 	points: ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"],
 	timeoutMs: 3000,

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 /**
- * The Decisions runtime every decision point shares: the OpenRouter key lookup, the one is-point-active predicate,
- * and a fail-open run() that returns a typed outcome plus a content-free DecisionRecord.
+ * The Decisions runtime every decision point shares: the key lookup, the one is-point-active predicate, and a
+ * fail-open run() that returns a typed outcome plus a content-free DecisionRecord. Jev runs on OpenRouter or the
+ * Vercel AI Gateway rail; `resolveDecisionsKeys` is the one place the rail and key are picked.
  */
 import { readStore, storePath as defaultStorePath } from "../mcp/store.ts";
 import { type DecideOutcome, decide, redact, resolveDecisionsUrl } from "./client.ts";
@@ -16,23 +17,56 @@ import {
 	type DecisionsRequest,
 	formatP,
 } from "./types.ts";
+import { decideVercel } from "./vercel.ts";
 
 type Env = Record<string, string | undefined>;
 
-export type KeySource = "store" | "OPENROUTER_API_KEY";
+export type KeySource = "store" | "OPENROUTER_API_KEY" | "AI_GATEWAY_API_KEY";
 
 /** Stored openrouter api_key (trimmed, non-empty) wins; else trimmed non-empty env.OPENROUTER_API_KEY; else undefined. Never throws. */
 export function resolveOpenRouterKey(storePath: string, env: Env): { key: string; source: KeySource } | undefined {
+	return resolveStoreKey(storePath, env, "openrouter", "OPENROUTER_API_KEY");
+}
+
+/** Stored vercel api_key (trimmed, non-empty) wins; else trimmed non-empty env.AI_GATEWAY_API_KEY; else undefined. Never throws. */
+export function resolveVercelKey(storePath: string, env: Env): { key: string; source: KeySource } | undefined {
+	return resolveStoreKey(storePath, env, "vercel", "AI_GATEWAY_API_KEY");
+}
+
+function resolveStoreKey(
+	storePath: string,
+	env: Env,
+	provider: string,
+	envVar: "OPENROUTER_API_KEY" | "AI_GATEWAY_API_KEY",
+): { key: string; source: KeySource } | undefined {
 	try {
 		const providers = readStore(storePath).providers as Record<string, unknown>;
-		const credential = providers.openrouter as { kind?: unknown; apiKey?: unknown } | undefined;
+		const credential = providers[provider] as { kind?: unknown; apiKey?: unknown } | undefined;
 		const stored = credential?.kind === "api_key" && typeof credential.apiKey === "string" ? credential.apiKey.trim() : "";
 		if (stored) return { key: stored, source: "store" };
 	} catch {
 		// unreadable store: fall back to the environment
 	}
-	const fromEnv = env.OPENROUTER_API_KEY?.trim();
-	return fromEnv ? { key: fromEnv, source: "OPENROUTER_API_KEY" } : undefined;
+	const fromEnv = env[envVar]?.trim();
+	return fromEnv ? { key: fromEnv, source: envVar } : undefined;
+}
+
+/** The picked rail: `auto` resolves to vercel when its key is present, else openrouter; explicit pins either. */
+export type ResolvedProvider = "openrouter" | "vercel";
+
+export interface ResolvedDecisionsKeys {
+	provider: ResolvedProvider;
+	key?: { key: string; source: KeySource };
+}
+
+/** The one rail + key picker, shared by the runtime, the CLI and the status line. Never throws. */
+export function resolveDecisionsKeys(config: DecisionsConfig, storePath: string, env: Env): ResolvedDecisionsKeys {
+	const vercel = resolveVercelKey(storePath, env);
+	const openrouter = resolveOpenRouterKey(storePath, env);
+	const provider: ResolvedProvider =
+		config.provider === "vercel" ? "vercel" : config.provider === "openrouter" ? "openrouter" : vercel ? "vercel" : "openrouter";
+	const key = provider === "vercel" ? vercel : openrouter;
+	return { provider, ...(key ? { key } : {}) };
 }
 
 export interface DecisionsDeps {
@@ -68,8 +102,9 @@ export type DecisionOutcome =
 
 export interface Decisions {
 	readonly config: DecisionsConfig;
-	/** The one is-point-active predicate: env.ULTRATHINK_DECISIONS !== "0" ∧ config.enabled ∧ config.points.includes(point)
-	 *  ∧ key present. Checks the kill switch, enabled and points first; resolves the key at most once per runtime (lazily). */
+	/** The one is-point-active predicate: env.ULTRATHINK_DECISIONS !== "0" ∧ config.points.includes(point) ∧ key
+	 *  present. Jev is always on; only the kill switch disables. Checks the kill switch and points first; resolves the
+	 *  key at most once per runtime (lazily). */
 	active(point: DecisionPoint): boolean;
 	/** One decision. Never rejects except with an AbortError (caller abort). */
 	run<P extends DecisionPoint>(point: P, state: DecisionStates[P], opts: RunDecisionOptions): Promise<DecisionOutcome>;
@@ -116,34 +151,33 @@ export function createDecisions(input: DecisionsInput): Decisions {
 		((line: string) => {
 			if (env.ULTRATHINK_DEBUG === "1") process.stderr.write(`[ultrathink] ${line}\n`);
 		});
-	let resolved = false;
-	let apiKey: string | undefined;
-	const key = (): string | undefined => {
-		if (!resolved) {
-			resolved = true;
-			apiKey = resolveOpenRouterKey(input.storePath ?? defaultStorePath(env), env)?.key;
-		}
-		return apiKey;
+	let resolved: ResolvedDecisionsKeys | undefined;
+	const keys = (): ResolvedDecisionsKeys => {
+		resolved ??= resolveDecisionsKeys(config, input.storePath ?? defaultStorePath(env), env);
+		return resolved;
 	};
 	const active = (point: DecisionPoint): boolean =>
-		!decisionsKilled(env) && config.enabled && config.points.includes(point) && key() !== undefined;
+		!decisionsKilled(env) && config.points.includes(point) && keys().key !== undefined;
 
 	return {
 		config,
 		active,
 		async run(point, state, opts) {
-			const apiKeyNow = active(point) ? key() : undefined;
-			if (!apiKeyNow) return { status: "inactive" };
+			const picked = active(point) ? keys() : undefined;
+			const apiKeyNow = picked?.key?.key;
+			if (!apiKeyNow || !picked) return { status: "inactive" };
 			const questionKey = QUESTION_KEYS[point];
 			const start = now();
 			let outcome: DecideOutcome;
 			try {
-				outcome = await decide(
+				// The Vercel rail has a fixed endpoint; only the OpenRouter rail honors ULTRATHINK_DECISIONS_URL.
+				const rail = picked.provider === "vercel" ? decideVercel : decide;
+				outcome = await rail(
 					buildDecisionsRequest(point, state, { model: config.model, zdr: config.zdr, sessionId: input.sessionId }),
 					{
 						apiKey: apiKeyNow,
 						timeoutMs: config.timeoutMs,
-						url: resolveDecisionsUrl(env).url,
+						...(picked.provider === "openrouter" ? { url: resolveDecisionsUrl(env).url } : {}),
 						fetch: input.fetch,
 						signal: opts.signal,
 						now,
