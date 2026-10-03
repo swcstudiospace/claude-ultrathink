@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { QUESTIONS } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG, type DecisionsConfig } from "../decisions/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { DISTILL_SYSTEM, observeDigest, parseLessons } from "./observe.ts";
+import { openStore, storeDir } from "./store.ts";
 import {
 	type CaptureFn,
 	type CaptureInput,
@@ -470,6 +474,84 @@ describe("observeDigest with the Jev teachable point", () => {
 			expect(bodies).toHaveLength(0);
 			expect(h.captured).toHaveLength(1);
 			expect(outcome).toMatchObject({ dropped: 0, decisions: [] });
+		}
+	});
+});
+
+describe("observeDigest auto-promotion (SKILL-03)", () => {
+	function dueStore(): { stateDir: string; cleanup: () => void } {
+		const stateDir = mkdtempSync(join(tmpdir(), "ut-observe-promote-"));
+		openStore(storeDir(stateDir)).put({
+			id: "abc0001",
+			name: "Due lesson",
+			description: "Something went wrong the first time.",
+			body: "Check the config before running the command.",
+			sourcePhase: "",
+			sourceArtifacts: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			tags: [],
+			relatedIds: [],
+			schema: 2,
+			kind: "pitfall",
+			status: "confirmed",
+			origin: "explicit",
+			project: "demo",
+			host: "muse",
+			confidence: 1,
+			occurrences: 3,
+			lastSeenAt: "2026-01-02T00:00:00.000Z",
+			dedupeKey: "due1",
+			recalled: 0,
+		});
+		return { stateDir, cleanup: () => rmSync(stateDir, { recursive: true, force: true }) };
+	}
+
+	function drafts(stateDir: string): string[] {
+		const dir = join(stateDir, "teach", "skill-drafts");
+		return existsSync(dir) ? readdirSync(dir) : [];
+	}
+
+	test("autoPromote on drafts the due moment for the observing host", async () => {
+		const { stateDir, cleanup } = dueStore();
+		try {
+			const h = harness({ teach: { autoPromote: true } });
+			h.ctx.stateDir = stateDir;
+			h.ctx.host = "muse";
+			const outcome = await observeDigest(digest(), h.ctx, { capture: h.capture });
+			expect(outcome.skipped).toBeUndefined();
+			expect(h.captured).toHaveLength(1);
+			const names = drafts(stateDir);
+			expect(names).toHaveLength(1);
+			expect(existsSync(join(stateDir, "teach", "skill-drafts", names[0] ?? "", "SKILL.md"))).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("autoPromote off drafts nothing", async () => {
+		const { stateDir, cleanup } = dueStore();
+		try {
+			const h = harness({ teach: { autoPromote: false } });
+			h.ctx.stateDir = stateDir;
+			h.ctx.host = "muse";
+			await observeDigest(digest(), h.ctx, { capture: h.capture });
+			expect(drafts(stateDir)).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a skipped digest promotes nothing even with autoPromote on", async () => {
+		const { stateDir, cleanup } = dueStore();
+		try {
+			const h = harness({ teach: { autoPromote: true } });
+			h.ctx.stateDir = stateDir;
+			h.ctx.host = "muse";
+			const outcome = await observeDigest(digest({ turns: [], toolCalls: 0 }), h.ctx, { capture: h.capture });
+			expect(outcome.skipped).toBeDefined();
+			expect(drafts(stateDir)).toEqual([]);
+		} finally {
+			cleanup();
 		}
 	});
 });
