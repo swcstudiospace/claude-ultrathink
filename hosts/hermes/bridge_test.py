@@ -137,9 +137,17 @@ def hermes(resolver: Callable[[], float] | None = None, config: str | None = Non
 
 
 def exited(pid: int) -> bool:
-	"""Whether pid is gone (or a zombie its new parent has yet to reap), polling up to 2s."""
+	"""Whether pid is gone, polling up to 2s. Detached children stay ours (start_new_session without
+	a double fork), so waitpid reaps our zombies; the rest are liveness-probed, with a /proc state
+	check on Linux. os.kill alone cannot see zombies, and macOS has no /proc."""
 	give_up = time.monotonic() + 2
 	while True:
+		try:
+			done, _status = os.waitpid(pid, os.WNOHANG)
+			if done:
+				return True
+		except ChildProcessError:
+			pass  # not our child: probe liveness below
 		try:
 			os.kill(pid, 0)
 		except ProcessLookupError:
@@ -148,7 +156,7 @@ def exited(pid: int) -> bool:
 			if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
 				return True
 		except OSError:
-			pass
+			pass  # no /proc on macOS
 		if time.monotonic() > give_up:
 			return False
 		time.sleep(0.05)
