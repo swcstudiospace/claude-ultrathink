@@ -849,6 +849,40 @@ describe("promote", () => {
 		expect(human.text).toContain("feed0002 confirmed pitfall x3");
 	});
 
+	test("--due lists newest first and the rendered draft passes the Hermes rules", async () => {
+		seed(
+			moment("feed0007-g", { occurrences: 9, createdAt: "2026-01-01T00:00:00.000Z" }),
+			moment("feed0008-h", { occurrences: 3, createdAt: "2026-03-01T00:00:00.000Z" }),
+			moment("feed0009-i", { occurrences: 2, createdAt: "2026-04-01T00:00:00.000Z" }),
+		);
+		const human = await run(["promote", "--due"]);
+		expect(human.text.split("\n")).toHaveLength(2);
+		expect(human.text.indexOf("feed0008")).toBeLessThan(human.text.indexOf("feed0007"));
+		expect(human.text).not.toContain("feed0009");
+		const result = await run(["promote", "feed0008", "--json"]);
+		expect(result.code).toBe(0);
+		const content = (json(result).draft as Json).content as string;
+		expect(content.startsWith("---\n")).toBe(true);
+		const end = content.indexOf("\n---\n", 3);
+		expect(end).toBeGreaterThan(0);
+		const fields: Record<string, string> = {};
+		for (const line of content.slice(4, end).split("\n")) {
+			const split = line.indexOf(": ");
+			fields[line.slice(0, split)] = line.slice(split + 2);
+		}
+		const name = fields["name"] ?? "";
+		const rawDescription = fields["description"] ?? "";
+		const description = rawDescription.startsWith('"') ? (JSON.parse(rawDescription) as string) : rawDescription;
+		expect(name).toMatch(/^[a-z0-9][a-z0-9-]{0,63}$/);
+		expect(description.length).toBeGreaterThan(0);
+		expect(description.length).toBeLessThanOrEqual(60);
+		expect(description.endsWith(".")).toBe(true);
+		expect(description).not.toMatch(/[:`<>\n]/);
+		expect(description).not.toMatch(/[.!?]\s/);
+		expect(content.slice(end + 5).trim().length).toBeGreaterThan(0);
+		expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(64_000);
+	});
+
 	test("--due with nothing due says so; --due with ids is a usage error", async () => {
 		expect((await run(["promote", "--due"])).text).toBe("No moments are due for promotion.");
 		expect((await run(["promote", "--due", "feed0001"])).code).toBe(2);
