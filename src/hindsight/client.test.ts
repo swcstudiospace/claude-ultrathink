@@ -453,10 +453,10 @@ describe("errors", () => {
 		const inits: (RequestInit | undefined)[] = [];
 		const redirecting = (async (input: string | URL | Request, init?: RequestInit) => {
 			inits.push(init);
-			return new Response(JSON.stringify({ detail: "moved" }), { status: 302, headers: { Location: "https://evil.example.test/x" } });
+			throw new TypeError("fetch failed: redirect mode is set to error");
 		}) as unknown as typeof fetch;
 		const failure = error(await client(redirecting).recall({ query: "q" }));
-		expect(failure.kind).toBe("invalid-response");
+		expect(failure.kind).toBe("network");
 		expect(inits).toHaveLength(1);
 		expect(inits[0]?.redirect).toBe("error");
 		expect(failure.message).not.toContain(KEY);

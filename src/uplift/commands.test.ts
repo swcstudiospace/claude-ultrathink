@@ -625,7 +625,7 @@ describe("runControl", () => {
 			} finally {
 				globalThis.fetch = realFetch;
 			}
-			expect(fetched.filter((url) => url.includes("hs.example.test") || url.includes("rag.example.test"))).toEqual([]);
+		expect(fetched).toEqual([]);
 		});
 	});
 
