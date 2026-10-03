@@ -65,7 +65,7 @@ Both tools are registered on the `ultrathink` toolset and hidden while `teach st
 
 `ultrathink_lesson_recall` takes `query` and an optional `limit`. Results are untrusted notes. The CLI accepts `--limit` from 1 to 10.
 
-`/ultrathink-learn <note>` saves the note as a `pattern` lesson. The name is the first sentence, cut to 80 characters. With an empty note it replies `Usage: /ultrathink-learn <note>`. On success: `Saved lesson <id> (retain: <retained|queued|local-only>).` On failure: `Could not save the lesson: <reason>.`
+`/ultrathink-learn <note>` saves the note as a `pattern` lesson. The name is the first sentence, cut to 80 characters. With an empty note it replies `Usage: /ultrathink-learn <note>`. On success: `Saved lesson <id> (retain: <retained|queued|local-only>).` On failure: `Could not save the lesson: <reason>`
 
 `/ultrathink-lessons` with no arguments lists lessons. The other forms:
 

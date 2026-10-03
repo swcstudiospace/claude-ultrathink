@@ -129,7 +129,7 @@ Search one question. With no `--dataset`, and with `datasetIds` empty, it search
 0.82  widgets.md: Widgets are stored in the widgets table.
 ```
 
-Each line is a similarity (two decimals, or `n/a`), the document name and an excerpt of at most 300 characters. No matches prints `RAGFlow search: no matches`. No datasets at all prints `RAGFlow search: error (not-ready) · no datasets to search` and exits 1. `--limit` must be an integer from 1 to 100. Anything else is a usage error (exit 2).
+Each line is a similarity (two decimals, or `n/a`), the document name and an excerpt of at most 300 characters. No matches prints `RAGFlow search: no matches`. No datasets at all prints `RAGFlow search: no datasets to search` and exits 1. `--limit` must be an integer from 1 to 100. Anything else is a usage error (exit 2).
 
 ## Grounding
 

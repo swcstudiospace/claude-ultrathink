@@ -97,7 +97,7 @@ Names are at most 120 characters, descriptions 300, bodies 2400.
 
 ### Redaction
 
-Before a lesson is hashed, written or sent, secrets are replaced with `[redacted]`. That covers PEM private keys, URL userinfo (`scheme://user:password@`), `Authorization` headers, `Bearer` tokens that look like credentials, JWTs, common token shapes, and assignments whose name ends in `key`, `token`, `secret`, `password` or `passwd` (`API_KEY`, `apiKey`, `client-secret`; `keyboard` is not one). An absolute path under your home directory that is outside the repository becomes `~/…/<last two segments>`. Redaction is the last defence: do not put a secret in a lesson on purpose. A redaction failure stores `[redacted]` rather than the original text.
+Before a lesson is hashed, written or sent, secrets are replaced with `[redacted]`. That covers PEM private keys, URL userinfo (`scheme://user:password@`), `Authorization` headers, `Bearer` tokens that look like credentials, JWTs, common token shapes, and assignments whose name ends in `key`, `token`, `secret`, `password` or `passwd` (`API_KEY`, `apiKey`, `client-secret`; `keyboard` is not one). An absolute path under your home directory that is outside the repository becomes `~/.../<last two segments>`. Redaction is the last defence: do not put a secret in a lesson on purpose. A redaction failure stores `[redacted]` rather than the original text.
 
 ## 4. List, show, confirm and forget
 
@@ -131,11 +131,11 @@ Forgot 3f2a9c1e-7b04-4d11-9a6e-1c0b8e4d2f10 · remote none
 
 `remote` is `deleted` (Hindsight removed it), `queued` (the delete is in the outbox) or `none` (it was never retained). Unknown id: `no moment <id>`, exit 1.
 
-`confirm`, `forget`, `capture`, `sync` and `promote` refuse to run while Teachable Moments is off. `list`, `show`, `status` and `recall` do not.
+`capture`, `confirm`, `forget`, `sync`, `promote` and `observe` refuse to run while Teachable Moments is off. `list`, `show`, `status` and `recall` do not.
 
 ## 5. Recall
 
-`teach.recall` defaults to on. Set it to `false` in any config file, including a project file, to stop injecting lessons into plans. The CLI can still search.
+`teach.recall` defaults to on. Set it to `false` in any config file, including a project file, to stop injecting lessons into plans. `teach recall` is gated too: with recall off it prints the off header below and exits 0.
 
 ```sh
 <clone>/bin/ultrathink teach recall "bun test"
@@ -220,7 +220,7 @@ The name is `lesson-` plus a slug of the lesson name, cut to 48 characters. The 
 
 `--install` writes the skill for `omp` and `claude` (under the host's skills directory) and marks the lessons promoted only when the file was created or updated. A name already taken by a skill ultrathink did not write, or a symlink, is refused: the line is `refused <path> · <reason>` and the command exits 1. The lessons are not marked promoted.
 
-**Hermes and `drafts` only draft**, even with `--install`. The file is `<state dir>/teach/skill-drafts/<name>/SKILL.md`, and the line is:
+**Hermes and `drafts` only draft**, even with `--install`. The file is `<state dir>/teach/skill-drafts/<name>/SKILL.md`, and the line is (Hermes adds the reason; `drafts` prints the bare `drafted <path>`):
 
 ```text
 drafted <state dir>/teach/skill-drafts/<name>/SKILL.md · install through Hermes skill_manage so skills.write_approval applies; ultrathink never writes ~/.hermes/skills

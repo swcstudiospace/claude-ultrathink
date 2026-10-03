@@ -59,7 +59,7 @@ Add a `hindsight` section to your user config, `${XDG_CONFIG_HOME:-~/.config}/ul
 
 `url` is the server's base URL. When `hindsight.url` is empty, `HINDSIGHT_API_URL` fills it in. No config file a repository controls can set the URL, so opening a repository cannot redirect the key.
 
-`bank` defaults to `ultrathink`. Set it only in a user file, and only as 1 to 64 characters that start with a letter or digit and then contain only letters, digits, `.`, `_` and `-`. Any other value is ignored and the default bank is kept.
+`bank` defaults to `ultrathink`. Set it only in a user file, and only as 1 to 64 characters that start with a letter or digit and then contain only letters, digits, `.`, `_` and `-`. Any other value is ignored and the earlier value stays.
 
 A project file can set `hindsight.enabled` to `false` for that repository. It cannot turn Hindsight on, and it cannot change `url`, `bank` or the timeouts.
 

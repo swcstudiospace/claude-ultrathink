@@ -304,8 +304,9 @@ Any other arguments print that line and exit 2. Exit 0 is ok. Exit 1 is not read
 | Health failed | `Hindsight check: error (<kind>) · <message>`. `--json` includes `ok`, `state`, `origin`, `bank`, `error` and `ms`. | 1 |
 | Ok | `Hindsight check: ok · Hindsight <version> · database connected · bank <bank> · <ms> ms`, then `Features: <name> on|off · …` (or `Features: none reported`). Version is `unknown` when the server reports none. | 0 |
 | Round trip failed | The ok lines, then `Hindsight roundtrip: failed · throwaway bank ultrathink-smoke-<hex>`, then one line per step. | 1 |
+| Round trip ok | The ok lines, then `Hindsight roundtrip: ok · throwaway bank ultrathink-smoke-<hex>`, then one line per step. | 0 |
 
-`--roundtrip` retains, recalls and deletes a probe in a throwaway `ultrathink-smoke-*` bank. It does not read or write the configured bank. Steps, in order, are `ensure bank`, `retain`, `recall`, `delete document` and `delete bank`. A step line is `  <name>: ok · <ms> ms`, `  <name>: failed (<kind>) · <message> · <ms> ms`, or `  <name>: skipped`. Cleanup runs even when an earlier step failed. The client sets the throwaway bank to `chunks` extraction mode; do not enable verbatim or reflect on a server that has no LLM.
+`--roundtrip` retains, recalls and deletes a probe in a throwaway `ultrathink-smoke-*` bank. It does not read or write the configured bank. Steps, in order, are `ensure bank`, `retain`, `recall`, `delete document` and `delete bank`. A step line is `  <name>: ok · <ms> ms`, `  <name>: failed (<kind>) · <message> · <ms> ms`, `  <name>: failed · <note> · <ms> ms` when a passed step's verification fails (recall found no nonce), or `  <name>: skipped`. Cleanup runs even when an earlier step failed. The client sets the throwaway bank to `chunks` extraction mode; do not enable verbatim or reflect on a server that has no LLM.
 
 `check` without `--roundtrip` asks `/health` and `/version`. Those two routes need no key, but the command uses the same readiness check as the status line, so it does not call them while the integration is off, the URL is missing or refused, or the key is missing.
 
