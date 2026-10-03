@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { ControlState } from "../claude/state.ts";
 import type { HostId } from "./types.ts";
@@ -115,5 +116,100 @@ describe("engineLabel", () => {
 		expect(engineLabel(config, {}, "claude-code")).toBe("claude:sonnet");
 		expect(engineLabel(config, {}, "grok-build")).toBe("grok-4.7@xhigh");
 		expect(engineLabel(config, { engine: "muse" }, "claude-code")).toBe("muse:muse-spark-1.3-contributor");
+	});
+});
+
+const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Every .ts file under `dir`, recursively. */
+function tsFiles(dir: string): string[] {
+	const out: string[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...tsFiles(path));
+		else if (entry.name.endsWith(".ts")) out.push(path);
+	}
+	return out;
+}
+
+describe("Vercel is Jev-only: engine code never references it (JEV-03)", () => {
+	const PATTERN = /vercel|ai_gateway|evaluation-model/i;
+
+	test("no engine source file mentions vercel, AI_GATEWAY or evaluation-model", () => {
+		const offenders: string[] = [];
+		let visited = 0;
+		for (const dir of ["host", "claude", "grok", "muse", "think"]) {
+			for (const file of tsFiles(join(SRC, dir))) {
+				if (file.endsWith(".test.ts")) continue;
+				visited++;
+				if (PATTERN.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+			}
+		}
+		expect(visited).toBeGreaterThan(0);
+		expect(offenders).toEqual([]);
+	});
+
+	test("every other production reference is allowlisted: src/decisions, the vercel key provider, the config merge, the status line", () => {
+		// Test files are exempt: they must name the feature to prove it (and fixtures may say "Vercel" incidentally).
+		const allowed = (rel: string): boolean =>
+			rel.startsWith("decisions/") ||
+			rel === "mcp/providers.ts" ||
+			rel === "mcp/cli.ts" ||
+			rel === "config.ts" ||
+			rel === "uplift/commands.ts";
+		const matches: string[] = [];
+		const offenders: string[] = [];
+		let visited = 0;
+		for (const file of tsFiles(SRC)) {
+			if (file.endsWith(".test.ts")) continue;
+			visited++;
+			const rel = relative(SRC, file);
+			if (!PATTERN.test(readFileSync(file, "utf8"))) continue;
+			matches.push(rel);
+			if (!allowed(rel)) offenders.push(rel);
+		}
+		expect(visited).toBeGreaterThan(50);
+		expect(matches).toContain("decisions/vercel.ts");
+		expect(matches).toContain("mcp/providers.ts");
+		expect(offenders).toEqual([]);
+	});
+});
+
+describe("selectEngine with only a Vercel key present (JEV-03)", () => {
+	test("auto still resolves per host and no label mentions vercel or gateway", async () => {
+		const saved = new Map<string, string | undefined>();
+		for (const name of ["OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "HINDSIGHT_API_KEY", "RAGFLOW_API_KEY"]) {
+			saved.set(name, process.env[name]);
+			delete process.env[name];
+		}
+		process.env.AI_GATEWAY_API_KEY = "[REDACTED]";
+		try {
+			const labels = {
+				muse: await labelOf(configWith({}), {}, "muse"),
+				grokBuild: await labelOf(
+					configWith({ grok: { ...defaultConfig().grok, home: emptyHome(), fallbackToClaude: false } }),
+					{},
+					"grok-build",
+				),
+				claudeCode: await labelOf(configWith({}), {}, "claude-code"),
+				hermes: await labelOf(configWith({}), {}, "hermes"),
+				omp: await labelOf(configWith({}), {}, "omp"),
+			};
+			expect(labels).toEqual({
+				muse: "muse:muse-spark-1.3-contributor",
+				grokBuild: "claude:sonnet (grok unavailable)",
+				claudeCode: "claude:sonnet",
+				hermes: "claude:sonnet",
+				omp: "claude:sonnet",
+			});
+			for (const label of Object.values(labels)) {
+				expect(label).not.toMatch(/vercel|gateway/i);
+			}
+		} finally {
+			for (const [name, value] of saved) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 	});
 });
