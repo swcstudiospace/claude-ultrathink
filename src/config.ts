@@ -9,6 +9,7 @@ import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type Dec
 import { DEFAULT_GROK_CONFIG, GROK_EFFORTS, GROK_TRANSPORTS, type GrokConfig, type GrokEffort, type GrokTransport } from "./grok/types.ts";
 import { DEFAULT_HITL_CONFIG, type HitlConfig } from "./hitl/types.ts";
 import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, MERGE_METHODS, type ShipConfig } from "./ship/types.ts";
+import { DEFAULT_MUSE_CONFIG, MUSE_EFFORTS, type MuseConfig, type MuseEffort } from "./muse/types.ts";
 import { CAPTURE_MODES, DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachConfig } from "./teach/types.ts";
 import { MAX_NODES, MIN_NODES, type ThinkConfig } from "./think/types.ts";
 
@@ -100,6 +101,7 @@ export interface UltrathinkConfig {
 	notion: NotionConfig;
 	linear: LinearConfig;
 	track: TrackConfig;
+	muse: MuseConfig;
 	ship: ShipConfig;
 	substrate: SubstrateConfig;
 	/** Jev decision points (OpenRouter Decisions API). Opt-in; no URL key by design (D1). */
@@ -128,6 +130,7 @@ export function defaultConfig(): UltrathinkConfig {
 		},
 		claude: { ...DEFAULT_CLAUDE_CONFIG },
 		grok: { ...DEFAULT_GROK_CONFIG },
+		muse: { ...DEFAULT_MUSE_CONFIG },
 		hitl: { ...DEFAULT_HITL_CONFIG },
 		notion: { ...DEFAULT_NOTION_CONFIG },
 		linear: { ...DEFAULT_LINEAR_CONFIG },
@@ -233,6 +236,19 @@ function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConf
 			typeof grok.shuntMaxTokens === "number" && Number.isInteger(grok.shuntMaxTokens) && grok.shuntMaxTokens > 0
 				? grok.shuntMaxTokens
 				: defaults.shuntMaxTokens,
+	};
+}
+
+/** Like `mergeClaude`: every layer may set the local CLI target; no project tightening (mirrors claude/grok). */
+function mergeMuse(muse: Record<string, unknown> | undefined, defaults: MuseConfig): MuseConfig {
+	if (!muse) return defaults;
+	return {
+		bin: nonEmpty(muse.bin, defaults.bin),
+		model: typeof muse.model === "string" ? muse.model.trim() : defaults.model,
+		reasoningEffort: MUSE_EFFORTS.includes(muse.reasoningEffort as MuseEffort)
+			? (muse.reasoningEffort as MuseEffort)
+			: defaults.reasoningEffort,
+		callTimeoutMs: nonNegativeMs(muse.callTimeoutMs, defaults.callTimeoutMs),
 	};
 }
 
@@ -484,6 +500,7 @@ export function mergeConfig(
 		uplift: mergeUplift(asRecord(file.uplift), base.uplift),
 		claude: mergeClaude(asRecord(file.claude), base.claude),
 		grok: mergeGrok(asRecord(file.grok), base.grok),
+		muse: mergeMuse(asRecord(file.muse), base.muse),
 		hitl: mergeHitl(asRecord(file.hitl), base.hitl),
 		think: mergeThink(asRecord(file.think), base.think),
 		notion: mergeNotion(asRecord(file.notion), base.notion),
