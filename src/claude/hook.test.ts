@@ -1529,7 +1529,7 @@ describe("lessons and RAGFlow documents in the plan", () => {
 
 	test("with nothing configured nothing runs, nothing is contacted and the record is unchanged", async () => {
 		const R = recordingFetch([() => new Response("")]);
-		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, fetch: R.fetch } });
+		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, storePath: tempStore(), fetch: R.fetch } });
 		try {
 			const result = await runPromptSubmit(input, deps);
 			expect(result.record).not.toHaveProperty("lessons");
@@ -1754,7 +1754,7 @@ describe("lessons and RAGFlow documents in the plan", () => {
 		config.teach.enabled = true;
 		config.ragflow.enabled = true;
 		config.ragflow.ground = true;
-		const { deps, cleanup } = baseDeps({ config, complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, fetch: R.fetch } });
+		const { deps, cleanup } = baseDeps({ config, complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, storePath: tempStore(), fetch: R.fetch } });
 		try {
 			const result = await runPromptSubmit(input, deps);
 			expect(result.record?.lessons).toMatchObject({ outcome: "none", count: 0, source: "none" });
@@ -1763,7 +1763,7 @@ describe("lessons and RAGFlow documents in the plan", () => {
 			expect(R.calls).toHaveLength(0);
 
 			// The kill switch beats the config.
-			const killed = await runPromptSubmit(input, { ...deps, decisionsDeps: { env: { ULTRATHINK_TEACH: "0" }, fetch: R.fetch } });
+			const killed = await runPromptSubmit(input, { ...deps, decisionsDeps: { env: { ULTRATHINK_TEACH: "0" }, storePath: tempStore(), fetch: R.fetch } });
 			expect(killed.record?.lessons?.outcome).toBe("off");
 			expect(R.calls).toHaveLength(0);
 		} finally {
