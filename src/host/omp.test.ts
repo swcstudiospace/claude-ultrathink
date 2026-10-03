@@ -46,6 +46,7 @@ function setup(
 		shipConfig?: (cwd: string) => ShipConfig;
 		teachContext?: OmpOptions["teachContext"];
 		spawnObserve?: OmpOptions["spawnObserve"];
+		readSessionModel?: OmpOptions["readSessionModel"];
 	} = {},
 	ctxExtra: Record<string, unknown> = {},
 ) {
@@ -405,6 +406,28 @@ describe("omp extension", () => {
 		gate.resolve("PLAN");
 		await flush();
 		expect(sent).toEqual([{ message: PLAN_MSG, options: { deliverAs: "aside" } }]);
+	});
+
+	test("the planner request carries the session model when the reader finds one", async () => {
+		let seen: Parameters<OmpPlanner>[0] | undefined;
+		const plan = async (...args: Parameters<OmpPlanner>) => {
+			seen = args[0];
+			return "";
+		};
+		const { run } = setup(plan, 1_000, { readSessionModel: () => "xai-oauth/grok-4.6" }, { sessionManager: { getSessionId: () => "s1", getSessionFile: () => "/s.jsonl" } });
+		await run("do it");
+		expect(seen?.model).toBe("xai-oauth/grok-4.6");
+	});
+
+	test("the planner request omits the model when the reader finds nothing", async () => {
+		let seen: Parameters<OmpPlanner>[0] | undefined;
+		const plan = async (...args: Parameters<OmpPlanner>) => {
+			seen = args[0];
+			return "";
+		};
+		const { run } = setup(plan, 1_000, { readSessionModel: () => undefined }, { sessionManager: { getSessionId: () => "s1" } });
+		await run("do it");
+		expect(seen && "model" in seen).toBe(false);
 	});
 });
 

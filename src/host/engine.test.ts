@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { ControlState } from "../claude/state.ts";
 import type { HostId } from "./types.ts";
-import { engineLabel, GROK_LOGIN_REQUIRED, HOST_DEFAULT_ENGINES, selectEngine } from "./engine.ts";
+import { engineForSessionModel, engineLabel, GROK_LOGIN_REQUIRED, HOST_DEFAULT_ENGINES, selectEngine } from "./engine.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -25,8 +25,8 @@ function configWith(overrides: Partial<UltrathinkConfig>): UltrathinkConfig {
 	return { ...defaultConfig(), ...overrides };
 }
 
-async function labelOf(config: UltrathinkConfig, state: ControlState, host: HostId): Promise<string> {
-	const selected = await selectEngine(config, state, "/repo", host);
+async function labelOf(config: UltrathinkConfig, state: ControlState, host: HostId, sessionModel?: unknown): Promise<string> {
+	const selected = await selectEngine(config, state, "/repo", host, sessionModel);
 	return "skipped" in selected ? `skipped:${selected.skipped}` : selected.label;
 }
 
@@ -211,5 +211,62 @@ describe("selectEngine with only a Vercel key present (JEV-03)", () => {
 				else process.env[name] = value;
 			}
 		}
+	});
+});
+
+describe("engineForSessionModel", () => {
+	test("maps model families case-insensitively, provider segment included", () => {
+		for (const [model, engine] of [
+			["claude-sonnet-4-5", "claude"],
+			["Anthropic/claude-opus", "claude"],
+			["xai-oauth/grok-4.6", "grok"],
+			["grok-4.7", "grok"],
+			["GROK-4.7-XHIGH", "grok"],
+			["muse-spark-1.3-contributor", "muse"],
+			["meta/Muse-Spark", "muse"],
+		] as const) {
+			expect(engineForSessionModel(model)).toBe(engine);
+		}
+	});
+
+	test("unknown families, Kimi included, keep the host default", () => {
+		for (const model of ["kimi-k2", "moonshot-v1-8k", "gpt-5", "", "  ", undefined, null, 42, {}]) {
+			expect(engineForSessionModel(model)).toBeUndefined();
+		}
+	});
+});
+
+describe("selectEngine session-model detection (hermes/omp)", () => {
+	const shunt = () => configWith({ grok: { ...defaultConfig().grok, transport: "shunt", shuntBaseUrl: "http://127.0.0.1:3001" } });
+
+	test("hermes and omp follow the session model under auto", async () => {
+		for (const host of ["hermes", "omp"] as const) {
+			expect(await labelOf(shunt(), {}, host, "xai-oauth/grok-4.6")).toBe("grok-4.7@shunt");
+			expect(await labelOf(shunt(), {}, host, "claude-sonnet-4-5")).toBe("claude:sonnet");
+			expect(await labelOf(shunt(), {}, host, "muse-spark-1.3-contributor")).toBe("muse:muse-spark-1.3-contributor");
+		}
+	});
+
+	test("unknown or missing models fall back to the host default", async () => {
+		for (const host of ["hermes", "omp"] as const) {
+			for (const model of ["kimi-k2", "gpt-5", "", undefined] as const) {
+				expect(await labelOf(shunt(), {}, host, model)).toBe("claude:sonnet");
+			}
+		}
+	});
+
+	test("an explicit engine pin wins over the session model", async () => {
+		const config = configWith({ ...shunt(), think: { ...defaultConfig().think, engine: "claude" } });
+		expect(await labelOf(config, {}, "hermes", "xai-oauth/grok-4.6")).toBe("claude:sonnet");
+	});
+
+	test("other hosts ignore the session model", async () => {
+		expect(await labelOf(shunt(), {}, "claude-code", "xai-oauth/grok-4.6")).toBe("claude:sonnet");
+		expect(await labelOf(shunt(), {}, "muse", "xai-oauth/grok-4.6")).toBe("muse:muse-spark-1.3-contributor");
+	});
+
+	test("a detected grok without a login fails over to Claude, never skips", async () => {
+		const config = configWith({ grok: { ...defaultConfig().grok, home: emptyHome(), fallbackToClaude: false } });
+		expect(await labelOf(config, {}, "omp", "grok-4.7")).toBe("claude:sonnet (grok unavailable)");
 	});
 });

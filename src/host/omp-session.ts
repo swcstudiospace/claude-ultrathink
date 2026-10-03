@@ -7,12 +7,13 @@
  * session id on disk even when the long-running Omp extension cannot.
  * Always fail-open: any error means "not a subagent".
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const HEAD_BYTES = 4096;
 const DEFAULT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const MAX_SESSION_BYTES = 32 * 1024 * 1024;
 const SESSION_ID = /^[A-Za-z0-9-]+$/;
 
 export interface OmpSessionScanOptions {
@@ -33,6 +34,34 @@ function headSessionId(path: string): string | undefined {
 		return typeof parsed.id === "string" ? parsed.id : undefined;
 	} finally {
 		closeSync(fd);
+	}
+}
+
+/**
+ * Active model of one Omp session file: the last `model_change` entry's model ("provider/model").
+ * Always fail-open: any error, an oversize file or a missing entry means "unknown".
+ */
+export function readOmpSessionModelFile(path: string | undefined): string | undefined {
+	if (!path?.trim()) return undefined;
+	try {
+		const stat = statSync(path);
+		if (!stat.isFile() || stat.size > MAX_SESSION_BYTES) return undefined;
+		const lines = readFileSync(path, "utf8").split("\n");
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (!lines[i].includes('"model_change"')) continue;
+			try {
+				const parsed: unknown = JSON.parse(lines[i]);
+				if (!parsed || typeof parsed !== "object") continue;
+				const entry = parsed as { type?: unknown; model?: unknown };
+				if (entry.type !== "model_change" || typeof entry.model !== "string" || !entry.model.trim()) continue;
+				return entry.model;
+			} catch {
+				// malformed lines are skipped
+			}
+		}
+		return undefined;
+	} catch {
+		return undefined;
 	}
 }
 

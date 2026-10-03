@@ -29,6 +29,7 @@ import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type BarState, type BarStore, createBarComponent, createBarStore } from "./omp-ui.ts";
 import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { readOmpSessionModelFile } from "./omp-session.ts";
 import { resolveStateDir } from "./paths.ts";
 import { createLineSplitter, parseProgressLine, type ProgressEvent } from "./progress.ts";
 import type { PlanView } from "./view.ts";
@@ -128,6 +129,8 @@ export interface OmpPlanRequest {
 	prompt: string;
 	cwd: string;
 	sessionId: string;
+	/** Active session model id, so the planner follows the model in use. */
+	model?: string;
 }
 
 export interface OmpPlan {
@@ -210,6 +213,7 @@ export const spawnEnginePlanner: OmpPlanner = (request, signal, onEvent) => {
 				prompt: request.prompt,
 				cwd: request.cwd,
 				session_id: request.sessionId,
+				model: request.model ?? "",
 			}),
 		);
 	} catch {
@@ -308,6 +312,8 @@ export function createOmpExtension(
 		mcp?: () => McpState;
 		/** File existence check for subagent detection; defaults to `existsSync`. */
 		exists?: (path: string) => boolean;
+		/** Session-model reader; defaults to `readOmpSessionModelFile`. */
+		readSessionModel?: (sessionFile: string | undefined) => string | undefined;
 		/** Ultrathink state dir holding `sessions/<id>.json`; defaults to the omp host state dir. */
 		stateDir?: string;
 		/** Local ship precheck (`git` only); defaults to `shipPrecheck`. */
@@ -327,6 +333,7 @@ export function createOmpExtension(
 	const uiEnabled = options.ui ?? true;
 	const readMcp = options.mcp ?? readMcpState;
 	const exists = options.exists ?? existsSync;
+	const readSessionModel = options.readSessionModel ?? readOmpSessionModelFile;
 	// Same dir the engine child writes (it runs in the session cwd), made absolute.
 	const stateDir = (cwd: string) => resolve(cwd, options.stateDir ?? resolveStateDir({ ...process.env, ULTRATHINK_HOST: "omp" }));
 
@@ -613,10 +620,17 @@ export function createOmpExtension(
 			scheduleMount();
 			if (isSubagentSession(ctx, exists)) return;
 			try {
+				let model: string | undefined;
+				try {
+					model = readSessionModel(ctx?.sessionManager?.getSessionFile?.());
+				} catch {
+					model = undefined;
+				}
 				const request: OmpPlanRequest = {
 					prompt: event?.prompt ?? "",
 					cwd: ctx?.cwd || process.cwd(),
 					sessionId: ctx?.sessionManager?.getSessionId?.() ?? "",
+					...(model ? { model } : {}),
 				};
 				const submission = turns.get(request.sessionId) ?? 0;
 				if (quick) {

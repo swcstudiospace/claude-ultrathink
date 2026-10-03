@@ -142,12 +142,12 @@ With `think.engine` set to `"auto"` (the default), each host plans with its own 
 | Host | Engine | Model |
 |---|---|---|
 | Claude Code | Claude | `claude.model` (`"sonnet"`) |
-| Hermes Agent | Claude | `claude.model` (`"sonnet"`) |
-| Omp | Claude | `claude.model` (`"sonnet"`) |
+| Hermes Agent | Session model | The engine follows the session's active model (Claude, Grok or Muse); Claude when it cannot be read |
+| Omp | Session model | The engine follows the session's active model (Claude, Grok or Muse); Claude when it cannot be read |
 | Grok Build | Grok | `grok.model` (`"grok-4.7"`) |
 | Muse Code | Muse | `muse.model` (`"muse-spark-1.3-contributor"`) |
 
-On Grok Build without a usable Grok login, planning falls back to Claude and the engine label ends in `(grok unavailable)`; `grok.fallbackToClaude` is not needed for this. Set `think.engine` to a named engine to plan with one engine on every host. Teachable Moments are stored per host (see [`teach`](#teach-teachable-moments)), so every host keeps its own lessons whichever engine it plans with.
+Hermes forwards its hook payload's model and Omp reads its session file's last `model_change` entry, so a Grok session plans with Grok and a Claude session with Claude. An unrecognized model (Kimi included, until it gets an engine) plans with Claude. On Grok Build without a usable Grok login, planning falls back to Claude and the engine label ends in `(grok unavailable)`; `grok.fallbackToClaude` is not needed for this. Set `think.engine` to a named engine to plan with one engine on every host. Teachable Moments are stored per host (see [`teach`](#teach-teachable-moments)), so every host keeps its own lessons whichever engine it plans with.
 
 ### `notion`: Notion tracking
 

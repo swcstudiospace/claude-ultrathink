@@ -77,14 +77,35 @@ function museEngine(config: UltrathinkConfig, cwd: string, suffix = ""): Selecte
 	);
 }
 
+/**
+ * Map a session's active model id to a planning engine. Omp and Hermes sessions run an array of
+ * models, so on those hosts the engine follows the model in use instead of the host default.
+ * Matching is case-insensitive over the whole id, provider segment included, so "xai-oauth/grok-4.6"
+ * and "grok-4.7" both resolve to Grok. Unknown families (Kimi included, until it gets an engine)
+ * return undefined and the caller keeps the host default.
+ */
+export function engineForSessionModel(model: unknown): "claude" | "grok" | "muse" | undefined {
+	if (typeof model !== "string") return undefined;
+	const id = model.toLowerCase();
+	if (id.includes("claude") || id.includes("anthropic")) return "claude";
+	if (id.includes("grok") || id.includes("xai")) return "grok";
+	if (id.includes("muse") || id.includes("spark")) return "muse";
+	return undefined;
+}
+
 export async function selectEngine(
 	config: UltrathinkConfig,
 	state: ControlState,
 	cwd: string,
 	host?: HostId,
+	sessionModel?: unknown,
 ): Promise<SelectedEngine | { skipped: string }> {
 	const requested = state.engine ?? config.think.engine;
-	const engine = requested === "auto" ? HOST_DEFAULT_ENGINES[host ?? detectHost()] : requested;
+	const resolvedHost = host ?? detectHost();
+	// Hermes and Omp sessions switch models mid-stream; elsewhere the host default is the model in use.
+	const detected =
+		requested === "auto" && (resolvedHost === "hermes" || resolvedHost === "omp") ? engineForSessionModel(sessionModel) : undefined;
+	const engine = requested === "auto" ? (detected ?? HOST_DEFAULT_ENGINES[resolvedHost]) : requested;
 	if (engine === "muse") return museEngine(config, cwd);
 	if (engine !== "grok" || !config.grok.enabled) return claudeEngine(config, cwd);
 	if (config.grok.transport !== "shunt") {
