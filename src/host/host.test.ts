@@ -305,6 +305,20 @@ describe("planPrompt", () => {
 		}
 	});
 
+	test("an engine child prompt skips before an engine is selected", async () => {
+		const { root, env, options, calls } = planHarness();
+		try {
+			// Shaped like the prompt a nested hook receives; the literal keeps this
+			// consumer-side pin independent of the producer constant in buildMusePrompt.
+			const nested = "<!-- ultrathink-child-prompt -->\n<system>\nX\n</system>\n\n<user_request>\nadd a widget\n</user_request>";
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: nested, cwd: root }, env, options);
+			expect(response).toEqual({ context: "", skipped: "nested-child" });
+			expect(calls.engine).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("stateless skips return before an engine is selected", async () => {
 		const { root, env, options, calls } = planHarness();
 		try {

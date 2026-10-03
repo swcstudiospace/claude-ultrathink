@@ -281,5 +281,8 @@ describe("planningTarget", () => {
 		expect(planningTarget(`<user_query>\n${child}\n</user_query>`, { cwd, home })).toEqual({ skip: "nested-child" });
 		expect(isNestedChildPrompt("fix the bug <!-- note -->")).toBe(false);
 		expect(planningTarget("fix the bug <!-- note -->", { cwd, home })).toMatchObject({ text: "fix the bug <!-- note -->" });
+		const quoted = `explain what ${CHILD_PROMPT_SENTINEL} does in this doc`;
+		expect(isNestedChildPrompt(quoted)).toBe(false);
+		expect(planningTarget(quoted, { cwd, home })).toMatchObject({ text: quoted });
 	});
 });

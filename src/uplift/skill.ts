@@ -33,9 +33,13 @@ export const ULTRATHINK_SKILLS: readonly string[] = ["ultrathink-kickoff", "ultr
  */
 export const CHILD_PROMPT_SENTINEL = "<!-- ultrathink-child-prompt -->";
 
-/** True when the prompt is an engine child call carrying {@link CHILD_PROMPT_SENTINEL}. */
+/**
+ * True when the prompt IS an engine child call: the marker opens the typed text (inside Grok's
+ * `<user_query>` wrapper when present). A user message that merely quotes the marker still plans.
+ */
 export function isNestedChildPrompt(prompt: string): boolean {
-	return prompt.includes(CHILD_PROMPT_SENTINEL);
+	const typed = grokUserQuery(prompt) ?? prompt;
+	return typed.trimStart().startsWith(CHILD_PROMPT_SENTINEL);
 }
 
 const SUMMARY_MAX = 600;
