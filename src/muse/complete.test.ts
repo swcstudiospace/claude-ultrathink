@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CHILD_ENV } from "../claude/complete.ts";
+import { CHILD_PROMPT_SENTINEL, planningTarget } from "../uplift/skill.ts";
 import { buildMuseArgs, buildMusePrompt, museComplete, parseMuseJsonl } from "./complete.ts";
 
 const dirs: string[] = [];
@@ -57,7 +58,15 @@ describe("buildMuseArgs", () => {
 
 describe("buildMusePrompt", () => {
 	test("system block above the user payload", () => {
-		expect(buildMusePrompt("SYS", "USER")).toBe("<system>\nSYS\n</system>\n\n<user_request>\nUSER\n</user_request>");
+		expect(buildMusePrompt("SYS", "USER")).toBe(
+			`${CHILD_PROMPT_SENTINEL}\n<system>\nSYS\n</system>\n\n<user_request>\nUSER\n</user_request>`,
+		);
+	});
+	test("the nesting sentinel rides first so nested hooks skip without the child env", () => {
+		expect(buildMusePrompt("SYS", "USER").startsWith(`${CHILD_PROMPT_SENTINEL}\n`)).toBe(true);
+	});
+	test("a built child prompt plans to a nested-child skip", () => {
+		expect(planningTarget(buildMusePrompt("SYS", "USER"), { cwd: "/nonexistent" })).toEqual({ skip: "nested-child" });
 	});
 });
 
