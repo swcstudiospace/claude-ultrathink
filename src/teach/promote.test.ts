@@ -708,6 +708,16 @@ describe("filterSkillworthy", () => {
 		expect(JSON.stringify(calls)).not.toContain(JEV_KEY);
 	});
 
+	test("with nothing to judge no request fires, even with Decisions on", async () => {
+		const f = fixture();
+		const { ctx, calls } = withSkillworthy(f, [0.01], { teach: { autoPromote: true } });
+		expect(await filterSkillworthy([], ctx)).toEqual([]);
+		expect(calls).toHaveLength(0);
+		const idle = await promoteDue(ctx);
+		expect(idle).toEqual({ drafted: [], installed: [] });
+		expect(calls).toHaveLength(0);
+	});
+
 	test("no decisions section, a point list without skillworthy, or the kill switch keeps every moment and asks nothing", async () => {
 		const lessons = [moment({ name: "one" }), moment({ name: "two" })];
 		const cases: Array<{ decisions?: Partial<DecisionsConfig> | false; env?: NodeJS.ProcessEnv }> = [
