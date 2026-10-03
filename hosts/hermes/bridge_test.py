@@ -1054,6 +1054,67 @@ def test_init_has_none_of_the_marker_strings_hermes_scans_for_in_its_first_8192_
 		assert marker not in head, marker
 
 
+def test_plugin_yaml_lists_exactly_the_hooks_and_tools_register_installs():
+	section: list[str] | None = None
+	hooks: list[str] = []
+	tools: list[str] = []
+	for line in (HERE / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+		if re.fullmatch(r"hooks:\s*", line):
+			section = hooks
+		elif re.fullmatch(r"provides_tools:\s*", line):
+			section = tools
+		elif re.fullmatch(r"[a-z_]+:.*", line):
+			section = None
+		elif section is not None:
+			item = re.fullmatch(r"\s+-\s+(\S+)\s*", line)
+			if item:
+				section.append(item.group(1))
+	assert hooks and tools
+	ctx = fake_ctx()
+	plugin.register(ctx)
+	assert sorted(set(ctx.hooks)) == sorted(hooks)
+	assert sorted(ctx.tools) == sorted(tools)
+
+
+def test_import_and_register_perform_no_network_or_process_io():
+	import ast
+	import socket
+	import subprocess
+
+	sources = {name: (HERE / name).read_text(encoding="utf-8") for name in ("__init__.py", "bridge.py")}
+	for name, source in sources.items():
+		tree = ast.parse(source)
+		imported: set[str] = set()
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Import):
+				imported.update(alias.name.split(".")[0] for alias in node.names)
+			elif isinstance(node, ast.ImportFrom) and node.module:
+				imported.add(node.module.split(".")[0])
+		assert not (imported & {"socket", "ssl", "urllib", "http", "requests", "httpx", "aiohttp"}), (name, imported)
+		# subprocess is only touched inside functions, never at module scope: importing runs no process.
+		for node in tree.body:
+			if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+				continue
+			for child in ast.walk(node):
+				assert not (isinstance(child, ast.Name) and child.id == "subprocess"), name
+	# register() itself starts nothing: with processes and sockets disabled it still installs everything.
+	ctx = fake_ctx()
+	real_popen, real_run, real_socket = subprocess.Popen, subprocess.run, socket.socket
+
+	def denied(*args: object, **kwargs: object) -> object:
+		raise AssertionError("register() must not start a process or open a socket")
+
+	subprocess.Popen = denied  # type: ignore[assignment]
+	subprocess.run = denied  # type: ignore[assignment]
+	socket.socket = denied  # type: ignore[assignment]
+	try:
+		plugin.register(ctx)
+	finally:
+		subprocess.Popen, subprocess.run, socket.socket = real_popen, real_run, real_socket
+	assert {"post_llm_call", "on_session_finalize", "pre_llm_call"} <= set(ctx.hooks)
+	assert {"ultrathink_lesson_save", "ultrathink_lesson_recall"} <= set(ctx.tools)
+
+
 def test_teach_status_is_cached_for_ten_minutes_and_a_failure_for_one():
 	with teach_env([STATUS_ON]) as directory, fake_clock() as now:
 		first = bridge.teach_status()
@@ -1475,6 +1536,8 @@ if __name__ == "__main__":
 	test_registers_the_teach_hooks_tools_commands_and_skill_next_to_the_old_ones()
 	test_registration_tolerates_a_ctx_missing_teach_methods_and_warns_once_per_piece()
 	test_init_has_none_of_the_marker_strings_hermes_scans_for_in_its_first_8192_chars()
+	test_plugin_yaml_lists_exactly_the_hooks_and_tools_register_installs()
+	test_import_and_register_perform_no_network_or_process_io()
 	test_teach_status_is_cached_for_ten_minutes_and_a_failure_for_one()
 	test_build_digest_reads_hermes_history_rows_and_flags_failed_tool_results()
 	test_build_digest_keeps_the_last_sixty_turns_cut_to_1500_chars_and_needs_two_tool_rows()
