@@ -69,6 +69,8 @@ function baseDeps(overrides: Partial<HookDeps> = {}): { deps: HookDeps; cleanup:
 		brief: async () => "",
 		now: () => 1_000,
 		log: () => {},
+		// Jev is always on, so tests that do not exercise the gate kill it: no ambient key, no network.
+		decisionsDeps: { env: { ULTRATHINK_DECISIONS: "0" } },
 		...overrides,
 	};
 	return { deps, cleanup };
@@ -912,9 +914,15 @@ function jevHarness(config: UltrathinkConfig, fetchImpl: typeof fetch, overrides
 	return { deps, calls, events, logs, cleanup };
 }
 
-/** The same run with a different config (e.g. BASELINE: decisions.enabled false), sharing the state dir and counters. */
+/** The same run with a different config (e.g. an earlier prompt with the tracked config), sharing the state dir and counters. */
 function withConfig(h: JevHarness, config: UltrathinkConfig): HookDeps {
 	return { ...h.deps, config };
+}
+
+/** The same run with Jev killed (BASELINE: decisions off), sharing everything else. */
+function offDeps(deps: HookDeps): HookDeps {
+	const decisionsDeps = deps.decisionsDeps;
+	return { ...deps, decisionsDeps: { ...decisionsDeps, env: { ...decisionsDeps?.env, ULTRATHINK_DECISIONS: "0" } } };
 }
 
 /** `value` with the random graph id replaced, so two planned runs compare equal. */
@@ -982,22 +990,32 @@ function failureFetch(failure: (typeof FAILURES)[number], key: string): { fetch:
 }
 
 describe("Jev plan gate", () => {
-	test("a fresh install sends nothing on the Claude and Grok surfaces and plans as today (AC-1.1)", async () => {
+	test("a fresh install sends nothing without a key, and consults Jev with one (AC-1.1, JEV-01)", async () => {
 		for (const surface of ["claude-code", "grok-build"]) {
-			const R = recordingFetch([JEV(0.01)]);
-			// FRESH: no decisions key anywhere, yet K is both stored and in the environment.
+			const R = recordingFetch([JEV(0.97)]);
+			// FRESH: no decisions key anywhere, and no key in the environment or store.
 			const h = jevHarness(trackedConfig(), R.fetch, {
 				surface,
-				decisionsDeps: { env: { OPENROUTER_API_KEY: K }, storePath: tempStore(K), fetch: R.fetch },
+				decisionsDeps: { env: {}, storePath: tempStore(), fetch: R.fetch },
 			});
 			try {
-				const result = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
+				const keyless = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
 				expect(R.calls).toHaveLength(0);
 				expect(h.calls.engine).toBeGreaterThanOrEqual(1);
-				expect(result.record?.plan).toBeDefined();
-				expect(result).not.toHaveProperty("decisions");
-				expect(result.record).not.toHaveProperty("decisions");
-				expect(result.output?.systemMessage).not.toContain("Decisions ·");
+				expect(keyless.record?.plan).toBeDefined();
+				expect(keyless).not.toHaveProperty("decisions");
+				expect(keyless.record).not.toHaveProperty("decisions");
+				expect(keyless.output?.systemMessage).not.toContain("Decisions ·");
+
+				const keyed = await runPromptSubmit(
+					{ ...input, prompt: NEW_WORK },
+					{
+						...h.deps,
+						decisionsDeps: { env: { OPENROUTER_API_KEY: K }, storePath: tempStore(K), fetch: R.fetch },
+					},
+				);
+				expect(R.calls).toHaveLength(1);
+				expect(keyed.output?.systemMessage).toContain("Decisions · plan 0.97");
 			} finally {
 				h.cleanup();
 			}
@@ -1010,7 +1028,7 @@ describe("Jev plan gate", () => {
 			const h = jevHarness(onConfig(), R.fetch, { surface });
 			try {
 				// An earlier planned prompt of this session: the skip must leave its record untouched (A13).
-				const earlier = await runPromptSubmit({ ...input, prompt: NEW_WORK }, withConfig(h, trackedConfig()));
+				const earlier = await runPromptSubmit({ ...input, prompt: NEW_WORK }, offDeps(withConfig(h, trackedConfig())));
 				const before = sessionText(h.deps.stateDir);
 				const counts = { ...h.calls };
 				h.events.length = 0;
@@ -1056,7 +1074,7 @@ describe("Jev plan gate", () => {
 			const R = recordingFetch([JEV(0.97)]);
 			const h = jevHarness(onConfig(), R.fetch, { surface });
 			try {
-				const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, withConfig(h, onConfig({ enabled: false })));
+				const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, offDeps(h.deps));
 				expect(R.calls).toHaveLength(0);
 				const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps);
 				expect(R.calls).toHaveLength(1);
@@ -1166,7 +1184,7 @@ describe("Jev plan gate", () => {
 			const R = recordingFetch([JEV(0.01)]);
 			const h = jevHarness(onConfig({ points }), R.fetch);
 			try {
-				const base = await runPromptSubmit({ ...input, prompt: ACK }, withConfig(h, onConfig({ enabled: false })));
+				const base = await runPromptSubmit({ ...input, prompt: ACK }, offDeps(h.deps));
 				const jev = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
 				expect(R.calls).toHaveLength(0);
 				expect(jev.record?.plan).toBeDefined();
@@ -1249,7 +1267,7 @@ describe("Jev plan gate", () => {
 		);
 		const config = loadConfig(claudeConfigPaths(project, { XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") }));
 		expect(Object.keys(config.decisions).sort()).toEqual(
-			["blockingAt", "enabled", "groundedAt", "model", "planSkipBelow", "points", "shipApproveAt", "shipVetoAtOrBelow", "skillworthyAt", "teachableAutoAt", "teachableBelow", "timeoutMs", "zdr"],
+			["blockingAt", "enabled", "groundedAt", "model", "planSkipBelow", "points", "provider", "shipApproveAt", "shipVetoAtOrBelow", "skillworthyAt", "teachableAutoAt", "teachableBelow", "timeoutMs", "zdr"],
 		);
 		expect(JSON.stringify(config.decisions)).not.toContain("evil.example");
 		const R = recordingFetch([JEV(0.04)]);
@@ -1271,7 +1289,7 @@ describe("Jev plan gate", () => {
 				const { fetch: fetchImpl, timeoutMs } = failureFetch(failure, "plan_worthy");
 				const h = jevHarness(onConfig({ points: ["plan"], timeoutMs }), fetchImpl);
 				try {
-					const base = await runPromptSubmit({ ...input, prompt: ACK }, withConfig(h, onConfig({ enabled: false })));
+					const base = await runPromptSubmit({ ...input, prompt: ACK }, offDeps(h.deps));
 					const jev = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
 					expect(jev.record?.plan).toBeDefined();
 					expectBaseline(jev, base, `Decisions · error (${failure.kind})`);
@@ -1350,7 +1368,7 @@ describe("Jev knowledge and blocking points through the hook", () => {
 				const h = jevHarness(onConfig({ points: ["knowledge"], timeoutMs }), fetchImpl, { knowledge: usedReader });
 				const deps = { ...h.deps, complete: clarifying(SETTLED) };
 				try {
-					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...deps, config: onConfig({ enabled: false }) });
+					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, offDeps(deps));
 					expect(base.record?.clarifications?.filter((c) => c.source === "knowledge")).toHaveLength(2);
 					const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, deps);
 					expect(jev.record?.clarifications).toEqual(base.record?.clarifications);
@@ -1376,7 +1394,7 @@ describe("Jev knowledge and blocking points through the hook", () => {
 				const h = jevHarness(onConfig({ points: ["blocking"], timeoutMs }), fetchImpl);
 				const deps = { ...h.deps, complete: clarifying(OPEN) };
 				try {
-					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...deps, config: onConfig({ enabled: false }) });
+					const base = await runPromptSubmit({ ...input, prompt: NEW_WORK }, offDeps(deps));
 					expect(base.record?.clarifications?.map((c) => c.blocking)).toEqual([false, false]);
 					const jev = await runPromptSubmit({ ...input, prompt: NEW_WORK }, deps);
 					expect(jev.record?.clarifications).toEqual(base.record?.clarifications);
@@ -1684,10 +1702,10 @@ describe("lessons and RAGFlow documents in the plan", () => {
 		const h = jevHarness(onConfig(), R.fetch, seams);
 		try {
 			expect((await runPromptSubmit({ ...input, prompt: ACK }, h.deps)).skipped).toBe("jev-skip");
-			expect((await runPromptSubmit({ ...input, prompt: "thanks" }, { ...h.deps, config: trackedConfig() })).skipped).toBe("skip");
+			expect((await runPromptSubmit({ ...input, prompt: "thanks" }, offDeps({ ...h.deps, config: trackedConfig() }))).skipped).toBe("skip");
 			expect(calls).toEqual({ recall: 0, ground: 0 });
 			// The same seams do run for a prompt that is planned.
-			const planned = await runPromptSubmit({ ...input, prompt: NEW_WORK }, { ...h.deps, config: trackedConfig() });
+			const planned = await runPromptSubmit({ ...input, prompt: NEW_WORK }, offDeps({ ...h.deps, config: trackedConfig() }));
 			expect(planned.record).toBeDefined();
 			expect(calls).toEqual({ recall: 1, ground: 1 });
 		} finally {

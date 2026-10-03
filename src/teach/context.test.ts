@@ -174,19 +174,18 @@ describe("decisions config layers", () => {
 		});
 	});
 
-	test("a project file cannot turn decisions.enabled on or add teachable or skillworthy", () => {
+	test("decisions.enabled is always on; a project file cannot add teachable or skillworthy beyond the user layer", () => {
 		const { cwd, env, writeJson } = sandbox();
 		const project = join(cwd, ".claude", "ultrathink.json");
-		writeJson(project, { decisions: { enabled: true, points: ["teachable", "skillworthy"] } });
-		expect(teachContext({ cwd, env }).config.decisions?.enabled).toBe(false);
+		// A project file alone: enabled:false is ignored (always on), points narrow from the defaults.
+		writeJson(project, { decisions: { enabled: false, points: ["teachable", "skillworthy"] } });
+		const alone = teachContext({ cwd, env }).config.decisions;
+		expect(alone?.enabled).toBe(true);
+		expect(alone?.points).toEqual(["teachable", "skillworthy"]);
 
+		// With a user layer, the project file can only narrow it, never widen it.
 		writeJson(join(env.XDG_CONFIG_HOME ?? "", "ultrathink", "config.json"), {
 			decisions: { enabled: false, points: ["plan"] },
-		});
-		expect(teachContext({ cwd, env }).config.decisions?.enabled).toBe(false);
-
-		writeJson(join(env.XDG_CONFIG_HOME ?? "", "ultrathink", "config.json"), {
-			decisions: { enabled: true, points: ["plan"] },
 		});
 		writeJson(project, { decisions: { enabled: true, points: ["plan", "teachable", "skillworthy"] } });
 		const loaded = teachContext({ cwd, env }).config.decisions;

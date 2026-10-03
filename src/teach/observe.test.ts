@@ -448,16 +448,13 @@ describe("observeDigest with the Jev teachable point", () => {
 		expect(outcome.decisions).toEqual([{ point: "teachable", action: "fail-open" }]);
 	});
 
-	test("no key, a disabled point, the kill switch or no decisions section make no request", async () => {
+	test("no key, an unlisted point, the kill switch or no decisions section make no request", async () => {
 		for (const setup of [
 			(h: Harness) => {
 				h.ctx.env = { HOME: "/home/someone" };
 			},
 			(h: Harness) => {
 				h.ctx.config = { ...h.ctx.config, decisions: { ...DEFAULT_DECISIONS_CONFIG, enabled: true, points: ["plan"] } };
-			},
-			(h: Harness) => {
-				h.ctx.config = { ...h.ctx.config, decisions: { ...DEFAULT_DECISIONS_CONFIG, enabled: false } };
 			},
 			(h: Harness) => {
 				h.ctx.env = { ...h.ctx.env, ULTRATHINK_DECISIONS: "0" };

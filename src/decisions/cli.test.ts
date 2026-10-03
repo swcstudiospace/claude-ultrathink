@@ -56,7 +56,8 @@ const ERR = (s: number, headers?: Record<string, string>) => () =>
 
 const USAGE =
 	"Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>";
-const NO_KEY = "no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)";
+const NO_KEY =
+	"no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)";
 
 /** Temp project, config layers and credential store; the env holds K unless overridden. */
 function setup(
@@ -105,7 +106,7 @@ describe("decisions check", () => {
 		const out = await runDecisionsCommand(["check"], setup(r));
 		expect(out).toEqual({
 			code: 0,
-			text: "Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost 0.000019 · zdr on · key from OPENROUTER_API_KEY",
+			text: "Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost 0.000019 · provider openrouter · zdr on · key from OPENROUTER_API_KEY",
 		});
 		expectNoKey(out.text);
 		expect(r.calls).toHaveLength(1);
@@ -124,7 +125,7 @@ describe("decisions check", () => {
 		const out = await runDecisionsCommand(["check"], setup(r));
 		expect(out).toEqual({
 			code: 1,
-			text: "Decisions check: error (auth) · decisions auth: HTTP 401: upstream said no for [redacted] · 0 ms · attempts 1 · zdr on · key from OPENROUTER_API_KEY",
+			text: "Decisions check: error (auth) · decisions auth: HTTP 401: upstream said no for [redacted] · 0 ms · attempts 1 · provider openrouter · zdr on · key from OPENROUTER_API_KEY",
 		});
 		expectNoKey(out.text);
 	});
@@ -139,7 +140,7 @@ describe("decisions check", () => {
 		});
 		const out = await runDecisionsCommand(["check"], deps);
 		expect(out.text).toBe(
-			"Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost n/a · zdr on · key from store · url http://127.0.0.1:9999/decisions",
+			"Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost n/a · provider openrouter · zdr on · key from store · url http://127.0.0.1:9999/decisions",
 		);
 		expect(r.calls.map((call) => call.url)).toEqual(["http://127.0.0.1:9999/decisions"]);
 		expect(r.calls[0]?.headers.authorization).toBe(`Bearer ${K}`);
@@ -152,7 +153,7 @@ describe("decisions check", () => {
 		] as const) {
 			const r = recordingFetch([reply]);
 			const out = await runDecisionsCommand(["check"], setup(r, { env: { ULTRATHINK_DECISIONS_URL: override } }));
-			expect(out.text.endsWith(" · key from OPENROUTER_API_KEY · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)")).toBe(true);
+			expect(out.text.endsWith(" · provider openrouter · zdr on · key from OPENROUTER_API_KEY · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)")).toBe(true);
 			expect(out.text).not.toContain("gw.example");
 			expect(out.text).not.toContain("hunter2");
 			expect(r.calls.map((call) => call.url)).toEqual([ENDPOINT]);
@@ -183,6 +184,38 @@ describe("decisions check", () => {
 		const out = await runDecisionsCommand(["check"], setup(r, { env: { OPENROUTER_API_KEY: undefined } }));
 		expect(out).toEqual({ code: 1, text: `Decisions check: ${NO_KEY}` });
 		expect(r.calls).toHaveLength(0);
+	});
+
+	test("auto with a Vercel key checks the vercel rail and shows provider vercel (JEV-02)", async () => {
+		const V = "vck_test_key_do_not_use";
+		const r = recordingFetch([
+			() =>
+				Response.json({
+					answers: { plan_worthy: { type: "boolean", probability: 0.9 } },
+					usage: { inputTokens: 100, outputTokens: 5 },
+				}),
+		]);
+		const out = await runDecisionsCommand(
+			["check"],
+			setup(r, { env: { OPENROUTER_API_KEY: undefined, AI_GATEWAY_API_KEY: V } }),
+		);
+		expect(out).toEqual({
+			code: 0,
+			text: "Decisions check: ok · typesafe-ai/jev (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost n/a · provider vercel · zdr on · key from AI_GATEWAY_API_KEY",
+		});
+		expect(r.calls).toHaveLength(1);
+		expect(r.calls[0].url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
+		expect(out.text).not.toContain(V);
+	});
+
+	test("explicit provider pins the rail even when both keys exist (JEV-02)", async () => {
+		const V = "vck_test_key_do_not_use";
+		const both = { OPENROUTER_API_KEY: K, AI_GATEWAY_API_KEY: V };
+		const r = recordingFetch([JEV(0.9)]);
+		const pinned = await runDecisionsCommand(["check"], setup(r, { config: { decisions: { provider: "openrouter" } }, env: both }));
+		expect(pinned.code).toBe(0);
+		expect(pinned.text).toContain("· provider openrouter ·");
+		expect(r.calls[0].url).toBe(ENDPOINT);
 	});
 });
 
@@ -223,6 +256,24 @@ describe("decisions probe (A11, §5.7)", () => {
 			expect(call.body).not.toHaveProperty("session_id");
 		}
 		expect((r.calls[1]?.body as { state: unknown }).state).toEqual({ message: "thanks, that works now", recent_conversation: "Assistant: done" });
+	});
+
+	test("probe dispatches to the vercel rail when auto picks it (JEV-02)", async () => {
+		const V = "vck_test_key_do_not_use";
+		const r = recordingFetch([
+			() => Response.json({ answers: { plan_worthy: { type: "boolean", probability: 0.97 } } }),
+		]);
+		const deps = setup(r, { env: { OPENROUTER_API_KEY: undefined, AI_GATEWAY_API_KEY: V } });
+		const file = writeCases(deps, [{ message: "build a widget", label: true }]);
+		const out = await runDecisionsCommand(["probe", "plan", file], deps);
+		expect(out.code).toBe(0);
+		expect(out.text.split("\n")).toEqual([
+			"#1 P 0.97 · plan · label true · agree",
+			"Decisions probe: plan · typesafe-ai/jev · cases 1 · labelled 1 · agree 1/1 · errors 0",
+		]);
+		expect(r.calls).toHaveLength(1);
+		expect(r.calls[0].url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
+		expect(out.text).not.toContain(V);
 	});
 
 	test("ship: veto, pass and approve under the thresholds; agreement follows the ship rule", async () => {

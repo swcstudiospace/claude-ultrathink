@@ -9,11 +9,20 @@ import {
 	createDecisions,
 	type DecisionsInput,
 	formatDebugLine,
+	resolveDecisionsKeys,
 	resolveOpenRouterKey,
+	resolveVercelKey,
 	type RunDecisionOptions,
 } from "./gate.ts";
 import { buildPlanState, buildSkillworthyState, buildTeachableState, QUESTIONS } from "./questions.ts";
-import { DECISION_POINTS, DEFAULT_DECISIONS_CONFIG, type DecisionsConfig, type DecisionsErrorKind, formatP } from "./types.ts";
+import {
+	DECISION_POINTS,
+	DEFAULT_DECISIONS_CONFIG,
+	type DecisionsConfig,
+	type DecisionsErrorKind,
+	formatP,
+	VERCEL_DECISIONS_URL,
+} from "./types.ts";
 
 const K = "sk-or-v1-UTTESTKEY-0123456789abcdef";
 const ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
@@ -152,16 +161,16 @@ describe("Decisions.active and inactive runs (AC-2.9)", () => {
 		expect(lines).toEqual([]);
 	});
 
-	test("disabled, or a point not listed, is inactive even with a key", async () => {
+	test("enabled:false no longer deactivates, but a point not listed is inactive even with a key (JEV-01)", async () => {
 		const r = recordingFetch([JEV(0.5)]);
 		const off = runtime(r.fetch, { config: { ...ON, enabled: false } }).decisions;
-		for (const point of DECISION_POINTS) expect(off.active(point)).toBe(false);
-		expect(await off.run("plan", PLAN_STATE, PLAN_OPTS)).toEqual({ status: "inactive" });
+		for (const point of DECISION_POINTS) expect(off.active(point)).toBe(true);
+		expect((await off.run("plan", PLAN_STATE, PLAN_OPTS)).status).toBe("ok");
 		const shipOnly = runtime(r.fetch, { config: { ...ON, points: ["ship"] } }).decisions;
 		expect(DECISION_POINTS.filter((point) => shipOnly.active(point))).toEqual(["ship"]);
 		const none = runtime(r.fetch, { config: { ...ON, points: [] } }).decisions;
 		expect(DECISION_POINTS.filter((point) => none.active(point))).toEqual([]);
-		expect(r.calls).toHaveLength(0);
+		expect(r.calls).toHaveLength(1);
 	});
 
 	test("K1: ULTRATHINK_DECISIONS=0 makes every point inactive with zero requests, even enabled with a key", async () => {
@@ -495,5 +504,92 @@ describe("formatP (A2)", () => {
 			"0.00",
 			"0.04",
 		]);
+	});
+});
+
+describe("provider routing (JEV-02)", () => {
+	const V = "vck_test_key_do_not_use";
+	const VEV = (p: number) => () =>
+		Response.json({
+			answers: { plan_worthy: { type: "boolean", probability: p } },
+			usage: { inputTokens: 100, outputTokens: 5 },
+		});
+
+	function storeWith(providers: Record<string, unknown>): string {
+		const dir = mkdtempSync(join(tmpdir(), "ut-decisions-rail-"));
+		dirs.push(dir);
+		const path = join(dir, "mcp-credentials.json");
+		writeFileSync(path, JSON.stringify({ version: 1, providers }), { mode: 0o600 });
+		return path;
+	}
+	const stored = (key: string) => ({ kind: "api_key", apiKey: key, updatedAt: 1 });
+
+	test("resolveVercelKey: the stored key wins over AI_GATEWAY_API_KEY, which is the fallback", () => {
+		const path = storeWith({ vercel: stored(V) });
+		expect(resolveVercelKey(path, { AI_GATEWAY_API_KEY: "other" })).toEqual({ key: V, source: "store" });
+		expect(resolveVercelKey(storeWith({}), { AI_GATEWAY_API_KEY: ` ${V} ` })).toEqual({ key: V, source: "AI_GATEWAY_API_KEY" });
+		expect(resolveVercelKey(storeWith({}), {})).toBeUndefined();
+	});
+
+	test("auto picks vercel iff its key is present; explicit pins either rail", () => {
+		const auto = { ...ON, provider: "auto" as const };
+		expect(resolveDecisionsKeys(auto, storeWith({}), { AI_GATEWAY_API_KEY: V }).provider).toBe("vercel");
+		expect(resolveDecisionsKeys(auto, storeWith({ vercel: stored(V) }), {}).provider).toBe("vercel");
+		expect(resolveDecisionsKeys(auto, storeWith({}), { OPENROUTER_API_KEY: K }).provider).toBe("openrouter");
+		expect(resolveDecisionsKeys(auto, storeWith({}), {}).provider).toBe("openrouter");
+		expect(resolveDecisionsKeys(auto, storeWith({}), {}).key).toBeUndefined();
+		const pinned = (provider: "openrouter" | "vercel") => ({ ...ON, provider });
+		const both = { AI_GATEWAY_API_KEY: V, OPENROUTER_API_KEY: K };
+		expect(resolveDecisionsKeys(pinned("openrouter"), storeWith({}), both)).toEqual({
+			provider: "openrouter",
+			key: { key: K, source: "OPENROUTER_API_KEY" },
+		});
+		expect(resolveDecisionsKeys(pinned("vercel"), storeWith({}), both)).toEqual({
+			provider: "vercel",
+			key: { key: V, source: "AI_GATEWAY_API_KEY" },
+		});
+		expect(resolveDecisionsKeys(pinned("vercel"), storeWith({}), { OPENROUTER_API_KEY: K }).key).toBeUndefined();
+	});
+
+	test("run() on the vercel rail posts the v4 endpoint and records the gateway model", async () => {
+		const r = recordingFetch([VEV(0.97)]);
+		const { decisions } = runtime(r.fetch, {
+			config: { ...ON, provider: "vercel" },
+			env: { AI_GATEWAY_API_KEY: V },
+		});
+		expect(decisions.active("plan")).toBe(true);
+		const outcome = await decisions.run("plan", PLAN_STATE, PLAN_OPTS);
+		expect(outcome.status).toBe("ok");
+		expect(r.calls).toHaveLength(1);
+		expect(r.calls[0].url).toBe(VERCEL_DECISIONS_URL);
+		expect(r.calls[0].headers["ai-model-id"]).toBe("typesafe-ai/jev");
+		expect(r.calls[0].body).toMatchObject({ questions: { plan_worthy: { type: "boolean" } } });
+		if (outcome.status !== "ok") throw new Error("expected ok");
+		expect(outcome.p).toBe(0.97);
+		expect(outcome.record).toMatchObject({ point: "plan", outcome: "ok", model: "typesafe-ai/jev", action: "plan" });
+	});
+
+	test("run() on auto with both keys uses vercel; explicit openrouter stays on OpenRouter", async () => {
+		const both = { AI_GATEWAY_API_KEY: V, OPENROUTER_API_KEY: K };
+		const r = recordingFetch([VEV(0.5)]);
+		const auto = runtime(r.fetch, { config: { ...ON, provider: "auto" }, env: both }).decisions;
+		await auto.run("plan", PLAN_STATE, PLAN_OPTS);
+		expect(r.calls[0].url).toBe(VERCEL_DECISIONS_URL);
+		const queued = recordingFetch([JEV(0.5)]);
+		const pinned = runtime(queued.fetch, { config: { ...ON, provider: "openrouter" }, env: both }).decisions;
+		expect(pinned.active("plan")).toBe(true);
+		await pinned.run("plan", PLAN_STATE, PLAN_OPTS);
+		expect(queued.calls[0].url).toBe(ENDPOINT);
+	});
+
+	test("the kill switch offs the vercel rail too, with zero requests", async () => {
+		const r = recordingFetch([VEV(0.5)]);
+		const { decisions } = runtime(r.fetch, {
+			config: { ...ON, provider: "vercel" },
+			env: { AI_GATEWAY_API_KEY: V, ULTRATHINK_DECISIONS: "0" },
+		});
+		expect(decisions.active("plan")).toBe(false);
+		expect(await decisions.run("plan", PLAN_STATE, PLAN_OPTS)).toEqual({ status: "inactive" });
+		expect(r.calls).toHaveLength(0);
 	});
 });

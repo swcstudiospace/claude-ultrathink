@@ -163,10 +163,10 @@ describe("planGate", () => {
 		expect(R.calls).toHaveLength(1);
 	});
 
-	test("an inactive point plans with zero requests and no record: disabled, not listed, or no key", async () => {
+	test("an inactive point plans with zero requests and no record: killed, not listed, or no key", async () => {
 		const R = recordingFetch([JEV(0.01)]);
 		for (const decisions of [
-			runtime(R.fetch, { enabled: false }),
+			runtime(R.fetch, {}, undefined, { OPENROUTER_API_KEY: K, ULTRATHINK_DECISIONS: "0" }),
 			runtime(R.fetch, { points: ["ship", "knowledge", "blocking"] }),
 			runtime(R.fetch, { points: [] }),
 			runtime(R.fetch, {}, undefined, {}),

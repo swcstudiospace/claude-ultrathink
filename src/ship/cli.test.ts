@@ -984,7 +984,13 @@ describe("runShip assess with Jev (DP-SHIP)", () => {
 	});
 
 	/** The real assessDone with a Jev runtime (K only in its injected env), an optional judge reply and PR bodies captured. */
-	function jevShip(o: { fetch: typeof fetch; judge?: string; config?: Partial<ShipConfig>; decisions?: Partial<DecisionsConfig> }): ShipDeps {
+	function jevShip(o: {
+		fetch: typeof fetch;
+		judge?: string;
+		config?: Partial<ShipConfig>;
+		decisions?: Partial<DecisionsConfig>;
+		env?: Record<string, string | undefined>;
+	}): ShipDeps {
 		const base = deps({ config: o.config });
 		const github = base.github(dir);
 		const { judge } = o;
@@ -997,7 +1003,7 @@ describe("runShip assess with Jev (DP-SHIP)", () => {
 				createDecisions({
 					config: { ...JEV_ON, ...o.decisions },
 					sessionId: record.sessionId,
-					env: { OPENROUTER_API_KEY: K },
+					env: o.env ?? { OPENROUTER_API_KEY: K },
 					storePath: join(dir, "mcp-credentials.json"),
 					fetch: o.fetch,
 					sleep: async () => {},
@@ -1007,9 +1013,9 @@ describe("runShip assess with Jev (DP-SHIP)", () => {
 		};
 	}
 
-	test("Decisions off: zero requests, and assess JSON and PR body equal the run without a Jev runtime", async () => {
+	test("Decisions killed: zero requests, and assess JSON and PR body equal the run without a Jev runtime", async () => {
 		const r = recordingFetch([JEV(0.03, COMPLETE)]);
-		const d = jevShip({ fetch: r.fetch, judge: DONE_REPLY, decisions: { enabled: false } });
+		const d = jevShip({ fetch: r.fetch, judge: DONE_REPLY, env: { OPENROUTER_API_KEY: K, ULTRATHINK_DECISIONS: "0" } });
 		const baseline = await ship("assess", { ...d, decisions: undefined });
 		expect((await ship("pr", { ...d, decisions: undefined })).output.ok).toBe(true);
 		writeFileSync(statePath, SPEC_STATE);

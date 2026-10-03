@@ -323,7 +323,8 @@ describe("substrate config", () => {
 
 /** Brief §5 defaults, written out so a drifted constant fails here (AC-1.6). */
 const DECISIONS_DEFAULTS: DecisionsConfig = {
-	enabled: false,
+	enabled: true,
+	provider: "auto",
 	model: "~typesafe/jev-latest",
 	points: ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"],
 	timeoutMs: 3000,
@@ -367,7 +368,7 @@ describe("decisions config", () => {
 		return loadConfig(sources);
 	}
 
-	test("a fresh install has decisions off with the brief §5 defaults (AC-1.6)", () => {
+	test("a fresh install has decisions on with the brief §5 defaults (AC-1.6)", () => {
 		expect(defaultConfig().decisions).toEqual(DECISIONS_DEFAULTS);
 		expect(loadLayers(undefined).decisions).toEqual(DECISIONS_DEFAULTS);
 		expect(loadLayers({ uplift: { enabled: false } }, { hitl: { maxQuestions: 2 } }).decisions).toEqual(DECISIONS_DEFAULTS);
@@ -378,12 +379,27 @@ describe("decisions config", () => {
 		expect(defaultConfig().decisions.points).toEqual(["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"]);
 	});
 
-	test("enabled adopts only a boolean; \"yes\" and 1 keep the earlier layer's value (AC-10.5)", () => {
-		expect(loadLayers({}, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
-		expect(loadLayers({ decisions: { enabled: true } }, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
-		for (const enabled of ["yes", 1]) {
-			expect(loadLayers({ decisions: { enabled: true } }, { decisions: { enabled } }).decisions.enabled).toBe(true);
-			expect(loadLayers({}, { decisions: { enabled } }).decisions.enabled).toBe(false);
+	test("enabled is always on: true, false, non-booleans and missing values all merge to true in every layer (JEV-01)", () => {
+		for (const enabled of [true, false, "yes", 1]) {
+			expect(loadLayers({ decisions: { enabled } }).decisions.enabled).toBe(true);
+			expect(loadLayers({}, { decisions: { enabled } }).decisions.enabled).toBe(true);
+			expect(loadLayers({}, undefined, { decisions: { enabled } }).decisions.enabled).toBe(true);
+		}
+		expect(loadLayers({}).decisions.enabled).toBe(true);
+		expect(loadLayers({ decisions: { enabled: false } }, { decisions: { enabled: false } }, { decisions: { enabled: false } }).decisions.enabled).toBe(
+			true,
+		);
+	});
+
+	test("provider accepts auto, openrouter and vercel per layer; anything else keeps the earlier layer (JEV-02)", () => {
+		expect(loadLayers({}).decisions.provider).toBe("auto");
+		expect(loadLayers({ decisions: { provider: "vercel" } }).decisions.provider).toBe("vercel");
+		expect(loadLayers({ decisions: { provider: "vercel" } }, { decisions: { provider: "openrouter" } }).decisions.provider).toBe("openrouter");
+		expect(loadLayers({ decisions: { provider: "openrouter" } }, { decisions: { provider: "auto" } }).decisions.provider).toBe("auto");
+		expect(loadLayers({}, undefined, { decisions: { provider: "vercel" } }).decisions.provider).toBe("vercel");
+		for (const provider of ["VERCEL", "gateway", "", 1, null]) {
+			expect(loadLayers({ decisions: { provider: "vercel" } }, { decisions: { provider } }).decisions.provider).toBe("vercel");
+			expect(loadLayers({}, { decisions: { provider } }).decisions.provider).toBe("auto");
 		}
 	});
 
@@ -472,7 +488,7 @@ describe("decisions config", () => {
 		}
 	});
 
-	test("url and endpoint keys in any layer are ignored: the merged section has exactly the ten keys and no URL (D1, AC-2.12)", () => {
+	test("url and endpoint keys in any layer are ignored: the merged section has exactly the fourteen keys and no URL (D1, AC-2.12)", () => {
 		const config = loadLayers(
 			{ decisions: { url: "https://evil.example/user" } },
 			{ decisions: { enabled: true, url: "https://evil.example/x", endpoint: "https://evil.example/y" } },
@@ -484,12 +500,12 @@ describe("decisions config", () => {
 	});
 
 	describe("a project file can only tighten consent (K5)", () => {
-		test("a project `enabled: true` never opts a user in; a project `enabled: false` turns off a user's `true`", () => {
-			expect(loadLayers({}, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(false);
-			expect(loadLayers({ decisions: { enabled: false } }, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(false);
+		test("a project `enabled` value never changes always-on: true and false in any combination stay true (JEV-01)", () => {
+			expect(loadLayers({}, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
+			expect(loadLayers({ decisions: { enabled: false } }, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
 			expect(loadLayers({ decisions: { enabled: true } }, undefined, { decisions: { enabled: true } }).decisions.enabled).toBe(true);
-			expect(loadLayers({ decisions: { enabled: true } }, undefined, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
-			expect(loadLayers({}, { decisions: { enabled: true } }, { decisions: { enabled: false } }).decisions.enabled).toBe(false);
+			expect(loadLayers({ decisions: { enabled: true } }, undefined, { decisions: { enabled: false } }).decisions.enabled).toBe(true);
+			expect(loadLayers({}, { decisions: { enabled: true } }, { decisions: { enabled: false } }).decisions.enabled).toBe(true);
 		});
 
 		test("a project `zdr: false` never lowers a user's retention guard; a project `zdr: true` raises a user's `false`", () => {
@@ -557,7 +573,7 @@ describe("decisions config", () => {
 			try {
 				expect(loadConfig([file.path]).decisions).toMatchObject({ enabled: true, zdr: false, points: ["plan", "ship"] });
 				expect(loadConfig([{ path: file.path, project: true }]).decisions).toMatchObject({
-					enabled: false,
+					enabled: true,
 					zdr: true,
 					points: ["plan", "ship"],
 				});

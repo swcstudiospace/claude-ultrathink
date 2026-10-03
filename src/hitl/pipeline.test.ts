@@ -499,6 +499,22 @@ function jev(fetchImpl: typeof fetch, points: DecisionPoint[], config: Partial<D
 	return { decisions, lines };
 }
 
+/** `OFF`: the same runtime with the kill switch set — no request, no record, no debug line. */
+function jevOff(fetchImpl: typeof fetch, points: DecisionPoint[]) {
+	const lines: string[] = [];
+	const decisions = createDecisions({
+		config: { ...DEFAULT_DECISIONS_CONFIG, enabled: true, points },
+		env: { OPENROUTER_API_KEY: K, ULTRATHINK_DECISIONS: "0" },
+		storePath: tempStore(),
+		fetch: fetchImpl,
+		now: () => 1000,
+		sleep: async () => {},
+		random: () => 0.5,
+		debug: (line) => lines.push(line),
+	});
+	return { decisions, lines };
+}
+
 interface ClarifyRun {
 	list: Clarification[];
 	records: DecisionRecord[];
@@ -627,33 +643,49 @@ describe("runClarify with Jev decisions", () => {
 		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
-	test("a fresh install sends nothing: no decisions key in any config layer, even with a stored and an env key (AC-1.4)", async () => {
+	test("a fresh install sends nothing without a key, and consults Jev with one (AC-1.4, JEV-01)", async () => {
 		const home = tempDir();
 		const env = { XDG_CONFIG_HOME: join(home, "xdg"), CLAUDE_CONFIG_DIR: join(home, "claude") };
 		mkdirSync(join(env.XDG_CONFIG_HOME, "ultrathink"), { recursive: true });
 		writeFileSync(join(env.XDG_CONFIG_HOME, "ultrathink", "config.json"), JSON.stringify({ hitl: { knowledgeBase: true } }));
 		const config = loadConfig(claudeConfigPaths(join(home, "project"), env));
+		const reply = [kbClaim(SESSIONS_Q), openItem()];
+
+		const today = await clarify(reply, { knowledge: kb() });
+		expect(today.list.map((item) => [item.id, item.source, item.blocking])).toEqual([
+			["q1", undefined, false],
+			["k1", "knowledge", false],
+		]);
+
+		// No key anywhere: nothing sent, today's result.
+		const r0 = recordingFetch([JEV(0.01, "supported")]);
+		const lines0: string[] = [];
+		const keyless = createDecisions({
+			config: config.decisions,
+			env: {},
+			storePath: tempStore(),
+			fetch: r0.fetch,
+			debug: (line) => lines0.push(line),
+		});
+		const run0 = await clarify(reply, { knowledge: kb(), decisions: keyless });
+		expect(r0.calls).toHaveLength(0);
+		expect(run0.records).toEqual([]);
+		expect(lines0).toEqual([]);
+		expect(run0.list).toEqual(today.list);
+
+		// With a key, the same fresh-install config consults Jev.
 		const r = recordingFetch([JEV(0.01, "supported")]);
 		const lines: string[] = [];
 		const decisions = createDecisions({
-			config: config.decisions,
+			config: { ...config.decisions, points: ["knowledge"] },
 			env: { OPENROUTER_API_KEY: K },
 			storePath: tempStore(K),
 			fetch: r.fetch,
 			debug: (line) => lines.push(line),
 		});
-		const reply = [kbClaim(SESSIONS_Q), openItem()];
-
-		const today = await clarify(reply, { knowledge: kb() });
-		const run = await clarify(reply, { knowledge: kb(), decisions });
-		expect(r.calls).toHaveLength(0);
-		expect(run.records).toEqual([]);
-		expect(lines).toEqual([]);
-		expect(run.list).toEqual(today.list);
-		expect(run.list.map((item) => [item.id, item.source, item.blocking])).toEqual([
-			["q1", undefined, false],
-			["k1", "knowledge", false],
-		]);
+		const run = await clarify([kbClaim(SESSIONS_Q)], { knowledge: kb(), decisions });
+		expect(r.calls).toHaveLength(1);
+		expect(run.records).toMatchObject([{ point: "knowledge", p: 0.01, action: "reject-claim" }]);
 	});
 
 	test("with only the plan and ship points listed, clarify sends nothing and returns today's result", async () => {
@@ -668,7 +700,7 @@ describe("runClarify with Jev decisions", () => {
 	describe("DP-KNOWLEDGE", () => {
 		test("an unsupported settled claim is asked as an open question with As stated / Something else, after exactly one request (AC-7.1)", async () => {
 			const r = recordingFetch([JEV(0.05, "supported")]);
-			const off = jev(r.fetch, ["knowledge"], { enabled: false }).decisions;
+			const off = jevOff(r.fetch, ["knowledge"]).decisions;
 			const baseline = await clarify([kbClaim(SESSIONS_Q)], { knowledge: kb(), decisions: off });
 			expect(baseline.list).toMatchObject([{ id: "k1", source: "knowledge", answer: SESSIONS_A, evidence: "docs/auth.md" }]);
 
@@ -709,7 +741,7 @@ describe("runClarify with Jev decisions", () => {
 		test("a supported claim stays settled exactly as with Jev off (AC-7.2)", async () => {
 			const r = recordingFetch([JEV(0.95, "supported")]);
 			const reply = [kbClaim(SESSIONS_Q), openItem()];
-			const baseline = await clarify(reply, { knowledge: kb(), decisions: jev(r.fetch, ["knowledge"], { enabled: false }).decisions });
+			const baseline = await clarify(reply, { knowledge: kb(), decisions: jevOff(r.fetch, ["knowledge"]).decisions });
 			const run = await clarify(reply, { knowledge: kb(), decisions: jev(r.fetch, ["knowledge"]).decisions });
 			expect(r.calls).toHaveLength(1);
 			expect(run.list).toEqual(baseline.list);
@@ -723,7 +755,7 @@ describe("runClarify with Jev decisions", () => {
 					throw new TypeError(`connect ECONNREFUSED while sending ${K}`);
 				},
 			]);
-			const baseline = await clarify([kbClaim(SESSIONS_Q)], { knowledge: kb(), decisions: jev(r.fetch, ["knowledge"], { enabled: false }).decisions });
+			const baseline = await clarify([kbClaim(SESSIONS_Q)], { knowledge: kb(), decisions: jevOff(r.fetch, ["knowledge"]).decisions });
 			const { decisions, lines } = jev(r.fetch, ["knowledge"]);
 			const run = await clarify([kbClaim(SESSIONS_Q)], { knowledge: kb(), decisions });
 			// A network error is transient: retried once within the budget.
@@ -806,7 +838,7 @@ describe("runClarify with Jev decisions", () => {
 			test(`${failure.name} keeps both claims settled exactly as with Jev off and records ${failure.kind} (AC-4.13)`, async () => {
 				const reply = [kbClaim(SESSIONS_Q), RECORDS_CLAIM];
 				const r = recordingFetch([failure.respond]);
-				const baseline = await clarify(reply, { knowledge: kb(), decisions: jev(r.fetch, ["knowledge"], { enabled: false }).decisions });
+				const baseline = await clarify(reply, { knowledge: kb(), decisions: jevOff(r.fetch, ["knowledge"]).decisions });
 				const { decisions, lines } = jev(r.fetch, ["knowledge"], failure.timeoutMs ? { timeoutMs: failure.timeoutMs } : {});
 				const run = await clarify(reply, { knowledge: kb(), decisions });
 				expect(r.calls).toHaveLength(reply.length * failure.attempts);
@@ -830,7 +862,7 @@ describe("runClarify with Jev decisions", () => {
 	describe("DP-BLOCKING", () => {
 		test("a risky default is promoted to blocking after exactly one request (AC-8.1)", async () => {
 			const r = recordingFetch([JEV(0.68, "risky")]);
-			const baseline = await clarify([openItem()], { decisions: jev(r.fetch, ["blocking"], { enabled: false }).decisions });
+			const baseline = await clarify([openItem()], { decisions: jevOff(r.fetch, ["blocking"]).decisions });
 			const { decisions, lines } = jev(r.fetch, ["blocking"]);
 			const run = await clarify([openItem()], { decisions });
 			expect(r.calls).toHaveLength(1);
@@ -844,7 +876,7 @@ describe("runClarify with Jev decisions", () => {
 
 		test("a low-risk default leaves the question exactly as with Jev off (AC-8.2)", async () => {
 			const r = recordingFetch([JEV(0.07, "risky")]);
-			const baseline = await clarify([openItem()], { decisions: jev(r.fetch, ["blocking"], { enabled: false }).decisions });
+			const baseline = await clarify([openItem()], { decisions: jevOff(r.fetch, ["blocking"]).decisions });
 			const run = await clarify([openItem()], { decisions: jev(r.fetch, ["blocking"]).decisions });
 			expect(r.calls).toHaveLength(1);
 			expect(run.list).toEqual(baseline.list);
@@ -916,7 +948,7 @@ describe("runClarify with Jev decisions", () => {
 			test(`${failure.name} leaves both questions non-blocking exactly as with Jev off and records ${failure.kind} (AC-4.14)`, async () => {
 				const reply = [openItem(), openItem("Should the v1 export endpoint be removed?")];
 				const r = recordingFetch([failure.respond]);
-				const baseline = await clarify(reply, { decisions: jev(r.fetch, ["blocking"], { enabled: false }).decisions });
+				const baseline = await clarify(reply, { decisions: jevOff(r.fetch, ["blocking"]).decisions });
 				const { decisions, lines } = jev(r.fetch, ["blocking"], failure.timeoutMs ? { timeoutMs: failure.timeoutMs } : {});
 				const run = await clarify(reply, { decisions });
 				expect(r.calls).toHaveLength(reply.length * failure.attempts);
@@ -972,7 +1004,7 @@ describe("runClarify with Jev decisions", () => {
 		test("without a rejected claim there is no second round, and a kept claim is never sent to the blocking point", async () => {
 			const reply = [kbClaim(SESSIONS_Q), openItem()];
 			const r = recordingFetch([JEV(0.95, "supported"), JEV(0.07, "risky")]);
-			const off = jev(r.fetch, ["knowledge", "blocking"], { enabled: false }).decisions;
+			const off = jevOff(r.fetch, ["knowledge", "blocking"]).decisions;
 			const baseline = await clarify(reply, { knowledge: kb(), decisions: off });
 			const run = await clarify(reply, { knowledge: kb(), decisions: jev(r.fetch, ["knowledge", "blocking"]).decisions });
 			expect(r.calls.map((call) => [Object.keys(sent(call).questions)[0], sent(call).state.question])).toEqual([
@@ -989,7 +1021,7 @@ describe("runClarify with Jev decisions", () => {
 		test("a rejected claim never displaces a clarifier question: with the cap full it is not asked and gets no second round", async () => {
 			const reply = [openItem(), kbClaim(SESSIONS_Q), openItem("Drop the legacy users column?", { blocking: true })];
 			const r = recordingFetch([JEV(0.05, "supported"), JEV(0.07, "risky")]);
-			const off = jev(r.fetch, ["knowledge", "blocking"], { enabled: false }).decisions;
+			const off = jevOff(r.fetch, ["knowledge", "blocking"]).decisions;
 			const baseline = await clarify(reply, { knowledge: kb(), decisions: off, maxQuestions: 2 });
 			expect(baseline.list.map((item) => [item.id, item.question, item.blocking])).toEqual([
 				["q1", COLUMN_Q, false],
@@ -1013,7 +1045,7 @@ describe("runClarify with Jev decisions", () => {
 		test("with an open slot left, a rejected claim is appended after every clarifier question and checked in round 2", async () => {
 			const reply = [openItem(), kbClaim(SESSIONS_Q), openItem("Drop the legacy users column?", { blocking: true })];
 			const r = recordingFetch([JEV(0.05, "supported"), JEV(0.07, "risky")]);
-			const off = jev(r.fetch, ["knowledge", "blocking"], { enabled: false }).decisions;
+			const off = jevOff(r.fetch, ["knowledge", "blocking"]).decisions;
 			const baseline = await clarify(reply, { knowledge: kb(), decisions: off, maxQuestions: 3 });
 
 			const run = await clarify(reply, { knowledge: kb(), decisions: jev(r.fetch, ["knowledge", "blocking"]).decisions, maxQuestions: 3 });

@@ -472,22 +472,25 @@ const PLAN_FAILURES: ReadonlyArray<{ name: string; kind: DecisionsErrorKind; res
 ];
 
 describe("planPrompt with the Jev plan gate", () => {
-	test("a fresh install sends nothing on Hermes, Muse and Omp and plans as today (AC-1.2)", async () => {
+	test("a fresh install sends nothing without a key, and consults Jev with one (AC-1.2, JEV-01)", async () => {
 		for (const host of ["hermes", "muse", "omp"] as const) {
-			const R = recordingFetch([JEV(0.01)]);
+			const R = recordingFetch([JEV(0.97)]);
+			// FRESH: no decisions key anywhere.
 			const h = jevPlanHarness(undefined);
 			try {
-				// FRESH: no decisions key anywhere, yet K is both stored and in the environment.
-				writeFileSync(
-					h.env.ULTRATHINK_MCP_STORE,
-					JSON.stringify({ version: 1, providers: { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } } }),
-					{ mode: 0o600 },
-				);
-				const response = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, h.env, h.options);
+				delete h.env.OPENROUTER_API_KEY;
+				const keyless = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, h.env, h.options);
 				expect(R.calls).toHaveLength(0);
-				expect(response.skipped).toBeUndefined();
-				expect(response.context).not.toBe("");
-				expect(response.summary).not.toContain("Decisions ·");
+				expect(keyless.skipped).toBeUndefined();
+				expect(keyless.context).not.toBe("");
+				expect(keyless.summary).not.toContain("Decisions ·");
+
+				h.env.OPENROUTER_API_KEY = K;
+				const keyed = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, h.env, h.options);
+				expect(R.calls).toHaveLength(1);
+				expect(keyed.skipped).toBeUndefined();
+				expect(keyed.context).not.toBe("");
+				expect(keyed.summary).toContain("Decisions · plan 0.97");
 			} finally {
 				rmSync(h.root, { recursive: true, force: true });
 			}
@@ -535,10 +538,10 @@ describe("planPrompt with the Jev plan gate", () => {
 	test("new work Jev plans is planned as today, with the Decisions bit and the record in the session (AC-3.4)", async () => {
 		for (const host of PLAN_HOSTS) {
 			const R = recordingFetch([JEV(0.97)]);
-			const h = jevPlanHarness({ enabled: false });
+			const h = jevPlanHarness({ enabled: true });
 			try {
-				const base = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, h.env, h.options);
-				h.configure({ enabled: true });
+				const off = { ...h.env, ULTRATHINK_DECISIONS: "0" };
+				const base = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, off, h.options);
 				const jev = await planPrompt({ host, session_id: "s1", prompt: NEW_WORK, cwd: h.root }, h.env, h.options);
 				expect(R.calls).toHaveLength(1);
 				expect(plannedContext(jev)).toBe(plannedContext(base));
@@ -625,10 +628,10 @@ describe("planPrompt with the Jev plan gate", () => {
 		for (const host of PLAN_HOSTS) {
 			for (const points of [["ship"], []]) {
 				const R = recordingFetch([JEV(0.01)]);
-				const h = jevPlanHarness({ enabled: false });
+				const h = jevPlanHarness({ enabled: true, points });
 				try {
-					const base = await planPrompt({ host, session_id: "s1", prompt: ACK, cwd: h.root }, h.env, h.options);
-					h.configure({ enabled: true, points });
+					const off = { ...h.env, ULTRATHINK_DECISIONS: "0" };
+					const base = await planPrompt({ host, session_id: "s1", prompt: ACK, cwd: h.root }, off, h.options);
 					const jev = await planPrompt({ host, session_id: "s1", prompt: ACK, cwd: h.root }, h.env, h.options);
 					expect(R.calls).toHaveLength(0);
 					expect(jev.context).not.toBe("");

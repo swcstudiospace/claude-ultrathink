@@ -753,16 +753,13 @@ describe("assessDone with Jev (DP-SHIP)", () => {
 	});
 	const clean = signals();
 
-	test("a fresh install makes zero requests and every assessment equals the pre-change result (AC-1.3)", async () => {
-		const store = join(decisionsDir(), "mcp-credentials.json");
-		const credential = { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } };
-		writeFileSync(store, JSON.stringify({ version: 1, providers: credential }), { mode: 0o600 });
+	test("a fresh install makes zero requests without a key, and consults Jev with one (AC-1.3, JEV-01)", async () => {
 		const r = recordingFetch([JEV(0.03, COMPLETE)]);
 		const decisions = createDecisions({
 			config: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
 			sessionId: RECORD.sessionId,
-			env: { OPENROUTER_API_KEY: K },
-			storePath: store,
+			env: {},
+			storePath: join(decisionsDir(), "mcp-credentials.json"),
 			fetch: r.fetch,
 		});
 		const runs: { mode: JudgeMode; complete?: ClaudeCompleter; expected: Partial<Assessment> }[] = [
@@ -778,6 +775,22 @@ describe("assessDone with Jev (DP-SHIP)", () => {
 			expect("decision" in fresh).toBe(false);
 		}
 		expect(r.calls).toHaveLength(0);
+
+		// With a key, the same default config consults Jev.
+		const store = join(decisionsDir(), "mcp-credentials.json");
+		const credential = { openrouter: { kind: "api_key", apiKey: K, updatedAt: 1 } };
+		writeFileSync(store, JSON.stringify({ version: 1, providers: credential }), { mode: 0o600 });
+		const r2 = recordingFetch([JEV(0.03, COMPLETE)]);
+		const keyed = createDecisions({
+			config: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
+			sessionId: RECORD.sessionId,
+			env: { OPENROUTER_API_KEY: K },
+			storePath: store,
+			fetch: r2.fetch,
+		});
+		const vetoed = await assessDone({ record: RECORD, signals: clean, diff: FULL_DIFF, complete: DONE_09, now, mode: "gate", decisions: keyed });
+		expect(vetoed).toMatchObject({ done: false, decision: { point: "ship", p: 0.03, action: "veto" } });
+		expect(r2.calls).toHaveLength(1);
 	});
 
 	test("Jev vetoes a confident LLM done on a full patch, after the judge's own gaps (AC-6.1)", async () => {

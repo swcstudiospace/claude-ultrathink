@@ -346,10 +346,10 @@ describe("openrouter API-key provider", () => {
 		expect(readFileSync(store(), "utf8")).toBe(before);
 	});
 
-	test("the usage text says openrouter, hindsight and ragflow are API-key only", () => {
+	test("the usage text says openrouter, vercel, hindsight and ragflow are API-key only", () => {
 		const { stderr } = run("auth", "set-key");
 		expect(stderr).toContain(
-			"  ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)\n  (openrouter, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)\n",
+			"  ultrathink-mcp auth set-key <provider> (--stdin | --env-file <path> --var <NAME>)\n  (openrouter, vercel, hindsight and ragflow are API-key only: set-key, status and logout; never serve, check or login)\n",
 		);
 	});
 

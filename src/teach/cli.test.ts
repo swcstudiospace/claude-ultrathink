@@ -992,7 +992,7 @@ describe("promote", () => {
 		expect(store().get("feed0001-a")?.status).toBe("confirmed");
 	});
 
-	test("--due with a low P omits the moment and says Jev skipped; decisions off lists it", async () => {
+	test("--due with a low P omits the moment and says Jev skipped; killed decisions list it", async () => {
 		seed(playbook());
 		const lowCalls = { n: 0 };
 		const low = await run(["promote", "--due"], {
@@ -1007,8 +1007,8 @@ describe("promote", () => {
 
 		const offCalls = { n: 0 };
 		const off = await run(["promote", "--due"], {
-			env: { ...baseEnv(), OPENROUTER_API_KEY: JEV_KEY },
-			config: { ...config(), decisions: decisionsOn({ enabled: false }) },
+			env: { ...baseEnv(), OPENROUTER_API_KEY: JEV_KEY, ULTRATHINK_DECISIONS: "0" },
+			config: { ...config(), decisions: decisionsOn() },
 			fetch: jevFetch(0.1, offCalls),
 		});
 		expect(off.code).toBe(0);
