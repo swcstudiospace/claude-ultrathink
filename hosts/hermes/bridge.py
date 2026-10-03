@@ -341,8 +341,18 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 		return ""
 	child_env = os.environ.copy()
 	child_env.update(env or {})
-	# Hermes passes no cwd to pre_llm_call; its tools run in TERMINAL_CWD.
-	cwd = payload.get("cwd") or child_env.get("TERMINAL_CWD", "").strip() or os.getcwd()
+	# Hermes passes no cwd to pre_llm_call, so the turn directory comes from the
+	# environment. Local CLI turns (platform "cli") run in the process directory
+	# (the launch dir; --in chdirs first); every other turn only has TERMINAL_CWD.
+	terminal_cwd = child_env.get("TERMINAL_CWD", "").strip()
+	try:
+		process_cwd = os.getcwd()
+	except OSError:
+		process_cwd = ""
+	if payload.get("platform") == "cli":
+		cwd = payload.get("cwd") or process_cwd or terminal_cwd
+	else:
+		cwd = payload.get("cwd") or terminal_cwd or process_cwd
 	request = {
 		"host": "hermes",
 		"session_id": payload.get("session_id") or payload.get("sessionId") or "",

@@ -542,7 +542,7 @@ ultrathink sets these itself. Do not set them.
 | `GROK_PLUGIN_ROOT`, `GROK_HOOK_EVENT`, `GROK_SESSION_ID` | Any of them set means the process runs under Grok Build. |
 | `MUSE_TOOL_USE_ID`, `MUSE_PLUGIN_ID` | Either set means the process runs under Muse Code, so `bin/ultrathink` run from Muse's shell tool changes the Muse state. |
 | `CLAUDE_PLUGIN_ROOT` | Set by the host for plugin hooks and commands. `hooks/hooks.json` and the command files in `commands/` use it to find the checkout. |
-| `TERMINAL_CWD` | Hermes only: the working directory for planning when Hermes passes none. |
+| `TERMINAL_CWD` | Hermes only: the working directory for planning when Hermes passes none, for every turn except local CLI (local CLI turns use the process directory first and this only as a fallback). |
 | `HERMES_SESSION_USER_NAME`, `HERMES_SESSION_KEY` | Hermes gateway session values (read through Hermes' session context, not the process environment): the sender name whose `[Name] ` tag is stripped from shared-session messages, and the chat that `/ultrathink-quick` sends its message to. |
 | `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` | Any of them set marks a remote session, so `auth login` prints port-forwarding hints (and uses the Tailscale route when you opted in). |
 | `USER`, `LOGNAME` | The user name in the printed `ssh -L` command. |
