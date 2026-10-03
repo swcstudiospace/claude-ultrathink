@@ -615,6 +615,27 @@ describe("sync", () => {
 		expect(store().outbox()).toHaveLength(0);
 	});
 
+	test("a failed capture queues one due entry and sync delivers it exactly once", async () => {
+		fake.failRetain = true;
+		const captured = await run(["capture", "--name", "Queued", "--body", "Body."]);
+		expect(captured.code).toBe(0);
+		expect(captured.text).toContain("retain queued");
+		const moments = store().list();
+		expect(moments).toHaveLength(1);
+		const entries = store().outbox();
+		expect(entries).toHaveLength(1);
+		expect(entries[0]).toMatchObject({ op: { op: "retain", momentId: moments[0]?.id }, attempts: 0, enqueuedAt: NOW, nextAt: NOW });
+		fake.failRetain = false;
+		const result = await run(["sync", "--json"]);
+		expect(result.code).toBe(0);
+		expect(json(result)).toEqual({ done: 1, pending: 0 });
+		expect(fake.retained).toHaveLength(1);
+		expect(fake.retained[0]?.documentId).toBe(`tm:${moments[0]?.id}`);
+		expect(store().outbox()).toHaveLength(0);
+		expect(json(await run(["sync", "--json"]))).toEqual({ done: 0, pending: 0 });
+		expect(fake.retained).toHaveLength(1);
+	});
+
 	test("exits 1 with the reason while writes stay pending", async () => {
 		fake.failRetain = true;
 		await run(["capture", "--name", "Queued", "--body", "Body."]);

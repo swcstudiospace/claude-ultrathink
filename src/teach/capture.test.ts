@@ -15,7 +15,7 @@ import {
 import { captureMoment, confirmMoment, forgetMoment, syncOutbox, TeachInputError } from "./capture.ts";
 import { contentFor, dedupeKeyFor, documentIdFor } from "./mapping.ts";
 import { openStore, storeDir } from "./store.ts";
-import { DEFAULT_TEACH_CONFIG, type CaptureInput, type TeachContext, type TeachableMoment } from "./types.ts";
+import { DEFAULT_TEACH_CONFIG, MAX_BODY_CHARS, MAX_DESCRIPTION_CHARS, MAX_NAME_CHARS, type CaptureInput, type TeachContext, type TeachableMoment } from "./types.ts";
 
 const dirs: string[] = [];
 
@@ -187,6 +187,22 @@ describe("captureMoment: normalization and redaction", () => {
 		expect(other.created).toBe(false);
 	});
 
+	test("field caps hold at the limit and just over it", async () => {
+		const { ctx } = setup();
+		const exact = await captureMoment({ name: "N".repeat(MAX_NAME_CHARS), description: "D".repeat(MAX_DESCRIPTION_CHARS), body: "b".repeat(MAX_BODY_CHARS) }, ctx);
+		expect(exact.moment.name).toHaveLength(MAX_NAME_CHARS);
+		expect(exact.moment.description).toHaveLength(MAX_DESCRIPTION_CHARS);
+		expect(exact.moment.body).toHaveLength(MAX_BODY_CHARS);
+		const over = await captureMoment(
+			{ name: `other ${"N".repeat(MAX_NAME_CHARS)}`, description: "D".repeat(MAX_DESCRIPTION_CHARS + 1), body: `z${"b".repeat(MAX_BODY_CHARS)}` },
+			ctx,
+		);
+		expect(over.moment.name).toHaveLength(MAX_NAME_CHARS);
+		expect(over.moment.description).toHaveLength(MAX_DESCRIPTION_CHARS);
+		expect(over.moment.body).toHaveLength(MAX_BODY_CHARS);
+		expect(over.moment.body.startsWith("z")).toBe(true);
+	});
+
 	test("related ids are kept only when they are valid ids, tags and artifacts are capped lists of lines", async () => {
 		const { ctx } = setup();
 		const { moment } = await captureMoment(
@@ -334,6 +350,23 @@ describe("captureMoment: repeats", () => {
 		expect(second.retain).toBe("retained");
 		expect(calls.retain.map((item) => item.documentId)).toEqual([documentIdFor(first.moment.id), documentIdFor(first.moment.id)]);
 		expect(calls.retain[1]?.metadata?.occurrences).toBe("2");
+	});
+
+	test("double capture is one file with occurrences 2 and one tm document", async () => {
+		const { client, calls } = fakeClient();
+		const { ctx, store } = setup({ hindsight: client });
+		const first = await captureMoment(lesson(), ctx);
+		const second = await captureMoment(lesson(), ctx);
+		expect(second.created).toBe(false);
+		expect(second.moment.id).toBe(first.moment.id);
+		expect(second.moment.occurrences).toBe(2);
+		expect(readdirSync(join(store.dir, "moments"))).toEqual([`${first.moment.id}.json`]);
+		const onDisk = JSON.parse(readFileSync(join(store.dir, "moments", `${first.moment.id}.json`), "utf8")) as TeachableMoment;
+		expect(onDisk).toMatchObject({ id: first.moment.id, occurrences: 2 });
+		// The repeat re-retains the updated moment, but it is one document: same tm:<id> every time.
+		expect(calls.retain.length).toBeGreaterThan(0);
+		expect(new Set(calls.retain.map((item) => item.documentId))).toEqual(new Set([`tm:${first.moment.id}`]));
+		expect(readdirSync(join(store.dir, "moments")).filter((file) => file.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("a lower-confidence repeat counts but does not replace the body", async () => {
