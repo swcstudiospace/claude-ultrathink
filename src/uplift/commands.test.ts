@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig, type UltrathinkConfig } from "../config.ts";
+import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { readControl } from "../claude/state.ts";
 import { writeStore } from "../mcp/store.ts";
 import {
@@ -138,6 +138,17 @@ describe("runControl", () => {
 		mkdirSync(join(io.cwd, ".claude"), { recursive: true });
 		// An empty Grok home keeps the OAuth status line off the real ~/.grok.
 		writeFileSync(join(io.cwd, ".claude", "ultrathink.json"), JSON.stringify({ grok: { home: join(dir, "grok") }, ...extra }));
+	}
+
+	/** User-layer config (`~/.config/ultrathink/config.json`); overwrites the whole file. */
+	function userServices(services: Record<string, unknown>): void {
+		mkdirSync(join(dir, "xdg", "ultrathink"), { recursive: true });
+		writeFileSync(join(dir, "xdg", "ultrathink", "config.json"), JSON.stringify(services));
+	}
+
+	/** The credential store holds no file; reads fall through to the environment. */
+	function clearStore(): void {
+		rmSync(process.env.ULTRATHINK_MCP_STORE as string, { recursive: true, force: true });
 	}
 
 	beforeEach(() => {
@@ -463,6 +474,159 @@ describe("runControl", () => {
 			expect(line).toStartWith(prefix);
 			expect(line).not.toStartWith(`${prefix} off (opt-in`);
 		}
+	});
+
+	test("a project file that tries to enable Hindsight and RAGFlow cannot turn status on or retarget the URL", async () => {
+		// User layer leaves both integrations off; the project layer tries to enable them,
+		// point them at a foreign host, and turn grounding on.
+		userServices({});
+		projectConfig({
+			hindsight: { enabled: true, url: "https://evil-hs.example", bank: "evil" },
+			ragflow: { enabled: true, ground: true, url: "https://evil-rf.example", datasetIds: ["evil"] },
+		});
+		// The same load bin/ultrathink status uses: the project layer changes nothing.
+		const merged = loadConfig(claudeConfigPaths(io.cwd));
+		expect(merged.hindsight.enabled).toBe(false);
+		expect(merged.hindsight.url).toBe("");
+		expect(merged.ragflow.enabled).toBe(false);
+		expect(merged.ragflow.ground).toBe(false);
+		expect(merged.ragflow.url).toBe("");
+		expect(merged.ragflow.datasetIds).toEqual([]);
+		const status = await runControl(["status"], io);
+		expect(status).toContain("Hindsight: off (opt-in: set hindsight.enabled)");
+		expect(status).toContain("RAGFlow: off (opt-in: set ragflow.enabled)");
+		expect(status).not.toContain("evil");
+	});
+
+	describe("Hindsight and RAGFlow status lines", () => {
+		const HS_URL = "https://hs.example.test";
+		const RF_URL = "https://rag.example.test";
+		const HS_STORE_KEY = "hs-store-KEY-aaa111";
+		const HS_ENV_KEY = "hs-env-KEY-bbb222";
+		const RF_STORE_KEY = "rf-store-KEY-ccc333";
+		const RF_ENV_KEY = "rf-env-KEY-ddd444";
+
+		function storeKeys(hindsight?: string, ragflow?: string): void {
+			const providers: Record<string, unknown> = {};
+			if (hindsight !== undefined) providers.hindsight = { kind: "api_key", apiKey: hindsight, updatedAt: 1 };
+			if (ragflow !== undefined) providers.ragflow = { kind: "api_key", apiKey: ragflow, updatedAt: 1 };
+			writeStore(process.env.ULTRATHINK_MCP_STORE as string, { version: 1, providers });
+		}
+
+		function serviceLines(text: string): { hindsight: string; ragflow: string } {
+			const hindsight = text.split("\n").find((line) => line.startsWith("Hindsight:"));
+			const ragflow = text.split("\n").find((line) => line.startsWith("RAGFlow:"));
+			if (hindsight === undefined || ragflow === undefined) throw new Error("status printed no Hindsight/RAGFlow lines");
+			return { hindsight, ragflow };
+		}
+
+		test("off, no URL, bad URL, no key, and ready each print a distinct line per integration", async () => {
+			const hindsight: string[] = [];
+			const ragflow: string[] = [];
+			const collect = async (): Promise<void> => {
+				const lines = serviceLines(await runControl(["status"], io));
+				hindsight.push(lines.hindsight);
+				ragflow.push(lines.ragflow);
+			};
+
+			userServices({});
+			clearStore();
+			await collect();
+			expect(hindsight[0]).toBe("Hindsight: off (opt-in: set hindsight.enabled)");
+			expect(ragflow[0]).toBe("RAGFlow: off (opt-in: set ragflow.enabled)");
+
+			userServices({ hindsight: { enabled: true }, ragflow: { enabled: true } });
+			await collect();
+			expect(hindsight[1]).toBe("Hindsight: on · no URL (set hindsight.url or HINDSIGHT_API_URL)");
+			expect(ragflow[1]).toBe("RAGFlow: on · no URL (set ragflow.url or RAGFLOW_URL)");
+
+			userServices({
+				hindsight: { enabled: true, url: "http://hindsight.example.com" },
+				ragflow: { enabled: true, url: "http://ragflow.example.com" },
+			});
+			await collect();
+			expect(hindsight[2]).toContain("Hindsight: on · bad URL (http is allowed only for");
+			expect(ragflow[2]).toContain("RAGFlow: on · bad URL (http is allowed only for");
+
+			userServices({ hindsight: { enabled: true, url: HS_URL }, ragflow: { enabled: true, url: RF_URL } });
+			await collect();
+			expect(hindsight[3]).toBe(
+				"Hindsight: on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)",
+			);
+			expect(ragflow[3]).toBe("RAGFlow: on · no key (run bin/ultrathink-mcp auth set-key ragflow --stdin, or set RAGFLOW_API_KEY)");
+
+			storeKeys(HS_STORE_KEY, RF_STORE_KEY);
+			const text = await runControl(["status"], io);
+			const ready = serviceLines(text);
+			hindsight.push(ready.hindsight);
+			ragflow.push(ready.ragflow);
+			expect(ready.hindsight).toBe(`Hindsight: on · ${HS_URL} · bank ultrathink · key from store`);
+			expect(ready.ragflow).toBe(`RAGFlow: on · ${RF_URL} · key from store · grounding off · all datasets`);
+			expect(text).not.toContain(HS_STORE_KEY);
+			expect(text).not.toContain(RF_STORE_KEY);
+
+			expect(new Set(hindsight).size).toBe(5);
+			expect(new Set(ragflow).size).toBe(5);
+		});
+
+		test("the kill switch forces the off line even when enabled, URL, and key are present", async () => {
+			userServices({ hindsight: { enabled: true, url: HS_URL }, ragflow: { enabled: true, url: RF_URL } });
+			storeKeys(HS_STORE_KEY, RF_STORE_KEY);
+			process.env.ULTRATHINK_HINDSIGHT = "0";
+			process.env.ULTRATHINK_RAGFLOW = "0";
+			const lines = serviceLines(await runControl(["status"], io));
+			expect(lines.hindsight).toBe("Hindsight: off (ULTRATHINK_HINDSIGHT=0)");
+			expect(lines.ragflow).toBe("RAGFlow: off (ULTRATHINK_RAGFLOW=0)");
+		});
+
+		test("an env URL fills in an empty config URL instead of the no-URL line", async () => {
+			userServices({ hindsight: { enabled: true }, ragflow: { enabled: true } });
+			clearStore();
+			process.env.HINDSIGHT_API_URL = "https://env-hs.example";
+			process.env.RAGFLOW_URL = "https://env-rf.example";
+			process.env.HINDSIGHT_API_KEY = HS_ENV_KEY;
+			process.env.RAGFLOW_API_KEY = RF_ENV_KEY;
+			const text = await runControl(["status"], io);
+			const lines = serviceLines(text);
+			expect(lines.hindsight).toBe("Hindsight: on · https://env-hs.example · bank ultrathink · key from HINDSIGHT_API_KEY");
+			expect(lines.ragflow).toBe("RAGFlow: on · https://env-rf.example · key from RAGFLOW_API_KEY · grounding off · all datasets");
+			expect(text).not.toContain(HS_ENV_KEY);
+			expect(text).not.toContain(RF_ENV_KEY);
+		});
+
+		test("the stored key wins over env keys, and env keys are named when nothing is stored", async () => {
+			userServices({ hindsight: { enabled: true, url: HS_URL }, ragflow: { enabled: true, url: RF_URL } });
+			clearStore();
+			process.env.HINDSIGHT_API_KEY = HS_ENV_KEY;
+			process.env.RAGFLOW_API_KEY = RF_ENV_KEY;
+			const fromEnv = serviceLines(await runControl(["status"], io));
+			expect(fromEnv.hindsight).toBe(`Hindsight: on · ${HS_URL} · bank ultrathink · key from HINDSIGHT_API_KEY`);
+			expect(fromEnv.ragflow).toBe(`RAGFlow: on · ${RF_URL} · key from RAGFLOW_API_KEY · grounding off · all datasets`);
+
+			storeKeys(HS_STORE_KEY, RF_STORE_KEY);
+			const text = await runControl(["status"], io);
+			const stored = serviceLines(text);
+			expect(stored.hindsight).toContain("key from store");
+			expect(stored.ragflow).toContain("key from store");
+			for (const secret of [HS_STORE_KEY, HS_ENV_KEY, RF_STORE_KEY, RF_ENV_KEY]) expect(text).not.toContain(secret);
+		});
+
+		test("status makes no request to either service", async () => {
+			userServices({ hindsight: { enabled: true, url: HS_URL }, ragflow: { enabled: true, url: RF_URL } });
+			storeKeys(HS_STORE_KEY, RF_STORE_KEY);
+			const fetched: string[] = [];
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = (async (input: string | URL | Request) => {
+				fetched.push(input instanceof Request ? input.url : String(input));
+				return new Response(null, { status: 500 });
+			}) as unknown as typeof fetch;
+			try {
+				await runControl(["status"], io);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+			expect(fetched.filter((url) => url.includes("hs.example.test") || url.includes("rag.example.test"))).toEqual([]);
+		});
 	});
 
 	test("bin/ultrathink decisions goes to the decisions command, not the control verbs", () => {
