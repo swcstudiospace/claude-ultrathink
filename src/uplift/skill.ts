@@ -24,7 +24,7 @@ export interface SkillLookup {
 }
 
 /** Ultrathink's own skills; a user typing one of them must never re-plan (duplicate tracker rows). */
-export const ULTRATHINK_SKILLS: readonly string[] = ["ultrathink-kickoff", "ultrathink-sync", "ultrathink-plan", "ultrathink-ship"];
+export const ULTRATHINK_SKILLS: readonly string[] = ["ultrathink-kickoff", "ultrathink-sync", "ultrathink-plan", "ultrathink-ship", "ultrathink-teach"];
 
 const SUMMARY_MAX = 600;
 const OMP_PREFIX_RE = /^\[IMPORTANT: User invoked the "([^"]+)" skill; follow its instructions\. Full skill below\.\]/;

@@ -51,12 +51,15 @@ export function redactForLog(input: string): string {
   return s;
 }
 
-/** Append a redacted failure line to `<stateDir>/a01-failures.log` (dir 0700, file 0600; best effort, never throws). */
+/** Maximum failure text per event: one event must never grow the log without bound. */
+export const A01_LOG_MESSAGE_MAX = 500;
+
+/** Append a redacted failure line to `<stateDir>/a01-failures.log` (dir 0700, file 0600; best effort, never throws). One event is one line, however long or broken the failure text is. */
 function markA01FailureInState(logMsg: string, stateDir?: string): void {
   try {
     const base = stateDir || resolveStateDir(process.env);
     mkdirSync(base, { recursive: true, mode: 0o700 });
-    const line = `${new Date().toISOString()} ${redactForLog(logMsg)}\n`;
+    const line = `${new Date().toISOString()} ${redactForLog(logMsg).replace(/\s+/g, " ").trim().slice(0, A01_LOG_MESSAGE_MAX)}\n`;
     appendFileSync(join(base, "a01-failures.log"), line, { encoding: "utf8", mode: 0o600 });
   } catch {
     // fail-open: never block caller

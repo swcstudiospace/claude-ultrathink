@@ -181,6 +181,13 @@ describe("planningTarget", () => {
 		expect(planningTarget(ompScaffold("ultrathink-ship", "Ship."), { cwd, home })).toEqual({ skip: "ultrathink-skill" });
 	});
 
+	test("ultrathink-teach skips on every host surface: slash, omp and hermes scaffolds", () => {
+		expect(planningTarget("/ultrathink-teach save this", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+		expect(planningTarget(ompScaffold("ultrathink-teach", "Teach."), { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+		expect(planningTarget(hermesSingle("ultrathink-teach"), { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+		expect(planningTarget(hermesSingle("ultrathink:ultrathink-teach", "save this"), { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+	});
+
 	test("every name of an /ultrathink-<verb> command skips: typed, expanded, stacked, or wrapped by Grok", () => {
 		const pluginRoot = join(dir, "plugin");
 		put(join(pluginRoot, "commands/ultrathink-quick.md"), "---\ndescription: quick message\n---\n$ARGUMENTS\n");

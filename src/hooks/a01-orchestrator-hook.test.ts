@@ -105,6 +105,16 @@ describe("a01 orchestrator hook failure log", () => {
 		expect(readdirSync(join(cwd, ".planning"))).toEqual([]);
 	});
 
+	test("a multi-line oversized failure is one bounded line", async () => {
+		const stateDir = join(tempDir(), "state");
+		const big = `first\nsecond\ttabbed ${"x".repeat(2000)}`;
+		await withA01OrchestratorTimeout(() => Promise.reject(new Error(big)), { timeoutMs: 5_000, stateDir });
+		const lines = logOf(stateDir).trim().split("\n");
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.length).toBeLessThanOrEqual(24 + 1 + 500);
+		expect(lines[0]).toContain("first second tabbed");
+	});
+
 	test("an unwritable state dir never blocks the caller", async () => {
 		const blocker = join(tempDir(), "file");
 		await Bun.write(blocker, "x");
