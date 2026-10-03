@@ -224,9 +224,20 @@ describe("engineForSessionModel", () => {
 			["GROK-4.7-XHIGH", "grok"],
 			["muse-spark-1.3-contributor", "muse"],
 			["meta/Muse-Spark", "muse"],
+			["anthropic/grok-4.7", "grok"],
+			["openrouter/anthropic/claude-sonnet", "claude"],
+			["xai-oauth/custom-alias", "grok"],
 		] as const) {
 			expect(engineForSessionModel(model)).toBe(engine);
 		}
+	});
+
+	test("the status label names the default honestly on session-model hosts", () => {
+		const config = configWith({});
+		expect(engineLabel(config, {}, "hermes")).toBe("claude:sonnet (follows session model)");
+		expect(engineLabel(config, {}, "omp")).toBe("claude:sonnet (follows session model)");
+		expect(engineLabel(config, { engine: "grok" }, "hermes")).toBe("grok-4.7@xhigh");
+		expect(engineLabel(config, {}, "claude-code")).toBe("claude:sonnet");
 	});
 
 	test("unknown families, Kimi included, keep the host default", () => {

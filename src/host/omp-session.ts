@@ -46,20 +46,27 @@ export function readOmpSessionModelFile(path: string | undefined): string | unde
 	try {
 		const stat = statSync(path);
 		if (!stat.isFile() || stat.size > MAX_SESSION_BYTES) return undefined;
-		const lines = readFileSync(path, "utf8").split("\n");
-		for (let i = lines.length - 1; i >= 0; i--) {
-			if (!lines[i].includes('"model_change"')) continue;
+		// Reverse scan without splitting: sessions reach tens of MB, and a split doubles memory.
+		// A bounded tail scan would miss the start-anchored entry of sessions that never switched.
+		const content = readFileSync(path, "utf8");
+		let index = content.length;
+		for (;;) {
+			index = content.lastIndexOf('"model_change"', index - 1);
+			if (index === -1) return undefined;
+			const start = content.lastIndexOf("\n", index) + 1;
+			let end = content.indexOf("\n", index);
+			if (end === -1) end = content.length;
 			try {
-				const parsed: unknown = JSON.parse(lines[i]);
-				if (!parsed || typeof parsed !== "object") continue;
-				const entry = parsed as { type?: unknown; model?: unknown };
-				if (entry.type !== "model_change" || typeof entry.model !== "string" || !entry.model.trim()) continue;
-				return entry.model;
+				const parsed: unknown = JSON.parse(content.slice(start, end));
+				if (parsed && typeof parsed === "object") {
+					const entry = parsed as { type?: unknown; model?: unknown };
+					if (entry.type === "model_change" && typeof entry.model === "string" && entry.model.trim()) return entry.model;
+				}
 			} catch {
 				// malformed lines are skipped
 			}
+			index = start;
 		}
-		return undefined;
 	} catch {
 		return undefined;
 	}

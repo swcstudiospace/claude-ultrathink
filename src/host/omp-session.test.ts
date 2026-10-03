@@ -98,6 +98,14 @@ describe("readOmpSessionModelFile", () => {
 		expect(readOmpSessionModelFile(path)).toBe("anthropic/claude-sonnet-4-5");
 	});
 
+	test("a message body quoting model_change does not shadow the entry", () => {
+		const path = writeJsonl("-proj/2026_s1.jsonl", [
+			change("xai-oauth/grok-4.6"),
+			JSON.stringify({ type: "message", message: { role: "user", content: 'what does "model_change" mean?' } }),
+		]);
+		expect(readOmpSessionModelFile(path)).toBe("xai-oauth/grok-4.6");
+	});
+
 	test("malformed lines and entries without a model are skipped", () => {
 		const path = writeJsonl("-proj/2026_s1.jsonl", [
 			change("xai-oauth/grok-4.6"),

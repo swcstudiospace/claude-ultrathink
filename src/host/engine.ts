@@ -86,11 +86,16 @@ function museEngine(config: UltrathinkConfig, cwd: string, suffix = ""): Selecte
  */
 export function engineForSessionModel(model: unknown): "claude" | "grok" | "muse" | undefined {
 	if (typeof model !== "string") return undefined;
+	const matchFamily = (text: string): "claude" | "grok" | "muse" | undefined => {
+		if (text.includes("claude") || text.includes("anthropic")) return "claude";
+		if (text.includes("grok") || text.includes("xai")) return "grok";
+		if (text.includes("muse") || text.includes("spark")) return "muse";
+		return undefined;
+	};
 	const id = model.toLowerCase();
-	if (id.includes("claude") || id.includes("anthropic")) return "claude";
-	if (id.includes("grok") || id.includes("xai")) return "grok";
-	if (id.includes("muse") || id.includes("spark")) return "muse";
-	return undefined;
+	const segments = id.split("/").filter((segment) => segment !== "");
+	// The model segment wins over the provider: "anthropic/grok-4.7" is Grok, not Claude.
+	return matchFamily(segments[segments.length - 1] ?? "") ?? matchFamily(id);
 }
 
 export async function selectEngine(
@@ -136,7 +141,15 @@ export async function selectEngine(
 
 export function engineLabel(config: UltrathinkConfig, state: ControlState, host?: HostId): string {
 	const requested = state.engine ?? config.think.engine;
-	const engine = requested === "auto" ? HOST_DEFAULT_ENGINES[host ?? detectHost()] : requested;
-	if (engine === "muse") return `muse:${config.muse.model || "session default"}`;
-	return engine === "grok" && config.grok.enabled ? grokEngineLabel(config.grok) : `claude:${config.claude.model || "session default"}`;
+	const resolvedHost = host ?? detectHost();
+	const engine = requested === "auto" ? HOST_DEFAULT_ENGINES[resolvedHost] : requested;
+	const label =
+		engine === "muse"
+			? `muse:${config.muse.model || "session default"}`
+			: engine === "grok" && config.grok.enabled
+				? grokEngineLabel(config.grok)
+				: `claude:${config.claude.model || "session default"}`;
+	// Hermes and Omp resolve per session, which a static label cannot show; name the default honestly.
+	if (requested === "auto" && (resolvedHost === "hermes" || resolvedHost === "omp")) return `${label} (follows session model)`;
+	return label;
 }
