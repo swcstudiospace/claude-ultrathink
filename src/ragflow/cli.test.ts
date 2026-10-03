@@ -94,6 +94,22 @@ describe("ragflow check", () => {
 		expect(result.text).toContain("RAGFlow check: error (network)");
 	});
 
+	test("a timeout names the kind, exits 1 and never prints the key", async () => {
+		const { fetch } = fakeFetch(() => new Promise<Response>(() => {}));
+		const result = await runRagflowCommand(["check"], deps(fetch, { config: config({ timeoutMs: 25 }) }));
+		expect(result.code).toBe(1);
+		expect(result.text).toContain("RAGFlow check: error (timeout)");
+		expect(result.text).not.toContain(KEY);
+	});
+
+	test("an API error exits 1 without the key", async () => {
+		const { fetch } = fakeFetch(() => new Response("", { status: 500 }));
+		const result = await runRagflowCommand(["check"], deps(fetch));
+		expect(result.code).toBe(1);
+		expect(result.text).toContain("RAGFlow check: error (server)");
+		expect(result.text).not.toContain(KEY);
+	});
+
 	test("not ready: the reason, exit 1, and no request", async () => {
 		const { fetch, calls } = fakeFetch(() => Response.json({ code: 0, data: [], total: 0 }));
 		const disabled = await runRagflowCommand(["check"], deps(fetch, { config: config({ enabled: false }) }));
@@ -159,6 +175,20 @@ describe("ragflow datasets", () => {
 		const result = await runRagflowCommand(["datasets"], deps(fetch));
 		expect(result.code).toBe(1);
 		expect(result.text).toContain("RAGFlow datasets: error (server)");
+	});
+
+	test("auth and timeout failures exit 1 without the key", async () => {
+		const denied = fakeFetch(() => Response.json({ code: 109, message: `invalid key ${KEY}` }));
+		const auth = await runRagflowCommand(["datasets"], deps(denied.fetch));
+		expect(auth.code).toBe(1);
+		expect(auth.text).toContain("RAGFlow datasets: error (auth)");
+		expect(auth.text).not.toContain(KEY);
+
+		const hanging = fakeFetch(() => new Promise<Response>(() => {}));
+		const timeout = await runRagflowCommand(["datasets"], deps(hanging.fetch, { config: config({ timeoutMs: 25 }) }));
+		expect(timeout.code).toBe(1);
+		expect(timeout.text).toContain("RAGFlow datasets: error (timeout)");
+		expect(timeout.text).not.toContain(KEY);
 	});
 
 	test("not ready exits 1 without a request", async () => {
@@ -239,11 +269,56 @@ describe("ragflow search", () => {
 		expect(result.text).not.toContain(QUESTION);
 	});
 
+	test("timeout and API failures exit 1 without the key or the question", async () => {
+		const hanging = fakeFetch(() => new Promise<Response>(() => {}));
+		const timeout = await runRagflowCommand(["search", QUESTION, "--dataset", "a"], deps(hanging.fetch, { config: config({ datasetIds: ["a"], timeoutMs: 25 }) }));
+		expect(timeout.code).toBe(1);
+		expect(timeout.text).toContain("RAGFlow search: error (timeout)");
+		expect(timeout.text).not.toContain(KEY);
+		expect(timeout.text).not.toContain(QUESTION);
+
+		const broken = fakeFetch(() => new Response("", { status: 500 }));
+		const api = await runRagflowCommand(["search", QUESTION, "--dataset", "a"], deps(broken.fetch));
+		expect(api.code).toBe(1);
+		expect(api.text).toContain("RAGFlow search: error (server)");
+		expect(api.text).not.toContain(KEY);
+		expect(api.text).not.toContain(QUESTION);
+	});
+
 	test("not ready exits 1 without a request", async () => {
 		const { fetch, calls } = fakeFetch(() => Response.json({ code: 0, data: { chunks: [] } }));
 		const result = await runRagflowCommand(["search", QUESTION], deps(fetch, { config: config({ enabled: false }) }));
 		expect(result).toEqual({ code: 1, text: "RAGFlow search: off (opt-in: set ragflow.enabled)" });
 		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("request paths", () => {
+	test("check, datasets and search never request a healthz URL; check uses the one-row datasets probe", async () => {
+		const seen: string[] = [];
+		const listing = () => Response.json({ code: 0, data: [{ id: "d1", name: "D" }], total: 1 });
+		const checkServer = fakeFetch((call) => {
+			seen.push(call.url);
+			return listing();
+		});
+		const checkResult = await runRagflowCommand(["check"], deps(checkServer.fetch));
+		expect(checkResult.code).toBe(0);
+		expect(checkServer.calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${URL_BASE}/api/v1/datasets?page=1&page_size=1`]);
+
+		const datasetsServer = fakeFetch((call) => {
+			seen.push(call.url);
+			return listing();
+		});
+		expect((await runRagflowCommand(["datasets"], deps(datasetsServer.fetch))).code).toBe(0);
+
+		const searchServer = fakeFetch((call) => {
+			seen.push(call.url);
+			return call.method === "GET" ? listing() : Response.json({ code: 0, data: { chunks: [] } });
+		});
+		expect((await runRagflowCommand(["search", QUESTION], deps(searchServer.fetch))).code).toBe(0);
+
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.some((url) => url.includes("healthz"))).toBe(false);
 	});
 });
 
