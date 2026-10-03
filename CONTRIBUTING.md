@@ -65,7 +65,7 @@ src/uplift/        Prompt Uplift (spec XML), which prompts to skip, skill invoca
 src/grok/          optional Grok engine and its transports
 src/hitl/          HITL clarification questions and answers
 src/substrate/     optional Agent Substrate brief (only when substrate.url or SUBSTRATE_URL is set)
-src/decisions/     optional OpenRouter Decisions (Jev) client: config defaults and thresholds, the
+src/decisions/     always-on Jev client over OpenRouter or Vercel: config defaults and thresholds, the
                    six questions (including teachable and skillworthy) and their state builders,
                    fail-open runner, decisions check|probe
 src/hindsight/     optional Hindsight client and `bin/ultrathink hindsight` (default off)

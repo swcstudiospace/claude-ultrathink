@@ -37,7 +37,7 @@ The skill drives `bin/ultrathink-ship`. Each gate is enforced by that CLI, not l
 | The Greptile CLI (tested with 3.4.1), signed in with `greptile login` | CLI mode review, when PR mode is not available |
 | A working engine: a logged-in `claude` CLI, or `grok login` (or your shunt gateway) when `think.engine` is `"grok"` | the done judge; required when `ship.autoMerge` is `true` |
 | Optional: GSD's `gsd-tools.cjs`, and `node` on `PATH` to run it | GSD roadmap progress in the assessment, when the repository has `.planning/ROADMAP.md` (see [GSD tools](#gsd-tools)) |
-| Optional: Jev decisions (`decisions.enabled: true` and an OpenRouter key) | a calibrated second check on the done assessment (see [Jev decision](#jev-decision)) |
+| Optional: Jev decisions (a Jev key for the resolved rail) | a calibrated second check on the done assessment (see [Jev decision](#jev-decision)) |
 | Bun 1.2 or later | `bin/ultrathink-ship` itself; without Bun it exits 127 with an install hint |
 
 You need at least one of the two Greptile setups. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md) for the credential store, and [Choose the engine](how-to/choose-engine.md) for the engine.
@@ -107,7 +107,7 @@ When the task is not done in gate mode, the skill hands the gaps back to you and
 
 ### Jev decision
 
-Optional and off by default. With Jev decisions on (`decisions.enabled: true`, `ship` in `decisions.points`, which it is by default, and an OpenRouter key; see [Use Jev decisions](how-to/use-jev-decisions.md)), `assess` also asks OpenRouter's Jev decision model one question: does the patch fully deliver the request and every acceptance criterion, with nothing missing, stubbed or left as a TODO? Jev answers with a probability, P(complete). This applies to every ship run, so to every GSD run by default.
+Optional and keyed: with `ship` in `decisions.points` (which it is by default) and a Jev key for the resolved rail (see [Use Jev decisions](how-to/use-jev-decisions.md)), `assess` also asks Jev one question: does the patch fully deliver the request and every acceptance criterion, with nothing missing, stubbed or left as a TODO? Jev answers with a probability, P(complete). This applies to every ship run, so to every GSD run by default.
 
 - Jev is asked only after the rules pass. A rule gap returns before any request, and Jev never overrides one. The GSD roadmap and verification signals stay rules and never go to Jev.
 - Jev gets only the original request, the items of the spec's `ACCEPTANCE_CRITERIA` element (up to 20, 500 characters each) and the patch (lockfiles left out, 24,000 characters at most). No diff stat, commit log, GSD or git signals.
@@ -388,4 +388,4 @@ The Jev thresholds for the done assessment are `decisions.shipVetoAtOrBelow` (de
 
 Either way, the plan has no `## Ship` section and no nudge is sent. `bin/ultrathink-ship` still works when you run it yourself. To keep the review but merge by hand, leave `"autoMerge": false`: `run` then stops once the PR is ready.
 
-To keep ship but stop only the Jev check, remove `"ship"` from `decisions.points`, or leave `decisions.enabled` off (the default).
+To keep ship but stop only the Jev check, remove `"ship"` from `decisions.points`, or set `ULTRATHINK_DECISIONS=0`.

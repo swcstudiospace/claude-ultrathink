@@ -111,7 +111,7 @@ Set these in the environment of the host process. They override config and the c
 | `ULTRATHINK_UPLIFT=0` | No planning at all for this process. Useful for automation and `claude -p` runners. |
 | `ULTRATHINK_TRACK=0` | The planner creates no Linear/Notion rows. Planning continues, and `ultrathink-kickoff` creates the rows in the agent's turn instead. With a tracker configured, `/ultrathink-status` shows `Tracking: kickoff`. `track.enabled: false` in config does the same, unless `/ultrathink-track on` was run on that host (the per-host setting beats `track.enabled`; this variable beats both). |
 | `ULTRATHINK_SHIP=0` | No ship nudge and no `## Ship` section in the plan, even with `ship.enabled: true`. See [Ship](ship.md). |
-| `ULTRATHINK_DECISIONS=0` | No Jev decision at any point, even with `decisions.enabled: true`: no request, no decision record, no plan-skip notice. `/ultrathink-status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` refuse with exit 1. See [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again). |
+| `ULTRATHINK_DECISIONS=0` | No Jev decision at any point, whatever the config says: no request, no decision record, no plan-skip notice. It is the only off switch. `/ultrathink-status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` refuse with exit 1. See [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again). |
 | `ULTRATHINK_HINDSIGHT=0` | No Hindsight request, even with `hindsight.enabled: true`. `/ultrathink-status` shows `Hindsight: off (ULTRATHINK_HINDSIGHT=0)`. |
 | `ULTRATHINK_RAGFLOW=0` | No RAGFlow request, even with `ragflow.enabled: true`. `/ultrathink-status` shows `RAGFlow: off (ULTRATHINK_RAGFLOW=0)`. |
 | `ULTRATHINK_TEACH=0` | No lesson capture, recall or promote while Teachable Moments would otherwise be on. See [Configuration](configuration.md#teach-teachable-moments). |
@@ -119,7 +119,7 @@ Set these in the environment of the host process. They override config and the c
 | `ULTRATHINK_HOST` | Forces the host id: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. This selects the state directory, which matters for `bin/ultrathink` run from a plain terminal. |
 | `ULTRATHINK_STATE_DIR` | Overrides the state directory. Use an absolute path (a relative one resolves differently per host; see [Configuration](configuration.md#environment-variables)). It is ignored if it points into a `.planning/` directory. |
 
-The other variables (credential store, OAuth callback and Tailscale opt-in, Hermes timeout, Agent Substrate, OpenRouter key and Decisions endpoint, GSD tools, Bun) are listed in [Configuration: Environment variables](configuration.md#environment-variables).
+The other variables (credential store, OAuth callback and Tailscale opt-in, Hermes timeout, Agent Substrate, Jev keys and Decisions endpoint, GSD tools, Bun) are listed in [Configuration: Environment variables](configuration.md#environment-variables).
 
 ## CLI reference
 
@@ -192,7 +192,7 @@ Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
-Decisions: off (opt-in: set decisions.enabled)
+Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
 Teach: off (opt-in: set teach.enabled)
@@ -213,7 +213,7 @@ What the lines can say:
 | `Substrate` | `off (optional: set substrate.url or SUBSTRATE_URL)`, `off (SUBSTRATE_DISABLED=1)`, or `<url> (SUBSTRATE_URL)` / `<url> (config)` showing where the URL came from. |
 | `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
 | `Knowledge base` | The Greptile knowledge-base read before the clarifying questions (see [`hitl.knowledgeBase`](configuration.md#hitl-clarifying-questions)): `off (opt-in: set hitl.knowledgeBase)`; `on · not read while HITL is off`; `on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)`; or `on · Greptile` (`on · Greptile · organization <org>` when `ship.greptileOrganization` is set). |
-| `Decisions` | Jev decisions through the OpenRouter Decisions API (see [`decisions`](configuration.md#decisions-jev-decisions-openrouter-decisions-api)): `off (ULTRATHINK_DECISIONS=0)` when that variable is set, whatever the config says; `off (opt-in: set decisions.enabled)`; `on · no OpenRouter key (…)` when no key is stored and `OPENROUTER_API_KEY` is unset; or `on · <model> · <points> · key from <source> · zdr on\|off`, where `<points>` is the `decisions.points` list joined by `, ` (or `no points`), `<source>` is `store` or `OPENROUTER_API_KEY` (never the key), and ` · url <url>` (origin and path only) is added while `ULTRATHINK_DECISIONS_URL` is in effect, or ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted. |
+| `Decisions` | Jev decisions over OpenRouter or Vercel (see [`decisions`](configuration.md#decisions-jev-decisions-openrouter-decisions-api)): `off (ULTRATHINK_DECISIONS=0)` when that variable is set, whatever the config says; `on · no Jev key (…)` when there is no key for the resolved rail; or `on · <model> · <points> · provider <vercel\|openrouter> · key from <source> · zdr on\|off`, where `<points>` is the `decisions.points` list joined by `, ` (or `no points`), `<source>` is `store`, `AI_GATEWAY_API_KEY` or `OPENROUTER_API_KEY` (never the key), and, on the OpenRouter rail only, ` · url <url>` (origin and path only) is added while `ULTRATHINK_DECISIONS_URL` is in effect, or ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted. |
 | `Model` | `claude.model` and `claude.concurrency`. |
 | `State` | The state directory in use. |
 | `Hindsight` | Starts with `Hindsight: `. `off (ULTRATHINK_HINDSIGHT=0)`; `off (opt-in: set hindsight.enabled)`; `on · no URL (set hindsight.url or HINDSIGHT_API_URL)`; `on · bad URL (<reason>)`; `on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`; or `on · <origin> · bank <bank> · key from <store|HINDSIGHT_API_KEY|HINDSIGHT_API_TOKEN>`. Never the key, never a URL path. |
@@ -221,18 +221,17 @@ What the lines can say:
 | `Teach` | Starts with `Teach: `. `off (opt-in: set teach.enabled)` while `teach.enabled` is false, even if `ULTRATHINK_TEACH=0` is set; `off (ULTRATHINK_TEACH=0)` when enabled and that variable is `0`; or `on · capture <mode> · recall on|off · <n> confirmed, <m> candidate · Hindsight <ready|off|no URL|bad URL|no key> · outbox <k>`. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
 
-The `Decisions:` line in full, in its four forms:
+The `Decisions:` line in full, in its three forms:
 
-- `Decisions: off (ULTRATHINK_DECISIONS=0)`: `ULTRATHINK_DECISIONS=0` is set in the environment. It is checked before `decisions.enabled`, and no point sends a request.
-- `Decisions: off (opt-in: set decisions.enabled)`: `decisions.enabled` is `false`, the default. No point sends a request.
-- `Decisions: on · no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`: turned on, but there is no key, so no point sends a request.
-- `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · key from store · zdr on`: turned on with the defaults and a stored key. With no stored key and the key in the environment it reads `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · key from OPENROUTER_API_KEY · zdr on`.
+- `Decisions: off (ULTRATHINK_DECISIONS=0)`: `ULTRATHINK_DECISIONS=0` is set in the environment. It is the only off switch, and no point sends a request.
+- `Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)`: no key for the resolved rail, so no point sends a request.
+- `Decisions: on · ~typesafe/jev-latest · plan, ship, knowledge, blocking, teachable, skillworthy · provider vercel · key from store · zdr on`: ready with the defaults and a stored key. With no stored key and the key in the environment it reads `… provider vercel · key from AI_GATEWAY_API_KEY · zdr on`, and on the OpenRouter rail `… provider openrouter · key from store · zdr on`.
 
-The ready form ends with ` · url <url>` while an accepted `ULTRATHINK_DECISIONS_URL` is in effect, showing only its origin and path, or with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted; requests then go to the default endpoint. See [Configuration: Environment variables](configuration.md#environment-variables).
+On the OpenRouter rail, the ready form ends with ` · url <url>` while an accepted `ULTRATHINK_DECISIONS_URL` is in effect, showing only its origin and path, or with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted; requests then go to the default endpoint. The Vercel rail never shows it. See [Configuration: Environment variables](configuration.md#environment-variables).
 
 #### `bin/ultrathink decisions`
 
-Operator tools for [Jev decisions](how-to/use-jev-decisions.md). Both read the `decisions` config for the current directory (`model`, `zdr`, `timeoutMs` and the thresholds) and ignore `decisions.enabled` and `decisions.points`, so you can try them before you turn Decisions on. `ULTRATHINK_DECISIONS=0` still applies: with it set, both refuse without a request. Both need an OpenRouter key (stored with `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) and send real requests to the Decisions API; one decision costs about $0.000019.
+Operator tools for [Jev decisions](how-to/use-jev-decisions.md). Both read the `decisions` config for the current directory (`provider`, `model`, `zdr`, `timeoutMs` and the thresholds) and ignore `decisions.enabled` and `decisions.points`. `ULTRATHINK_DECISIONS=0` still applies: with it set, both refuse without a request. Both need a Jev key for the resolved rail (stored with `bin/ultrathink-mcp auth set-key vercel --stdin` or `bin/ultrathink-mcp auth set-key openrouter --stdin`, or `AI_GATEWAY_API_KEY` / `OPENROUTER_API_KEY`) and send real requests to that rail; one OpenRouter decision costs about $0.000019.
 
 ```text
 Usage: ultrathink decisions check | ultrathink decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>
@@ -243,17 +242,17 @@ Any other arguments print that usage line and exit 2.
 `decisions check` sends one plan-gate decision about a fixed test message (`Add a --verbose flag to the export command`, no session id) and prints one line, for example:
 
 ```text
-Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 512 ms · attempts 1 · cost 0.000019 · zdr on · key from store
+Decisions check: ok · typesafe/jev-1.13-20260917 (requested ~typesafe/jev-latest) · 512 ms · attempts 1 · cost 0.000019 · provider openrouter · zdr on · key from store
 ```
 
 | Result | Output | Exit |
 |---|---|---|
-| Answered | `Decisions check: ok · <resolved model> (requested <decisions.model>) · <ms> ms · attempts <n> · cost <cost> · zdr on\|off · key from <store\|OPENROUTER_API_KEY>`. `<cost>` is `n/a` when OpenRouter reports none. | 0 |
-| Failed | `Decisions check: error (<kind>) · <message> · <ms> ms · attempts <n> · zdr on\|off · key from <source>`. `<message>` is the redacted one-line error, for example `decisions auth: HTTP 401: User not found.` See [Troubleshooting: Decisions](troubleshooting.md#decisions) for every `<kind>`. | 1 |
+| Answered | `Decisions check: ok · <resolved model> (requested <decisions.model>) · <ms> ms · attempts <n> · cost <cost> · provider <vercel\|openrouter> · zdr on\|off · key from <store\|AI_GATEWAY_API_KEY\|OPENROUTER_API_KEY>`. `<cost>` is `n/a` when the rail reports none (Vercel always reports none). | 0 |
+| Failed | `Decisions check: error (<kind>) · <message> · <ms> ms · attempts <n> · provider <vercel\|openrouter> · zdr on\|off · key from <source>`. `<message>` is the redacted one-line error, for example `decisions auth: HTTP 401: User not found.` See [Troubleshooting: Decisions](troubleshooting.md#decisions) for every `<kind>`. | 1 |
 | Turned off | `Decisions check: off (ULTRATHINK_DECISIONS=0)`, with `ULTRATHINK_DECISIONS=0` set; no request is sent | 1 |
-| No key | `Decisions check: no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)` | 1 |
+| No key | `Decisions check: no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)` | 1 |
 
-While `ULTRATHINK_DECISIONS_URL` is in effect, the ok and error lines end with ` · url <url>`, its origin and path only. When it is set but not accepted, they end with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` instead, and the check used the default endpoint. The key is never printed.
+On the OpenRouter rail, while `ULTRATHINK_DECISIONS_URL` is in effect, the ok and error lines end with ` · url <url>`, its origin and path only. When it is set but not accepted, they end with ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` instead, and the check used the default endpoint. The Vercel rail never shows it. The key is never printed.
 
 `decisions probe <plan|ship|knowledge|blocking|teachable|skillworthy> <cases.json>` runs your own cases through one decision point, one request after another, and shows what that point would do with each under the current thresholds. `<cases.json>` is resolved against the current directory and holds a JSON array of 1 to 200 case objects. Each case has the state fields of its point, plus an optional `label`: `true` when the right answer is yes, `false` when it is no. For `teachable` and `skillworthy`, yes means the candidate should stand.
 
@@ -286,7 +285,7 @@ Decisions probe: plan · typesafe/jev-1.13-20260917 · cases 2 · labelled 2 · 
 - A case line is `#<n> P <P> · <action>`, plus ` · label <true|false> · agree` (or `DISAGREE`) when the case has a label. P is printed with two decimals, cut rather than rounded, so a printed value never crosses a threshold. A case whose decision failed prints `#<n> error (<kind>)`.
 - For `plan`, `knowledge` and `blocking`, a case agrees when `label: true` meets `plan`, `keep` or `promote` and `label: false` meets the other action. For `ship`, `label: true` agrees unless the action is `veto`, and `label: false` agrees unless it is `approve`. For `skillworthy`, `label: true` agrees with `keep` and `label: false` agrees with `skip`. For `teachable`, the label agrees unless the action is `drop`: `keep` and `auto-confirm` both count as yes.
 - The summary is `Decisions probe: <point> · <model> · cases <n> · labelled <m> · agree <a>/<m> · errors <e>`, with the resolved model of the first answered case.
-- Exit 0 when every case was answered, 1 when any case failed, when `ULTRATHINK_DECISIONS=0` is set (`Decisions probe: off (ULTRATHINK_DECISIONS=0)`, printed once the file is checked; no request is sent) or when there is no key (`Decisions probe: no OpenRouter key (run bin/ultrathink-mcp auth set-key openrouter --stdin, or set OPENROUTER_API_KEY)`). An unreadable or invalid file exits 2 before any request, with `Decisions probe: <reason>`, for example `Decisions probe: case #3: "message" must be a non-empty string` or `Decisions probe: plan-cases.json is not a JSON array of 1 to 200 cases`.
+- Exit 0 when every case was answered, 1 when any case failed, when `ULTRATHINK_DECISIONS=0` is set (`Decisions probe: off (ULTRATHINK_DECISIONS=0)`, printed once the file is checked; no request is sent) or when there is no key for the resolved rail (`Decisions probe: no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)`). An unreadable or invalid file exits 2 before any request, with `Decisions probe: <reason>`, for example `Decisions probe: case #3: "message" must be a non-empty string` or `Decisions probe: plan-cases.json is not a JSON array of 1 to 200 cases`.
 
 ### `bin/ultrathink hindsight`
 
@@ -397,7 +396,7 @@ usage:
 |---|---|
 | `serve <provider>` | Stdio MCP server that relays to the hosted provider and adds credentials from the store. Hosts run this; `bun scripts/mcp-register.ts` registers it. `ULTRATHINK_MCP_DEBUG=1` logs relay events to stderr. When a credential is missing, the error says how to add one: for Notion `ultrathink-mcp auth login notion`; for Linear and Greptile either `auth login <provider>` (OAuth) or `auth set-key <provider> --stdin` (an API key from that account's settings). |
 | `auth status` | One line per provider (kind, ready or not ready, detail), then the store path. A key-provider row reads `<id>  api_key  ready  api key set (<n> chars)` or `<id>  none  not ready  not configured`. The key itself is never printed. |
-| `auth set-key <provider>` | Stores an API key for `linear`, `greptile`, `openrouter`, `hindsight` or `ragflow`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. It prints only the key's length, for example `hindsight: api key stored (<n> chars)`. Notion has no API-key route. A stored key wins over the provider's environment variable (`OPENROUTER_API_KEY`, `HINDSIGHT_API_KEY`, `RAGFLOW_API_KEY`). |
+| `auth set-key <provider>` | Stores an API key for `linear`, `greptile`, `openrouter`, `vercel`, `hindsight` or `ragflow`, read from stdin (`--stdin`) or from a `NAME=value` line in an env file (`--env-file <path> --var <NAME>`). Surrounding quotes and a leading `export` are stripped. It prints only the key's length, for example `hindsight: api key stored (<n> chars)`. Notion has no API-key route. A stored key wins over the provider's environment variable (`OPENROUTER_API_KEY`, `AI_GATEWAY_API_KEY`, `HINDSIGHT_API_KEY`, `RAGFLOW_API_KEY`). |
 | `auth login <provider>` | OAuth login (Notion needs it; Linear and Greptile can use it instead of a key). See [OAuth login options](#oauth-login-options). |
 | `auth logout <provider>` | Removes that provider's credentials. |
 | `check [provider...]` | Runs `initialize` and `tools/list` against each MCP provider (`notion`, `linear` and `greptile` by default; never `openrouter`, `hindsight` or `ragflow`) and prints `OK <n> tools` or `FAIL <reason>`. Exits 1 if any provider fails. |
@@ -440,7 +439,7 @@ usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.
 
 `--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it. `merge` is the only way the ship flow merges: agents must never merge any other way (no `gh pr merge`, no web UI), and a PR merged outside the flow without a passing review of its head is reported blocked, never recorded as a ship merge.
 
-With Jev decisions on (`decisions.enabled: true`, `ship` in `decisions.points` and an OpenRouter key), `assess` also asks Jev whether the patch fully delivers the request, alongside the engine judge, after the rule checks pass. Its JSON then gains `decision`: `{"p": <P>, "model": "<resolved model>", "action": "<action>"}`, or `{"action": "fail-open", "error": "<kind>"}` when Jev could not answer. It gains `"source": "jev"` only when Jev gave the verdict because there was no usable engine verdict, which happens only in gate mode with `ship.autoMerge` off. With Decisions off, the JSON is unchanged. See [Ship: Jev decision](ship.md#jev-decision).
+With `ship` in `decisions.points` and a Jev key for the resolved rail, `assess` also asks Jev whether the patch fully delivers the request, alongside the engine judge, after the rule checks pass. Its JSON then gains `decision`: `{"p": <P>, "model": "<resolved model>", "action": "<action>"}`, or `{"action": "fail-open", "error": "<kind>"}` when Jev could not answer. It gains `"source": "jev"` only when Jev gave the verdict because there was no usable engine verdict, which happens only in gate mode with `ship.autoMerge` off. With Decisions off, the JSON is unchanged. See [Ship: Jev decision](ship.md#jev-decision).
 
 ### `scripts/setup.ts`
 

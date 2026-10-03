@@ -131,17 +131,17 @@ A repository without `.planning/ROADMAP.md` needs no GSD at all.
 
 ## Optional: add the Jev check
 
-Jev is a decision model on OpenRouter that answers one yes/no question with a calibrated probability. With Jev decisions on, the done assessment also asks it whether the patch fully delivers the request and every acceptance criterion in the spec, with nothing missing, stubbed or left as a TODO. It is off by default and applies to every ship run, so to every GSD run. Setup: [Use Jev decisions](use-jev-decisions.md). The short version:
+Jev is a decision model on OpenRouter and the Vercel AI Gateway that answers one yes/no question with a calibrated probability. With a Jev key, the done assessment also asks it whether the patch fully delivers the request and every acceptance criterion in the spec, with nothing missing, stubbed or left as a TODO. It is always on and applies to every ship run, so to every GSD run. Setup: [Use Jev decisions](use-jev-decisions.md). The short version:
 
 ```sh
-<clone>/bin/ultrathink-mcp auth set-key openrouter --stdin   # paste the OpenRouter key, then Ctrl-D
+<clone>/bin/ultrathink-mcp auth set-key vercel --stdin   # paste the Vercel key, then Ctrl-D
 ```
 
 ```json
-{ "decisions": { "enabled": true, "points": ["ship"] } }
+{ "decisions": { "points": ["ship"] } }
 ```
 
-Put it in your user config, `~/.config/ultrathink/config.json`: a project file cannot turn Jev on. `"points": ["ship"]` asks Jev only here. The short form `{ "decisions": { "enabled": true } }` turns on all four points, so the plan gate (which can skip planning for your messages) and the knowledge and blocking checks of the clarifying questions ask Jev too.
+Put it in your user config, `~/.config/ultrathink/config.json`: a project file cannot add points. `"points": ["ship"]` asks Jev only here. Without it, all six points ask Jev, so the plan gate (which can skip planning for your messages), the knowledge and blocking checks of the clarifying questions, and the teachable and skillworthy checks ask Jev too.
 
 What it does to a ship run:
 
@@ -198,6 +198,6 @@ Merge on GitHub the way you normally do. ultrathink does not watch the PR after 
 
 Either way the plan has no `## Ship` section and no nudge is sent. `bin/ultrathink-ship` still works when you run it yourself.
 
-To keep ship but drop only the Jev check, remove `"ship"` from `decisions.points`, or leave `decisions.enabled` off.
+To keep ship but drop only the Jev check, remove `"ship"` from `decisions.points`, or set `ULTRATHINK_DECISIONS=0`.
 
 For what ship sends to GitHub, Greptile and the engine, see [Privacy](../privacy.md).

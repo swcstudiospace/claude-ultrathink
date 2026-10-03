@@ -17,7 +17,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Choose the engine](how-to/choose-engine.md): plan with your host's own engine (Claude, Grok or Muse).
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to the pull request, Greptile review and merge flow.
 - [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md): opt in to reading the repository's Greptile knowledge base before the clarifying questions.
-- [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model at the plan, ship, knowledge and blocking points, check it, tune its thresholds and pin the model.
+- [Use Jev decisions](how-to/use-jev-decisions.md): store a Jev key for the always-on decision model at the plan, ship, knowledge, blocking, teachable and skillworthy points, check it over OpenRouter or Vercel, tune its thresholds and pin the model.
 - [Connect Hindsight](how-to/connect-hindsight.md): opt in to the Hindsight memory server, store the key, check it and prove a round trip.
 - [Connect RAGFlow](how-to/connect-ragflow.md): opt in to RAGFlow document search, check it without the healthz probe, and turn grounding on.
 - [Use Teachable Moments](how-to/use-teachable-moments.md): capture, confirm, recall and promote lessons. Off until you turn it on.

@@ -80,7 +80,7 @@ To avoid extra plans for follow-ups, prefix them with `raw:` or run `/ultrathink
 | One shell or process | `ULTRATHINK_UPLIFT=0` |
 | Tracker rows only | `/ultrathink-track off` |
 | The ship flow | It is off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` also turns it off |
-| Jev decisions | They are off unless you set `decisions.enabled`; set it back to `false` (see [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again)) |
+| Jev decisions | They are always on; set `ULTRATHINK_DECISIONS=0` or remove the keys (see [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again)) |
 | Teachable Moments | Off unless you set `teach.enabled`. `ULTRATHINK_TEACH=0` turns it off for that process (see [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again)) |
 | Hindsight | Off unless you set `hindsight.enabled`. `ULTRATHINK_HINDSIGHT=0` turns it off for that process |
 | RAGFlow | Off unless you set `ragflow.enabled`. `ULTRATHINK_RAGFLOW=0` turns it off for that process |
@@ -101,7 +101,7 @@ Never into your repository's working tree, and never into `.planning/`.
 
 ## What data leaves my machine?
 
-Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, OpenRouter (Jev decisions, `decisions.enabled`), Hindsight (`hindsight.enabled`), RAGFlow (`ragflow.enabled`), Agent Substrate and Tailscale only after you configure them. A lesson is redacted before it is stored or sent. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
+Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, Hindsight (`hindsight.enabled`), RAGFlow (`ragflow.enabled`), Agent Substrate and Tailscale only after you configure them. Jev decisions (OpenRouter or Vercel) are always on but send nothing until you store or set a key. A lesson is redacted before it is stored or sent. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
 
 The full table, with what each destination receives and how to turn it off, is in [Privacy and data flow](privacy.md).
 

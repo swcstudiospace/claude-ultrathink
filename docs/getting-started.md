@@ -96,7 +96,7 @@ Linear team: not configured
 Substrate: off (optional: set substrate.url or SUBSTRATE_URL)
 Ship: off (opt-in: set ship.enabled)
 Knowledge base: off (opt-in: set hitl.knowledgeBase)
-Decisions: off (opt-in: set decisions.enabled)
+Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
 Teach: off (opt-in: set teach.enabled)
@@ -262,7 +262,7 @@ On a fresh install, `bin/ultrathink status` already shows the three off lines fr
 - [Choose the engine](how-to/choose-engine.md): plan with Grok instead of Claude.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer nodes, no questions, skipping planning for small messages.
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to opening, reviewing and merging pull requests.
-- [Use Jev decisions](how-to/use-jev-decisions.md): opt in to OpenRouter's Jev decision model, which skips planning for messages that are not new work and double-checks ship's done verdict.
+- [Use Jev decisions](how-to/use-jev-decisions.md): store a Jev key for the always-on decision model, which skips planning for messages that are not new work and double-checks ship's done verdict.
 - [Use Teachable Moments](how-to/use-teachable-moments.md): opt in to lessons, recall and promotion.
 - [Connect Hindsight](how-to/connect-hindsight.md) and [Connect RAGFlow](how-to/connect-ragflow.md): the optional memory server and document search.
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository.

@@ -126,7 +126,7 @@ The credential store holds one entry per provider. Remove the ones you stored:
 <clone>/bin/ultrathink-mcp auth logout ragflow
 ```
 
-Each prints `<provider>: logged out`, for example `hindsight: logged out`. There is no flag that drops every provider at once: the usage line is `ultrathink-mcp auth logout <provider>`. OpenRouter, if you stored a key for Jev decisions, is the same command with `openrouter`.
+Each prints `<provider>: logged out`, for example `hindsight: logged out`. There is no flag that drops every provider at once: the usage line is `ultrathink-mcp auth logout <provider>`. OpenRouter and Vercel, if you stored a key for Jev decisions, are the same command with `openrouter` or `vercel`.
 
 or delete the file itself: `$ULTRATHINK_MCP_STORE` if you set it, otherwise `${XDG_CONFIG_HOME:-~/.config}/ultrathink/mcp-credentials.json`. A `mcp-credentials.json.lock` directory next to it, if one is left, can go too.
 

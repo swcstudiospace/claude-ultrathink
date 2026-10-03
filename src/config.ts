@@ -361,9 +361,10 @@ function unitInterval(value: unknown, fallback: number): number {
 const MAX_DECISIONS_TIMEOUT_MS = 30_000;
 
 /**
- * Per-field merge; only the thirteen known keys are read, so a layer can never add a URL (D1). A project layer (a file a cloned
- * repository controls) may only tighten consent (K5): `enabled` true→false, `zdr` false→true, `points` narrowed to the
- * intersection with the lower layers; the remaining keys merge as usual.
+ * Per-field merge; only the fourteen known keys are read, so a layer can never add a URL (D1). `enabled` is ignored in
+ * every layer: Jev is always on, and only ULTRATHINK_DECISIONS=0 disables it. A project layer (a file a cloned repository
+ * controls) may only tighten consent (K5): `zdr` false→true, `points` narrowed to the intersection with the lower layers;
+ * the remaining keys merge as usual.
  */
 function mergeDecisions(decisions: Record<string, unknown> | undefined, defaults: DecisionsConfig, project: boolean): DecisionsConfig {
 	if (!decisions) return defaults;
