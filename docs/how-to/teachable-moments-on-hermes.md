@@ -35,7 +35,7 @@ Nothing is started when:
 
 | Result | Why |
 |---|---|
-| capture is `explicit` (the default) | Only an explicit `teach capture` creates a lesson. Raise `teach.capture` to `observe` or `auto` in your user config. A project file can only lower that mode. |
+| capture is `explicit` | Only an explicit `teach capture` creates a lesson. Raise `teach.capture` to `observe` or `auto` in your user config (the default is `auto`). A project file can only lower that mode. |
 | Teachable Moments is off | `teach status` did not report `enabled`. |
 | the turn is a subagent or a cron turn | Those are skipped. |
 | the history has fewer than two tool rows | There is not enough of a turn to observe. `teach observe` also skips a digest with fewer tool calls than `teach.observeMinToolCalls` (default 4). |

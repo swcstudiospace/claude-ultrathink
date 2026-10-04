@@ -20,7 +20,7 @@ import {
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 import type { DocsLookup } from "../ragflow/types.ts";
-import type { LessonsLookup } from "../teach/types.ts";
+import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
 const result = { xml: "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>", original: "x", root: "BUILD_PROMPT", source: "llm" as const };
 
@@ -667,6 +667,17 @@ describe("lessons and documents", () => {
 		}
 	});
 
+	test("the skills section sits after the documents and before the specification", () => {
+		const skills = "## Relevant skills\n\n- **lesson-bun** — Use when running bun test.\n  /s/skills/lesson-bun/SKILL.md (drafts)";
+		const out = formatPromptContext({ result, brief: "observed line", lessons, docs, skills, statePath: "/s/x.json" });
+		const at = (needle: string) => out.indexOf(needle);
+		expect(at("## Documents (RAGFlow)")).toBeLessThan(at("## Relevant skills"));
+		expect(at("## Relevant skills")).toBeLessThan(at("<BUILD_PROMPT>"));
+		expect(out).toContain(skills);
+		const plain = formatPromptContext({ result, brief: "observed line", lessons, docs, statePath: "/s/x.json" });
+		expect(formatPromptContext({ result, brief: "observed line", lessons, docs, skills: "  \n", statePath: "/s/x.json" })).toBe(plain);
+	});
+
 	test("a plain prompt keeps its cap: the specification gives way, the sections do not", () => {
 		const small = { lessons: lessons.slice(0, 400), docs: docs.slice(0, 350) };
 		const out = formatPromptContext({ result: { ...result, xml: bigXml }, ...small, maxChars: 4_000 });
@@ -695,6 +706,17 @@ describe("lessons and documents", () => {
 			expect(out.indexOf(SUBSTRATE_CONTEXT_HEADER)).toBeLessThan(out.indexOf("## Lessons from earlier work"));
 			expect(out.indexOf("## Lessons from earlier work")).toBeLessThan(out.indexOf("## Documents (RAGFlow)"));
 			expect(out.indexOf("## Documents (RAGFlow)")).toBeLessThan(out.indexOf("## Ultrathink tracking"));
+		});
+
+		test("the skills pointers are dropped before the documents shrink", () => {
+			const longSkills = `## Relevant skills\n\n${"s".repeat(1_500)}`;
+			const limit = natural({ brief, lessons: longLessons, docs: longDocs }) + 1;
+			const out = fit(limit, { brief, lessons: longLessons, docs: longDocs, skills: longSkills });
+			expect(out.length).toBeLessThanOrEqual(limit);
+			expect(out).toContain(brief);
+			expect(out).toContain(longLessons);
+			expect(out).toContain(longDocs);
+			expect(out).not.toContain("## Relevant skills");
 		});
 
 		test("the documents shrink first and nothing else moves", () => {
@@ -814,6 +836,17 @@ describe("lessons and documents", () => {
 				docs: docsLookup({}),
 			});
 			expect(out).toBe("Prompt Uplift · BUILD_PROMPT · llm · Substrate · brief 2 lines · Knowledge · 1 docs · Lessons · 3 recalled (hindsight) · Docs · 4 excerpts (RAGFlow)");
+		});
+
+		test("skills: recall count, or the error reason; nothing for off or none", () => {
+			const skillsLookup = (over: Partial<SkillsLookup>): SkillsLookup => ({ outcome: "used", count: 2, names: ["a", "b"], chars: 300, ms: 5, ...over });
+			const summary = (lookup: SkillsLookup) => formatSummary({ result, docs: docsLookup({}), skills: lookup });
+			expect(summary(skillsLookup({}))).toContain("· Docs · 4 excerpts (RAGFlow) · Skills · 2 recalled");
+			expect(summary(skillsLookup({ outcome: "error", count: 0, names: [], reason: "timeout" }))).toContain("· Skills · error (timeout)");
+			for (const outcome of ["off", "none"] as const) {
+				expect(summary(skillsLookup({ outcome, count: 0, names: [] }))).not.toContain("Skills");
+			}
+			expect(formatSummary({ result })).not.toContain("Skills");
 		});
 	});
 });

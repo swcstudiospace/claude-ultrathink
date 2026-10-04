@@ -2,13 +2,13 @@
 
 Teachable Moments keeps short lessons from earlier work so a later session can recall them. A lesson is a name, a body and a kind (`bug`, `pitfall`, `pattern`, `decision` or `playbook`). It is stored under the host's state directory, and, once confirmed, copied to Hindsight when that integration is ready.
 
-It is **off by default**. With `teach.enabled` unset, nothing is stored and nothing is recalled. A repository's project file cannot turn it on. A capture, a recall or a sync that fails does not block the prompt.
+It is **on by default**: finished turns are distilled into lessons (`capture: "auto"`), recurring lessons become skills (`autoPromote: true`), and matching lessons and skills are recalled into later plans (`recall: true`). With `teach.enabled` set to `false`, nothing is stored and nothing is recalled. A repository's project file can only turn it off or lower it, never on. A capture, a recall or a sync that fails does not block the prompt.
 
 Lessons never go into the repository and never into `.planning/`. They live in `<state dir>/teach/` (`moments/`, `outbox/`, `inbox/`, `skill-drafts/`). The state directory is the host's, for example `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink` on Claude Code. `ULTRATHINK_STATE_DIR` moves it, unless that path points into `.planning/`, in which case it is ignored. The full table is in [Uninstall](uninstall.md#6-delete-planning-state).
 
 `<clone>` is the directory you cloned ultrathink into.
 
-- [1. Turn it on](#1-turn-it-on)
+- [1. Defaults](#1-defaults)
 - [2. Choose a capture mode](#2-choose-a-capture-mode)
 - [3. Save a lesson](#3-save-a-lesson)
 - [4. List, show, confirm and forget](#4-list-show-confirm-and-forget)
@@ -19,15 +19,9 @@ Lessons never go into the repository and never into `.planning/`. They live in `
 
 Sharing lessons across machines needs [Hindsight](connect-hindsight.md). Hermes has its own commands and tools: [Teachable Moments on Hermes](teachable-moments-on-hermes.md).
 
-## 1. Turn it on
+## 1. Defaults
 
-Add a `teach` section to your user config, `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`:
-
-```json
-{ "teach": { "enabled": true } }
-```
-
-That is capture mode `explicit` (the default) and recall on. A project file (`<repo>/.claude/ultrathink.json`) cannot set `enabled` to true. It can set it to false, turn `recall` off, turn `autoPromote` off and lower `capture`. It cannot raise a mode.
+Nothing to configure: a fresh install captures, recalls and promotes. That is `enabled: true`, capture mode `auto`, recall on and `autoPromote: true`. A project file (`<repo>/.claude/ultrathink.json`) cannot set `enabled` to true. It can set it to false, turn `recall` off, turn `autoPromote` off and lower `capture`. It cannot raise a mode.
 
 From the project directory:
 
@@ -36,7 +30,7 @@ From the project directory:
 ```
 
 ```text
-Teach: on · capture explicit · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
+Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
 ```
 
 `Hindsight off` means the memory server is not opted in; lessons still stay local. The same report, with every status counted, is:
@@ -46,17 +40,17 @@ Teach: on · capture explicit · recall on · 0 confirmed, 0 candidate · Hindsi
 ```
 
 ```text
-Teach: on · capture explicit · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
+Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
 Moments: 0 candidate, 0 confirmed, 0 promoted, 0 superseded · outbox 0
 ```
 
 The second line always counts candidate, confirmed, promoted and superseded. Asking for status does not create the store. While Teachable Moments is off the first line is `Teach: off (opt-in: set teach.enabled)`. With `ULTRATHINK_TEACH=0` it is `Teach: off (ULTRATHINK_TEACH=0)`.
 
-`teach status --json` prints `{"enabled":true,"capture":"explicit","recall":true,"hindsight":"off","moments":{"candidate":0,"confirmed":0,"promoted":0,"superseded":0},"outbox":0}`. `hindsight` is `ready`, `off` or `unready`.
+`teach status --json` prints `{"enabled":true,"capture":"auto","recall":true,"hindsight":"off","moments":{"candidate":0,"confirmed":0,"promoted":0,"superseded":0},"outbox":0}`. `hindsight` is `ready`, `off` or `unready`.
 
 ## 2. Choose a capture mode
 
-`teach.capture` is one of three modes. The default is `explicit`.
+`teach.capture` is one of three modes. The default is `auto`.
 
 | Mode | What creates a lesson | What you do next |
 |---|---|---|
@@ -157,6 +151,8 @@ The header is `<source> · <n> lesson(s)`. `source` is `hindsight` when the serv
 
 On a planned prompt, with recall on and at least one lesson used, the same `## Lessons from earlier work` section is added to the plan, before the spec. The summary line then includes `Lessons · <n> recalled (hindsight)` or `Lessons · <n> recalled (local)`. A failed lookup that found nothing local does not add the section; the summary can show `Lessons · error (<reason>)` and the prompt still goes through. Lessons are untrusted evidence. They are notes from an earlier session, not instructions.
 
+The same recall also matches promoted skills: moments with a promotion record, plus the drafts under `<state dir>/teach/skill-drafts/` (the only place Hermes and Muse skills live). Matches are added as `## Relevant skills` after the documents section: one line per skill with its trigger and its `SKILL.md` path, never the skill body. The summary line then includes `Skills · <n> recalled`, or `Skills · error (<reason>)` when the lookup failed. The orchestration step tells the agent to pass the lessons and skills that apply to each unit into the subagents it dispatches, so autonomous runs (including GSD phase workers) see them.
+
 Recall asks Hindsight first when it is ready, then this machine's confirmed and promoted lessons. Hits this machine has already superseded or queued for deletion are hidden.
 
 ## 6. When Hindsight is down
@@ -238,11 +234,11 @@ Marked 1 moment(s) promoted · <name> (hermes)
 
 `--skill` is lowercase letters, digits and hyphens. `--mark-promoted` needs `--skill` and `--target`, and cannot be combined with `--install`.
 
-`teach.autoPromote` installs due lessons without a human step. It is **user-file only** and **default off**. A project file cannot turn it on. While it is on, due lessons are drafted, and installed for the host's target unless that target is `hermes` or `drafts`. Hermes still only gets a draft. Leave it off unless you want skills written into the Claude or Omp skill directory on their own.
+`teach.autoPromote` installs due lessons without a human step. It is **user-file only** and **default on**. A project file can turn it off but cannot turn it on. While it is on, due lessons are drafted at the end of every `teach observe` run, and installed for the host's target unless that target is `hermes` or `drafts`. Hermes and Muse still only get a draft. Set it to `false` if you do not want skills written into the Claude or Omp skill directory on their own.
 
 ## Turn it off again
 
-- `"teach": { "enabled": false }` (the default). No capture, confirm, forget, sync or promote runs. `bin/ultrathink status` shows `Teach: off (opt-in: set teach.enabled)`. A project file can do this for its repository.
+- `"teach": { "enabled": false }`. No capture, confirm, forget, sync or promote runs. `bin/ultrathink status` shows `Teach: off (opt-in: set teach.enabled)`. A project file can do this for its repository.
 - `"teach": { "recall": false }` stops injection into plans. Capture still works. A project file can do this.
 - `"teach": { "capture": "explicit" }` stops background observe. A project file can lower the mode, not raise it.
 - `ULTRATHINK_TEACH=0` in the host's environment turns Teachable Moments off for that process, whatever any config file says. Mutating commands print `Teachable Moments is off (ULTRATHINK_TEACH=0)` and exit 1.

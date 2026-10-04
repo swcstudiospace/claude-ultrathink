@@ -73,7 +73,7 @@ The specification includes a Graph of Thought with a per-node rationale/conclusi
 
 Orchestrate it:
 1. Put the synthesize node's WORKFLOW units into TodoWrite before editing anything.
-2. Run the file-disjoint units of the same wave as parallel Task subagents launched in one message; give each subagent its explicit files, change, and acceptance criteria.
+2. Run the file-disjoint units of the same wave as parallel Task subagents launched in one message; give each subagent its explicit files, change, and acceptance criteria, plus any recalled lessons or skills that apply to its unit.
 3. Serialize dependent waves: verify each wave with the checks it names before starting the next.
 4. Do not start writing code until any blocking clarifications are settled.
 5. Run the final Verify commands before finishing.`;

@@ -8,6 +8,7 @@
  *   store.ts    openStore(dir): TeachStore
  *   capture.ts  captureMoment: CaptureFn, syncOutbox(ctx): Promise<SyncOutcome>
  *   recall.ts   recallLessons: RecallFn, formatLessonsSection(outcome, maxChars): string, lessonsLookup(outcome): LessonsLookup
+ *   skills.ts   recallSkills, formatSkillsSection(outcome, maxChars): string, skillsLookup(outcome): SkillsLookup
  *   observe.ts  observeDigest: ObserveFn
  *   promote.ts  promotionCandidates(ctx), renderSkillDraft(moments, ctx), installSkill(draft, target, ctx)
  *   cli.ts      runTeachCommand(argv, deps): Promise<CliResult>
@@ -85,11 +86,11 @@ export const CAPTURE_MODES = ["explicit", "observe", "auto"] as const;
 export type CaptureMode = (typeof CAPTURE_MODES)[number];
 
 export interface TeachConfig {
-	/** Opt-in master switch. A project file can only turn it off. */
+	/** Master switch (on by default). A project file can only turn it off. */
 	enabled: boolean;
 	/** A project file can only lower it (auto -> observe -> explicit). */
 	capture: CaptureMode;
-	/** Inject recalled lessons into plans. */
+	/** Inject recalled lessons and skills into plans. */
 	recall: boolean;
 	/** Lessons per plan, 1..10. */
 	recallLimit: number;
@@ -97,7 +98,7 @@ export interface TeachConfig {
 	recallChars: number;
 	/** Occurrences before a confirmed moment is offered as a skill. */
 	promoteAfter: number;
-	/** Install promoted skills without a human step. User files only; default off. */
+	/** Install promoted skills without a human step. User files only; default on. */
 	autoPromote: boolean;
 	/** `observe` skips turns with fewer tool calls than this. */
 	observeMinToolCalls: number;
@@ -106,13 +107,13 @@ export interface TeachConfig {
 }
 
 export const DEFAULT_TEACH_CONFIG: TeachConfig = {
-	enabled: false,
-	capture: "explicit",
+	enabled: true,
+	capture: "auto",
 	recall: true,
 	recallLimit: 5,
 	recallChars: 3_000,
 	promoteAfter: 3,
-	autoPromote: false,
+	autoPromote: true,
 	observeMinToolCalls: 4,
 	timeoutMs: 2_500,
 };
@@ -227,6 +228,38 @@ export interface LessonsLookup {
 	chars: number;
 	ms: number;
 	source: "hindsight" | "local" | "none";
+	reason?: string;
+}
+
+/** One promoted skill matched to a prompt: a pointer, not the skill body (the lesson text already recalls). */
+export interface RecalledSkill {
+	name: string;
+	description: string;
+	/** Absolute SKILL.md path when known (drafts always; installs when the moment recorded it). */
+	path?: string;
+	target: SkillTarget;
+	/** Moments the skill was made from. */
+	sourceIds: string[];
+	occurrences: number;
+}
+
+export interface SkillRecallOutcome {
+	status: RecallStatus;
+	skills: RecalledSkill[];
+	/** Characters of the formatted section, 0 unless `status` is "used". */
+	chars: number;
+	ms: number;
+	/** One line when `status` is "error" or "off". */
+	reason?: string;
+}
+
+/** The record a session keeps of one skills lookup (names only, no skill text). */
+export interface SkillsLookup {
+	outcome: RecallStatus;
+	count: number;
+	names: string[];
+	chars: number;
+	ms: number;
 	reason?: string;
 }
 

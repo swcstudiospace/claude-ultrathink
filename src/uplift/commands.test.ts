@@ -465,13 +465,13 @@ describe("runControl", () => {
 		expect(usage[probe + 4]).toStartWith("In an agent:");
 	});
 
-	test("status shows Hindsight, RAGFlow and Teach as opt-in right after the Decisions line on a fresh install", async () => {
+	test("status shows Hindsight and RAGFlow as opt-in and Teach on by default right after the Decisions line on a fresh install", async () => {
 		const lines = (await runControl(["status"], io)).split("\n");
 		const decisions = lines.findIndex((line) => line.startsWith("Decisions:"));
 		expect(decisions).toBeGreaterThan(-1);
 		expect(lines[decisions + 1]).toStartWith("Hindsight: off (opt-in");
 		expect(lines[decisions + 2]).toStartWith("RAGFlow: off (opt-in");
-		expect(lines[decisions + 3]).toStartWith("Teach: off (opt-in");
+		expect(lines[decisions + 3]).toStartWith("Teach: on · capture auto · recall on");
 		expect(lines[decisions + 4]).toStartWith("Model:");
 	});
 

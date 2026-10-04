@@ -99,12 +99,12 @@ Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
-Teach: off (opt-in: set teach.enabled)
+Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
 Model: sonnet · concurrency 3
 State: /home/<you>/.claude/ultrathink
 ```
 
-The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight, no RAGFlow and no Teachable Moments.
+The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight and no RAGFlow. Teachable Moments distills finished turns and recalls lessons and skills locally; with Hindsight off, none of that leaves the machine.
 
 ## 5. Send your first prompt
 

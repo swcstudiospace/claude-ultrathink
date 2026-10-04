@@ -81,7 +81,7 @@ To avoid extra plans for follow-ups, prefix them with `raw:` or run `/ultrathink
 | Tracker rows only | `/ultrathink-track off` |
 | The ship flow | It is off unless you set `ship.enabled`; `ULTRATHINK_SHIP=0` also turns it off |
 | Jev decisions | They are always on; set `ULTRATHINK_DECISIONS=0` or remove the keys (see [Use Jev decisions](how-to/use-jev-decisions.md#turn-it-off-again)) |
-| Teachable Moments | Off unless you set `teach.enabled`. `ULTRATHINK_TEACH=0` turns it off for that process (see [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again)) |
+| Teachable Moments | On by default; set `teach.enabled: false` to turn it off. `ULTRATHINK_TEACH=0` turns it off for that process (see [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again)) |
 | Hindsight | Off unless you set `hindsight.enabled`. `ULTRATHINK_HINDSIGHT=0` turns it off for that process |
 | RAGFlow | Off unless you set `ragflow.enabled`. `ULTRATHINK_RAGFLOW=0` turns it off for that process |
 | Everything | [Uninstall](how-to/uninstall.md) |
@@ -107,7 +107,7 @@ The full table, with what each destination receives and how to turn it off, is i
 
 ## Is Teachable Moments on by default?
 
-No. `teach.enabled`, `hindsight.enabled` and `ragflow.enabled` all default to false, so a fresh install stores nothing and contacts neither server. `bin/ultrathink status` shows `Teach: off (opt-in: set teach.enabled)`, `Hindsight: off (opt-in: set hindsight.enabled)` and `RAGFlow: off (opt-in: set ragflow.enabled)`. If you turn lessons on and set no capture mode, the mode is `explicit`: only a capture you run creates a lesson. Recall defaults to on, but only after `teach.enabled` is on. See [Use Teachable Moments](how-to/use-teachable-moments.md).
+Yes. `teach.enabled` defaults to true with `capture: "auto"` and `autoPromote: true`, so a fresh install distills finished turns into lessons, recalls matching lessons and skills into plans, and installs recurring lessons as skills. `hindsight.enabled` and `ragflow.enabled` still default to false, so lessons stay on the local machine and neither server is contacted: `bin/ultrathink status` shows `Hindsight: off (opt-in: set hindsight.enabled)` and `RAGFlow: off (opt-in: set ragflow.enabled)`. Set `teach.enabled: false` to turn lessons off entirely. See [Use Teachable Moments](how-to/use-teachable-moments.md).
 
 ## Where do lessons live?
 
@@ -115,7 +115,7 @@ In `<state dir>/teach/`, for example `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink
 
 ## Can a project file turn lessons on?
 
-No. `<repo>/.claude/ultrathink.json` can turn `teach`, `hindsight` and `ragflow` off, turn `teach.recall` and `ragflow.ground` off, and lower `teach.capture` (`auto` to `observe` or `explicit`, `observe` to `explicit`). It cannot enable them, set a URL, a bank or a dataset, or turn `teach.autoPromote` on. Set those in your user file, `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`.
+No: a project file can only tighten Teachable Moments, never loosen it. `<repo>/.claude/ultrathink.json` can turn `teach`, `hindsight` and `ragflow` off, turn `teach.recall` and `ragflow.ground` off, and lower `teach.capture` (`auto` to `observe` or `explicit`, `observe` to `explicit`). It cannot enable `hindsight` or `ragflow`, set a URL, a bank or a dataset, override an explicit `teach.enabled: false`, or turn `teach.autoPromote` back on. Set those in your user file, `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`.
 
 ## What if Hindsight is down?
 

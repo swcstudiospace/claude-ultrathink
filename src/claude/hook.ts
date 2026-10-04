@@ -30,7 +30,8 @@ import { docsLookup, formatDocsSection, groundDocs } from "../ragflow/ground.ts"
 import { teachContext, teachEnabled } from "../teach/context.ts";
 import { formatLessonsSection, lessonsLookup, recallLessons } from "../teach/recall.ts";
 import type { GroundOutcome, DocsLookup } from "../ragflow/types.ts";
-import type { LessonsLookup, RecallOutcome } from "../teach/types.ts";
+import { formatSkillsSection, recallSkills, skillsLookup, SKILL_SECTION_CHARS } from "../teach/skills.ts";
+import type { LessonsLookup, RecallOutcome, SkillRecallOutcome, SkillsLookup } from "../teach/types.ts";
 import { isSubagentEnvelope } from "../host/envelope.ts";
 import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
@@ -96,6 +97,11 @@ export interface HookDeps {
 	recall?: (input: { query: string; cwd: string; signal: AbortSignal }) => Promise<RecallOutcome>;
 	/** RAGFlow document grounding. Defaults to `groundDocs` when `config.ragflow.enabled && config.ragflow.ground`; same query rule. */
 	ground?: (input: { query: string; signal: AbortSignal }) => Promise<GroundOutcome>;
+	/**
+	 * Promoted-skills lookup (Teachable Moments). Defaults to `recallSkills` when `config.teach.enabled && config.teach.recall`;
+	 * an injected seam always runs. Same query rule as `recall`.
+	 */
+	skills?: (input: { query: string; cwd: string; signal: AbortSignal }) => Promise<SkillRecallOutcome>;
 }
 
 export interface PromptSubmitResult {
@@ -229,6 +235,40 @@ function startGround(deps: HookDeps, input: LookupInput): Promise<GroundOutcome>
 	);
 }
 
+/** Promoted-skills lookup; undefined when nothing is configured to run. Never rejects. */
+function startSkills(
+	deps: HookDeps,
+	input: LookupInput & { cwd: string; sessionId: string; host: string; log: (message: string) => void },
+): Promise<SkillRecallOutcome> | undefined {
+	const seam = deps.skills;
+	const teach = deps.config.teach;
+	if (!seam && !(teach.enabled && teach.recall)) return undefined;
+	const started = input.now();
+	const run =
+		seam ??
+		(async (arg: { query: string; cwd: string; signal: AbortSignal }): Promise<SkillRecallOutcome> => {
+			const ctx = teachContext({
+				host: input.host,
+				cwd: arg.cwd,
+				env: input.env,
+				sessionId: input.sessionId,
+				stateDir: deps.stateDir,
+				config: { teach, hindsight: deps.config.hindsight },
+				signal: arg.signal,
+				now: input.now,
+				log: input.log,
+			});
+			if (!teachEnabled(ctx)) return { status: "off", skills: [], chars: 0, ms: 0, reason: "disabled" };
+			return recallSkills({ query: arg.query }, ctx);
+		});
+	return bounded(
+		(signal) => run({ query: input.query, cwd: input.cwd, signal }),
+		teach.timeoutMs,
+		input.parent,
+		(reason) => ({ status: "error", skills: [], chars: 0, ms: input.now() - started, reason }),
+	);
+}
+
 export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps): Promise<PromptSubmitResult> {
 	const now = deps.now ?? Date.now;
 	const emit = (event: ProgressEvent): void => {
@@ -336,6 +376,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		const groundPromise = lookups
 			? startGround(deps, { query: lookupQuery, env: lookupEnv, parent: controller.signal, now })
 			: undefined;
+		const skillsPromise = lookups
+			? startSkills(deps, { query: lookupQuery, cwd, sessionId, host: surfaceId, env: lookupEnv, parent: controller.signal, now, log })
+			: undefined;
 
 		// The knowledge-base prefetch (find the repo, list documents, read index.md) overlaps the uplift and the
 		// Graph of Thought; the topic-specific documents are read right before clarify.
@@ -372,8 +415,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
 		stage("brief", "end", true, brief ? `${brief.split("\n").length} lines` : "none");
 
-		// Settled before anything is formatted so the record says what happened; both are bounded and never reject.
-		const [recalled, grounded] = await Promise.all([recallPromise, groundPromise]);
+		// Settled before anything is formatted so the record says what happened; all are bounded and never reject.
+		const [recalled, grounded, skilled] = await Promise.all([recallPromise, groundPromise, skillsPromise]);
 		let lessons: LessonsLookup | undefined;
 		let lessonsText = "";
 		if (recalled) {
@@ -397,6 +440,18 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				docs = { status: "error", count: 0, chars: 0, ms: grounded.ms, datasets: grounded.datasets, reason: "format" };
 			}
 			log(`docs (RAGFlow): ${docs.status} · ${docs.count} excerpts · ${docs.datasets} datasets · ${docs.ms}ms${docs.reason ? ` · ${docs.reason}` : ""}`);
+		}
+		let skills: SkillsLookup | undefined;
+		let skillsText = "";
+		if (skilled) {
+			try {
+				skills = skillsLookup(skilled);
+				skillsText = formatSkillsSection(skilled, SKILL_SECTION_CHARS);
+			} catch (error) {
+				log(`skills: format failed: ${error instanceof Error ? error.name : "error"}`);
+				skills = { outcome: "error", count: 0, names: [], chars: 0, ms: skilled.ms, reason: "format" };
+			}
+			log(`skills: ${skills.outcome} · ${skills.count} · ${skills.ms}ms${skills.reason ? ` · ${skills.reason}` : ""}`);
 		}
 
 		let graph: ThoughtGraph | undefined;
@@ -537,6 +592,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			...(knowledge ? { knowledge } : {}),
 			...(lessons ? { lessons } : {}),
 			...(docs ? { docs } : {}),
+			...(skills ? { skills } : {}),
 			...(records.length ? { decisions: records } : {}),
 		};
 		let specPath: string | undefined;
@@ -580,6 +636,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					knowledge,
 					lessons: lessonsText,
 					docs: docsText,
+					skills: skillsText,
 					skillHints: deps.surface === "hermes",
 					// No spec file (the write failed) means nothing to point at: fall back to the inline spec.
 					handoff: deps.surface === "hermes" && specPath !== undefined,
@@ -602,6 +659,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				knowledge,
 				lessons,
 				docs,
+				skills,
 				...(engineError ? { engineError } : {}),
 				elapsedMs: now() - started,
 				decisions: records,

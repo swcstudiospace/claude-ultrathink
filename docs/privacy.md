@@ -11,7 +11,7 @@ This page lists every destination, what it receives, when, and how to turn it of
 
 ## What leaves your machine
 
-On a fresh install, only your host's engine row applies: tracking, ship, the Greptile knowledge base, Hindsight, RAGFlow, Teachable Moments, the shunt gateway, Agent Substrate and Tailscale are all off until you configure them. Jev decisions are always on but send nothing until you store or set a key. Two exceptions reach xAI or the hosted trackers without ultrathink's own tracking: `bin/ultrathink status` may refresh an expired Grok login (see [Planning engine](#planning-engine)), and `bun scripts/setup.ts apply` registers the hosted Notion and Linear MCP servers in Claude Code (see [Claude Code's own MCP entries](#claude-codes-own-mcp-entries)).
+On a fresh install, only your host's engine row and the local Teachable Moments loop apply: tracking, ship, the Greptile knowledge base, Hindsight, RAGFlow, the shunt gateway, Agent Substrate and Tailscale are all off until you configure them. Teachable Moments distills finished turns into local lessons, recalls matching lessons and skills into plans, and installs recurring lessons as skills, all on the local machine — Hindsight stays off, so nothing leaves it. Jev decisions are always on but send nothing until you store or set a key. Two exceptions reach xAI or the hosted trackers without ultrathink's own tracking: `bin/ultrathink status` may refresh an expired Grok login (see [Planning engine](#planning-engine)), and `bun scripts/setup.ts apply` registers the hosted Notion and Linear MCP servers in Claude Code (see [Claude Code's own MCP entries](#claude-codes-own-mcp-entries)).
 
 | Destination | Data sent | When | How to turn it off |
 |---|---|---|---|

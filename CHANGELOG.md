@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Plans recall promoted skills, not just lessons. The planner matches the prompt against promoted moments and the drafts under `<stateDir>/teach/skill-drafts/` (where Hermes and Muse skills live, since those hosts never install) and adds a `## Relevant skills` section after the documents: one line per skill with its trigger and `SKILL.md` path, never the skill body. The session record keeps a `skills` lookup (outcome, count, names) and the summary gains a `Skills · <n> recalled` bit; on Hermes the pointers are the first evidence dropped when the handoff runs out of room. The orchestration step tells the agent to pass the lessons and skills that apply to each unit into the subagents it dispatches, so autonomous runs see them.
+
+### Changed
+
+- Teachable Moments are on by default: `teach.enabled` and `teach.autoPromote` now default to `true` and `teach.capture` to `"auto"`, so finished turns are distilled into lessons, matching lessons and skills are recalled into every planned prompt, and recurring lessons are installed as skills without a human step. Everything still runs on the local machine unless Hindsight is configured, and a project file can still only turn the feature off or lower it. To keep the old behaviour, set `"teach": { "enabled": false }` (or `"capture": "explicit", "autoPromote": false` to keep manual capture with recall).
+
 ### Fixed
 
 - Omp and Hermes plan with the session's active model again. The host-neutral plan entry dropped the `model` field both hosts send, so `think.engine: "auto"` always fell back to the Claude host default — on a Muse session with Claude out of credits every plan was the 5-node boilerplate graph with one-question fills and no tracker rows. The entry now forwards `model` to engine selection.

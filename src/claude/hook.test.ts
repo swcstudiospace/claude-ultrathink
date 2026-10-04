@@ -15,7 +15,7 @@ import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubm
 import { readSession, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 import type { TrackingRefs } from "../track/types.ts";
 import type { GroundOutcome } from "../ragflow/types.ts";
-import type { RecalledLesson, RecallOutcome } from "../teach/types.ts";
+import type { RecalledLesson, RecallOutcome, RecalledSkill, SkillRecallOutcome } from "../teach/types.ts";
 
 function tempStateDir(): { dir: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-hook-"));
@@ -1482,6 +1482,15 @@ describe("lessons and RAGFlow documents in the plan", () => {
 		ms: 7,
 		datasets: 1,
 	};
+	const skill: RecalledSkill = {
+		name: "lesson-bun-test",
+		description: "Use when running the suite MARKER_S1",
+		path: "/state/teach/skill-drafts/lesson-bun-test/SKILL.md",
+		target: "drafts",
+		sourceIds: ["m1"],
+		occurrences: 3,
+	};
+	const skillHits: SkillRecallOutcome = { status: "used", skills: [skill], chars: 200, ms: 4 };
 	const never = (): Promise<never> => Promise.withResolvers<never>().promise;
 
 	function echoConfig(): UltrathinkConfig {
@@ -1534,6 +1543,35 @@ describe("lessons and RAGFlow documents in the plan", () => {
 		}
 	});
 
+	test("a used skills lookup adds its section after the documents, and the record and summary say so", async () => {
+		const { deps, cleanup } = baseDeps({
+			config: echoConfig(),
+			complete: smartComplete(),
+			clarify: async () => [],
+			recall: async () => recalled,
+			ground: async () => grounded,
+			skills: async () => skillHits,
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const context = contextOf(result);
+			const at = (needle: string) => context.indexOf(needle);
+			expect(at("## Documents (RAGFlow)")).toBeGreaterThan(-1);
+			expect(at("## Documents (RAGFlow)")).toBeLessThan(at("## Relevant skills"));
+			expect(at("## Relevant skills")).toBeLessThan(at("<BUILD_PROMPT>"));
+			expect(context).toContain("MARKER_S1");
+			expect(result.output?.systemMessage).toContain("Skills · 1 recalled");
+
+			// The record keeps the lookup, never skill text, and reads back from disk.
+			expect(result.record?.skills).toMatchObject({ outcome: "used", count: 1, names: ["lesson-bun-test"] });
+			const stored = readSession(deps.stateDir, "s1");
+			expect(stored?.skills).toEqual(result.record?.skills);
+			expect(JSON.stringify(stored)).not.toContain("MARKER_S1");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("off, none and error lookups leave the planner text exactly as without them", async () => {
 		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [] });
 		try {
@@ -1575,12 +1613,13 @@ describe("lessons and RAGFlow documents in the plan", () => {
 		}
 	});
 
-	test("with nothing configured nothing runs, nothing is contacted and the record is unchanged", async () => {
+	test("with nothing configured only the local lessons and skills lookups run and nothing is contacted", async () => {
 		const R = recordingFetch([() => new Response("")]);
 		const { deps, cleanup } = baseDeps({ config: echoConfig(), complete: smartComplete(), clarify: async () => [], decisionsDeps: { env: {}, storePath: tempStore(), fetch: R.fetch } });
 		try {
 			const result = await runPromptSubmit(input, deps);
-			expect(result.record).not.toHaveProperty("lessons");
+			expect(result.record?.lessons).toMatchObject({ outcome: "none", count: 0 });
+			expect(result.record?.skills).toMatchObject({ outcome: "none", count: 0 });
 			expect(result.record).not.toHaveProperty("docs");
 			expect(contextOf(result)).not.toContain("## Lessons from earlier work");
 			expect(contextOf(result)).not.toContain("## Documents (RAGFlow)");
