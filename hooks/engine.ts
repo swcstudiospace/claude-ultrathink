@@ -11,7 +11,7 @@ import { planPrompt, type PlanRequest } from "../src/host/plan.ts";
 import { createFdProgressSink } from "../src/host/progress.ts";
 import { isHostId } from "../src/host/types.ts";
 
-function requestFrom(value: unknown): PlanRequest {
+export function requestFrom(value: unknown): PlanRequest {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	const record = value as Record<string, unknown>;
 	const host = typeof record.host === "string" && isHostId(record.host) ? record.host : undefined;
@@ -24,6 +24,9 @@ function requestFrom(value: unknown): PlanRequest {
 		transcript_path: text("transcript_path") ?? text("transcriptPath"),
 		parent_session_id: text("parent_session_id") ?? text("parentSessionId"),
 		platform: text("platform"),
+		// Hermes forwards its hook payload's model and Omp its session file's last model_change entry;
+		// under think.engine auto the planner follows it instead of the host default.
+		model: text("model"),
 	};
 }
 
@@ -49,10 +52,12 @@ async function main(): Promise<void> {
 	process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-main()
-	.catch(() => {
-		process.stdout.write(`${JSON.stringify({ context: "", skipped: "engine-error" })}\n`);
-	})
-	.finally(() => {
-		process.exit(0);
-	});
+if (import.meta.main) {
+	main()
+		.catch(() => {
+			process.stdout.write(`${JSON.stringify({ context: "", skipped: "engine-error" })}\n`);
+		})
+		.finally(() => {
+			process.exit(0);
+		});
+}

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Omp and Hermes plan with the session's active model again. The host-neutral plan entry dropped the `model` field both hosts send, so `think.engine: "auto"` always fell back to the Claude host default — on a Muse session with Claude out of credits every plan was the 5-node boilerplate graph with one-question fills and no tracker rows. The entry now forwards `model` to engine selection.
+
 ## [0.4.0] - 2026-10-04
 
 A fresh install now contacts only the services you configured, the installers work from any clone on Linux and macOS (Windows through WSL), and the documentation is written for people outside the project. Several defaults changed; every entry under **Changed** and **Removed** says how to keep the old behaviour.
