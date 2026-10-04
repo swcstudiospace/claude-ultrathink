@@ -511,10 +511,13 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			}
 		}
 
+		// Read once: the record, the summary and the context all report the same first error.
+		const engineError = deps.engineError?.();
 		const record: SessionRecord = {
 			sessionId,
 			at: now(),
 			engine: deps.engine,
+			...(engineError ? { engineError } : {}),
 			host: deps.surface ?? "claude-code",
 			result,
 			graph,
@@ -552,6 +555,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				hookEventName: "UserPromptSubmit",
 				additionalContext: formatPromptContext({
 					result,
+					engine: deps.engine,
+					...(engineError ? { engineError } : {}),
 					graph,
 					clarifications,
 					brief,
@@ -589,7 +594,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				knowledge,
 				lessons,
 				docs,
-				engineError: deps.engineError?.(),
+				...(engineError ? { engineError } : {}),
 				elapsedMs: now() - started,
 				decisions: records,
 			});

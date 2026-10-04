@@ -156,6 +156,10 @@ export function formatPlanSkipNotice(p: number): string {
 
 export interface PromptContextInput {
 	result: UpliftResult;
+	/** Thinking engine label; named in the degradation notice when the plan fell back. */
+	engine?: string;
+	/** First engine error message; with a fallback result it adds the degradation notice. */
+	engineError?: string;
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
 	/** Agent Substrate briefing; empty or absent when the substrate is unreachable. */
@@ -270,6 +274,18 @@ export function formatPromptContext(input: PromptContextInput): string {
 			: UPLIFT_CONTEXT_HEADER;
 	const parts: string[] = [header];
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
+	// A failed engine still delivers boilerplate (fail-open), but the agent must know it is
+	// boilerplate and why: otherwise a dead engine looks like a terse real plan with rows to come.
+	if (input.result.source === "fallback" && input.engineError) {
+		const engine = input.engine?.trim() || "thinking engine";
+		parts.push(
+			[
+				"## Planning degraded",
+				"",
+				`The ${engine} planning call failed (${input.engineError}). The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
+			].join("\n"),
+		);
+	}
 	if (input.handoff) {
 		const graphId = input.plan?.graphId ?? input.tracking?.graphId;
 		if (graphId) parts.push(`Graph ID: ${graphId}`);
@@ -302,7 +318,18 @@ export function formatPromptContext(input: PromptContextInput): string {
 		if (hitl) tail.push(hitl);
 	}
 	if (input.trackingOff) tail.push(TRACKING_OFF_NOTE);
-	else if (input.statePath) {
+	else if (input.statePath && !input.plan) {
+		// No track plan (fallback output): no rows exist and `track complete` has nothing to finish,
+		// so kickoff resolves clarifications only instead of running it.
+		const kickoff = skillReference("ultrathink-kickoff", hints);
+		tail.push(
+			[
+				"## Ultrathink tracking",
+				"",
+				`No tracker rows were created for this plan, and none will be. Before starting work, invoke ${kickoff} with stateFile=${input.statePath} only to resolve any blocking clarifications; it must not create rows. Do not start coding before it returns.`,
+			].join("\n"),
+		);
+	} else if (input.statePath) {
 		const complete = input.tracking?.status === "complete";
 		const finish = input.trackCommand
 			? `, which first runs \`${input.trackCommand} --state ${shellArg(input.statePath)}\` to finish the missing Notion/Linear rows`

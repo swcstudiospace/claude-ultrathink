@@ -50,7 +50,7 @@ If `plan` is missing (tracking failed to build), skip straight to step 5 with th
 Rows go to the Notion data source `notion.dataSourceUrl` (a `collection://…` URL) and the Linear team `linear.team` from the ultrathink config: `~/.config/ultrathink/config.json`, `~/.claude/ultrathink.json` and `<project>/.claude/ultrathink.json`, later files winning. `<repo>/bin/ultrathink status`, run from the project directory, prints both as `Notion: …` and `Linear team: …` (`not configured` when unset); `<repo>` is the plugin root (this file is `<repo>/skills/ultrathink-kickoff/SKILL.md`). Skip a tracker that is not configured silently: create nothing in it and do not mention it. If the user asks to set up Notion tracking, `<repo>/bin/ultrathink-mcp notion init --parent <page url or id> --write-config` creates the database and saves its `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`.
 
 - If `tracking.status` is `"complete"`: every row exists in each configured tracker. Skip all row creation and go to step 3.
-- Otherwise — `tracking` is absent (on Hermes the planner creates no rows, so it always is on the first run) or not complete — run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool:
+- Otherwise — `tracking` is absent (on Hermes the planner creates no rows, so it always is on the first run) or not complete — and the state file has a `plan`, run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool (without a `plan` there are no rows to finish: skip to step 3):
 
   ```sh
   <repo>/bin/ultrathink-mcp track complete --state <stateFile>

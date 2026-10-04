@@ -33,6 +33,8 @@ export interface SessionRecord {
 	at: number;
 	/** Thinking engine label, e.g. "grok-4.7@xhigh", "<shuntModel or model>@shunt" or "claude:sonnet". */
 	engine?: string;
+	/** First engine error message (redacted), when a plan call threw; explains a fallback source. */
+	engineError?: string;
 	/** Host that planned this prompt. Absent on records written before multi-host support. */
 	host?: string;
 	result: UpliftResult;

@@ -97,7 +97,7 @@ The command still took effect when nothing was printed. Check with `bin/ultrathi
 
 ## Every plan shows fallback
 
-Every summary line shows `fallback` as the source (often with an `Engine error · …` segment), and no rows are created.
+Every summary line shows `fallback` as the source (often with an `Engine error · …` segment), and no rows are created. The plan context also carries a `## Planning degraded` block naming the engine and the error, and the session record keeps it as `engineError`.
 
 - **Claude engine: update the `claude` CLI.** The Claude engine runs `claude -p` with `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`. A CLI too old to know these flags fails every call, so every plan falls back. Claude Code 2.1.278 is the tested version; update to it or later, and check that `claude.bin` (default `claude`) is the binary on the host's `PATH` and that it is logged in.
 - **Grok engine:** check the login (`SuperGrok OAuth:` in `bin/ultrathink status`) or, for `shunt`, see [Grok shunt gateway not configured](#grok-shunt-gateway-not-configured).
@@ -402,6 +402,7 @@ The same pass redacts PEM private keys, URL userinfo, assignment-shaped secrets,
 - **No status bar.** The bar, live graph and plan cards render only in the TUI (`mode: "tui"`). RPC, print and JSON modes plan the same way without the chrome.
 - **Not planned.** Task-subagent sessions, and a top-level `omp -p --no-session` run, are treated as subagents and never planned.
 - `omp plugin link <clone>` loads `src/host/omp.ts` through `package.json` `omp.extensions`. `omp plugin list` should show `ultrathink`.
+- **Stale extension after an update.** The extension — session-model routing, the status bar, the plan cards — loads from the linked clone when the Omp session starts; pulling the clone does not refresh running sessions. After updating, restart your Omp sessions (or re-run `omp plugin link <clone>`), then check `omp plugin list` shows the new version (`ultrathink@0.4.0`). A session started before the update keeps planning on the old code: for example, on Claude instead of the session's Muse model, with a short boilerplate graph when Claude is out of credits.
 
 ## Uninstalling
 

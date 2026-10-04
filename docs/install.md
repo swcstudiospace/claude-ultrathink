@@ -268,7 +268,7 @@ omp plugin link <clone>
 
 ### Verify
 
-1. `omp plugin list` shows `ultrathink@0.3.0` as enabled.
+1. `omp plugin list` shows `ultrathink@0.4.0` as enabled.
 2. Start the Omp TUI. The `ultrathink` status bar appears above the status band.
 3. Run `/ultrathink-status`. Omp shows the state as a notification.
 4. Send a non-trivial prompt. The status bar shows the planning stages, and the plan appears as a card, either inline or later as an aside.
