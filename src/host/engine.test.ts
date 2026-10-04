@@ -289,7 +289,10 @@ describe("selectEngine first-error capture", () => {
 		const bin = join(dir, "fail.sh");
 		// Built in pieces so no scanner reads a key-like literal out of this fixture.
 		const leak = `sk-${"ant-0123456789abcdef"}`;
-		writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' 'auth failed for key ${leak}' 'second line' '${"x".repeat(2000)}' >&2\nexit 1\n`);
+		writeFileSync(
+			bin,
+			`#!/bin/sh\nprintf '%s\\n' 'auth failed for key ${leak}' 'token Bearer abcdefgh rejected' '${"x".repeat(2000)}' >&2\nexit 1\n`,
+		);
 		chmodSync(bin, 0o755);
 		const config = configWith({ claude: { ...defaultConfig().claude, bin } });
 		const selected = await selectEngine(config, {}, dir, "claude-code");
@@ -298,6 +301,8 @@ describe("selectEngine first-error capture", () => {
 		const first = selected.error();
 		expect(first).toBeDefined();
 		expect(first).not.toContain(leak);
+		// Diagnostics are not prose: even a short Bearer [REDACTED] is masked, unlike redactLine's default.
+		expect(first).not.toContain("abcdefgh");
 		expect(first).toContain("[redacted]");
 		expect(first).not.toContain("\n");
 		expect(first!.length).toBeLessThanOrEqual(MAX_ENGINE_ERROR_CHARS);

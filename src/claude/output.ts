@@ -9,6 +9,7 @@
  * framed as the user's own request, elaborated by a plugin the user installed.
  */
 import { join } from "node:path";
+import { MAX_ENGINE_ERROR_CHARS } from "../host/engine.ts";
 import { SHIP_CLI } from "../ship/nudge.ts";
 import { type DecisionRecord, formatP } from "../decisions/types.ts";
 import { formatHitlAddendum } from "../hitl/format.ts";
@@ -275,15 +276,18 @@ function degradedStageName(token: string): string {
  * recorded engine error), or — under a real spec — the think stages that fell back.
  */
 function degradationNotice(
-	input: Pick<PromptContextInput, "result" | "engine" | "engineError" | "degraded">,
+	input: Pick<PromptContextInput, "result" | "engine" | "engineError" | "degraded" | "tracking" | "trackingOff">,
 ): string | undefined {
 	const engine = input.engine?.trim() || "thinking engine";
+	// The capture already bounds this; bound again so a long error can never blow the host context
+	// (the Hermes handoff keeps this notice even past its ceiling).
+	const failure = input.engineError ? ` (${input.engineError.slice(0, MAX_ENGINE_ERROR_CHARS)})` : "";
 	if (input.result.source === "fallback") {
 		if (input.engineError) {
 			return [
 				"## Planning degraded",
 				"",
-				`The ${engine} planning call failed (${input.engineError}). The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
+				`The ${engine} planning call failed${failure}. The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
 			].join("\n");
 		}
 		return [
@@ -294,12 +298,18 @@ function degradationNotice(
 	}
 	const degraded = input.degraded ?? [];
 	if (degraded.length === 0) return undefined;
-	const failure = input.engineError ? ` (${input.engineError})` : "";
 	const stages = degraded.map(degradedStageName).join(", ");
+	const rows = input.trackingOff
+		? "No tracker rows were created (tracking is off)."
+		: input.tracking?.status === "complete"
+			? "Tracker rows were created; rows under the unverified parts carry boilerplate."
+			: input.tracking
+				? `Tracker rows are incomplete (${input.tracking.status}); rows under the unverified parts carry boilerplate.`
+				: "Tracker rows are left for ultrathink-kickoff; rows under the unverified parts will carry boilerplate.";
 	return [
 		"## Planning degraded",
 		"",
-		`Some ${engine} planning calls failed${failure}: ${stages} use fallback content — treat those parts as unverified. Tracker rows were still created; rows under the unverified parts carry boilerplate.`,
+		`Some ${engine} planning calls failed${failure}: ${stages} use fallback content — treat those parts as unverified. ${rows}`,
 	].join("\n");
 }
 

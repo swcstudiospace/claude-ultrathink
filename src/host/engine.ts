@@ -7,7 +7,7 @@
  * `fallbackToClaude` is set; a host-default grok without a login falls back
  * to Muse instead. The shunt transport does not need `grok login`.
  */
-import { grokAuthStatusFresh } from "../grok/auth.ts";
+import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { createGrokCompleter } from "../grok/complete.ts";
 import { grokEngineLabel } from "../grok/label.ts";
 import { type ClaudeCompleter, createClaudeCompleter } from "../claude/complete.ts";
@@ -46,7 +46,9 @@ function captureFirstError(label: string, complete: ClaudeCompleter): SelectedEn
 			try {
 				return await complete(system, user, signal);
 			} catch (error) {
-				first ??= redactLine(error instanceof Error ? error.message : String(error), MAX_ENGINE_ERROR_CHARS);
+				// redactLine keeps short Bearer [REDACTED] as prose; engine stderr is diagnostics, not prose,
+				// so mask every remaining Bearer [REDACTED] too before the error is persisted and shown.
+				first ??= redactSecrets(redactLine(error instanceof Error ? error.message : String(error), MAX_ENGINE_ERROR_CHARS));
 				throw error;
 			}
 		},

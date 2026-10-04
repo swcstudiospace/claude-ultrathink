@@ -110,19 +110,25 @@ describe("formatPromptContext", () => {
 		);
 	});
 
-	test("a real spec with degraded think stages names them and says rows still exist", () => {
-		const out = formatPromptContext({
-			result,
-			engine: "claude:sonnet",
-			engineError: "boom",
-			degraded: ["graph", "fill:n2"],
-			graph: FALLBACK_GRAPH,
-		});
+	test("a real spec with degraded think stages names them and reflects the tracking state", () => {
+		const base = { result, engine: "claude:sonnet", engineError: "boom", degraded: ["graph", "fill:n2"], graph: FALLBACK_GRAPH };
+		const out = formatPromptContext({ ...base, tracking: complete });
 		expect(out).toContain("## Planning degraded");
 		expect(out).toContain("the graph structure, the n2 fill use fallback content");
 		expect(out).toContain("(boom)");
-		expect(out).toContain("Tracker rows were still created");
+		expect(out).toContain("Tracker rows were created; rows under the unverified parts carry boilerplate.");
 		expect(out).not.toContain("generic fallback text");
+		// Deferred (Hermes), partial, and off: never claim rows that do not exist yet.
+		expect(formatPromptContext(base)).toContain("Tracker rows are left for ultrathink-kickoff");
+		expect(formatPromptContext({ ...base, tracking: partial })).toContain("Tracker rows are incomplete (partial)");
+		expect(formatPromptContext({ ...base, trackingOff: true })).toContain("No tracker rows were created (tracking is off).");
+	});
+
+	test("a long engine error is bounded in the notice so handoffs cannot spill", () => {
+		const out = formatPromptContext({ result, engine: "claude:sonnet", engineError: "e".repeat(2000), degraded: ["graph"] });
+		expect(out).toContain("## Planning degraded");
+		expect(out).not.toContain("e".repeat(501));
+		expect(out).toContain(`(${"e".repeat(500)})`);
 	});
 
 	test("without a track plan the graph addendum promises no issue links", () => {

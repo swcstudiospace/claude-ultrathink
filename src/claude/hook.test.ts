@@ -139,7 +139,7 @@ describe("runPromptSubmit", () => {
 			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
 			expect(ctx).toContain("## Planning degraded");
 			expect(ctx).toContain("the n2 fill use fallback content");
-			expect(ctx).toContain("Tracker rows were still created");
+			expect(ctx).toContain("Tracker rows are left for ultrathink-kickoff");
 		} finally {
 			cleanup();
 		}
