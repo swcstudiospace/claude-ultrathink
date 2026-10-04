@@ -160,6 +160,8 @@ export interface PromptContextInput {
 	engine?: string;
 	/** First engine error message; with a fallback result it adds the degradation notice. */
 	engineError?: string;
+	/** Plan stages that fell back to boilerplate ("uplift", "graph", "fill:<nodeId>"); drives the notice wording. */
+	degraded?: string[];
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
 	/** Agent Substrate briefing; empty or absent when the substrate is unreachable. */
@@ -262,6 +264,45 @@ function formatLinkedIssues(plan: TrackPlan, tracking: TrackingRefs, providers: 
 	].join("\n");
 }
 
+function degradedStageName(token: string): string {
+	if (token === "graph") return "the graph structure";
+	if (token.startsWith("fill:")) return `the ${token.slice("fill:".length)} fill`;
+	return `the ${token} step`;
+}
+
+/**
+ * Warns the agent that parts of the plan are boilerplate: a failed uplift (with or without a
+ * recorded engine error), or — under a real spec — the think stages that fell back.
+ */
+function degradationNotice(
+	input: Pick<PromptContextInput, "result" | "engine" | "engineError" | "degraded">,
+): string | undefined {
+	const engine = input.engine?.trim() || "thinking engine";
+	if (input.result.source === "fallback") {
+		if (input.engineError) {
+			return [
+				"## Planning degraded",
+				"",
+				`The ${engine} planning call failed (${input.engineError}). The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
+			].join("\n");
+		}
+		return [
+			"## Planning degraded",
+			"",
+			`Planning produced no usable model output (an empty or invalid completion, or a prompt over the uplift size limit), so the specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Shorten the prompt or fix the engine and resend to get a real plan.`,
+		].join("\n");
+	}
+	const degraded = input.degraded ?? [];
+	if (degraded.length === 0) return undefined;
+	const failure = input.engineError ? ` (${input.engineError})` : "";
+	const stages = degraded.map(degradedStageName).join(", ");
+	return [
+		"## Planning degraded",
+		"",
+		`Some ${engine} planning calls failed${failure}: ${stages} use fallback content — treat those parts as unverified. Tracker rows were still created; rows under the unverified parts carry boilerplate.`,
+	].join("\n");
+}
+
 export function formatPromptContext(input: PromptContextInput): string {
 	const maxChars = input.maxChars ?? DEFAULT_CONTEXT_CHARS;
 	const hints = input.skillHints || input.handoff;
@@ -276,16 +317,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
 	// A failed engine still delivers boilerplate (fail-open), but the agent must know it is
 	// boilerplate and why: otherwise a dead engine looks like a terse real plan with rows to come.
-	if (input.result.source === "fallback" && input.engineError) {
-		const engine = input.engine?.trim() || "thinking engine";
-		parts.push(
-			[
-				"## Planning degraded",
-				"",
-				`The ${engine} planning call failed (${input.engineError}). The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
-			].join("\n"),
-		);
-	}
+	const degradedNotice = degradationNotice(input);
+	if (degradedNotice) parts.push(degradedNotice);
 	if (input.handoff) {
 		const graphId = input.plan?.graphId ?? input.tracking?.graphId;
 		if (graphId) parts.push(`Graph ID: ${graphId}`);
@@ -301,7 +334,9 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 	const tail: string[] = [];
 	if (input.graph) {
-		const think = (input.trackingOff ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim();
+		// Without a track plan no rows exist and none will: the tracked addendum would send the
+		// agent looking for issue links that cannot exist.
+		const think = (input.trackingOff || !input.plan ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim();
 		tail.push(hints ? `${think}\n${HERMES_TOOL_NAMES}` : think);
 		const waves = workflowWaves(input.graph)
 			.map((w) => `${w.wave}: ${w.ids.join(", ")}${w.parallel ? " (parallel)" : ""}`)

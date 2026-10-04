@@ -35,6 +35,8 @@ export interface SessionRecord {
 	engine?: string;
 	/** First engine error message (redacted), when a plan call threw; explains a fallback source. */
 	engineError?: string;
+	/** Plan stages that fell back to boilerplate, in run order: "uplift", "graph", "fill:<nodeId>". Absent when every stage used LLM output. */
+	degraded?: string[];
 	/** Host that planned this prompt. Absent on records written before multi-host support. */
 	host?: string;
 	result: UpliftResult;

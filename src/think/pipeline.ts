@@ -7,6 +7,7 @@ import {
 	extractJsonObject,
 	graphSketch,
 	injectGraphXml,
+	isFallbackGraph,
 	normalizeGraph,
 	parseNodeFill,
 	topoSort,
@@ -16,6 +17,8 @@ import { MAX_NODES, MIN_NODES, type ThoughtGraph, type ThoughtNode } from "./typ
 
 export interface ThinkResult extends UpliftResult {
 	graph: ThoughtGraph;
+	/** Think stages that fell back to boilerplate: the graph structure, and node fills by id. */
+	degraded: { graph: boolean; fills: string[] };
 }
 
 export interface RunThinkOptions {
@@ -92,13 +95,14 @@ async function buildGraph(
 	opts: RunThinkOptions,
 	minNodes: number,
 	maxNodes: number,
-): Promise<ThoughtGraph> {
+): Promise<{ graph: ThoughtGraph; fallback: boolean }> {
 	try {
 		const raw = await opts.complete(GRAPH_SYSTEM_PROMPT, graphUserPayload(opts.uplift), opts.signal);
-		return normalizeGraph(extractJsonObject(raw), opts.uplift.original, minNodes, maxNodes);
+		const graph = normalizeGraph(extractJsonObject(raw), opts.uplift.original, minNodes, maxNodes);
+		return { graph, fallback: isFallbackGraph(graph) };
 	} catch (error) {
 		if (isAbortError(error)) throw error;
-		return normalizeGraph(null, opts.uplift.original, minNodes, maxNodes);
+		return { graph: normalizeGraph(null, opts.uplift.original, minNodes, maxNodes), fallback: true };
 	}
 }
 
@@ -106,7 +110,7 @@ async function fillNode(
 	opts: RunThinkOptions,
 	graph: ThoughtGraph,
 	node: ThoughtNode,
-): Promise<void> {
+): Promise<boolean> {
 	const index = graph.nodes.indexOf(node);
 	const total = graph.nodes.length;
 	const base = { id: node.id, title: node.title, kind: node.kind, index, total };
@@ -117,6 +121,8 @@ async function fillNode(
 		const fill = parseNodeFill(raw);
 		node.thinking = fill.thinking;
 		node.conclusion = fill.conclusion;
+		// An empty fill degrades to the question downstream, same as a throw: report it the same way.
+		fallback = !fill.thinking && !fill.conclusion;
 	} catch (error) {
 		if (isAbortError(error)) throw error;
 		node.thinking = node.question;
@@ -127,14 +133,21 @@ async function fillNode(
 	opts.onEvent?.(
 		fallback ? { type: "node", phase: "done", ...base, fallback: true, steps } : { type: "node", phase: "done", ...base, steps },
 	);
+	return fallback;
 }
 
-async function fillLevel(opts: RunThinkOptions, graph: ThoughtGraph, group: ThoughtNode[], limit: number): Promise<void> {
+async function fillLevel(
+	opts: RunThinkOptions,
+	graph: ThoughtGraph,
+	group: ThoughtNode[],
+	limit: number,
+	failed: string[],
+): Promise<void> {
 	let cursor = 0;
 	const worker = async (): Promise<void> => {
 		while (cursor < group.length) {
 			const node = group[cursor++]!;
-			await fillNode(opts, graph, node);
+			if (await fillNode(opts, graph, node)) failed.push(node.id);
 		}
 	};
 	await Promise.all(Array.from({ length: Math.min(limit, group.length) }, worker));
@@ -146,7 +159,8 @@ export async function runThink(opts: RunThinkOptions): Promise<ThinkResult> {
 	const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
 
 	opts.onProgress?.("Graph of Thought…");
-	const graph = await buildGraph(opts, minNodes, maxNodes);
+	const built = await buildGraph(opts, minNodes, maxNodes);
+	const graph = built.graph;
 	graph.nodes = topoSort(graph.nodes);
 	opts.onEvent?.({
 		type: "graph",
@@ -154,21 +168,22 @@ export async function runThink(opts: RunThinkOptions): Promise<ThinkResult> {
 		nodes: graph.nodes.map((node) => ({ id: node.id, title: node.title, kind: node.kind, dependsOn: [...node.dependsOn] })),
 	});
 
+	const fills: string[] = [];
 	if (concurrency === 1) {
 		for (let index = 0; index < graph.nodes.length; index++) {
 			const node = graph.nodes[index]!;
 			opts.onProgress?.(`Node detail n${index + 1}/${graph.nodes.length} · ${node.kind}…`);
-			await fillNode(opts, graph, node);
+			if (await fillNode(opts, graph, node)) fills.push(node.id);
 		}
 	} else {
 		let done = 0;
 		for (const group of dependencyLevels(graph.nodes)) {
 			opts.onProgress?.(`Node detail ${done + 1}-${done + group.length}/${graph.nodes.length}…`);
-			await fillLevel(opts, graph, group, concurrency);
+			await fillLevel(opts, graph, group, concurrency, fills);
 			done += group.length;
 		}
 	}
 
 	const xml = injectGraphXml(opts.uplift.xml, graph);
-	return { ...opts.uplift, xml, graph, source: opts.uplift.source };
+	return { ...opts.uplift, xml, graph, source: opts.uplift.source, degraded: { graph: built.fallback, fills } };
 }

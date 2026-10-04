@@ -103,6 +103,18 @@ export function normalizeGraph(
 	};
 }
 
+/**
+ * True when the graph is the boilerplate fallback: normalizeGraph substitutes it whenever fewer
+ * than minNodes parse, so a model echoing it verbatim is boilerplate too and reports the same.
+ */
+export function isFallbackGraph(graph: ThoughtGraph): boolean {
+	if (graph.goal !== FALLBACK_GRAPH.goal || graph.nodes.length !== FALLBACK_GRAPH.nodes.length) return false;
+	return FALLBACK_GRAPH.nodes.every((node, index) => {
+		const item = graph.nodes[index];
+		return item !== undefined && item.id === node.id && item.kind === node.kind && item.question === node.question;
+	});
+}
+
 export function topoSort(nodes: ThoughtNode[]): ThoughtNode[] {
 	const byId = new Map(nodes.map((node) => [node.id, node]));
 	const incoming = new Map<string, number>();

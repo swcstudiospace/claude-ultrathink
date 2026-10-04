@@ -8,6 +8,7 @@ import {
 	graphSketch,
 	graphToXml,
 	injectGraphXml,
+	isFallbackGraph,
 	normalizeGraph,
 	parseNodeFill,
 	topoSort,
@@ -26,6 +27,20 @@ describe("extractJsonObject", () => {
 describe("extractTag", () => {
 	test("reads inner text case-insensitively", () => {
 		expect(extractTag("<THINKING> step </THINKING>", "thinking")).toBe("step");
+	});
+});
+
+describe("isFallbackGraph", () => {
+	test("matches the substituted boilerplate but no real graph", () => {
+		expect(isFallbackGraph(FALLBACK_GRAPH)).toBe(true);
+		expect(isFallbackGraph(normalizeGraph(null, "goal", MIN_NODES, MAX_NODES))).toBe(true);
+		const real = normalizeGraph(
+			{ goal: "Ship it", nodes: FALLBACK_GRAPH.nodes.map((node) => ({ ...node, question: `${node.question} (task)` })) },
+			"goal",
+			MIN_NODES,
+			MAX_NODES,
+		);
+		expect(isFallbackGraph(real)).toBe(false);
 	});
 });
 

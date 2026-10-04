@@ -207,4 +207,31 @@ describe("runThink onEvent", () => {
 		expect(done.find((event) => event.id === "n2")).toMatchObject({ fallback: true, steps: ["Step 1: Q2"] });
 		expect(events.filter((event) => event.phase === "start").every((event) => event.steps === undefined)).toBe(true);
 	});
+
+	test("reports which think stages fell back: graph, failed fills, empty fills", async () => {
+		const fill = "<node><thinking>t</thinking><conclusion>c</conclusion></node>";
+		const healthy = await runThink({
+			uplift,
+			complete: async (_system, user) => (user.includes("current_node") ? fill : graphJson(5)),
+		});
+		expect(healthy.degraded).toEqual({ graph: false, fills: [] });
+
+		const badGraph = await runThink({
+			uplift,
+			complete: async (_system, user) => (user.includes("current_node") ? fill : "not json at all"),
+		});
+		expect(badGraph.graph.nodes).toHaveLength(5);
+		expect(badGraph.degraded.graph).toBe(true);
+
+		const badFill = await runThink({
+			uplift,
+			complete: async (_system, user) => {
+				if (!user.includes("current_node")) return graphJson(5);
+				if (user.includes('current_node id="n2"')) throw new Error("node boom");
+				if (user.includes('current_node id="n4"')) return "";
+				return fill;
+			},
+		});
+		expect(badFill.degraded).toEqual({ graph: false, fills: ["n2", "n4"] });
+	});
 });

@@ -400,6 +400,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		}
 
 		let graph: ThoughtGraph | undefined;
+		let thinkDegraded: string[] = [];
 		const thinkOn = deps.control.thinkEnabled ?? deps.config.think.enabled;
 		if (thinkOn && !controller.signal.aborted) {
 			stage("think", "start");
@@ -416,6 +417,10 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				});
 				result = thought;
 				graph = thought.graph;
+				thinkDegraded = [
+					...(thought.degraded.graph ? ["graph"] : []),
+					...thought.degraded.fills.map((id) => `fill:${id}`),
+				];
 				stage("think", "end", true, `${graph.nodes.length} nodes`);
 			} catch (error) {
 				log(`think failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -513,11 +518,13 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 
 		// Read once: the record, the summary and the context all report the same first error.
 		const engineError = deps.engineError?.();
+		const degraded = [...(result.source === "fallback" ? ["uplift"] : []), ...thinkDegraded];
 		const record: SessionRecord = {
 			sessionId,
 			at: now(),
 			engine: deps.engine,
 			...(engineError ? { engineError } : {}),
+			...(degraded.length > 0 ? { degraded } : {}),
 			host: deps.surface ?? "claude-code",
 			result,
 			graph,
@@ -557,6 +564,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					result,
 					engine: deps.engine,
 					...(engineError ? { engineError } : {}),
+					...(degraded.length > 0 ? { degraded } : {}),
 					graph,
 					clarifications,
 					brief,

@@ -99,11 +99,37 @@ describe("formatPromptContext", () => {
 		expect(out).toContain("claude exited 1");
 		expect(out).toContain("generic fallback text");
 		expect(out.indexOf("## Planning degraded")).toBeLessThan(out.indexOf(result.xml));
-		// Real output, or a fallback with no engine error behind it, stays quiet.
+		// A fallback with no recorded error still warns, without blaming a call that never threw.
+		const quiet = formatPromptContext({ result: fallback, engine: "claude:sonnet", graph: FALLBACK_GRAPH });
+		expect(quiet).toContain("## Planning degraded");
+		expect(quiet).toContain("no usable model output");
+		expect(quiet).not.toContain("planning call failed");
+		// Real output with no degraded stage stays quiet, even with a recorded error.
 		expect(formatPromptContext({ result, engine: "claude:sonnet", engineError: "claude exited 1" })).not.toContain(
 			"## Planning degraded",
 		);
-		expect(formatPromptContext({ result: fallback, engine: "claude:sonnet" })).not.toContain("## Planning degraded");
+	});
+
+	test("a real spec with degraded think stages names them and says rows still exist", () => {
+		const out = formatPromptContext({
+			result,
+			engine: "claude:sonnet",
+			engineError: "boom",
+			degraded: ["graph", "fill:n2"],
+			graph: FALLBACK_GRAPH,
+		});
+		expect(out).toContain("## Planning degraded");
+		expect(out).toContain("the graph structure, the n2 fill use fallback content");
+		expect(out).toContain("(boom)");
+		expect(out).toContain("Tracker rows were still created");
+		expect(out).not.toContain("generic fallback text");
+	});
+
+	test("without a track plan the graph addendum promises no issue links", () => {
+		const bare = formatPromptContext({ result, graph: FALLBACK_GRAPH });
+		expect(bare).toContain("## Graph of Thought");
+		expect(bare).not.toContain("matching issue link");
+		expect(formatPromptContext({ result, graph: FALLBACK_GRAPH, plan })).toContain("matching issue link");
 	});
 
 	test("without a track plan the tracking tail says no rows will exist, not that they are missing", () => {

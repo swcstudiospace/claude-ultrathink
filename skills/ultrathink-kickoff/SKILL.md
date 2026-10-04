@@ -43,14 +43,14 @@ interface SessionRecord {
 
 The spec file is the same path with `.xml` instead of `.json` (`sessions/<id>.xml`); the prompt context also names it as the spec path.
 
-If `plan` is missing (tracking failed to build), skip straight to step 5 with the spec file (or `result.xml`) as the final prompt — do not block on tracking. This is the fail-open path.
+If `plan` is missing (the planner fell back to boilerplate), take the no-plan path: skip steps 1–3 (no rows to finish, nothing to register), resolve clarifications in step 4 from `record.clarifications`, then step 5 with the spec file (or `result.xml`) as the final prompt — do not block on tracking. This is the fail-open path.
 
 ## 1. Finish tracking
 
 Rows go to the Notion data source `notion.dataSourceUrl` (a `collection://…` URL) and the Linear team `linear.team` from the ultrathink config: `~/.config/ultrathink/config.json`, `~/.claude/ultrathink.json` and `<project>/.claude/ultrathink.json`, later files winning. `<repo>/bin/ultrathink status`, run from the project directory, prints both as `Notion: …` and `Linear team: …` (`not configured` when unset); `<repo>` is the plugin root (this file is `<repo>/skills/ultrathink-kickoff/SKILL.md`). Skip a tracker that is not configured silently: create nothing in it and do not mention it. If the user asks to set up Notion tracking, `<repo>/bin/ultrathink-mcp notion init --parent <page url or id> --write-config` creates the database and saves its `notion.dataSourceUrl` to `~/.config/ultrathink/config.json`.
 
 - If `tracking.status` is `"complete"`: every row exists in each configured tracker. Skip all row creation and go to step 3.
-- Otherwise — `tracking` is absent (on Hermes the planner creates no rows, so it always is on the first run) or not complete — and the state file has a `plan`, run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool (without a `plan` there are no rows to finish: skip to step 3):
+- Otherwise — `tracking` is absent (on Hermes the planner creates no rows, so it always is on the first run) or not complete — and the state file has a `plan`, run the command printed in the prompt's **Ultrathink tracking** section once with the shell tool (without a `plan` there are no rows to finish: skip to step 4, reading `record.clarifications`):
 
   ```sh
   <repo>/bin/ultrathink-mcp track complete --state <stateFile>
@@ -96,6 +96,8 @@ This is an optional integration. Run it only when an MCP server named `substrate
 
 ## 4. Resolve HITL clarifications
 
+Without a `plan`, read `record.clarifications` instead of `plan.hitl`: blocking questions are those with `blocking: true` and no `answer`, non-blocking those with `blocking: false` and no `answer` (already-answered items stay answered).
+
 - For every item in `plan.hitl.nonBlocking`: proceed with its `default` option and state the assumption plainly in your next message (do not ask about it).
 - For every item in `plan.hitl.blocking` (at most 4, already deduplicated): call the host's question tool **once** (`AskUserQuestion` in Claude Code, `ask` in Omp, `clarify` in Hermes), passing all of them together — each with its `header`, `question`, and `options` (the option matching `default` first). If no question tool is available, proceed with every blocking default and say so.
 - On Hermes, that one call is `clarify` with `{"questions": [{"question": "<header>: <question>", "choices": ["<default label>", "<other option label>", …]}]}` — at most 4 choices per question with the default first (Hermes labels the first choice Recommended and adds Other itself) and at most 5 questions. If an answer says no user is available (Hermes `-q`/`-z` modes) or the tool errors, proceed with every blocking default and say so.
@@ -105,9 +107,9 @@ This is an optional integration. Run it only when an MCP server named `substrate
 
 1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent). If the Notion MCP tools are not available in this session, tell the user once to register them with `bun <repo>/scripts/mcp-register.ts` (or connect the official Notion MCP server), skip this update and continue — never block the work.
 2. The final prompt is the **full spec file** (`sessions/<id>.xml`, the spec path from the prompt context), which already carries the `<ISSUES>` block with identifiers and URLs. Do not use `plan.task.upliftedPrompt` — that copy is truncated to 1900 characters.
-3. Copy every **Linked issues** TODO line into the host TODO tool verbatim, keeping the identifier and URL on each line. When step 1 ran `track complete`, take the lines from its output — the prompt-context lines are stale then (they still show `(pending)` rows); otherwise take them from the prompt context.
+3. Copy every **Linked issues** TODO line into the host TODO tool verbatim, keeping the identifier and URL on each line. When step 1 ran `track complete`, take the lines from its output — the prompt-context lines are stale then (they still show `(pending)` rows); otherwise take them from the prompt context (without a `plan` there are none — skip).
 4. Mark the session kicked off, once: `<repo>/bin/ultrathink-mcp session mark --state <stateFile> kicked-off`. Fail open: if it errors, ignore it and continue.
 
 ## 6. Proceed as normal
 
-Treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns. Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.
+Treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns (without a `plan` there are no URLs to pass). Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.

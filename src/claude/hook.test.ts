@@ -122,6 +122,46 @@ describe("runPromptSubmit", () => {
 		}
 	});
 
+	test("a real spec with a failed fill records the stage and warns without discarding the plan", async () => {
+		const flaky = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			complete: async (system, user) => {
+				if (user.includes('current_node id="n2"')) throw new Error("boom");
+				return flaky(system, user);
+			},
+			engineError: () => "boom",
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.result.source).toBe("llm");
+			expect(result.record?.plan).toBeDefined();
+			expect(result.record?.degraded).toEqual(["fill:n2"]);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Planning degraded");
+			expect(ctx).toContain("the n2 fill use fallback content");
+			expect(ctx).toContain("Tracker rows were still created");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("an engine that returns nothing warns without blaming a call that never threw", async () => {
+		const { deps, cleanup } = baseDeps({ complete: async () => "" });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.result.source).toBe("fallback");
+			expect(result.record?.engineError).toBeUndefined();
+			expect(result.record?.degraded?.[0]).toBe("uplift");
+			expect(result.record?.degraded).toContain("graph");
+			expect(result.record?.degraded).toHaveLength(7);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Planning degraded");
+			expect(ctx).toContain("no usable model output");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("uplift + think + track: additionalContext carries the kickoff instruction, record carries the plan", async () => {
 		const { deps, cleanup } = baseDeps({ complete: smartComplete() });
 		try {
