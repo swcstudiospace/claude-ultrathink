@@ -14,8 +14,12 @@ import { type ClaudeCompleter, createClaudeCompleter } from "../claude/complete.
 import { createMuseCompleter } from "../muse/complete.ts";
 import type { UltrathinkConfig } from "../config.ts";
 import type { ControlState } from "../claude/state.ts";
+import { redactLine } from "../teach/redact.ts";
 import { detectHost } from "./detect.ts";
 import type { HostId } from "./types.ts";
+
+/** First engine errors are persisted and shown to the agent: redacted, one line, bounded. */
+export const MAX_ENGINE_ERROR_CHARS = 500;
 
 export interface SelectedEngine {
 	label: string;
@@ -42,7 +46,9 @@ function captureFirstError(label: string, complete: ClaudeCompleter): SelectedEn
 			try {
 				return await complete(system, user, signal);
 			} catch (error) {
-				first ??= redactSecrets(error instanceof Error ? error.message : String(error));
+				// redactLine keeps short Bearer [REDACTED] as prose; engine stderr is diagnostics, not prose,
+				// so mask every remaining Bearer [REDACTED] too before the error is persisted and shown.
+				first ??= redactSecrets(redactLine(error instanceof Error ? error.message : String(error), MAX_ENGINE_ERROR_CHARS));
 				throw error;
 			}
 		},

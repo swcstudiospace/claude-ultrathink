@@ -101,6 +101,7 @@ describe("runPromptSubmit", () => {
 			complete: async () => {
 				throw new Error("boom");
 			},
+			engineError: () => "boom",
 		});
 		try {
 			const result = await runPromptSubmit(input, deps);
@@ -109,6 +110,53 @@ describe("runPromptSubmit", () => {
 			// Fallback output must not pollute the shared Notion/Linear tracker with
 			// generic FALLBACK_GRAPH boilerplate rows — the turn proceeds untracked.
 			expect(result.record?.plan).toBeUndefined();
+			// But the failure is recorded and loud: the record keeps the first engine error,
+			// and the context says the spec is boilerplate instead of promising rows to come.
+			expect(result.record?.engineError).toBe("boom");
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Planning degraded");
+			expect(ctx).toContain("No tracker rows were created for this plan, and none will be.");
+			expect(result.output?.systemMessage).toContain("Engine error · boom");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a real spec with a failed fill records the stage and warns without discarding the plan", async () => {
+		const flaky = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			complete: async (system, user) => {
+				if (user.includes('current_node id="n2"')) throw new Error("boom");
+				return flaky(system, user);
+			},
+			engineError: () => "boom",
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.result.source).toBe("llm");
+			expect(result.record?.plan).toBeDefined();
+			expect(result.record?.degraded).toEqual(["fill:n2"]);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Planning degraded");
+			expect(ctx).toContain("the n2 fill use fallback content");
+			expect(ctx).toContain("Tracker rows are left for ultrathink-kickoff");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("an engine that returns nothing warns without blaming a call that never threw", async () => {
+		const { deps, cleanup } = baseDeps({ complete: async () => "" });
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.result.source).toBe("fallback");
+			expect(result.record?.engineError).toBeUndefined();
+			expect(result.record?.degraded?.[0]).toBe("uplift");
+			expect(result.record?.degraded).toContain("graph");
+			expect(result.record?.degraded).toHaveLength(7);
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("## Planning degraded");
+			expect(ctx).toContain("no usable model output");
 		} finally {
 			cleanup();
 		}

@@ -1,6 +1,6 @@
 {
 	"name": "ultrathink",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"private": true,
 	"type": "module",
 	"description": "Plans every prompt into a spec + Graph of Thought, tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR, across Claude Code, Grok Build, Hermes Agent, Muse and Omp.",

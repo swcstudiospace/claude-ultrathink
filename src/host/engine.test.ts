@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { ControlState } from "../claude/state.ts";
 import type { HostId } from "./types.ts";
-import { engineForSessionModel, engineLabel, GROK_LOGIN_REQUIRED, HOST_DEFAULT_ENGINES, selectEngine } from "./engine.ts";
+import { engineForSessionModel, engineLabel, GROK_LOGIN_REQUIRED, HOST_DEFAULT_ENGINES, MAX_ENGINE_ERROR_CHARS, selectEngine } from "./engine.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -279,5 +279,32 @@ describe("selectEngine session-model detection (hermes/omp)", () => {
 	test("a detected grok without a login fails over to Claude, never skips", async () => {
 		const config = configWith({ grok: { ...defaultConfig().grok, home: emptyHome(), fallbackToClaude: false } });
 		expect(await labelOf(config, {}, "omp", "grok-4.7")).toBe("claude:sonnet (grok unavailable)");
+	});
+});
+
+describe("selectEngine first-error capture", () => {
+	test("the recorded error is redacted, one line, and bounded", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-engine-error-"));
+		dirs.push(dir);
+		const bin = join(dir, "fail.sh");
+		// Built in pieces so no scanner reads a key-like literal out of this fixture.
+		const leak = `sk-${"ant-0123456789abcdef"}`;
+		writeFileSync(
+			bin,
+			`#!/bin/sh\nprintf '%s\\n' 'auth failed for key ${leak}' 'token Bearer abcdefgh rejected' '${"x".repeat(2000)}' >&2\nexit 1\n`,
+		);
+		chmodSync(bin, 0o755);
+		const config = configWith({ claude: { ...defaultConfig().claude, bin } });
+		const selected = await selectEngine(config, {}, dir, "claude-code");
+		if ("skipped" in selected) throw new Error("expected a claude engine");
+		await expect(selected.complete("system", "user")).rejects.toThrow();
+		const first = selected.error();
+		expect(first).toBeDefined();
+		expect(first).not.toContain(leak);
+		// Diagnostics are not prose: even a short Bearer [REDACTED] is masked, unlike redactLine's default.
+		expect(first).not.toContain("abcdefgh");
+		expect(first).toContain("[redacted]");
+		expect(first).not.toContain("\n");
+		expect(first!.length).toBeLessThanOrEqual(MAX_ENGINE_ERROR_CHARS);
 	});
 });

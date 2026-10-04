@@ -9,6 +9,7 @@
  * framed as the user's own request, elaborated by a plugin the user installed.
  */
 import { join } from "node:path";
+import { MAX_ENGINE_ERROR_CHARS } from "../host/engine.ts";
 import { SHIP_CLI } from "../ship/nudge.ts";
 import { type DecisionRecord, formatP } from "../decisions/types.ts";
 import { formatHitlAddendum } from "../hitl/format.ts";
@@ -156,6 +157,12 @@ export function formatPlanSkipNotice(p: number): string {
 
 export interface PromptContextInput {
 	result: UpliftResult;
+	/** Thinking engine label; named in the degradation notice when the plan fell back. */
+	engine?: string;
+	/** First engine error message; with a fallback result it adds the degradation notice. */
+	engineError?: string;
+	/** Plan stages that fell back to boilerplate ("uplift", "graph", "fill:<nodeId>"); drives the notice wording. */
+	degraded?: string[];
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
 	/** Agent Substrate briefing; empty or absent when the substrate is unreachable. */
@@ -258,6 +265,54 @@ function formatLinkedIssues(plan: TrackPlan, tracking: TrackingRefs, providers: 
 	].join("\n");
 }
 
+function degradedStageName(token: string): string {
+	if (token === "graph") return "the graph structure";
+	if (token.startsWith("fill:")) return `the ${token.slice("fill:".length)} fill`;
+	return `the ${token} step`;
+}
+
+/**
+ * Warns the agent that parts of the plan are boilerplate: a failed uplift (with or without a
+ * recorded engine error), or — under a real spec — the think stages that fell back.
+ */
+function degradationNotice(
+	input: Pick<PromptContextInput, "result" | "engine" | "engineError" | "degraded" | "tracking" | "trackingOff">,
+): string | undefined {
+	const engine = input.engine?.trim() || "thinking engine";
+	// The capture already bounds this; bound again so a long error can never blow the host context
+	// (the Hermes handoff keeps this notice even past its ceiling).
+	const failure = input.engineError ? ` (${input.engineError.slice(0, MAX_ENGINE_ERROR_CHARS)})` : "";
+	if (input.result.source === "fallback") {
+		if (input.engineError) {
+			return [
+				"## Planning degraded",
+				"",
+				`The ${engine} planning call failed${failure}. The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
+			].join("\n");
+		}
+		return [
+			"## Planning degraded",
+			"",
+			`Planning produced no usable model output (an empty or invalid completion, or a prompt over the uplift size limit), so the specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Shorten the prompt or fix the engine and resend to get a real plan.`,
+		].join("\n");
+	}
+	const degraded = input.degraded ?? [];
+	if (degraded.length === 0) return undefined;
+	const stages = degraded.map(degradedStageName).join(", ");
+	const rows = input.trackingOff
+		? "No tracker rows were created (tracking is off)."
+		: input.tracking?.status === "complete"
+			? "Tracker rows were created; rows under the unverified parts carry boilerplate."
+			: input.tracking
+				? `Tracker rows are incomplete (${input.tracking.status}); rows under the unverified parts carry boilerplate.`
+				: "Tracker rows are left for ultrathink-kickoff; rows under the unverified parts will carry boilerplate.";
+	return [
+		"## Planning degraded",
+		"",
+		`Some ${engine} planning calls failed${failure}: ${stages} use fallback content — treat those parts as unverified. ${rows}`,
+	].join("\n");
+}
+
 export function formatPromptContext(input: PromptContextInput): string {
 	const maxChars = input.maxChars ?? DEFAULT_CONTEXT_CHARS;
 	const hints = input.skillHints || input.handoff;
@@ -270,6 +325,10 @@ export function formatPromptContext(input: PromptContextInput): string {
 			: UPLIFT_CONTEXT_HEADER;
 	const parts: string[] = [header];
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
+	// A failed engine still delivers boilerplate (fail-open), but the agent must know it is
+	// boilerplate and why: otherwise a dead engine looks like a terse real plan with rows to come.
+	const degradedNotice = degradationNotice(input);
+	if (degradedNotice) parts.push(degradedNotice);
 	if (input.handoff) {
 		const graphId = input.plan?.graphId ?? input.tracking?.graphId;
 		if (graphId) parts.push(`Graph ID: ${graphId}`);
@@ -285,7 +344,9 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 	const tail: string[] = [];
 	if (input.graph) {
-		const think = (input.trackingOff ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim();
+		// Without a track plan no rows exist and none will: the tracked addendum would send the
+		// agent looking for issue links that cannot exist.
+		const think = (input.trackingOff || !input.plan ? THINK_ADDENDUM_UNTRACKED : THINK_ADDENDUM).trim();
 		tail.push(hints ? `${think}\n${HERMES_TOOL_NAMES}` : think);
 		const waves = workflowWaves(input.graph)
 			.map((w) => `${w.wave}: ${w.ids.join(", ")}${w.parallel ? " (parallel)" : ""}`)
@@ -302,7 +363,18 @@ export function formatPromptContext(input: PromptContextInput): string {
 		if (hitl) tail.push(hitl);
 	}
 	if (input.trackingOff) tail.push(TRACKING_OFF_NOTE);
-	else if (input.statePath) {
+	else if (input.statePath && !input.plan) {
+		// No track plan (fallback output): no rows exist and `track complete` has nothing to finish,
+		// so kickoff resolves clarifications only instead of running it.
+		const kickoff = skillReference("ultrathink-kickoff", hints);
+		tail.push(
+			[
+				"## Ultrathink tracking",
+				"",
+				`No tracker rows were created for this plan, and none will be. Before starting work, invoke ${kickoff} with stateFile=${input.statePath} only to resolve any blocking clarifications; it must not create rows. Do not start coding before it returns.`,
+			].join("\n"),
+		);
+	} else if (input.statePath) {
 		const complete = input.tracking?.status === "complete";
 		const finish = input.trackCommand
 			? `, which first runs \`${input.trackCommand} --state ${shellArg(input.statePath)}\` to finish the missing Notion/Linear rows`

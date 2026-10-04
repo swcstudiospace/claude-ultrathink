@@ -91,6 +91,63 @@ describe("formatPromptContext", () => {
 		expect(out.indexOf("## Clarifications (HITL)")).toBeLessThan(out.indexOf("## Ultrathink tracking"));
 	});
 
+	test("a failed engine adds a degradation notice before the boilerplate spec", () => {
+		const fallback = { ...result, source: "fallback" as const };
+		const out = formatPromptContext({ result: fallback, engine: "claude:sonnet", engineError: "claude exited 1", graph: FALLBACK_GRAPH });
+		expect(out).toContain("## Planning degraded");
+		expect(out).toContain("claude:sonnet");
+		expect(out).toContain("claude exited 1");
+		expect(out).toContain("generic fallback text");
+		expect(out.indexOf("## Planning degraded")).toBeLessThan(out.indexOf(result.xml));
+		// A fallback with no recorded error still warns, without blaming a call that never threw.
+		const quiet = formatPromptContext({ result: fallback, engine: "claude:sonnet", graph: FALLBACK_GRAPH });
+		expect(quiet).toContain("## Planning degraded");
+		expect(quiet).toContain("no usable model output");
+		expect(quiet).not.toContain("planning call failed");
+		// Real output with no degraded stage stays quiet, even with a recorded error.
+		expect(formatPromptContext({ result, engine: "claude:sonnet", engineError: "claude exited 1" })).not.toContain(
+			"## Planning degraded",
+		);
+	});
+
+	test("a real spec with degraded think stages names them and reflects the tracking state", () => {
+		const base = { result, engine: "claude:sonnet", engineError: "boom", degraded: ["graph", "fill:n2"], graph: FALLBACK_GRAPH };
+		const out = formatPromptContext({ ...base, tracking: complete });
+		expect(out).toContain("## Planning degraded");
+		expect(out).toContain("the graph structure, the n2 fill use fallback content");
+		expect(out).toContain("(boom)");
+		expect(out).toContain("Tracker rows were created; rows under the unverified parts carry boilerplate.");
+		expect(out).not.toContain("generic fallback text");
+		// Deferred (Hermes), partial, and off: never claim rows that do not exist yet.
+		expect(formatPromptContext(base)).toContain("Tracker rows are left for ultrathink-kickoff");
+		expect(formatPromptContext({ ...base, tracking: partial })).toContain("Tracker rows are incomplete (partial)");
+		expect(formatPromptContext({ ...base, trackingOff: true })).toContain("No tracker rows were created (tracking is off).");
+	});
+
+	test("a long engine error is bounded in the notice so handoffs cannot spill", () => {
+		const out = formatPromptContext({ result, engine: "claude:sonnet", engineError: "e".repeat(2000), degraded: ["graph"] });
+		expect(out).toContain("## Planning degraded");
+		expect(out).not.toContain("e".repeat(501));
+		expect(out).toContain(`(${"e".repeat(500)})`);
+	});
+
+	test("without a track plan the graph addendum promises no issue links", () => {
+		const bare = formatPromptContext({ result, graph: FALLBACK_GRAPH });
+		expect(bare).toContain("## Graph of Thought");
+		expect(bare).not.toContain("matching issue link");
+		expect(formatPromptContext({ result, graph: FALLBACK_GRAPH, plan })).toContain("matching issue link");
+	});
+
+	test("without a track plan the tracking tail says no rows will exist, not that they are missing", () => {
+		const fallback = { ...result, source: "fallback" as const };
+		const out = formatPromptContext({ result: fallback, graph: FALLBACK_GRAPH, statePath: "/s/session.json" });
+		expect(out).toContain("## Ultrathink tracking");
+		expect(out).toContain("No tracker rows were created for this plan, and none will be.");
+		expect(out).toContain("it must not create rows");
+		expect(out).not.toContain("which first runs");
+		expect(out).not.toContain("which first finishes");
+	});
+
 	test("truncates oversized xml at a line boundary and points at the spec file", () => {
 		const big = { ...result, xml: Array.from({ length: 500 }, (_, i) => `<L${i}>${"y".repeat(100)}</L${i}>`).join("\n") };
 		const out = formatPromptContext({ result: big, specPath: "/s/big.xml", maxChars: 8_000 });
@@ -391,7 +448,7 @@ describe("tracking", () => {
 	test("partial or absent tracking: kickoff runs the track command first when known", () => {
 		const withCmd = formatPromptContext({ result, plan, tracking: partial, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete" });
 		expect(withCmd).toContain("stateFile=/s/x.json, which first runs `/r/bin/ultrathink-mcp track complete --state /s/x.json` to finish the missing");
-		const without = formatPromptContext({ result, statePath: "/s/x.json" });
+		const without = formatPromptContext({ result, plan, statePath: "/s/x.json" });
 		expect(without).toContain("stateFile=/s/x.json, which first finishes the missing");
 		expect(without).not.toContain("--state");
 		expect(without).not.toContain("## Linked issues");
@@ -404,7 +461,7 @@ describe("tracking", () => {
 	});
 
 	test("skill hints: a host that does not list plugin skills gets each skill's load call and an existing SKILL.md path", () => {
-		const out = formatPromptContext({ result, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", ship: true, skillHints: true });
+		const out = formatPromptContext({ result, plan, tracking: partial, statePath: "/s/x.json", trackCommand: "/r/bin/ultrathink-mcp track complete", ship: true, skillHints: true });
 		for (const name of ["ultrathink-kickoff", "ultrathink-ship"]) {
 			expect(out).toContain(`skill_view name="ultrathink:${name}"`);
 			const path = new RegExp(`read (/\\S+/skills/${name}/SKILL\\.md)\\)`).exec(out)?.[1];
