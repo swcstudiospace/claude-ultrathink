@@ -361,7 +361,8 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 		"platform": payload.get("platform") or "",
 		"parent_session_id": parent or "",
 	}
-	# Unknown stays absent: an empty string would pose as a known model downstream.
+	# An unknown session model stays absent: omission is the wire representation
+	# of unknown, so the engine entry can tell "no model was sent" apart from a model id.
 	model = payload.get("model")
 	if isinstance(model, str) and model.strip():
 		request["model"] = model.strip()
