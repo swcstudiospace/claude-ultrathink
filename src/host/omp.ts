@@ -154,6 +154,21 @@ export const NO_PLAN =
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
+/**
+ * The engine child's stdin payload. An unknown session model stays absent:
+ * omission is the wire representation of unknown, so the entry can tell
+ * "no model was sent" apart from a model id.
+ */
+export function encodeEngineRequest(request: OmpPlanRequest): Record<string, unknown> {
+	return {
+		host: "omp",
+		prompt: request.prompt,
+		cwd: request.cwd,
+		session_id: request.sessionId,
+		...(request.model ? { model: request.model } : {}),
+	};
+}
+
 export const spawnEnginePlanner: OmpPlanner = (request, signal, onEvent) => {
 	const { promise, resolve } = Promise.withResolvers<OmpPlan>();
 	const empty = (): void => resolve({ context: "" });
@@ -207,15 +222,7 @@ export const spawnEnginePlanner: OmpPlanner = (request, signal, onEvent) => {
 			}
 		});
 		child.stdin?.on("error", () => {});
-		child.stdin?.end(
-			JSON.stringify({
-				host: "omp",
-				prompt: request.prompt,
-				cwd: request.cwd,
-				session_id: request.sessionId,
-				model: request.model ?? "",
-			}),
-		);
+		child.stdin?.end(JSON.stringify(encodeEngineRequest(request)));
 	} catch {
 		empty();
 	}
