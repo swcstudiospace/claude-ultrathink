@@ -360,8 +360,11 @@ def plan(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
 		"cwd": cwd,
 		"platform": payload.get("platform") or "",
 		"parent_session_id": parent or "",
-		"model": payload.get("model") or "",
 	}
+	# Unknown stays absent: an empty string would pose as a known model downstream.
+	model = payload.get("model")
+	if isinstance(model, str) and model.strip():
+		request["model"] = model.strip()
 	child_env["ULTRATHINK_HOST"] = "hermes"
 	bun = child_env.get("BUN")
 	# A plugin directory copied out of its clone has no engine (nor bin/run-bun) beside it.

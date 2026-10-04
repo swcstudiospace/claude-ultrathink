@@ -213,7 +213,8 @@ export const spawnEnginePlanner: OmpPlanner = (request, signal, onEvent) => {
 				prompt: request.prompt,
 				cwd: request.cwd,
 				session_id: request.sessionId,
-				model: request.model ?? "",
+				// Unknown stays absent: an empty string would pose as a known model downstream.
+				...(request.model ? { model: request.model } : {}),
 			}),
 		);
 	} catch {
