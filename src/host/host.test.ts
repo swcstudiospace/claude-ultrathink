@@ -9,7 +9,7 @@ import type { DecisionsErrorKind } from "../decisions/types.ts";
 import type { Tracker } from "../track/gateway.ts";
 import { writePlanCarrier } from "./carrier.ts";
 import { detectHost } from "./detect.ts";
-import type { SelectedEngine } from "./engine.ts";
+import type { EngineSelectionContext, ModelResolution, SelectedEngine } from "./engine.ts";
 import { isSubagentEnvelope, normalizeEnvelope, parseEnvelope } from "./envelope.ts";
 import { isPlanningPath, resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanOptions, type PlanResponse } from "./plan.ts";
@@ -196,6 +196,20 @@ async function stubComplete(_system: string, user: string): Promise<string> {
 	});
 }
 
+/** The honest record an injected stub engine carries: an explicit fake wire target, never a detected model. */
+const STUB_RESOLUTION: ModelResolution = {
+	version: "1.0.0",
+	state: "override",
+	host: "claude-code",
+	transport: "claude-cli",
+	source: "engine-model",
+	reason: "explicit-model",
+	engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+	modelId: "stub",
+	modelKnown: true,
+	label: "claude:stub [override]",
+};
+
 /** An isolated home with Linear and Notion configured, and seams that count engine and tracker use. */
 function planHarness(): {
 	root: string;
@@ -225,7 +239,7 @@ function planHarness(): {
 		options: {
 			selectEngine: async (): Promise<SelectedEngine> => {
 				calls.engine++;
-				return { label: "stub", complete: stubComplete, error: () => undefined };
+				return { label: "stub", complete: stubComplete, error: () => undefined, resolution: STUB_RESOLUTION };
 			},
 			createTracker: () => {
 				calls.createTracker++;
@@ -272,6 +286,7 @@ describe("planPrompt", () => {
 						return stubComplete(system, user);
 					},
 					error: () => undefined,
+					resolution: { ...STUB_RESOLUTION, host },
 				};
 			};
 			try {
@@ -289,17 +304,20 @@ describe("planPrompt", () => {
 
 	test("the request model reaches engine selection", async () => {
 		const { root, env, options } = planHarness();
-		let seen: unknown = "unset";
+		const seen: Array<EngineSelectionContext | undefined> = [];
 		const inner = options.selectEngine;
 		options.selectEngine = (async (...args: Parameters<NonNullable<typeof inner>>) => {
-			seen = args[4];
+			seen.push(args[3]);
 			return inner!(...args);
 		}) as typeof inner;
 		try {
 			await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root, model: "grok-4.7" }, env, options);
-			expect(seen).toBe("grok-4.7");
+			expect(seen[0]).toEqual({ host: "hermes", sessionModel: "grok-4.7", purpose: "planning" });
 			await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
-			expect(seen).toBeUndefined();
+			expect(seen).toHaveLength(2);
+			expect(seen[1]?.host).toBe("omp");
+			expect(seen[1]?.purpose).toBe("planning");
+			expect(seen[1]?.sessionModel).toBeUndefined();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

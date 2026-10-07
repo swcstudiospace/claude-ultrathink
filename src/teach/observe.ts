@@ -158,7 +158,7 @@ export function parseLessons(text: string): Lesson[] {
 async function engineComplete(ctx: TeachContext): Promise<NonNullable<TeachContext["complete"]> | string> {
 	const config = loadConfig(claudeConfigPaths(ctx.cwd, ctx.env));
 	const host = (HOSTS as readonly string[]).includes(ctx.host) ? (ctx.host as HostId) : undefined;
-	const engine = await selectEngine(config, readControl(ctx.stateDir), ctx.cwd, host);
+	const engine = await selectEngine(config, readControl(ctx.stateDir), ctx.cwd, { host, purpose: "auxiliary", signal: ctx.signal });
 	return "skipped" in engine ? engine.skipped : engine.complete;
 }
 

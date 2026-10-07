@@ -12,6 +12,8 @@ import { DEFAULT_SHIP_CONFIG, GREPTILE_MAX_SCORE, JUDGE_MODES, type JudgeMode, M
 import { DEFAULT_MUSE_CONFIG, MUSE_EFFORTS, type MuseConfig, type MuseEffort } from "./muse/types.ts";
 import { CAPTURE_MODES, DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachConfig } from "./teach/types.ts";
 import { MAX_NODES, MIN_NODES, THINK_ENGINES, type ThinkConfig, type ThinkEngine } from "./think/types.ts";
+import { type HostId, isHostId } from "./host/types.ts";
+import { type LegacyRoute, ROUTE_DEFAULT_MODELS } from "./route-defaults.ts";
 
 export interface ClaudeConfig {
 	/** `claude` binary used for headless completions. */
@@ -41,7 +43,7 @@ export const CLAUDE_USER_PROMPT_HOOK_TIMEOUT_SEC = 86_400;
 
 export const DEFAULT_CLAUDE_CONFIG: ClaudeConfig = {
 	bin: "claude",
-	model: "sonnet",
+	model: ROUTE_DEFAULT_MODELS.claude,
 	thinking: false,
 	settingSources: "",
 	callTimeoutMs: 0,
@@ -92,6 +94,27 @@ export const DEFAULT_SUBSTRATE_CONFIG: SubstrateConfig = {
 	url: "",
 };
 
+/** A per-host planning model override; "" in a field means no override for it. */
+export interface HostModelOverride {
+	/** Exact credential-bearing provider id the planning target must belong to; "" = no provider constraint. */
+	provider: string;
+	/** Opaque model or host selector; "" = no model override. */
+	model: string;
+}
+
+/**
+ * Planning model selection (`models` in any config layer). `hosts` targets an existing host; `providerDefaults` maps an
+ * exact credential provider id to the selector native Omp planning uses when the live model is unusable. Neither can
+ * define endpoints, headers or credentials, and no legacy CLI route consumes `providerDefaults` (its eligible set is empty).
+ */
+export interface ModelsConfig {
+	hosts: Partial<Record<HostId, HostModelOverride>>;
+	providerDefaults: Record<string, string>;
+}
+
+/** Where an effective legacy route model came from: the route-default map, a nonblank file-layer pin, or a file-layer blank. */
+export type LegacyModelProvenance = "route-default" | "file-pin" | "explicit-blank";
+
 export interface UltrathinkConfig {
 	uplift: { enabled: boolean; skipTrivial: boolean; maxChars: number; echo: boolean };
 	claude: ClaudeConfig;
@@ -112,6 +135,13 @@ export interface UltrathinkConfig {
 	ragflow: RagflowConfig;
 	/** Teachable Moments capture, recall and promotion. Opt-in; a project file can only lower it. */
 	teach: TeachConfig;
+	/** Planning model overrides and exact-provider default selectors; built-in `{ hosts: {}, providerDefaults: {} }`. */
+	models: ModelsConfig;
+	/**
+	 * Provenance of the effective `claude.model`, `grok.model` and `muse.model`, recorded by the merge in memory only and never
+	 * read from a config file. `grok` is never "explicit-blank": its non-empty merge ignores blanks.
+	 */
+	modelProvenance: Readonly<Record<LegacyRoute, LegacyModelProvenance>>;
 }
 
 export function defaultConfig(): UltrathinkConfig {
@@ -141,6 +171,8 @@ export function defaultConfig(): UltrathinkConfig {
 		hindsight: { ...DEFAULT_HINDSIGHT_CONFIG },
 		ragflow: { ...DEFAULT_RAGFLOW_CONFIG, datasetIds: [...DEFAULT_RAGFLOW_CONFIG.datasetIds] },
 		teach: { ...DEFAULT_TEACH_CONFIG },
+		models: { hosts: {}, providerDefaults: providerDictionary({}) },
+		modelProvenance: { claude: "route-default", grok: "route-default", muse: "route-default" },
 	};
 }
 
@@ -250,6 +282,69 @@ function mergeMuse(muse: Record<string, unknown> | undefined, defaults: MuseConf
 			: defaults.reasoningEffort,
 		callTimeoutMs: nonNegativeMs(muse.callTimeoutMs, defaults.callTimeoutMs),
 	};
+}
+
+/** C0 and C1 control characters: NUL, newline, ESC (ANSI), DEL and the rest. */
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+/** A selector or provider string carrying a control character is never sent anywhere; resolution reports it `selector-invalid`. */
+export function hasControlCharacter(value: string): boolean {
+	return CONTROL_CHARACTER.test(value);
+}
+
+/**
+ * A `models` string field after the merge truth table: undefined for a wrong type (the lower layer stays), "" for a blank
+ * (a deliberate reset), otherwise trimmed of surrounding whitespace only. A string carrying a control character is kept
+ * as written, so resolution can diagnose it before a trim could hide it.
+ */
+function selectorField(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	if (!value.trim()) return "";
+	return hasControlCharacter(value) ? value : value.trim();
+}
+
+/** Provider keys never merged into a dictionary, in any layer (prototype pollution, T-15-01). An object lookup would hit the prototype itself. */
+const UNSAFE_DICTIONARY_KEYS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
+/** A prototype-free copy of a provider dictionary's own entries, so no inherited property can act as a mapping. */
+function providerDictionary(entries: Readonly<Record<string, string>>): Record<string, string> {
+	const out = Object.create(null) as Record<string, string>;
+	for (const [key, value] of Object.entries(entries)) out[key] = value;
+	return out;
+}
+
+/**
+ * Per-entry merge of `models` (D-05): a wrong type keeps the lower value, a blank host field clears it, a blank provider
+ * default removes the lower selector (exposing the host-catalog tier), and unknown hosts and prototype keys are ignored.
+ */
+function mergeModels(models: Record<string, unknown> | undefined, defaults: ModelsConfig): ModelsConfig {
+	if (!models) return defaults;
+	const hosts: Partial<Record<HostId, HostModelOverride>> = { ...defaults.hosts };
+	for (const [host, entry] of Object.entries(asRecord(models.hosts) ?? {})) {
+		const fields = asRecord(entry);
+		if (!fields || !isHostId(host)) continue;
+		const provider = selectorField(fields.provider);
+		const model = selectorField(fields.model);
+		if (provider === undefined && model === undefined) continue;
+		const lower = hosts[host];
+		hosts[host] = { provider: provider ?? lower?.provider ?? "", model: model ?? lower?.model ?? "" };
+	}
+	const providerDefaults = providerDictionary(defaults.providerDefaults);
+	for (const [provider, selector] of Object.entries(asRecord(models.providerDefaults) ?? {})) {
+		if (UNSAFE_DICTIONARY_KEYS.includes(provider)) continue;
+		const value = selectorField(selector);
+		if (value === "") delete providerDefaults[provider];
+		else if (value !== undefined) providerDefaults[provider] = value;
+	}
+	return { hosts, providerDefaults };
+}
+
+/** What a layer leaves on a legacy route model's provenance; a blank clears Claude and Muse, Grok's non-empty merge ignores it. */
+function modelPin(section: Record<string, unknown> | undefined, lower: LegacyModelProvenance, blankClears: boolean): LegacyModelProvenance {
+	const model = section?.model;
+	if (typeof model !== "string") return lower;
+	if (model.trim()) return "file-pin";
+	return blankClears ? "explicit-blank" : lower;
 }
 
 /** A non-empty http(s) URL with trailing slashes stripped; anything else falls back. */
@@ -500,11 +595,14 @@ export function mergeConfig(
 	options: { project?: boolean } = {},
 ): UltrathinkConfig {
 	if (!file) return base;
+	const claude = asRecord(file.claude);
+	const grok = asRecord(file.grok);
+	const muse = asRecord(file.muse);
 	return {
 		uplift: mergeUplift(asRecord(file.uplift), base.uplift),
-		claude: mergeClaude(asRecord(file.claude), base.claude),
-		grok: mergeGrok(asRecord(file.grok), base.grok),
-		muse: mergeMuse(asRecord(file.muse), base.muse),
+		claude: mergeClaude(claude, base.claude),
+		grok: mergeGrok(grok, base.grok),
+		muse: mergeMuse(muse, base.muse),
 		hitl: mergeHitl(asRecord(file.hitl), base.hitl),
 		think: mergeThink(asRecord(file.think), base.think),
 		notion: mergeNotion(asRecord(file.notion), base.notion),
@@ -516,6 +614,12 @@ export function mergeConfig(
 		hindsight: mergeHindsight(asRecord(file.hindsight), base.hindsight, options.project === true),
 		ragflow: mergeRagflow(asRecord(file.ragflow), base.ragflow, options.project === true),
 		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
+		models: mergeModels(asRecord(file.models), base.models),
+		modelProvenance: {
+			claude: modelPin(claude, base.modelProvenance.claude, true),
+			grok: modelPin(grok, base.modelProvenance.grok, false),
+			muse: modelPin(muse, base.modelProvenance.muse, true),
+		},
 	};
 }
 

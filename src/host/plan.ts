@@ -136,7 +136,7 @@ export async function planPrompt(
 			}
 		}
 		if (decision.action !== "uplift") return skip(`precheck-${decision.action}`);
-		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd, host, request.model);
+		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd, { host, sessionModel: request.model, purpose: "planning" });
 		if ("skipped" in engine) return skip(engine.skipped);
 		const sessionId = request.session_id?.trim() || "unknown";
 		const result = await runPromptSubmit(

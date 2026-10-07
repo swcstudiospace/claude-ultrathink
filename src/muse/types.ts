@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-export const MUSE_MODEL_DEFAULT = "muse-spark-1.3-contributor";
+import { ROUTE_DEFAULT_MODELS } from "../route-defaults.ts";
+
+/** The Muse route default (`ROUTE_DEFAULT_MODELS.muse`); `DEFAULT_MUSE_CONFIG.model` references it. */
+export const MUSE_MODEL_DEFAULT = ROUTE_DEFAULT_MODELS.muse;
 
 export const MUSE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 

@@ -103,11 +103,11 @@ async function main(): Promise<void> {
 	}
 	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);
-	const engine = await selectEngine(config, state, cwd);
+	const engine = await selectEngine(config, state, cwd, { host, purpose: "planning" });
 	if ("skipped" in engine) {
-		log("skipped: grok engine selected but not logged in (fallbackToClaude=false)");
-		// A skill invocation must never receive a login-required systemMessage that eats the command.
-		if (!input.skill) process.stdout.write(JSON.stringify({ systemMessage: engine.skipped }));
+		log(`skipped: engine ${engine.resolution.state} (${engine.resolution.reason})`);
+		// A skill invocation must never receive a skip systemMessage (e.g. Grok login required) that eats the command.
+		if (!input.skill) process.stdout.write(JSON.stringify({ systemMessage: engine.notice ?? engine.skipped }));
 		return;
 	}
 
