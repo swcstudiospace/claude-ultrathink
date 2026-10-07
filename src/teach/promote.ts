@@ -38,7 +38,7 @@ const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 /** Hermes' limit for the description of a new skill. */
 const DESCRIPTION_MAX = 60;
 /** Omp refuses managed skills over 64 000 bytes; leave headroom. */
-const CONTENT_MAX_BYTES = 60_000;
+export const CONTENT_MAX_BYTES = 60_000;
 const NAME_MAX = 48;
 const TRIGGER = "Use when ";
 const MARKER_RE = /<!--\s*ultrathink:teach\b/;

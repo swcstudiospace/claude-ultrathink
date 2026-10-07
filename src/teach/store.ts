@@ -3,11 +3,13 @@
 /**
  * The local Teachable Moments store: one JSON file per moment and one per pending Hindsight write (the outbox), under
  * `<stateDir>/teach`. One file per record, written to a temp file and renamed, means several hosts and detached
- * `observe` processes can share it without a lock: the worst case is one writer's update winning. Synchronous fs only,
- * so a hook can use it without an event loop. Corrupt or foreign files are skipped, never thrown.
+ * `observe` processes can share it without a lock: the worst case is one writer's update winning. The store itself is
+ * synchronous fs only, so a hook can use it without an event loop; `listRecentMoments`/`readMoment` are the async,
+ * bounded readers for plan-time lookups that must stay responsive. Corrupt or foreign files are skipped, never thrown.
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isPlanningPath } from "../host/paths.ts";
 import { redactLine } from "./redact.ts";
@@ -149,6 +151,64 @@ function recordIds(dir: string): string[] {
 	} catch {
 		return [];
 	}
+}
+
+/** One moment file read asynchronously; undefined when it is missing, not a regular file, larger than `maxBytes` or invalid. */
+async function readMomentFile(momentsDir: string, id: string, maxBytes: number): Promise<TeachableMoment | undefined> {
+	try {
+		const path = join(momentsDir, `${id}.json`);
+		const stat = await lstat(path);
+		if (!stat.isFile() || stat.size > maxBytes) return undefined;
+		const bytes = await readFile(path);
+		if (bytes.length > maxBytes) return undefined;
+		return parseMoment(JSON.parse(bytes.toString("utf8")), id);
+	} catch {
+		return undefined;
+	}
+}
+
+/** One moment of the store at `dir` (`<stateDir>/teach`), read asynchronously with a size cap. */
+export async function readMoment(dir: string, id: string, maxBytes: number): Promise<TeachableMoment | undefined> {
+	return isValidId(id) ? readMomentFile(join(dir, "moments"), id, maxBytes) : undefined;
+}
+
+/**
+ * The newest moments of the store at `dir` by file mtime (every write renames a fresh file into place): at most `max`
+ * files, each at most `maxBytes`, symlinks skipped. Async between files and stops early, with what it has, once `signal`
+ * aborts; the caller checks the signal.
+ */
+export async function listRecentMoments(
+	dir: string,
+	options: { max: number; maxBytes: number; signal?: AbortSignal },
+): Promise<TeachableMoment[]> {
+	const momentsDir = join(dir, "moments");
+	let files: string[];
+	try {
+		files = await readdir(momentsDir);
+	} catch {
+		return [];
+	}
+	const entries: { id: string; mtimeMs: number }[] = [];
+	for (const file of files) {
+		if (options.signal?.aborted) return [];
+		if (!file.endsWith(".json")) continue;
+		const id = file.slice(0, -".json".length);
+		if (!isValidId(id)) continue;
+		try {
+			const stat = await lstat(join(momentsDir, file));
+			if (stat.isFile() && stat.size <= options.maxBytes) entries.push({ id, mtimeMs: stat.mtimeMs });
+		} catch {
+			// removed meanwhile
+		}
+	}
+	entries.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.id < b.id ? -1 : 1));
+	const moments: TeachableMoment[] = [];
+	for (const { id } of entries.slice(0, Math.max(0, options.max))) {
+		if (options.signal?.aborted) break;
+		const moment = await readMomentFile(momentsDir, id, options.maxBytes);
+		if (moment) moments.push(moment);
+	}
+	return moments;
 }
 
 function opKey(op: OutboxOp): string {
