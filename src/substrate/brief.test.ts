@@ -89,6 +89,48 @@ describe("fetchBrief", () => {
 		await fetchBrief({ repo: "a/b" }, { SUBSTRATE_TOKEN: "secret-token" }, URL_);
 		expect((captured().headers as Record<string, string>).authorization).toBe("Bearer secret-token");
 	});
+
+	test("a caller signal is combined with the request timeout and ends the request as an empty brief", async () => {
+		let seen: AbortSignal | undefined;
+		globalThis.fetch = ((_url: string, init: RequestInit) => {
+			seen = init.signal ?? undefined;
+			return new Promise<Response>((_resolve, reject) => {
+				init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			});
+		}) as unknown as typeof fetch;
+		const caller = new AbortController();
+		const pending = fetchBrief({ repo: "a/b", signal: caller.signal }, { SUBSTRATE_TIMEOUT_MS: "60000" }, URL_);
+		expect(seen?.aborted).toBe(false);
+		caller.abort();
+		expect(await pending).toBe("");
+		expect(seen?.aborted).toBe(true);
+	});
+
+	test("the request timeout still applies when the caller never aborts", async () => {
+		// Real timer: the request timeout is the platform AbortSignal.timeout, which a fake clock does not drive; 20 ms keeps it short.
+		globalThis.fetch = ((_url: string, init: RequestInit) =>
+			new Promise<Response>((_resolve, reject) => {
+				init.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "TimeoutError")));
+			})) as unknown as typeof fetch;
+		const started = Date.now();
+		expect(await fetchBrief({ repo: "a/b", signal: new AbortController().signal }, { SUBSTRATE_TIMEOUT_MS: "20" }, URL_)).toBe("");
+		expect(Date.now() - started).toBeLessThan(2_000);
+	});
+
+	test("an already cancelled caller sends no request", async () => {
+		const urls = recordFetch();
+		const caller = new AbortController();
+		caller.abort();
+		expect(await fetchBrief({ repo: "a/b", signal: caller.signal }, {}, URL_)).toBe("");
+		expect(urls).toEqual([]);
+	});
+
+	test("the body stays the snake_case keys: the signal goes to the request, never the server", async () => {
+		const captured = stubFetch(() => new Response("ok"));
+		await fetchBrief({ repo: "a/b", branch: "main", signal: new AbortController().signal }, {}, URL_);
+		expect(JSON.parse(String(captured().body))).toEqual({ repo: "a/b", branch: "main", surface: "claude-code" });
+		expect(captured().signal).toBeInstanceOf(AbortSignal);
+	});
 });
 
 describe("emitEvent", () => {

@@ -788,6 +788,52 @@ describe("engineLabel", () => {
 		expect(engineLabel(config, {}, "claude-code")).toBe("claude:sonnet");
 		expect(engineLabel(config, {}, "grok-build")).toBe("grok-4.7@xhigh");
 		expect(engineLabel(config, { engine: "muse" }, "claude-code")).toBe("muse:muse-spark-1.3-contributor");
+		// A models.hosts wire model replaces the route's engine model, as selection does; a provider constraint has no
+		// legacy binding and shows unresolved; a disabled Grok route keeps Claude's own model, never the host override.
+		const wire = mergeConfig({ models: { hosts: { "claude-code": { model: "wire-c" }, muse: { model: "wire-m" }, "grok-build": { model: "wire-g" } } } }, config);
+		expect(engineLabel(wire, {}, "claude-code")).toBe("claude:wire-c");
+		expect(engineLabel(wire, {}, "muse")).toBe("muse:wire-m");
+		expect(engineLabel(wire, {}, "grok-build")).toBe("wire-g@xhigh");
+		expect(engineLabel(mergeConfig({ grok: { enabled: false } }, wire), {}, "grok-build")).toBe("claude:sonnet");
+		const constrained = mergeConfig({ models: { hosts: { "claude-code": { provider: "anthropic" } } } }, config);
+		expect(engineLabel(constrained, {}, "claude-code")).toBe("claude:unresolved [transport-incompatible]");
+	});
+
+	test("Omp auto is native: an observed record names its model, without one the live model is not observed (§9 path 6)", () => {
+		const config = defaultConfig();
+		const observed: ModelResolution = {
+			version: "1.0.0",
+			state: "detected",
+			host: "omp",
+			transport: "omp-native",
+			source: "ctx.model",
+			reason: "live-model",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			provider: "anthropic",
+			modelId: "claude-x",
+			modelKnown: true,
+			label: "omp-native:anthropic/claude-x [detected]",
+		};
+		expect(engineLabel(config, {}, "omp")).toBe("omp-native:auto (live model not observed)");
+		expect(engineLabel(config, {}, "omp", observed)).toBe("omp-native:anthropic/claude-x [detected]");
+		expect(engineLabel(config, { engine: "auto" }, "omp", observed)).toBe("omp-native:anthropic/claude-x [detected]");
+		// A record observed for another engine request or host is not the current selection: the static label stands.
+		expect(engineLabel(config, { engine: "claude" }, "omp", observed)).toBe("claude:sonnet");
+		expect(engineLabel(config, {}, "hermes", observed)).toBe("claude:sonnet (follows session model)");
+		expect(engineLabel(config, {}, "claude-code", observed)).toBe("claude:sonnet");
+		// A named Omp engine opted out of native planning; its own observed legacy record names the route and default.
+		const named: ModelResolution = {
+			version: "1.0.0",
+			state: "default",
+			host: "omp",
+			transport: "claude-cli",
+			source: "cli-default",
+			reason: "cli-delegation",
+			engineSelection: { engine: "claude", source: "control", nativeOptOut: true },
+			modelKnown: false,
+			label: "claude:CLI default (model unobserved)",
+		};
+		expect(engineLabel(config, { engine: "claude" }, "omp", named)).toBe("claude:CLI default (model unobserved)");
 	});
 });
 
@@ -904,10 +950,11 @@ describe("engineForSessionModel", () => {
 		}
 	});
 
-	test("the status label names the default honestly on session-model hosts", () => {
+	test("the status label names the default honestly on session-model hosts; Omp auto never guesses a CLI route", () => {
 		const config = configWith({});
 		expect(engineLabel(config, {}, "hermes")).toBe("claude:sonnet (follows session model)");
-		expect(engineLabel(config, {}, "omp")).toBe("claude:sonnet (follows session model)");
+		expect(engineLabel(config, {}, "omp")).toBe("omp-native:auto (live model not observed)");
+		expect(engineLabel(config, { engine: "claude" }, "omp")).toBe("claude:sonnet");
 		expect(engineLabel(config, { engine: "grok" }, "hermes")).toBe("grok-4.7@xhigh");
 		expect(engineLabel(config, {}, "claude-code")).toBe("claude:sonnet");
 	});

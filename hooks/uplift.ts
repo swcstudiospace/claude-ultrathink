@@ -71,7 +71,7 @@ async function main(): Promise<void> {
 	}
 	if (command) {
 		if (grok) clearPlanCarrier(stateDir);
-		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir, cwd });
+		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir, cwd, host });
 		process.stdout.write(JSON.stringify({ decision: "block", reason }));
 		return;
 	}
@@ -103,7 +103,16 @@ async function main(): Promise<void> {
 	}
 	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);
-	const engine = await selectEngine(config, state, cwd, { host, purpose: "planning" });
+	// Legacy route evidence only when the host's own envelope carries it (blank means unknown); nothing is read from a
+	// transcript (AD-4). selectEngine reads a session model for Hermes `auto` routing only, so other routes are unchanged.
+	const sessionModel = typeof envelope.model === "string" && envelope.model.trim() ? envelope.model.trim() : undefined;
+	const provider = typeof envelope.provider === "string" && envelope.provider.trim() ? envelope.provider.trim() : undefined;
+	const engine = await selectEngine(config, state, cwd, {
+		host,
+		purpose: "planning",
+		...(sessionModel ? { sessionModel } : {}),
+		...(provider ? { provider } : {}),
+	});
 	if ("skipped" in engine) {
 		log(`skipped: engine ${engine.resolution.state} (${engine.resolution.reason})`);
 		// A skill invocation must never receive a skip systemMessage (e.g. Grok login required) that eats the command.
@@ -117,6 +126,7 @@ async function main(): Promise<void> {
 		complete: engine.complete,
 		engine: engine.label,
 		engineError: engine.error,
+		modelResolution: engine.resolution,
 		stateDir,
 		surface: host,
 		conversation: recentConversationFromTranscript,

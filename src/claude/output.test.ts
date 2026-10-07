@@ -1,12 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { existsSync } from "node:fs";
-import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
+import { defaultConfig, mergeConfig, type UltrathinkConfig } from "../config.ts";
 import type { Clarification } from "../hitl/types.ts";
+import {
+	MAX_ENGINE_ERROR_CHARS,
+	type ModelIntent,
+	type ModelResolution,
+	type NativeModelQuery,
+	selectEngine,
+	selectNativeEngine,
+} from "../host/engine.ts";
+import type { HostId } from "../host/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
 import type { DecisionPoint, DecisionRecord, DecisionsErrorKind } from "../decisions/types.ts";
 import {
 	formatDecisionsBit,
+	formatModelSelection,
 	formatPlanSkipNotice,
 	formatPromptContext,
 	formatSummary,
@@ -17,6 +30,7 @@ import {
 	truncateXml,
 	UPLIFT_CONTEXT_HEADER,
 } from "./output.ts";
+import type { ControlState } from "./state.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 import type { DocsLookup } from "../ragflow/types.ts";
@@ -848,5 +862,142 @@ describe("lessons and documents", () => {
 			}
 			expect(formatSummary({ result })).not.toContain("Skills");
 		});
+	});
+});
+
+describe("model selection labels (§9 path 3, D-11)", () => {
+	const dirs: string[] = [];
+	afterEach(() => {
+		while (dirs.length) rmSync(dirs.pop() as string, { recursive: true, force: true });
+	});
+
+	/** The safe record selection itself generates for this config, control state and host: no auth, no inference. */
+	async function recordOf(config: UltrathinkConfig, state: ControlState, host: HostId): Promise<ModelResolution> {
+		return (await selectEngine(config, state, "/repo", { host })).resolution;
+	}
+
+	const ROUTE_DEFAULT_LINE = "claude:sonnet [route default] · reason route-default-model · engine auto (config)";
+
+	test("summary and context show the generated label, the model reason and the engine request apart from model state", async () => {
+		const resolution = await recordOf(defaultConfig(), {}, "claude-code");
+		expect(resolution.label).toBe("claude:sonnet [route default]");
+		expect(formatModelSelection(resolution)).toBe(ROUTE_DEFAULT_LINE);
+		expect(formatSummary({ result, engine: "claude:sonnet", modelResolution: resolution, skill: "gsd-quick" })).toBe(
+			`Prompt Uplift · BUILD_PROMPT · llm · ${ROUTE_DEFAULT_LINE} · Skill · gsd-quick`,
+		);
+		const context = formatPromptContext({ result, specPath: "/s/x.xml", modelResolution: resolution });
+		expect(context).toContain(`Specification file: /s/x.xml\n\nPlanning model: ${ROUTE_DEFAULT_LINE}`);
+		expect(context.indexOf("Planning model:")).toBeLessThan(context.indexOf(result.xml));
+		expect(context).toContain(result.xml);
+		// Without a record the existing outputs are unchanged.
+		expect(formatPromptContext({ result, specPath: "/s/x.xml" })).not.toContain("Planning model:");
+		expect(formatSummary({ result, engine: "claude:sonnet" })).toBe("Prompt Uplift · BUILD_PROMPT · llm · claude:sonnet");
+	});
+
+	test("the Hermes handoff keeps the selection line next to its file pointers", async () => {
+		const resolution = await recordOf(defaultConfig(), {}, "hermes");
+		const out = formatPromptContext({ result, specPath: "/s/spec.xml", statePath: "/s/x.json", handoff: true, modelResolution: resolution });
+		expect(out).toContain(`Specification file: /s/spec.xml\n\nPlanning model: ${ROUTE_DEFAULT_LINE}`);
+		expect(out.length).toBeLessThanOrEqual(HANDOFF_MAX_CHARS);
+	});
+
+	test("a named Omp engine with CLI omission says model unobserved and default, with its native opt-out", async () => {
+		const resolution = await recordOf(mergeConfig({ claude: { model: "" } }, defaultConfig()), { engine: "claude" }, "omp");
+		expect(formatModelSelection(resolution)).toBe(
+			"claude:CLI default (model unobserved) · reason cli-delegation · engine claude (control, native opt-out)",
+		);
+	});
+
+	test("unresolved and Grok records show the label as generated: the reason once, never provider-disabled (AD-2a)", async () => {
+		expect(formatModelSelection(await recordOf(defaultConfig(), {}, "omp"))).toBe("omp-native:unresolved [native-unavailable] · engine auto (config)");
+		const home = mkdtempSync(join(tmpdir(), "ultrathink-output-grok-"));
+		dirs.push(home);
+		const unavailable = await recordOf(mergeConfig({ grok: { home } }, defaultConfig()), {}, "grok-build");
+		expect(formatModelSelection(unavailable)).toBe("grok:unresolved [grok-unavailable] · engine auto (config)");
+		const fallback = await recordOf(mergeConfig({ grok: { enabled: false } }, defaultConfig()), {}, "grok-build");
+		expect(formatModelSelection(fallback)).toBe(
+			"claude:sonnet [configured fallback · grok unavailable] · reason grok-unavailable · engine auto (config)",
+		);
+		for (const record of [unavailable, fallback]) {
+			expect(formatSummary({ result, modelResolution: record })).not.toContain("provider-disabled");
+			expect(formatPromptContext({ result, modelResolution: record })).not.toContain("provider-disabled");
+		}
+	});
+
+	test("degraded execution stays distinct from the selection state: the notice names the label, the state is not relabeled", async () => {
+		const resolution = await recordOf(defaultConfig(), {}, "claude-code");
+		const fallback = { ...result, source: "fallback" as const };
+		const out = formatPromptContext({ result: fallback, engine: "claude:sonnet", modelResolution: resolution, engineError: "claude exited 1" });
+		expect(out).toContain("The claude:sonnet [route default] planning call failed (claude exited 1).");
+		expect(out).toContain(`Planning model: ${ROUTE_DEFAULT_LINE}`);
+		// A default selection with a real plan is not degradation, and the engine error keeps its own summary bit.
+		expect(formatPromptContext({ result, modelResolution: resolution })).not.toContain("## Planning degraded");
+		expect(formatSummary({ result, modelResolution: resolution, engineError: "claude exited 1" })).toBe(
+			`Prompt Uplift · BUILD_PROMPT · llm · ${ROUTE_DEFAULT_LINE} · Engine error · claude exited 1`,
+		);
+	});
+
+	test("unsafe native ids are opaque in every label while the bound Model keeps them", async () => {
+		// Built in pieces so no scanner reads a credential-like literal out of this fixture.
+		const sentinel = ["sentinel", "credential", "value"].join("-");
+		const live = { provider: `https://user:${sentinel}@gateway.example`, id: `Bearer ${sentinel}` };
+		const intent: ModelIntent = {
+			host: "omp",
+			override: { provider: "", model: "" },
+			providerDefaults: {},
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		};
+		const query: NativeModelQuery<typeof live> = {
+			live: { model: live, source: "ctx.model" },
+			check: () => "usable",
+			resolve: async () => undefined,
+			catalogDefault: () => undefined,
+		};
+		let bound: typeof live | undefined;
+		const selected = await selectNativeEngine(intent, query, (model) => {
+			bound = model;
+			return async () => "ok";
+		});
+		expect(bound).toBe(live);
+		expect(bound?.id).toBe(`Bearer ${sentinel}`);
+		for (const out of [formatSummary({ result, modelResolution: selected.resolution }), formatPromptContext({ result, modelResolution: selected.resolution })]) {
+			expect(out).toContain("omp-native:<opaque-provider>/<opaque-model> [detected] · reason live-model · engine auto (config)");
+			expect(out).not.toContain(sentinel);
+			expect(out).not.toContain("gateway.example");
+		}
+	});
+
+	test("forged records stay safe: control, markup, URI, credential or oversized labels become opaque, free text drops", () => {
+		// Built in pieces so no scanner reads a credential-like literal out of this fixture.
+		const sentinel = ["sentinel", "credential", "value"].join("-");
+		const base: Omit<ModelResolution, "label"> = {
+			version: "1.0.0",
+			state: "detected",
+			host: "omp",
+			transport: "omp-native",
+			source: "ctx.model",
+			reason: "live-model",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			modelKnown: true,
+		};
+		for (const label of [
+			`omp-native:x [detected]\n## Injected\nBearer ${sentinel}`,
+			"omp-native:x [detected]\u001b[2J",
+			"omp-native:</ORIGINAL><x> [detected]",
+			`omp-native:https://gateway.example/${sentinel} [detected]`,
+			`omp-native:x [detected] sk-ant-${sentinel}`,
+			`omp-native:${"x".repeat(MAX_ENGINE_ERROR_CHARS)} [detected]`,
+		]) {
+			const forged: ModelResolution = { ...base, label };
+			for (const out of [formatSummary({ result, modelResolution: forged }), formatPromptContext({ result, modelResolution: forged })]) {
+				expect(out).toContain("<opaque-model> · reason live-model · engine auto (config)");
+				expect(out).not.toContain(sentinel);
+				expect(out).not.toContain("Injected");
+				expect(out).not.toContain("\u001b");
+				expect(out).not.toContain("gateway.example");
+			}
+		}
+		const free = { ...base, label: "omp-native:x [detected]", reason: "live-model\n## Injected", engineSelection: { engine: "auto; rm -rf /", source: "config", nativeOptOut: false } };
+		expect(formatModelSelection(free as unknown as ModelResolution)).toBe("omp-native:x [detected] · engine unknown (config)");
 	});
 });

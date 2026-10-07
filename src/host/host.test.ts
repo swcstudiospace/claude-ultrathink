@@ -4,12 +4,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { readControl, sessionPath, writeControl } from "../claude/state.ts";
+import { readControl, readSession, sessionPath, writeControl } from "../claude/state.ts";
+import { defaultConfig } from "../config.ts";
 import type { DecisionsErrorKind } from "../decisions/types.ts";
 import type { Tracker } from "../track/gateway.ts";
 import { writePlanCarrier } from "./carrier.ts";
 import { detectHost } from "./detect.ts";
-import type { EngineSelectionContext, ModelResolution, SelectedEngine } from "./engine.ts";
+import { type EngineSelectionContext, type ModelResolution, type NativeEngineSelector, type SelectedEngine, selectNativeEngine } from "./engine.ts";
 import { isSubagentEnvelope, normalizeEnvelope, parseEnvelope } from "./envelope.ts";
 import { isPlanningPath, resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanOptions, type PlanResponse } from "./plan.ts";
@@ -273,36 +274,36 @@ describe("planPrompt", () => {
 		}
 	});
 
-	test("uplift and every node fill share the one selected engine on every host", async () => {
+	test("uplift, the graph, every node fill and the HITL call share the one selected engine on every host, and the plan carries its record", async () => {
 		for (const host of ["claude-code", "grok-build", "hermes", "muse", "omp"] as const) {
 			const { root, env, options, calls } = planHarness();
 			const phases: string[] = [];
+			const completers = new Set<unknown>();
+			const resolution: ModelResolution = { ...STUB_RESOLUTION, host };
 			options.selectEngine = async () => {
 				calls.engine++;
-				return {
-					label: `stub:${host}`,
-					complete: async (system: string, user: string) => {
-						phases.push(user.includes("<user_request>") ? "uplift" : user.includes("current_node") ? "fill" : "graph");
-						return stubComplete(system, user);
-					},
-					error: () => undefined,
-					resolution: { ...STUB_RESOLUTION, host },
+				const complete = async (system: string, user: string) => {
+					completers.add(complete);
+					phases.push(user.includes("<user_request>") ? "uplift" : user.startsWith("<spec>") ? "clarify" : user.includes("current_node") ? "fill" : "graph");
+					return stubComplete(system, user);
 				};
+				return { label: `stub:${host}`, complete, error: () => undefined, resolution };
 			};
 			try {
-				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
+				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, { ...env, PI_CODING_AGENT_DIR: join(root, "omp") }, options);
 				expect(response.skipped).toBeUndefined();
 				expect(calls.engine).toBe(1);
-				expect(phases[0]).toBe("uplift");
-				expect(phases).toContain("graph");
-				expect(phases.filter((phase) => phase === "fill").length).toBeGreaterThanOrEqual(5);
+				expect(completers.size).toBe(1);
+				expect(phases).toEqual(["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"]);
+				expect(response.modelResolution).toEqual(resolution);
+				expect(readSession(env.ULTRATHINK_STATE_DIR, "s1")?.modelResolution).toEqual(resolution);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
 		}
 	});
 
-	test("the request model reaches engine selection", async () => {
+	test("the selector receives the flight context: host, legacy model and provider evidence, session id, signal and native selector", async () => {
 		const { root, env, options } = planHarness();
 		const seen: Array<EngineSelectionContext | undefined> = [];
 		const inner = options.selectEngine;
@@ -310,14 +311,23 @@ describe("planPrompt", () => {
 			seen.push(args[3]);
 			return inner!(...args);
 		}) as typeof inner;
+		const native: NativeEngineSelector = async () => {
+			throw new Error("an injected selectEngine stays authoritative: the native selector is only handed over");
+		};
+		const controller = new AbortController();
 		try {
-			await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root, model: "grok-4.7" }, env, options);
-			expect(seen[0]).toEqual({ host: "hermes", sessionModel: "grok-4.7", purpose: "planning" });
-			await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, env, options);
+			await planPrompt(
+				{ host: "hermes", session_id: " s1 ", prompt: "add a widget", cwd: root, model: "grok-4.7", provider: "xai" },
+				env,
+				{ ...options, native, signal: controller.signal },
+			);
+			expect(seen[0]).toEqual({ host: "hermes", sessionModel: "grok-4.7", provider: "xai", sessionId: "s1", signal: controller.signal, native, purpose: "planning" });
+			expect(seen[0]?.signal).toBe(controller.signal);
+			expect(seen[0]?.native).toBe(native);
+			await planPrompt({ host: "omp", prompt: "add a widget", cwd: root }, { ...env, PI_CODING_AGENT_DIR: join(root, "omp") }, options);
 			expect(seen).toHaveLength(2);
-			expect(seen[1]?.host).toBe("omp");
-			expect(seen[1]?.purpose).toBe("planning");
-			expect(seen[1]?.sessionModel).toBeUndefined();
+			expect(seen[1]).toEqual({ host: "omp", purpose: "planning" });
+			for (const key of ["sessionModel", "provider", "sessionId", "signal", "native"] as const) expect(seen[1]?.[key]).toBeUndefined();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -819,6 +829,335 @@ describe("planPrompt lessons and documents", () => {
 				expect(response.context).toBe("");
 			}
 			expect(calls).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("planPrompt flight context, cancellation and the resolution record", () => {
+	const ompEnv = (root: string, env: Record<string, string>): Record<string, string> => ({ ...env, PI_CODING_AGENT_DIR: join(root, "omp") });
+
+	test("Omp auto runs every stage on the one native Model and resolver its flight selected, under the caller's lifetime; no secret leaves", async () => {
+		const { root, env, options } = planHarness();
+		delete options.selectEngine;
+		const controller = new AbortController();
+		const events: ProgressEvent[] = [];
+		const model = {
+			provider: "acme",
+			id: "sol-1",
+			api: "acme-chat",
+			providerType: "acme",
+			baseUrl: "https://SECRET-ENDPOINT.invalid/v1",
+			headers: { authorization: "Bearer SECRET-TOKEN" },
+		};
+		const selections: Array<AbortSignal | undefined> = [];
+		const bound: Array<{ resolver: () => Promise<string> }> = [];
+		const stages: Array<{ phase: string; model: unknown; resolver: unknown; signal: AbortSignal | undefined }> = [];
+		options.native = (intent, signal) => {
+			selections.push(signal);
+			return selectNativeEngine(
+				intent,
+				{ live: { model, source: "ctx.model" }, check: () => "usable", resolve: async () => undefined, catalogDefault: () => undefined },
+				(chosen) => {
+					// One auth route per flight: the resolver is created with the bound Model, never per stage.
+					const resolver = async () => "SECRET-KEY";
+					bound.push({ resolver });
+					return async (system, user, stageSignal) => {
+						const phase = user.includes("<user_request>") ? "uplift" : user.startsWith("<spec>") ? "clarify" : user.includes("current_node") ? "fill" : "graph";
+						stages.push({ phase, model: chosen, resolver, signal: stageSignal });
+						return stubComplete(system, user);
+					};
+				},
+			);
+		};
+		try {
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+				...options,
+				signal: controller.signal,
+				progress: (event) => events.push(event),
+			});
+			expect(response.skipped).toBeUndefined();
+			expect(selections).toEqual([controller.signal]);
+			expect(bound).toHaveLength(1);
+			expect(stages.map((stage) => stage.phase)).toEqual(["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"]);
+			for (const stage of stages) {
+				expect(stage.model).toBe(model);
+				expect(stage.resolver).toBe(bound[0]?.resolver);
+				expect(stage.signal?.aborted).toBe(false);
+			}
+			// PlanOptions.signal -> HookDeps.signal: every stage signal is the planning lifetime the caller aborts.
+			controller.abort();
+			expect(stages.every((stage) => stage.signal?.aborted)).toBe(true);
+			const record: ModelResolution = {
+				version: "1.0.0",
+				state: "detected",
+				host: "omp",
+				transport: "omp-native",
+				source: "ctx.model",
+				reason: "live-model",
+				engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+				api: "acme-chat",
+				providerType: "acme",
+				provider: "acme",
+				modelId: "sol-1",
+				modelKnown: true,
+				label: "omp-native:acme/sol-1 [detected]",
+			};
+			expect(response.modelResolution).toEqual(record);
+			const session = readFileSync(response.statePath ?? "", "utf8");
+			expect(readSession(env.ULTRATHINK_STATE_DIR!, "s1")?.modelResolution).toEqual(record);
+			expect(events.find((event) => event.type === "begin")).toMatchObject({ modelResolution: record });
+			expect(events.at(-1)).toMatchObject({ type: "end", outcome: "planned", modelResolution: record });
+			for (const output of [JSON.stringify(response), session, JSON.stringify(events)]) expect(output).not.toContain("SECRET");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a named engine opts out of native planning: the native selector is never called", async () => {
+		const { root, env, options } = planHarness();
+		delete options.selectEngine;
+		const controller = new AbortController();
+		let nativeCalls = 0;
+		try {
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+				...options,
+				control: { engine: "claude" },
+				signal: controller.signal,
+				native: async () => {
+					nativeCalls++;
+					throw new Error("a named engine must not reach the native selector");
+				},
+				// Stop the flight as it begins, so the legacy route spawns no CLI child.
+				progress: (event) => {
+					if (event.type === "begin") controller.abort();
+				},
+			});
+			expect(nativeCalls).toBe(0);
+			expect(response.skipped).toBe("aborted");
+			expect(response.modelResolution).toMatchObject({
+				host: "omp",
+				transport: "claude-cli",
+				engineSelection: { engine: "claude", source: "control", nativeOptOut: true },
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an unresolved selection returns empty context, its stable code, the notice as summary and the record; nothing is planned", async () => {
+		const { root, env, options, calls } = planHarness();
+		delete options.selectEngine;
+		const events: ProgressEvent[] = [];
+		const record: ModelResolution = {
+			version: "1.0.0",
+			state: "unresolved",
+			host: "omp",
+			transport: "omp-native",
+			source: "none",
+			reason: "native-unavailable",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			modelKnown: false,
+			label: "omp-native:unresolved [native-unavailable]",
+		};
+		try {
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+				...options,
+				progress: (event) => events.push(event),
+			});
+			expect(response).toEqual({
+				context: "",
+				skipped: "native-unavailable",
+				summary: "Prompt Uplift skipped · omp-native:unresolved [native-unavailable]",
+				modelResolution: record,
+			});
+			expect(events).toEqual([{ type: "end", at: expect.any(Number), outcome: "skipped", detail: "native-unavailable", modelResolution: record }]);
+			expect(calls).toEqual({ engine: 0, createTracker: 0, track: 0 });
+			expect(existsSync(sessionPath(env.ULTRATHINK_STATE_DIR!, "s1"))).toBe(false);
+
+			// A selection skip without its own notice still gets the safe generated one.
+			const invalid: ModelResolution = { ...STUB_RESOLUTION, state: "unresolved", reason: "selector-invalid", modelKnown: false, label: "claude:unresolved [selector-invalid]" };
+			delete invalid.modelId;
+			options.selectEngine = async () => ({ skipped: "selector-invalid", resolution: invalid });
+			expect(await planPrompt({ host: "claude-code", session_id: "s1", prompt: "add a widget", cwd: root }, env, options)).toEqual({
+				context: "",
+				skipped: "selector-invalid",
+				summary: "Prompt Uplift skipped · claude:unresolved [selector-invalid]",
+				modelResolution: invalid,
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a parser-flagged unknown host is unresolved / unsupported-host: no selection, host control or plan", async () => {
+		const { root, env, options, calls } = planHarness();
+		const stateDir = env.ULTRATHINK_STATE_DIR!;
+		const events: ProgressEvent[] = [];
+		const record: ModelResolution = {
+			version: "1.0.0",
+			state: "unresolved",
+			host: "unknown",
+			source: "none",
+			reason: "unsupported-host",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			modelKnown: false,
+			label: "unknown:unresolved [unsupported-host]",
+		};
+		try {
+			writeControl(stateDir, { skipOnce: true });
+			const response = await planPrompt({ invalidHost: true, session_id: "s1", prompt: "add a widget", cwd: root }, env, {
+				...options,
+				progress: (event) => events.push(event),
+			});
+			expect(response).toEqual({
+				context: "",
+				skipped: "unsupported-host",
+				summary: "Prompt Uplift skipped · unknown:unresolved [unsupported-host]",
+				modelResolution: record,
+			});
+			expect(events).toEqual([{ type: "end", at: expect.any(Number), outcome: "skipped", detail: "unsupported-host", modelResolution: record }]);
+			expect(calls).toEqual({ engine: 0, createTracker: 0, track: 0 });
+			// No detected host's control is read or consumed, and nothing is written.
+			expect(readControl(stateDir).skipOnce).toBe(true);
+			expect(existsSync(sessionPath(stateDir, "s1"))).toBe(false);
+			// Stateless skips still decide first; a captured named engine is reported as the control's request.
+			expect(await planPrompt({ invalidHost: true, prompt: "  ", cwd: root }, env, options)).toEqual({ context: "", skipped: "empty" });
+			const named = await planPrompt({ invalidHost: true, prompt: "add a widget", cwd: root }, env, { ...options, control: { engine: "claude" } });
+			expect(named.modelResolution?.engineSelection).toEqual({ engine: "claude", source: "control", nativeOptOut: false });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a flight cancelled before selection returns the aborted boundary with no selection, record or write", async () => {
+		const { root, env, options, calls } = planHarness();
+		const controller = new AbortController();
+		controller.abort();
+		const events: ProgressEvent[] = [];
+		try {
+			const response = await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root }, env, {
+				...options,
+				signal: controller.signal,
+				progress: (event) => events.push(event),
+			});
+			expect(response).toEqual({ context: "", skipped: "aborted" });
+			expect(events).toEqual([expect.objectContaining({ type: "end", outcome: "skipped", detail: "aborted" })]);
+			expect(calls).toEqual({ engine: 0, createTracker: 0, track: 0 });
+			expect(existsSync(sessionPath(env.ULTRATHINK_STATE_DIR!, "s1"))).toBe(false);
+			// Deterministic skips still decide first.
+			expect(await planPrompt({ host: "hermes", prompt: "ok", cwd: root }, env, { ...options, signal: controller.signal })).toEqual({
+				context: "",
+				skipped: "precheck-skip",
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a native selector cancelled mid-lookup returns the aborted boundary without a record", async () => {
+		const { root, env, options, calls } = planHarness();
+		delete options.selectEngine;
+		const controller = new AbortController();
+		try {
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+				...options,
+				signal: controller.signal,
+				native: async () => {
+					controller.abort();
+					throw new DOMException("aborted", "AbortError");
+				},
+			});
+			expect(response).toEqual({ context: "", skipped: "aborted" });
+			expect(calls).toEqual({ engine: 0, createTracker: 0, track: 0 });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a cancellation during a stage returns the aborted boundary with the safe record; no session, tracker or carrier", async () => {
+		for (const host of ["hermes", "omp"] as const) {
+			const { root, env, options, calls } = planHarness();
+			const controller = new AbortController();
+			options.selectEngine = async () => {
+				calls.engine++;
+				return {
+					label: "stub",
+					error: () => undefined,
+					resolution: STUB_RESOLUTION,
+					complete: async (system: string, user: string) => {
+						if (!user.includes("current_node")) return stubComplete(system, user);
+						controller.abort();
+						throw new DOMException("aborted", "AbortError");
+					},
+				};
+			};
+			try {
+				const response = await planPrompt({ host, session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+					...options,
+					signal: controller.signal,
+				});
+				expect({ host, response }).toEqual({ host, response: { context: "", skipped: "aborted", modelResolution: STUB_RESOLUTION } });
+				expect(calls.track).toBe(0);
+				expect(existsSync(sessionPath(env.ULTRATHINK_STATE_DIR!, "s1"))).toBe(false);
+				expect(existsSync(join(env.ULTRATHINK_STATE_DIR!, "last-plan.json"))).toBe(false);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("a flight cancelled once its plan is built delivers no context and writes no carrier", async () => {
+		const { root, env, options } = planHarness();
+		const controller = new AbortController();
+		try {
+			const response = await planPrompt({ host: "omp", session_id: "s1", prompt: "add a widget", cwd: root }, ompEnv(root, env), {
+				...options,
+				signal: controller.signal,
+				// The caller cancels as runPromptSubmit reports its finished plan, before planPrompt delivers it.
+				progress: (event) => {
+					if (event.type === "end" && event.outcome === "planned") controller.abort();
+				},
+			});
+			expect(response).toEqual({ context: "", skipped: "aborted", modelResolution: STUB_RESOLUTION });
+			expect(existsSync(join(env.ULTRATHINK_STATE_DIR!, "last-plan.json"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("captured config, control and stateDir are used as given; skip-once is still consumed into that state directory", async () => {
+		const { root, env, options } = planHarness();
+		const stateDir = join(root, "captured-state");
+		const config = defaultConfig();
+		config.think.enabled = false;
+		const control = { hitlEnabled: false };
+		const seen: Array<Parameters<NonNullable<PlanOptions["selectEngine"]>>> = [];
+		const inner = options.selectEngine!;
+		options.selectEngine = async (...args) => {
+			seen.push(args);
+			return inner(...args);
+		};
+		try {
+			const response = await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root }, env, { ...options, config, control, stateDir });
+			expect(response.statePath).toBe(sessionPath(stateDir, "s1"));
+			expect(existsSync(sessionPath(env.ULTRATHINK_STATE_DIR!, "s1"))).toBe(false);
+			expect(seen[0]?.[0]).toBe(config);
+			expect(seen[0]?.[1]).toBe(control);
+			const record = readSession(stateDir, "s1");
+			expect(record?.graph).toBeUndefined();
+			expect(record?.clarifications).toEqual([]);
+			// A captured control is a value, not a store: an armed skip-once is consumed and saved in the state directory.
+			const skipped = await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root }, env, {
+				...options,
+				config,
+				control: { skipOnce: true },
+				stateDir,
+			});
+			expect(skipped).toEqual({ context: "", skipped: "precheck-skip" });
+			expect(readControl(stateDir).skipOnce).toBe(false);
+			expect(seen).toHaveLength(1);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

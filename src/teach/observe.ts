@@ -154,7 +154,12 @@ export function parseLessons(text: string): Lesson[] {
 	return lessons;
 }
 
-/** The configured planning engine, as the planner selects it. `claudeComplete` marks its child with ULTRATHINK_CHILD=1. */
+/**
+ * The configured engine on its auxiliary CLI route (`purpose: "auxiliary"`): a detached distiller has no invoking live
+ * model or auth, so it never inherits a native session target and never rebuilds one from a SessionRecord. A missing or
+ * expired Grok login switches to Claude only with `grok.fallbackToClaude: true`. `claudeComplete` marks its child with
+ * ULTRATHINK_CHILD=1.
+ */
 async function engineComplete(ctx: TeachContext): Promise<NonNullable<TeachContext["complete"]> | string> {
 	const config = loadConfig(claudeConfigPaths(ctx.cwd, ctx.env));
 	const host = (HOSTS as readonly string[]).includes(ctx.host) ? (ctx.host as HostId) : undefined;

@@ -12,6 +12,7 @@ import { THINK_ENGINES, type ThinkEngine, type ThoughtGraph } from "../think/typ
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
+import type { ModelResolution } from "../host/engine.ts";
 import { resolveStateDir } from "../host/paths.ts";
 import type { ShipState } from "../ship/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
@@ -31,8 +32,13 @@ export interface ControlState {
 export interface SessionRecord {
 	sessionId: string;
 	at: number;
-	/** Thinking engine label, e.g. "grok-4.7@xhigh", "<shuntModel or model>@shunt" or "claude:sonnet". */
+	/** Thinking engine label: the selected route and its wire model, e.g. "claude:<model>", "<model>@<effort>" or "<shuntModel or model>@shunt". */
 	engine?: string;
+	/**
+	 * Safe selection record (UT-Planning-ModelSelection §6) of the engine that planned this prompt: allowlisted and
+	 * display-safe, never a Model, endpoint or credential. Set only on a real persisted plan; absent on older records.
+	 */
+	modelResolution?: ModelResolution;
 	/** First engine error message (redacted), when a plan call threw; explains a fallback source. */
 	engineError?: string;
 	/** Plan stages that fell back to boilerplate, in run order: "uplift", "graph", "fill:<nodeId>". Absent when every stage used LLM output. */

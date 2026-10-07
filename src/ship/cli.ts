@@ -656,7 +656,8 @@ async function main(): Promise<number> {
 		engine: async () => {
 			const stateFile = stateIndex >= 0 ? argv[stateIndex + 1] : undefined;
 			if (!stateFile) return undefined;
-			// state file lives at <stateDir>/sessions/<id>.json
+			// state file lives at <stateDir>/sessions/<id>.json. The judge is an auxiliary helper on the configured CLI route
+			// (explicit engine/model or the host's route default); it never replays the session's planning model or auth.
 			const selected = await selectEngine(config, readControl(dirname(dirname(resolve(stateFile)))), cwd, { purpose: "auxiliary" });
 			return "skipped" in selected ? undefined : selected.complete;
 		},

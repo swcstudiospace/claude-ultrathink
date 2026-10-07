@@ -551,17 +551,33 @@ export async function selectNativeEngine<M extends NativeModelIdentity>(
 		: selected(fallback.model, { state: "default", source: fallback.tier, reason: "active-unavailable" });
 }
 
-export function engineLabel(config: UltrathinkConfig, state: ControlState, host?: HostId): string {
+/**
+ * The status label of the current engine request; mirrors selection without auth checks. An `observed` record for the
+ * same host and engine request (the live session's latest resolution, which only the host process can pass) shows its
+ * generated label. Omp planning under `auto` is native, so without one the label says the live model is not observed
+ * instead of guessing a CLI route (§9 path 6). On a legacy route a `models.hosts` wire model replaces the engine model,
+ * and a provider constraint, which no legacy route can bind (§5.2), shows unresolved as selection reports it. Hermes
+ * routes by session-model family under `auto` (AD-3), which a static label cannot show, so it names the default route.
+ */
+export function engineLabel(config: UltrathinkConfig, state: ControlState, host?: HostId, observed?: ModelResolution): string {
 	const requested = state.engine ?? config.think.engine;
 	const resolvedHost = host ?? detectHost();
+	if (observed?.host === resolvedHost && observed.engineSelection.engine === requested) return observed.label;
+	if (requested === "auto" && resolvedHost === "omp") return "omp-native:auto (live model not observed)";
 	const engine = requested === "auto" ? HOST_DEFAULT_ENGINES[resolvedHost] : requested;
-	const label =
-		engine === "muse"
-			? `muse:${config.muse.model || "session default"}`
-			: engine === "grok" && config.grok.enabled
-				? grokEngineLabel(config.grok)
-				: `claude:${config.claude.model || "session default"}`;
-	// Hermes and Omp resolve per session, which a static label cannot show; name the default honestly.
-	if (requested === "auto" && (resolvedHost === "hermes" || resolvedHost === "omp")) return `${label} (follows session model)`;
+	const override = config.models.hosts[resolvedHost] ?? { provider: "", model: "" };
+	let label: string;
+	if (override.provider) {
+		const invalid = hasControlCharacter(override.provider) || hasControlCharacter(override.model);
+		label = `${engine}:unresolved [${invalid ? "selector-invalid" : "transport-incompatible"}]`;
+	} else if (engine === "muse") {
+		label = `muse:${override.model || config.muse.model || "session default"}`;
+	} else if (engine === "grok" && config.grok.enabled) {
+		label = grokEngineLabel({ ...config.grok, model: override.model || config.grok.model });
+	} else {
+		// A disabled Grok route runs Claude on Claude's own model (configured fallback), never the host's wire selector.
+		label = `claude:${(engine === "claude" && override.model) || config.claude.model || "session default"}`;
+	}
+	if (requested === "auto" && resolvedHost === "hermes") return `${label} (follows session model)`;
 	return label;
 }

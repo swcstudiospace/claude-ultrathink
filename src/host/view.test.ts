@@ -2,9 +2,10 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { SessionRecord } from "../claude/state.ts";
+import type { ModelResolution } from "./engine.ts";
 import type { ProgressEvent } from "./progress.ts";
 import { planPrompt } from "./plan.ts";
-import { buildPlanView } from "./view.ts";
+import { buildPlanView, projectResolution } from "./view.ts";
 
 const ref = (identifier: string) => ({ id: identifier, identifier, url: `https://linear.app/x/${identifier}`, title: identifier });
 
@@ -100,6 +101,130 @@ describe("buildPlanView", () => {
 		expect(view.nodes.map((n) => n.dependsOn)).toEqual([[], ["n1"], ["n1"], ["n2", "n3"]]);
 		expect(view.skill).toBe("gsd-quick");
 		expect(buildPlanView(record(), 0)).not.toHaveProperty("skill");
+	});
+});
+
+describe("buildPlanView model resolution (§9 path 3)", () => {
+	const detected: ModelResolution = {
+		version: "1.0.0",
+		state: "detected",
+		host: "omp",
+		transport: "omp-native",
+		source: "ctx.model",
+		reason: "live-model",
+		engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		api: "anthropic-messages",
+		provider: "anthropic",
+		modelId: "claude-x",
+		modelKnown: true,
+		label: "omp-native:anthropic/claude-x [detected]",
+	};
+
+	test("projects the record's safe resolution, shows its label as the engine and leaves graph and XML as recorded", () => {
+		const base = record();
+		const planned = { ...base, modelResolution: detected };
+		const before = structuredClone(planned);
+		const view = buildPlanView(planned, 4200);
+		expect(view.modelResolution).toEqual(detected);
+		expect(view.modelResolution).not.toBe(detected);
+		expect(view.engine).toBe("omp-native:anthropic/claude-x [detected]");
+		const { engine: _engine, modelResolution: _resolution, ...rest } = view;
+		const { engine: _legacy, ...plain } = buildPlanView(base, 4200);
+		expect(rest).toEqual(plain);
+		expect(planned).toEqual(before);
+	});
+
+	test("a record without a resolution keeps its recorded engine label and carries none", () => {
+		const view = buildPlanView(record(), 0);
+		expect(view.engine).toBe("claude:sonnet");
+		expect(view).not.toHaveProperty("modelResolution");
+	});
+
+	test("engine request stays apart from model state: a named engine with CLI omission says model unobserved and default", () => {
+		const cliDefault: ModelResolution = {
+			version: "1.0.0",
+			state: "default",
+			host: "omp",
+			transport: "claude-cli",
+			source: "cli-default",
+			reason: "cli-delegation",
+			engineSelection: { engine: "claude", source: "control", nativeOptOut: true },
+			modelKnown: false,
+			label: "claude:CLI default (model unobserved)",
+		};
+		const view = buildPlanView({ ...record(), modelResolution: cliDefault }, 0);
+		expect(view.modelResolution).toEqual(cliDefault);
+		expect(view.engine).toBe("claude:CLI default (model unobserved)");
+		// The parser's unsupported-host diagnostic has no transport, provider or model and keeps its reason.
+		const unsupported: ModelResolution = {
+			version: "1.0.0",
+			state: "unresolved",
+			host: "unknown",
+			source: "none",
+			reason: "unsupported-host",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			modelKnown: false,
+			label: "unknown:unresolved [unsupported-host]",
+		};
+		expect(projectResolution(unsupported)).toEqual(unsupported);
+	});
+
+	test("the projection is allowlisted and display-safe: extra fields drop, unsafe ids and labels become opaque", () => {
+		// Built in pieces so no scanner reads a credential-like literal out of this fixture.
+		const sentinel = ["sentinel", "credential", "value"].join("-");
+		const raw = {
+			...detected,
+			provider: "https://gateway.example",
+			modelId: `user:${sentinel}@gateway`,
+			providerType: "<script>",
+			label: `omp-native:x [detected]\nBearer ${sentinel}`,
+			engineSelection: { ...detected.engineSelection, credential: sentinel },
+			baseUrl: "https://gateway.example/v1",
+			headers: { authorization: sentinel },
+			apiKey: sentinel,
+			model: { id: "x", apiKey: sentinel },
+		};
+		expect(projectResolution(raw)).toEqual({
+			version: "1.0.0",
+			state: "detected",
+			host: "omp",
+			transport: "omp-native",
+			source: "ctx.model",
+			reason: "live-model",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			api: "anthropic-messages",
+			providerType: "<opaque-provider>",
+			provider: "<opaque-provider>",
+			modelId: "<opaque-model>",
+			modelKnown: true,
+			label: "<opaque-model>",
+		});
+		const view = JSON.stringify(buildPlanView({ ...record(), modelResolution: raw as unknown as ModelResolution }, 0));
+		expect(view).not.toContain(sentinel);
+		expect(view).not.toContain("gateway.example");
+		for (const label of ["claude:x [override]\u001b[31m", "claude:</ORIGINAL> [override]", "claude:token=abc [override]", `claude:${"a".repeat(600)}`]) {
+			expect(projectResolution({ ...detected, label })?.label).toBe("<opaque-model>");
+		}
+	});
+
+	test("anything that is not a version 1.0.0 record projects to nothing, and the view falls back to the engine label", () => {
+		for (const value of [
+			undefined,
+			null,
+			"omp-native:x",
+			42,
+			[],
+			{},
+			{ ...detected, version: "2.0.0" },
+			{ ...detected, engineSelection: null },
+			{ ...detected, state: "Detected!" },
+			{ ...detected, modelKnown: "yes" },
+		]) {
+			expect(projectResolution(value)).toBeUndefined();
+		}
+		const view = buildPlanView({ ...record(), modelResolution: null as unknown as ModelResolution }, 0);
+		expect(view.engine).toBe("claude:sonnet");
+		expect(view).not.toHaveProperty("modelResolution");
 	});
 });
 

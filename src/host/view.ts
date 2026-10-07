@@ -2,15 +2,21 @@
 // Copyright (C) 2026 SWC Studio
 /**
  * Display-only projection of a planned session for host UIs (Omp transcript
- * cards). Pure: the model never reads this, it reads the hook context.
+ * cards), and of a model resolution record for every display surface. Pure:
+ * the model never reads this, it reads the hook context.
  */
 import type { SessionRecord } from "../claude/state.ts";
+import { displayId, displayLabel, displayToken, OPAQUE_MODEL, OPAQUE_PROVIDER } from "../claude/output.ts";
 import { dependencyLevels } from "../think/graph.ts";
+import type { ModelResolution } from "./engine.ts";
 
 export interface PlanView {
 	root: string;
 	source: "llm" | "fallback";
+	/** Display label of the planning selection: the resolution record's safe label, else the recorded engine label. */
 	engine?: string;
+	/** The selection's safe record, projected for display (§9 path 3): engine request kept apart from model state. */
+	modelResolution?: ModelResolution;
 	/** Name of the skill the user invoked, when the plan covers a skill invocation. */
 	skill?: string;
 	graphId?: string;
@@ -39,6 +45,52 @@ export interface PlanView {
 }
 
 const NODE_PREFIX = /^\[[^\]]*\]\s*/;
+
+/** A JSON object: not null, not an array. */
+function isFields(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Display projection of a model resolution record (§6, §9, D-11): only the allowlisted fields, the label through
+ * `displayLabel`, ids through `displayId` and fixed-vocabulary values as plain tokens. A record read back from disk or
+ * carried between processes brings no extra or unsafe content into a view, status line or summary. Anything that is not
+ * a version 1.0.0 record projects to undefined, so a malformed saved record shows nothing instead of failing the surface.
+ */
+export function projectResolution(value: unknown): ModelResolution | undefined {
+	if (!isFields(value) || value.version !== "1.0.0" || !isFields(value.engineSelection)) return undefined;
+	const selection = value.engineSelection;
+	const state = displayToken(value.state);
+	const host = displayToken(value.host);
+	const source = displayToken(value.source);
+	const reason = displayToken(value.reason);
+	const engine = displayToken(selection.engine);
+	const requestSource = displayToken(selection.source);
+	if (!state || !host || !source || !reason || !engine || !requestSource) return undefined;
+	if (typeof selection.nativeOptOut !== "boolean" || typeof value.modelKnown !== "boolean") return undefined;
+	const transport = displayToken(value.transport);
+	const defaultSource = displayToken(value.defaultSource);
+	const api = typeof value.api === "string" ? displayId(value.api, OPAQUE_PROVIDER) : undefined;
+	const providerType = typeof value.providerType === "string" ? displayId(value.providerType, OPAQUE_PROVIDER) : undefined;
+	const provider = typeof value.provider === "string" ? displayId(value.provider, OPAQUE_PROVIDER) : undefined;
+	const modelId = typeof value.modelId === "string" ? displayId(value.modelId, OPAQUE_MODEL) : undefined;
+	return {
+		version: "1.0.0",
+		state,
+		host,
+		...(transport ? { transport } : {}),
+		source,
+		reason,
+		engineSelection: { engine, source: requestSource, nativeOptOut: selection.nativeOptOut },
+		...(defaultSource ? { defaultSource } : {}),
+		...(api ? { api } : {}),
+		...(providerType ? { providerType } : {}),
+		...(provider ? { provider } : {}),
+		...(modelId ? { modelId } : {}),
+		modelKnown: value.modelKnown,
+		label: displayLabel(value.label),
+	} as ModelResolution;
+}
 
 export function buildPlanView(record: SessionRecord, elapsedMs: number): PlanView {
 	const { graph, plan, tracking } = record;
@@ -82,10 +134,11 @@ export function buildPlanView(record: SessionRecord, elapsedMs: number): PlanVie
 			...(recommended ? { recommended } : {}),
 		};
 	});
+	const modelResolution = projectResolution(record.modelResolution);
 	return {
 		root: record.result.root,
 		source: record.result.source,
-		...(record.engine ? { engine: record.engine } : {}),
+		...(modelResolution ? { engine: modelResolution.label, modelResolution } : record.engine ? { engine: record.engine } : {}),
 		...(record.skill ? { skill: record.skill.name } : {}),
 		...(plan?.graphId ? { graphId: plan.graphId } : {}),
 		...(graph?.goal ? { goal: graph.goal } : {}),
