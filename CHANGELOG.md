@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Agent Substrate: a planned prompt now reports itself to the substrate. With `substrate.url` or `SUBSTRATE_URL` set, `runPromptSubmit` sends one `note` event (`POST <url>/events`) once the plan's session record is written, on every host. It carries the Graph ID as `graph_id`, the session id `<host session id>:<Graph ID>` (so each planned graph gets its own chain), the host as `surface`, the repository and branch, the summary `ultrathink planned graph <graphId> (<n> nodes)`, and the payload `{ ultrathink: "plan", nodes, host }` plus `skill` (the skill's name) when a skill was invoked; the substrate adopts the Graph ID unchanged as its correlation key. No text of the prompt, the spec or the plan is sent, and nothing is sent for a prompt that is not planned, a fallback spec (no Graph ID), a session without an id or a record that could not be written. The request follows the brief's rules: no URL or `SUBSTRATE_DISABLED=1` means no request, `SUBSTRATE_TOKEN` is the bearer token, it times out after 1.5 s (`SUBSTRATE_TIMEOUT_MS`), and a refusal, a timeout or an error changes nothing the prompt gets. Registering the graph stays the `ultrathink-kickoff` skill's `graph_register` step.
+
 ### Fixed
 
 - Omp and Hermes plan with the session's active model again. The host-neutral plan entry dropped the `model` field both hosts send, so `think.engine: "auto"` always fell back to the Claude host default — on a Muse session with Claude out of credits every plan was the 5-node boilerplate graph with one-question fills and no tracker rows. The entry now forwards `model` to engine selection.

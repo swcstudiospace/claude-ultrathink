@@ -109,4 +109,52 @@ describe("emitEvent", () => {
 		);
 		expect(urls).toEqual(["https://env.test/events"]);
 	});
+
+	test("sends snake_case keys, the content type and the bearer token, which is what the server reads", async () => {
+		const captured = stubFetch(() => new Response("{}", { status: 202 }));
+		await emitEvent(
+			{
+				kind: "note",
+				summary: "ultrathink planned graph ut-1 (5 nodes)",
+				surface: "hermes",
+				sessionId: "s1",
+				graphId: "ut-1",
+				nodeId: "n1",
+				repo: "a/b",
+				branch: "main",
+				payload: { ultrathink: "plan", nodes: 5 },
+			},
+			{ SUBSTRATE_TOKEN: "secret-token" },
+			URL_,
+		);
+		const init = captured();
+		expect(init.method).toBe("POST");
+		expect(init.headers).toEqual({ "content-type": "application/json", authorization: "Bearer secret-token" });
+		expect(JSON.parse(String(init.body))).toEqual({
+			kind: "note",
+			summary: "ultrathink planned graph ut-1 (5 nodes)",
+			surface: "hermes",
+			session_id: "s1",
+			graph_id: "ut-1",
+			node_id: "n1",
+			repo: "a/b",
+			branch: "main",
+			payload: { ultrathink: "plan", nodes: 5 },
+		});
+
+		// No surface named: the event is Claude Code's, as for the brief.
+		await emitEvent({ kind: "note", summary: "s" }, {}, URL_);
+		expect(JSON.parse(String(captured().body)).surface).toBe("claude-code");
+	});
+
+	test("a non-2xx answer is not an accepted event, and a server that never answers is given up on at the timeout", async () => {
+		stubFetch(() => new Response("upstream exploded", { status: 503 }));
+		expect(await emitEvent({ kind: "note", summary: "s" }, {}, URL_)).toBe(false);
+
+		globalThis.fetch = ((_url: string, init: RequestInit) =>
+			new Promise<Response>((_resolve, reject) => {
+				init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			})) as unknown as typeof fetch;
+		expect(await emitEvent({ kind: "note", summary: "s" }, { SUBSTRATE_TIMEOUT_MS: "20" }, URL_)).toBe(false);
+	});
 });

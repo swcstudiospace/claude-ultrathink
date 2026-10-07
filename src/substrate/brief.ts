@@ -4,7 +4,10 @@
  * Agent Substrate client — an optional integration.
  *
  * Fetches the cross-agent briefing before the Graph of Thought is built, so the
- * graph is planned knowing what other agents already did in this repo.
+ * graph is planned knowing what other agents already did in this repo, and
+ * reports the plan back once it exists: `emitEvent` appends one `note` event
+ * carrying the Graph ID, which the substrate adopts unchanged as its
+ * correlation key (the caller is `runPromptSubmit`).
  *
  * Opt-in: nothing is contacted unless a server URL is set, either through the
  * `SUBSTRATE_URL` environment variable or `substrate.url` in the ultrathink
