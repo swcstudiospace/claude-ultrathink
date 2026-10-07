@@ -104,7 +104,7 @@ Model: sonnet · concurrency 3
 State: /home/<you>/.claude/ultrathink
 ```
 
-The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine call: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight and no RAGFlow. Teachable Moments distills finished turns and recalls lessons and skills locally; with Hindsight off, none of that leaves the machine.
+The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine calls: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight and no RAGFlow. The engine calls include Teachable Moments, which is on by default: each qualifying finished turn sends the engine one extra call with a redacted excerpt of the session, tool results included, to distill lessons (see [Privacy](privacy.md#planning-engine-lesson-distillation); `"teach": { "capture": "explicit" }` stops it). The lessons, recall and skill installs stay on the local machine while Hindsight is off.
 
 ## 5. Send your first prompt
 

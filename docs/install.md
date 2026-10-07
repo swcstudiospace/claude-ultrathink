@@ -79,7 +79,7 @@ Optional:
 | A Hindsight API key (`bin/ultrathink-mcp auth set-key hindsight --stdin`, or `HINDSIGHT_API_KEY` / `HINDSIGHT_API_TOKEN`) | [Hindsight](how-to/connect-hindsight.md) (opt-in, `hindsight.enabled`). Not an MCP server. |
 | A RAGFlow API key (`bin/ultrathink-mcp auth set-key ragflow --stdin`, or `RAGFLOW_API_KEY`) | [RAGFlow](how-to/connect-ragflow.md) (opt-in, `ragflow.enabled`). Not an MCP server. |
 
-A fresh install plans prompts and learns from finished turns. Linear and Notion tracking, ship, the Agent Substrate brief, Hindsight, RAGFlow and the Tailscale OAuth callback are all off until you configure them; Teachable Moments captures, recalls and promotes on the local machine by default (see [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again) to turn it off). See [Configuration](configuration.md) and [Tracking](tracking.md).
+A fresh install plans prompts and learns from finished turns. Linear and Notion tracking, ship, the Agent Substrate brief, Hindsight, RAGFlow and the Tailscale OAuth callback are all off until you configure them. Teachable Moments is on by default: it keeps lessons, recalls them and installs skills on the local machine, and distills each qualifying finished turn with one extra call to the planning engine that carries a redacted excerpt of the session, tool results included (see [Privacy](privacy.md#planning-engine-lesson-distillation), and [Use Teachable Moments](how-to/use-teachable-moments.md#turn-it-off-again) to turn it off). See [Configuration](configuration.md) and [Tracking](tracking.md).
 
 Each host keeps its own state directory. Planning never writes `.planning/` into your working directory. Teachable Moments state is `<state directory>/teach/`, never `<cwd>/.planning`.
 
