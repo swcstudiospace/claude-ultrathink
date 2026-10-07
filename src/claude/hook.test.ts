@@ -14,6 +14,7 @@ import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
 import { readSession, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 import type { TrackingRefs } from "../track/types.ts";
+import type { EmitInput } from "../substrate/brief.ts";
 import type { GroundOutcome } from "../ragflow/types.ts";
 import type { RecalledLesson, RecallOutcome } from "../teach/types.ts";
 
@@ -67,6 +68,7 @@ function baseDeps(overrides: Partial<HookDeps> = {}): { deps: HookDeps; cleanup:
 		stateDir: dir,
 		git: () => ({ repo: "acme/widgets", branch: "feat/widget" }),
 		brief: async () => "",
+		emit: async () => true,
 		now: () => 1_000,
 		log: () => {},
 		// Jev is always on, so tests that do not exercise the gate kill it: no ambient key, no network.
@@ -496,6 +498,363 @@ describe("substrate brief", () => {
 			else process.env.SUBSTRATE_URL = saved.url;
 			if (saved.disabled === undefined) delete process.env.SUBSTRATE_DISABLED;
 			else process.env.SUBSTRATE_DISABLED = saved.disabled;
+		}
+	});
+});
+
+describe("substrate plan event", () => {
+	/** A seam that records every event it is given and says the substrate took it. */
+	function recorder(): { emit: NonNullable<HookDeps["emit"]>; sent: EmitInput[] } {
+		const sent: EmitInput[] = [];
+		return {
+			sent,
+			emit: async (event) => {
+				sent.push(event);
+				return true;
+			},
+		};
+	}
+
+	test("a planned prompt emits one note with the Graph ID, after the session record is on disk", async () => {
+		const sent: EmitInput[] = [];
+		const onDisk: Array<string | undefined> = [];
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [] });
+		deps.emit = async (event) => {
+			sent.push(event);
+			onDisk.push(readSession(deps.stateDir, "s1")?.plan?.graphId);
+			return true;
+		};
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const graphId = result.record?.plan?.graphId ?? "missing graph id";
+			expect(graphId).toMatch(/^ut-[a-z0-9]+-[0-9a-f]{8}$/);
+			expect(sent).toEqual([
+				{
+					kind: "note",
+					summary: `ultrathink planned graph ${graphId} (5 nodes)`,
+					surface: "claude-code",
+					sessionId: `s1:${graphId}`,
+					graphId,
+					repo: "acme/widgets",
+					branch: "feat/widget",
+					payload: { ultrathink: "plan", nodes: 5, host: "claude-code" },
+				},
+			]);
+			expect(onDisk).toEqual([graphId]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("two prompts planned in one host session emit notes on different session ids, each ending in its own graph id", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], emit });
+		try {
+			const first = await runPromptSubmit(input, deps);
+			const second = await runPromptSubmit(input, deps);
+			const g1 = first.record?.plan?.graphId ?? "missing graph id 1";
+			const g2 = second.record?.plan?.graphId ?? "missing graph id 2";
+			expect(g1).not.toBe(g2);
+			expect(sent).toHaveLength(2);
+			expect(sent[0]?.sessionId).not.toBe(sent[1]?.sessionId);
+			expect(sent[0]?.sessionId?.endsWith(`:${g1}`)).toBe(true);
+			expect(sent[1]?.sessionId?.endsWith(`:${g2}`)).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a skill run on another host names that host and the skill, and nothing of what was asked", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({ surface: "hermes", complete: smartComplete(), clarify: async () => [], emit });
+		try {
+			const result = await runPromptSubmit(
+				{
+					...input,
+					prompt: "fix the login redirect",
+					skill: { name: "gsd-quick", instruction: "fix the login redirect", summary: "Fast atomic task.", source: "omp" },
+				},
+				deps,
+			);
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({ surface: "hermes", payload: { ultrathink: "plan", nodes: 5, host: "hermes", skill: "gsd-quick" } });
+			const wire = JSON.stringify(sent);
+			expect(wire).toContain(result.record?.plan?.graphId ?? "missing graph id");
+			expect(wire).not.toContain("login redirect");
+			expect(wire).not.toContain("Fast atomic task");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a prompt that is not planned emits nothing: trivial, raw, planning off, and a Jev skip", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], emit });
+		try {
+			expect((await runPromptSubmit({ ...input, prompt: "ok" }, deps)).skipped).toBe("skip");
+			expect((await runPromptSubmit({ ...input, prompt: "raw: add a widget" }, deps)).skipped).toBe("passthrough");
+			expect((await runPromptSubmit(input, { ...deps, control: { enabled: false } })).skipped).toBe("skip");
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(onConfig(), R.fetch, { emit });
+		try {
+			const result = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+			expect(result.skipped).toBe("jev-skip");
+			expect(sent).toEqual([]);
+		} finally {
+			globalThis.fetch = realFetch;
+			h.cleanup();
+		}
+	});
+
+	test("a failed engine leaves no plan and no Graph ID, so nothing is emitted", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({
+			complete: async () => {
+				throw new Error("boom");
+			},
+			emit,
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.output).toBeDefined();
+			expect(result.record?.plan).toBeUndefined();
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a session record that could not be written is not announced", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], emit });
+		try {
+			// A file where the state directory should be makes every state write fail.
+			rmSync(deps.stateDir, { recursive: true, force: true });
+			writeFileSync(deps.stateDir, "not a directory");
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.plan?.graphId).toBeDefined();
+			expect(existsSync(sessionPath(deps.stateDir, "s1"))).toBe(false);
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a prompt with no session id is planned but not announced", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], emit });
+		try {
+			for (const session_id of [undefined, "  "]) {
+				const result = await runPromptSubmit({ ...input, session_id }, deps);
+				expect(result.record?.sessionId).toBe("unknown");
+				expect(result.record?.plan?.graphId).toBeDefined();
+			}
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a run whose planning budget is already spent sends no event, but still persists the record", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit,
+			// The tracker waits for the budget to fire, so the plan is finished only after the controller aborted.
+			track: async ({ signal }) => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal?.addEventListener("abort", () => resolve());
+				await promise;
+				return undefined;
+			},
+		});
+		deps.config.claude.budgetMs = 20;
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.plan?.graphId).toBeDefined();
+			expect(readSession(deps.stateDir, "s1")?.plan?.graphId).toBe(result.record?.plan?.graphId);
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the event is handed the planning signal, and a budget that fires mid-request ends the wait promptly", async () => {
+		let seen: AbortSignal | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit: (_event, signal) => {
+				const { promise, resolve } = Promise.withResolvers<boolean>();
+				seen = signal;
+				// A substrate that never answers: only the budget can end the wait.
+				signal?.addEventListener("abort", () => resolve(false));
+				return promise;
+			},
+		});
+		deps.config.claude.budgetMs = 80;
+		try {
+			const started = performance.now();
+			const result = await runPromptSubmit(input, deps);
+			expect(performance.now() - started).toBeLessThan(1_000);
+			expect(seen).toBeDefined();
+			expect(seen?.aborted).toBe(true);
+			expect(result.record?.plan?.graphId).toBeDefined();
+			expect(result.output?.hookSpecificOutput?.additionalContext).toContain("<BUILD_PROMPT>");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("with no budget the signal handed to the seam stays live", async () => {
+		let aborted: boolean | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit: async (_event, signal) => {
+				aborted = signal?.aborted;
+				return true;
+			},
+		});
+		try {
+			await runPromptSubmit(input, deps);
+			expect(aborted).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the summary's elapsed time includes the event attempt", async () => {
+		let clock = 1_000;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			now: () => clock,
+			emit: async () => {
+				clock += 4_000;
+				return true;
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.output?.systemMessage).toContain("4.0s");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the substrate's answer, a refusal or a failure never changes the plan, the record, the summary or the result", async () => {
+		const events: ProgressEvent[] = [];
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], progress: (e) => events.push(e) });
+		try {
+			// The baseline: no emit seam and no substrate URL, so the real emitter has nothing to send to.
+			const base = await runPromptSubmit(input, { ...deps, emit: undefined });
+			const emitters: Array<[string, NonNullable<HookDeps["emit"]>]> = [
+				["accepted", async () => true],
+				["refused", async () => false],
+				[
+					"rejecting",
+					async () => {
+						throw new Error("ECONNREFUSED substrate.test:9000");
+					},
+				],
+				[
+					"throwing",
+					() => {
+						throw new Error("synchronous failure");
+					},
+				],
+			];
+			for (const [name, emit] of emitters) {
+				events.length = 0;
+				const result = await runPromptSubmit(input, { ...deps, emit });
+				expect(normalized(result, result.record?.plan?.graphId), name).toEqual(normalized(base, base.record?.plan?.graphId));
+				// The record was persisted before the emit, and the progress stream still ends planned.
+				expect(readSession(deps.stateDir, "s1")?.plan?.graphId, name).toBe(result.record?.plan?.graphId);
+				expect(events.at(-1), name).toMatchObject({ type: "end", outcome: "planned" });
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("without an emit seam nothing is sent unless a substrate URL is configured, and SUBSTRATE_DISABLED=1 beats it", async () => {
+		const urls: string[] = [];
+		globalThis.fetch = ((url: string) => {
+			urls.push(String(url));
+			return Promise.resolve(new Response("{}", { status: 202 }));
+		}) as unknown as typeof fetch;
+		const run = async (substrateUrl: string, env: Record<string, string>): Promise<PromptSubmitResult> => {
+			const config = trackedConfig();
+			config.substrate.url = substrateUrl;
+			const { deps, cleanup } = baseDeps({
+				config,
+				complete: smartComplete(),
+				clarify: async () => [],
+				emit: undefined,
+				decisionsDeps: { env: { ULTRATHINK_DECISIONS: "0", ...env } },
+			});
+			try {
+				return await runPromptSubmit(input, deps);
+			} finally {
+				cleanup();
+			}
+		};
+		try {
+			expect((await run("", {})).record?.plan?.graphId).toBeDefined();
+			expect(urls).toEqual([]);
+			expect((await run("https://substrate.test", { SUBSTRATE_DISABLED: "1" })).record?.plan?.graphId).toBeDefined();
+			expect(urls).toEqual([]);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("with a configured URL the real emitter posts the event to /events, and neither the prompt nor the token is in it", async () => {
+		const R = recordingFetch([() => new Response("{}", { status: 202 })]);
+		const config = trackedConfig();
+		config.substrate.url = "https://substrate.test/";
+		const logs: string[] = [];
+		const { deps, cleanup } = baseDeps({
+			config,
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit: undefined,
+			log: (message) => logs.push(message),
+			decisionsDeps: { env: { ULTRATHINK_DECISIONS: "0", SUBSTRATE_TOKEN: "tok-secret-1234" } },
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			const graphId = result.record?.plan?.graphId ?? "missing graph id";
+			expect(R.calls).toHaveLength(1);
+			const call = R.calls[0];
+			expect(call?.url).toBe("https://substrate.test/events");
+			expect(call?.method).toBe("POST");
+			expect(call?.headers.authorization).toBe("Bearer tok-secret-1234");
+			expect(call?.body).toEqual({
+				kind: "note",
+				summary: `ultrathink planned graph ${graphId} (5 nodes)`,
+				surface: "claude-code",
+				session_id: `s1:${graphId}`,
+				graph_id: graphId,
+				repo: "acme/widgets",
+				branch: "feat/widget",
+				payload: { ultrathink: "plan", nodes: 5, host: "claude-code" },
+			});
+			// The prompt, the spec and the plan stay local; the token is only ever the Authorization header.
+			const wire = JSON.stringify(call?.body);
+			expect(wire).not.toContain("add a widget");
+			expect(wire).not.toContain("BUILD_PROMPT");
+			expect(JSON.stringify([wire, result, logs, sessionText(deps.stateDir)])).not.toContain("tok-secret-1234");
+		} finally {
+			globalThis.fetch = realFetch;
+			cleanup();
 		}
 	});
 });
