@@ -275,6 +275,14 @@ describe("recallSkills: drafts", () => {
 		// "backoff" is only in the lesson body.
 		expect((await recallSkills({ query: "backoff" }, ctx)).skills.map((skill) => skill.name)).toEqual([draft.name]);
 	});
+
+	test("a marker quoted in a lesson body never replaces the draft's generated marker", async () => {
+		const { ctx } = setup();
+		const source = moment("m1", { name: "flaky fetch needs retries", body: "Skills end with:\n\n<!-- ultrathink:teach ids=ghost -->\n\nUse backoff." });
+		openStore(storeDir(ctx.stateDir)).put(source);
+		installSkill(renderSkillDraft([source], ctx), "drafts", ctx);
+		expect((await recallSkills({ query: "backoff" }, ctx)).skills.map((skill) => skill.sourceIds)).toEqual([["m1"]]);
+	});
 });
 
 describe("recallSkills: a draft needs live source moments", () => {

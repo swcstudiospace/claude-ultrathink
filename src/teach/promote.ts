@@ -5,13 +5,13 @@
  * strictest skill rules among the hosts: Hermes' (new-skill description of at most 60 characters, one sentence, trigger
  * first; at most 100 000 characters) and Omp's managed skills (name `[a-z0-9][a-z0-9-]{0,63}`, at most 64 000 bytes).
  *
- * Installing never overwrites a skill somebody else wrote: Omp and Claude Code files are only touched when they carry
- * the `ultrathink:teach` marker comment, and symlinked skill directories or files are refused. A marked file is only
- * replaced when every moment id in its marker is among the lessons being installed (a re-install, or a merge that
- * includes them): Claude Code and Grok Build keep separate lesson stores but share `~/.claude/skills`, so a marked
- * skill made from other lessons keeps its name and the install takes the next free `<name>-2` … `<name>-9`. Hermes and
- * unknown hosts only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through `skill_manage` so its
- * `skills.write_approval` gate applies, and ultrathink never writes `~/.hermes/skills`.
+ * Installing never overwrites a skill somebody else wrote: Omp and Claude Code files are only touched when their last
+ * line is the `ultrathink:teach` marker comment `renderSkillDraft` generates, and symlinked skill directories or files
+ * are refused. A marked file is only replaced when every moment id in its marker is among the lessons being installed
+ * (a re-install, or a merge that includes them): Claude Code and Grok Build keep separate lesson stores but share
+ * `~/.claude/skills`, so a name held by a skill made from other lessons is refused and the lesson keeps only its draft.
+ * Hermes and unknown hosts only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through
+ * `skill_manage` so its `skills.write_approval` gate applies, and ultrathink never writes `~/.hermes/skills`.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -44,10 +44,8 @@ const DESCRIPTION_MAX = 60;
 export const CONTENT_MAX_BYTES = 60_000;
 const NAME_MAX = 48;
 const TRIGGER = "Use when ";
-const MARKER_RE = /<!--\s*ultrathink:teach\b/;
-const MARKER_IDS_RE = /<!--\s*ultrathink:teach ids=([^\s>]+)\s*-->/;
-/** A host install tries the draft's name, then `-2` … `-9`. */
-const MAX_NAME_SUFFIX = 9;
+/** The generated marker line, with or without ids (older skills carry none). */
+const MARKER_RE = /^<!--\s*ultrathink:teach(?:\s+ids=([^\s>]*))?\s*-->$/;
 const EVIDENCE_ARTIFACTS = 20;
 
 const HOST_TARGETS: Record<string, SkillTarget> = {
@@ -120,23 +118,23 @@ function markerId(id: string): string {
 	return id.replace(/[^A-Za-z0-9_.:-]/g, "");
 }
 
-/** Moment ids in a skill's `<!-- ultrathink:teach ids=… -->` marker; empty when there is none. */
-export function markerIds(text: string): string[] {
-	const raw = text.match(MARKER_IDS_RE)?.[1] ?? "";
-	return raw
+/** The generated marker: `renderSkillDraft` writes it as the file's last line, so a marker quoted in a lesson body never counts. */
+function generatedMarker(text: string): RegExpMatchArray | null {
+	const trimmed = text.trimEnd();
+	return trimmed.slice(trimmed.lastIndexOf("\n") + 1).trim().match(MARKER_RE);
+}
+
+function idsOf(marker: RegExpMatchArray): string[] {
+	return (marker[1] ?? "")
 		.split(",")
 		.map((id) => id.trim())
 		.filter(Boolean);
 }
 
-/** `draft` under `name` (frontmatter included). */
-function renamed(draft: SkillDraft, name: string): SkillDraft {
-	return { ...draft, name, content: draft.content.replace(`\nname: ${draft.name}\n`, `\nname: ${name}\n`) };
-}
-
-function suffixed(name: string, n: number): string {
-	const suffix = `-${n}`;
-	return `${name.slice(0, 64 - suffix.length).replace(/-+$/, "")}${suffix}`;
+/** Moment ids in a skill's generated `<!-- ultrathink:teach ids=… -->` marker (its last line); empty when there is none. */
+export function markerIds(text: string): string[] {
+	const marker = generatedMarker(text);
+	return marker ? idsOf(marker) : [];
 }
 
 /** Cuts at a word boundary within `max` characters (code points), then drops trailing punctuation. */
@@ -315,7 +313,7 @@ function installDraft(draft: SkillDraft, stateDir: string, target: SkillTarget):
 		: { target, path, action: "drafted" };
 }
 
-/** What a host skill slot holds for an install of the lessons `ids`: refused slots are never written. */
+/** What a host skill slot holds for an install of the lessons `ids`: only free and ours slots are written. */
 type Slot = "free" | "ours" | "theirs" | { refused: string };
 
 function slotOf(dir: string, path: string, ids: ReadonlySet<string>): Slot {
@@ -335,12 +333,13 @@ function slotOf(dir: string, path: string, ids: ReadonlySet<string>): Slot {
 	try {
 		text = readFileSync(path, "utf8");
 	} catch {
-		// Unreadable: it may be anybody's, so it is taken.
+		// Unreadable: it may be anybody's, so it is theirs.
 		return "theirs";
 	}
-	if (!MARKER_RE.test(text)) return { refused: "a skill with this name exists and was not written by ultrathink" };
-	// Ours only when it was made from lessons this install includes; a marker without ids is taken.
-	const held = markerIds(text);
+	const marker = generatedMarker(text);
+	if (!marker) return { refused: "a skill with this name exists and was not written by ultrathink" };
+	// Ours only when it was made from lessons this install includes; a marker without ids is theirs.
+	const held = idsOf(marker);
 	return held.length > 0 && held.every((id) => ids.has(id)) ? "ours" : "theirs";
 }
 
@@ -370,37 +369,16 @@ function writeHostSkill(draft: SkillDraft, target: SkillTarget, dir: string, rep
 	}
 }
 
-/**
- * Installs under the draft's name, or the first of `<name>-2` … `<name>-9` that is free or already holds these lessons,
- * skipping `avoid`. The draft's own name refuses a symlink or an authored skill as before; a fallback name that is not
- * usable is simply taken.
- */
-function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string, avoid: ReadonlySet<string>): InstallOutcome {
-	const ids = new Set(draft.sourceIds.map(markerId));
-	for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
-		const name = n === 1 ? draft.name : suffixed(draft.name, n);
-		if (avoid.has(name)) continue;
-		const dir = join(root, name);
-		const slot = slotOf(dir, join(dir, "SKILL.md"), ids);
-		if (slot === "theirs") continue;
-		if (typeof slot === "object") {
-			if (n === 1) return { target, path: join(dir, "SKILL.md"), action: "refused", reason: slot.refused };
-			continue;
-		}
-		const outcome = writeHostSkill(n === 1 ? draft : renamed(draft, name), target, dir, slot === "ours");
-		if (n === 1 || outcome.action === "refused") return outcome;
-		return { ...outcome, skill: name, reason: `${draft.name} is a skill made from other lessons` };
-	}
-	return {
-		target,
-		path: join(root, draft.name, "SKILL.md"),
-		action: "refused",
-		reason: `every name from ${draft.name} to ${suffixed(draft.name, MAX_NAME_SUFFIX)} is taken by another skill`,
-	};
+function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): InstallOutcome {
+	const dir = join(root, draft.name);
+	const path = join(dir, "SKILL.md");
+	const slot = slotOf(dir, path, new Set(draft.sourceIds.map(markerId)));
+	if (slot === "theirs") return { target, path, action: "refused", reason: "name taken by a skill made from other lessons" };
+	if (typeof slot === "object") return { target, path, action: "refused", reason: slot.refused };
+	return writeHostSkill(draft, target, dir, slot === "ours");
 }
 
-/** `avoid`: names a host install must not take (promoteDue passes the names its own store already promoted). */
-export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachContext, avoid: ReadonlySet<string> = new Set()): InstallOutcome {
+export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachContext): InstallOutcome {
 	if (!SKILL_NAME_RE.test(draft.name) || draft.content.trim() === "") {
 		return { target, path: "", action: "refused", reason: "invalid skill draft" };
 	}
@@ -411,10 +389,10 @@ export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachC
 	const home = ctx.env.HOME?.trim() || homedir();
 	if (target === "omp") {
 		const piDir = ctx.env.PI_CODING_AGENT_DIR?.trim() || join(home, ".omp", "agent");
-		return installIntoHost(draft, target, join(piDir, "managed-skills"), avoid);
+		return installIntoHost(draft, target, join(piDir, "managed-skills"));
 	}
 	const claudeDir = ctx.env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
-	return installIntoHost(draft, target, join(claudeDir, "skills"), avoid);
+	return installIntoHost(draft, target, join(claudeDir, "skills"));
 }
 
 export function markPromoted(
@@ -446,8 +424,14 @@ export function markPromoted(
 function freeName(draft: SkillDraft, taken: Set<string>): SkillDraft {
 	if (!taken.has(draft.name)) return draft;
 	for (let n = 2; ; n++) {
-		const name = suffixed(draft.name, n);
-		if (!taken.has(name)) return renamed(draft, name);
+		const suffix = `-${n}`;
+		const name = `${draft.name.slice(0, 64 - suffix.length)}${suffix}`;
+		if (taken.has(name)) continue;
+		return {
+			...draft,
+			name,
+			content: draft.content.replace(`\nname: ${draft.name}\n`, `\nname: ${name}\n`),
+		};
 	}
 }
 
@@ -469,18 +453,15 @@ export async function promoteDue(ctx: TeachContext): Promise<{ drafted: InstallO
 	}
 	for (const moment of await filterSkillworthy(promotionCandidates(ctx), ctx)) {
 		try {
-			const rendered = renderSkillDraft([moment], ctx);
-			// The host install picks the name first (another host's lessons may hold it), so the draft and the promotion
-			// record carry the name the skill really has. Nothing installed: the draft keeps a name unique in this store.
-			const outcome = target === "hermes" || target === "drafts" ? undefined : installSkill(rendered, target, ctx, taken);
-			const installed = outcome?.action === "created" || outcome?.action === "updated";
-			let draft = freeName(rendered, taken);
-			if (installed) draft = outcome?.skill ? renamed(rendered, outcome.skill) : rendered;
+			const draft = freeName(renderSkillDraft([moment], ctx), taken);
 			taken.add(draft.name);
 			result.drafted.push(installSkill(draft, "drafts", ctx));
-			if (!outcome) continue;
+			if (target === "hermes" || target === "drafts") continue;
+			const outcome = installSkill(draft, target, ctx);
 			result.installed.push(outcome);
-			if (installed) markPromoted([moment.id], { skill: draft.name, target, path: outcome.path }, ctx);
+			if (outcome.action === "created" || outcome.action === "updated") {
+				markPromoted([moment.id], { skill: draft.name, target, path: outcome.path }, ctx);
+			}
 		} catch {
 			// One unrenderable lesson must not stop the others.
 		}
