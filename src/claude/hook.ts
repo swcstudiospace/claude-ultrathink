@@ -77,7 +77,7 @@ export interface HookDeps {
 	 * `config.substrate.url`, with the env the host injected (`decisionsDeps.env`) or else `process.env`. Called once,
 	 * after the session record is written; its answer, a rejection or a throw never changes the result.
 	 */
-	emit?: (event: EmitInput) => Promise<boolean>;
+	emit?: (event: EmitInput, signal?: AbortSignal) => Promise<boolean>;
 	/** Host that asked for the brief and is named on the plan event. Defaults to Claude so existing callers stay stable. */
 	surface?: string;
 	now?: () => number;
@@ -244,24 +244,39 @@ function startGround(deps: HookDeps, input: LookupInput): Promise<GroundOutcome>
  */
 async function announcePlan(
 	deps: HookDeps,
-	input: { plan: TrackPlan; sessionId: string; host: string; skill?: string; repo?: string; branch?: string },
+	input: {
+		plan: TrackPlan;
+		sessionId: string;
+		host: string;
+		skill?: string;
+		repo?: string;
+		branch?: string;
+		/** The planning budget: once it fires there is no point telling the substrate, so the request is skipped or cut short. */
+		signal: AbortSignal;
+	},
 ): Promise<void> {
 	try {
+		if (input.signal.aborted) return;
 		const { plan, host } = input;
 		const nodes = plan.issues.length;
 		// The host's own env when it injected one (planPrompt does, for the brief too), else the process's.
 		const env = deps.decisionsDeps?.env ?? process.env;
-		const send = deps.emit ?? ((event: EmitInput) => emitEvent(event, env, deps.config.substrate.url));
-		await send({
-			kind: "note",
-			summary: `ultrathink planned graph ${plan.graphId} (${nodes} nodes)`,
-			surface: host,
-			sessionId: `${input.sessionId}:${plan.graphId}`,
-			graphId: plan.graphId,
-			repo: input.repo,
-			branch: input.branch,
-			payload: { ultrathink: "plan", nodes, host, ...(input.skill ? { skill: input.skill } : {}) },
-		});
+		const send =
+			deps.emit ??
+			((event: EmitInput, signal?: AbortSignal) => emitEvent(event, env, deps.config.substrate.url, signal));
+		await send(
+			{
+				kind: "note",
+				summary: `ultrathink planned graph ${plan.graphId} (${nodes} nodes)`,
+				surface: host,
+				sessionId: `${input.sessionId}:${plan.graphId}`,
+				graphId: plan.graphId,
+				repo: input.repo,
+				branch: input.branch,
+				payload: { ultrathink: "plan", nodes, host, ...(input.skill ? { skill: input.skill } : {}) },
+			},
+			input.signal,
+		);
 	} catch {
 		// fail-open: the substrate records a plan, it never gates one
 	}
@@ -624,6 +639,20 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				}),
 			},
 		};
+		// One event, after every fallible step, for a plan that exists and whose record is on disk, in a session the
+		// substrate can chain on: a skip, a fallback spec, a failed state write or an unknown session leaves nothing behind.
+		// Bounded by the planning budget, and ahead of the summary so the elapsed time it shows includes the attempt.
+		if (plan?.graphId && statePath && sessionId !== "unknown") {
+			await announcePlan(deps, {
+				plan,
+				sessionId,
+				host: surfaceId,
+				skill: skill?.name,
+				repo: git.repo,
+				branch: git.branch,
+				signal: controller.signal,
+			});
+		}
 		if (deps.config.claude.echo) {
 			output.systemMessage = formatSummary({
 				result,
@@ -644,11 +673,6 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				elapsedMs: now() - started,
 				decisions: records,
 			});
-		}
-		// One event, after every fallible step, for a plan that exists and whose record is on disk, in a session the
-		// substrate can chain on: a skip, a fallback spec, a failed state write or an unknown session leaves nothing behind.
-		if (plan?.graphId && statePath && sessionId !== "unknown") {
-			await announcePlan(deps, { plan, sessionId, host: surfaceId, skill: skill?.name, repo: git.repo, branch: git.branch });
 		}
 		outcome = "planned";
 		return { output, record, ...(records.length ? { decisions: records } : {}) };

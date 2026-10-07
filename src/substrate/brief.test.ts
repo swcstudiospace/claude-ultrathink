@@ -157,4 +157,31 @@ describe("emitEvent", () => {
 			})) as unknown as typeof fetch;
 		expect(await emitEvent({ kind: "note", summary: "s" }, { SUBSTRATE_TIMEOUT_MS: "20" }, URL_)).toBe(false);
 	});
+
+	test("an already-aborted signal sends nothing", async () => {
+		const urls = recordFetch();
+		expect(await emitEvent({ kind: "note", summary: "s" }, {}, URL_, AbortSignal.abort())).toBe(false);
+		expect(urls).toEqual([]);
+	});
+
+	test("a signal aborted while the request hangs ends it promptly, well inside the substrate timeout", async () => {
+		globalThis.fetch = ((_url: string, init: RequestInit) => {
+			const { promise, reject } = Promise.withResolvers<Response>();
+			init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+			return promise;
+		}) as unknown as typeof fetch;
+		const controller = new AbortController();
+		const started = performance.now();
+		const pending = emitEvent({ kind: "note", summary: "s" }, { SUBSTRATE_TIMEOUT_MS: "30000" }, URL_, controller.signal);
+		controller.abort();
+		expect(await pending).toBe(false);
+		expect(performance.now() - started).toBeLessThan(5_000);
+	});
+
+	test("a live signal leaves the request unchanged", async () => {
+		const captured = stubFetch(() => new Response("{}", { status: 202 }));
+		const controller = new AbortController();
+		expect(await emitEvent({ kind: "note", summary: "s" }, {}, URL_, controller.signal)).toBe(true);
+		expect(captured().signal?.aborted).toBe(false);
+	});
 });

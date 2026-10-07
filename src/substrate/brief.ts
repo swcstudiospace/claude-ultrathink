@@ -103,16 +103,19 @@ export interface EmitInput {
 
 /**
  * Append an event. Returns whether it landed; callers are expected to ignore that.
- * Same opt-in rule as {@link fetchBrief}: no URL, no request.
+ * Same opt-in rule as {@link fetchBrief}: no URL, no request. The optional `signal` (the caller's own budget) cuts the
+ * request short, or skips it when already aborted, on top of the substrate timeout.
  */
 export async function emitEvent(
 	input: EmitInput,
 	env: Record<string, string | undefined> = process.env,
 	url = "",
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	const target = resolveSubstrate(env, url);
-	if (!target) return false;
+	if (!target || signal?.aborted) return false;
 	try {
+		const timeout = AbortSignal.timeout(timeoutMs(env));
 		const response = await fetch(`${target.url}/events`, {
 			method: "POST",
 			headers: { "content-type": "application/json", ...authHeaders(env) },
@@ -127,7 +130,7 @@ export async function emitEvent(
 				branch: input.branch,
 				payload: input.payload,
 			}),
-			signal: AbortSignal.timeout(timeoutMs(env)),
+			signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
 		});
 		return response.ok;
 	} catch {

@@ -660,6 +660,95 @@ describe("substrate plan event", () => {
 		}
 	});
 
+	test("a run whose planning budget is already spent sends no event, but still persists the record", async () => {
+		const { emit, sent } = recorder();
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit,
+			// The tracker waits for the budget to fire, so the plan is finished only after the controller aborted.
+			track: async ({ signal }) => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal?.addEventListener("abort", () => resolve());
+				await promise;
+				return undefined;
+			},
+		});
+		deps.config.claude.budgetMs = 20;
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.plan?.graphId).toBeDefined();
+			expect(readSession(deps.stateDir, "s1")?.plan?.graphId).toBe(result.record?.plan?.graphId);
+			expect(sent).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the event is handed the planning signal, and a budget that fires mid-request ends the wait promptly", async () => {
+		let seen: AbortSignal | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit: (_event, signal) => {
+				const { promise, resolve } = Promise.withResolvers<boolean>();
+				seen = signal;
+				// A substrate that never answers: only the budget can end the wait.
+				signal?.addEventListener("abort", () => resolve(false));
+				return promise;
+			},
+		});
+		deps.config.claude.budgetMs = 80;
+		try {
+			const started = performance.now();
+			const result = await runPromptSubmit(input, deps);
+			expect(performance.now() - started).toBeLessThan(1_000);
+			expect(seen).toBeDefined();
+			expect(seen?.aborted).toBe(true);
+			expect(result.record?.plan?.graphId).toBeDefined();
+			expect(result.output?.hookSpecificOutput?.additionalContext).toContain("<BUILD_PROMPT>");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("with no budget the signal handed to the seam stays live", async () => {
+		let aborted: boolean | undefined;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit: async (_event, signal) => {
+				aborted = signal?.aborted;
+				return true;
+			},
+		});
+		try {
+			await runPromptSubmit(input, deps);
+			expect(aborted).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the summary's elapsed time includes the event attempt", async () => {
+		let clock = 1_000;
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			now: () => clock,
+			emit: async () => {
+				clock += 4_000;
+				return true;
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.output?.systemMessage).toContain("4.0s");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("the substrate's answer, a refusal or a failure never changes the plan, the record, the summary or the result", async () => {
 		const events: ProgressEvent[] = [];
 		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [], progress: (e) => events.push(e) });
