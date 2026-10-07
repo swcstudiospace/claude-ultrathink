@@ -55,8 +55,12 @@ function moment(id: string, status: MomentStatus): TeachableMoment {
 }
 
 describe("teachStatusLine", () => {
-	test("off by default, and says how to opt in", () => {
-		const line = teachStatusLine({ teach: DEFAULT_TEACH_CONFIG, hindsight: DEFAULT_HINDSIGHT_CONFIG }, {}, storePath);
+	test("off says how to opt back in", () => {
+		const line = teachStatusLine(
+			{ teach: { ...DEFAULT_TEACH_CONFIG, enabled: false }, hindsight: DEFAULT_HINDSIGHT_CONFIG },
+			{},
+			storePath,
+		);
 		expect(line).toBe("Teach: off (opt-in: set teach.enabled)");
 	});
 
@@ -65,7 +69,7 @@ describe("teachStatusLine", () => {
 	});
 
 	test("on without a state directory omits the counts and the outbox", () => {
-		expect(teachStatusLine(config(), {}, storePath)).toBe("Teach: on · capture explicit · recall on · Hindsight off");
+		expect(teachStatusLine(config(), {}, storePath)).toBe("Teach: on · capture auto · recall on · Hindsight off");
 	});
 
 	test("shows the capture mode and recall switch", () => {
@@ -86,7 +90,7 @@ describe("teachStatusLine", () => {
 
 	test("an absent store reads as zero and is not created", () => {
 		const line = teachStatusLine(config(), {}, storePath, stateDir);
-		expect(line).toBe("Teach: on · capture explicit · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0");
+		expect(line).toBe("Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0");
 		expect(existsSync(storeDir(stateDir))).toBe(false);
 	});
 

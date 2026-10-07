@@ -111,9 +111,12 @@ function run(argv: string[], over: Partial<CommandDeps> = {}): Promise<CliResult
 	});
 }
 
-/** Runs with the default config (Teachable Moments off). */
+/** Runs with Teachable Moments explicitly off. */
 function runOff(argv: string[], over: Partial<CommandDeps> = {}): Promise<CliResult> {
-	return run(argv, { config: { teach: { ...DEFAULT_TEACH_CONFIG }, hindsight: { ...DEFAULT_HINDSIGHT_CONFIG } }, ...over });
+	return run(argv, {
+		config: { teach: { ...DEFAULT_TEACH_CONFIG, enabled: false }, hindsight: { ...DEFAULT_HINDSIGHT_CONFIG } },
+		...over,
+	});
 }
 
 /** Fake OpenRouter key. Not a real credential; the credential file in this harness is empty. */

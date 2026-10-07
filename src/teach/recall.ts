@@ -56,14 +56,23 @@ function tokens(text: string): string[] {
 		.filter((token) => token.length >= 3);
 }
 
+/** Distinct query tokens worth matching: lowercase, at least 3 characters, stopwords dropped. Shared with skills recall. */
+export function queryTokens(query: string): string[] {
+	return [...new Set(tokens(query).filter((token) => !Object.hasOwn(STOPWORDS, token)))];
+}
+
+/** How many of `wanted` appear in `text` (same tokenization as the query side). Shared with skills recall. */
+export function tokenOverlap(wanted: readonly string[], text: string): number {
+	if (wanted.length === 0) return 0;
+	const have = new Set(tokens(text));
+	return wanted.filter((token) => have.has(token)).length;
+}
+
 /** Local match: weighted overlap of the query's tokens with name (3), description (2) and body (1), plus a small bonus for repeated lessons. */
 function recallLocal(store: TeachStore, project: string, query: string, limit: number): RecalledLesson[] {
-	const wanted = [...new Set(tokens(query).filter((token) => !Object.hasOwn(STOPWORDS, token)))];
+	const wanted = queryTokens(query);
 	if (wanted.length === 0) return [];
-	const overlap = (text: string): number => {
-		const have = new Set(tokens(text));
-		return wanted.filter((token) => have.has(token)).length;
-	};
+	const overlap = (text: string): number => tokenOverlap(wanted, text);
 	const scored: { moment: TeachableMoment; score: number }[] = [];
 	for (const moment of store.list()) {
 		if (moment.status !== "confirmed" && moment.status !== "promoted") continue;

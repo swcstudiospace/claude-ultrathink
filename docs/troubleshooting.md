@@ -29,7 +29,7 @@ Knowledge base: off (opt-in: set hitl.knowledgeBase)
 Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --stdin or AI_GATEWAY_API_KEY; OpenRouter: bin/ultrathink-mcp auth set-key openrouter --stdin or OPENROUTER_API_KEY)
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
-Teach: off (opt-in: set teach.enabled)
+Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
 Model: sonnet · concurrency 3
 State: ~/.claude/ultrathink
 ```
@@ -49,7 +49,7 @@ What the less obvious lines mean:
 | `Decisions: …` | Jev decisions over OpenRouter or Vercel. Jev is always on; `Decisions: off (ULTRATHINK_DECISIONS=0)` shows whenever that variable is set, whatever the config says. When on, it shows the model, the active points, the rail (`provider vercel` or `provider openrouter`), where the key came from (`key from store`, `key from AI_GATEWAY_API_KEY` or `key from OPENROUTER_API_KEY`, never the key) and whether zero data retention is requested, or `Decisions: on · no Jev key (…)` when there is no key for the resolved rail. On the OpenRouter rail, a trailing ` · url <url>` means `ULTRATHINK_DECISIONS_URL` is in effect; a trailing ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` means it is set but not accepted. See [Decisions](#decisions). |
 | `Hindsight: …` | The optional memory server. `Hindsight: off (opt-in: set hindsight.enabled)` until a user file sets `hindsight.enabled`, and `Hindsight: off (ULTRATHINK_HINDSIGHT=0)` whenever that variable is the exact string `0`. A missing key names the command to run: `Hindsight: on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`. See [Hindsight](#hindsight). |
 | `RAGFlow: …` | Optional document search. `RAGFlow: off (opt-in: set ragflow.enabled)` until you opt in, and `RAGFlow: off (ULTRATHINK_RAGFLOW=0)` when that variable is `0`. A missing key names `bin/ultrathink-mcp auth set-key ragflow --stdin`. See [RAGFlow](#ragflow). |
-| `Teach: …` | Teachable Moments. `Teach: off (opt-in: set teach.enabled)` until a user file turns it on. State is under the host state directory's `teach/`, never `<cwd>/.planning`. See [Teachable Moments](#teachable-moments). |
+| `Teach: …` | Teachable Moments. On by default (`capture auto`, auto-promote); `Teach: off (opt-in: set teach.enabled)` only when a user file turned it off. State is under the host state directory's `teach/`, never `<cwd>/.planning`. See [Teachable Moments](#teachable-moments). |
 
 After each planned prompt, hosts that show the summary (`claude.echo`, on by default) print one line such as `Prompt Uplift · UPLIFTED_PROMPT · llm · claude:sonnet · Graph of Thought · 6 nodes · Tracking · 6 issues · 18 sub-issues linked · 41.2s`. A `fallback` source means the engine call failed, and an `Engine error · …` segment shows the first error. With Jev decisions on, a `Decisions · …` segment shows what Jev decided, for example `Decisions · plan 0.97` or `Decisions · error (credits)`.
 
@@ -333,13 +333,13 @@ Never probe `/system/healthz`, `/v1/system/healthz` or `/api/v1/system/healthz`.
 
 ## Teachable Moments
 
-Off until `teach.enabled` is set in a user file. See [Configuration](configuration.md#teach-teachable-moments) and [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`). On Hermes, see [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
+On by default (`enabled`, `auto` capture, auto-promote). See [Configuration](configuration.md#teach-teachable-moments) and [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`). On Hermes, see [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
 
 State is `<stateDir>/teach/` (`moments/`, `outbox/`, `inbox/`, `skill-drafts/`). `ULTRATHINK_STATE_DIR` overrides the state directory and is ignored when it points into `.planning`. Nothing is written into `<cwd>/.planning`.
 
 | Symptom | Meaning | What to do |
 |---|---|---|
-| `Teach: off (opt-in: set teach.enabled)` | Off, including when a project file sets `enabled: true`. | Set `teach.enabled` in `~/.config/ultrathink/config.json`. |
+| `Teach: off (opt-in: set teach.enabled)` | Off: a user file set `enabled: false` (a project file's `enabled: true` cannot override that). | Remove the `false`, or set `teach.enabled: true` in `~/.config/ultrathink/config.json`. |
 | `Teach: off (ULTRATHINK_TEACH=0)` | Enabled, and the exact string `0` is set. Mutating `teach` commands exit 1. | Unset `ULTRATHINK_TEACH`. |
 | `Teach: on · … · Hindsight no key` | Lessons stay local. A retain is not attempted. | Fix the `Hindsight:` line. The word after `Hindsight` is `ready`, `off`, `no URL`, `bad URL` or `no key`. |
 | `retain queued` | The local file was written. Hindsight did not take it. The outbox retries (1 minute, doubling, capped at 6 hours). | `bin/ultrathink teach sync` after Hindsight is ready. A failure does not block the caller. |

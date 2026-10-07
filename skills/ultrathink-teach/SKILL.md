@@ -9,7 +9,7 @@ Teachable Moments keeps short lessons from earlier work so the next session does
 
 ## 0. Is it on?
 
-Run `<repo>/bin/ultrathink teach status` from the project directory. It starts with `Teach: ` and says whether Teachable Moments is enabled. While `teach.enabled` is off (the default) nothing is saved or recalled: stop here without a report and carry on. On Hermes the `ultrathink_lesson_save` and `ultrathink_lesson_recall` tools are hidden while it is off.
+Run `<repo>/bin/ultrathink teach status` from the project directory. It starts with `Teach: ` and says whether Teachable Moments is enabled (on by default, with `auto` capture and auto-promote). While `teach.enabled` is off nothing is saved or recalled: stop here without a report and carry on. On Hermes the `ultrathink_lesson_save` and `ultrathink_lesson_recall` tools are hidden while it is off.
 
 ## 1. When to save a lesson
 

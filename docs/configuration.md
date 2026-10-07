@@ -302,17 +302,17 @@ Health is a one-row dataset listing, `GET /api/v1/datasets?page=1&page_size=1`. 
 
 ### `teach`: Teachable Moments
 
-Teachable Moments are opt-in. With `enabled: false`, nothing is stored and nothing is recalled. See [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`) and, on Hermes, [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
+Teachable Moments are on by default: finished turns are distilled into lessons and recurring lessons become skills without a human step. With `enabled: false`, nothing is stored and nothing is recalled. See [Use Teachable Moments](how-to/use-teachable-moments.md) (`docs/how-to/use-teachable-moments.md`) and, on Hermes, [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Opt-in master switch. Only a user file can set it to `true`: in the project file only `false` counts. `ULTRATHINK_TEACH=0` (the exact string) turns it off for the process when this is `true`. |
-| `capture` | `"explicit"`, `"observe"` or `"auto"` | `"explicit"` | `explicit`: only `teach capture` (CLI, agent tool or slash command) creates moments. `observe`: hosts also hand finished turns to a detached `teach observe`, which stores local candidates. `auto`: a candidate whose confidence is at least 0.8 is confirmed and retained without a human step, unless Jev holds it (see `teachableAutoAt`). A project file can only lower the mode (`auto` to `observe` to `explicit`). |
-| `recall` | boolean | `true` | Inject recalled lessons into plans. Does nothing while `enabled` is false. A project file can only turn it off. The section starts with `## Lessons from earlier work` and is framed as untrusted evidence. |
+| `enabled` | boolean | `true` | Master switch. Only a user file can set it to `true`: in the project file only `false` counts. `ULTRATHINK_TEACH=0` (the exact string) turns it off for the process when this is `true`. |
+| `capture` | `"explicit"`, `"observe"` or `"auto"` | `"auto"` | `explicit`: only `teach capture` (CLI, agent tool or slash command) creates moments. `observe`: hosts also hand finished turns to a detached `teach observe`, which stores local candidates. `auto`: a candidate whose confidence is at least 0.8 is confirmed and retained without a human step, unless Jev holds it (see `teachableAutoAt`). A project file can only lower the mode (`auto` to `observe` to `explicit`). |
+| `recall` | boolean | `true` | Inject recalled lessons and skills into plans. Does nothing while `enabled` is false. A project file can only turn it off. The lessons section starts with `## Lessons from earlier work` and is framed as untrusted evidence; the skills section starts with `## Relevant skills`. |
 | `recallLimit` | integer, 1 to 10 | `5` | Lessons per plan. |
 | `recallChars` | integer, 500 to 8000 | `3000` | Cap on the characters of the lessons section. |
 | `promoteAfter` | integer, 2 to 20 | `3` | Occurrences before a confirmed moment is offered as a skill. A confirmed `playbook` is offered without waiting for this count. |
-| `autoPromote` | boolean | `false` | Install a due moment for the host that captured it, without a human step. User files only; a project file can only turn it off. Hermes and unknown hosts still only get a draft. Off is report-only: `teach promote --due` lists them. |
+| `autoPromote` | boolean | `true` | Install a due moment for the host that captured it, without a human step. User files only; a project file can only turn it off. Hermes, Muse and unknown hosts still only get a draft. Off is report-only: `teach promote --due` lists them. |
 | `observeMinToolCalls` | integer, 0 to 50 | `4` | `observe` skips a turn with fewer tool calls than this. |
 | `timeoutMs` | integer, 500 to 30000 | `2500` | Budget in milliseconds for the recall inside the planner. |
 
@@ -336,7 +336,7 @@ All keys are optional; write only the ones you change. This file shows every key
 
 - `notion.dataSourceUrl` and `linear.team` hold placeholders. Replace them with your own values, or leave them `""` to keep tracking unconfigured.
 - `grok.shuntBaseUrl`, `grok.shuntModel` and `substrate.url` are `""`, which is the default and means off. Set them only if you run those services.
-- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch`, `hitl.knowledgeBase`, `hindsight.enabled`, `ragflow.enabled`, `ragflow.ground`, `teach.enabled` and `teach.autoPromote` are `false`, the opt-in defaults. `hindsight.url` and `ragflow.url` are `""`, which means those services are not contacted. `decisions.enabled` is `true`: Jev is always on, and the value is ignored.
+- `ship.enabled`, `ship.autoMerge`, `ship.deleteBranch`, `hitl.knowledgeBase`, `hindsight.enabled`, `ragflow.enabled` and `ragflow.ground` are `false`, the opt-in defaults. `hindsight.url` and `ragflow.url` are `""`, which means those services are not contacted. `teach.enabled` and `teach.autoPromote` are `true` and `teach.capture` is `"auto"`: lessons and skills are created without a human step. `decisions.enabled` is `true`: Jev is always on, and the value is ignored.
 
 ```json
 {
@@ -428,13 +428,13 @@ All keys are optional; write only the ones you change. This file shows every key
     "groundChars": 3000
   },
   "teach": {
-    "enabled": false,
-    "capture": "explicit",
+    "enabled": true,
+    "capture": "auto",
     "recall": true,
     "recallLimit": 5,
     "recallChars": 3000,
     "promoteAfter": 3,
-    "autoPromote": false,
+    "autoPromote": true,
     "observeMinToolCalls": 4,
     "timeoutMs": 2500
   }

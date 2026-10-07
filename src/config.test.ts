@@ -804,20 +804,20 @@ describe("teach config", () => {
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	});
 
-	test("defaults are off, explicit capture, and each defaultConfig() is independent", () => {
+	test("defaults are on, auto capture with auto-promote, and each defaultConfig() is independent", () => {
 		expect(base.teach).toEqual({
-			enabled: false,
-			capture: "explicit",
+			enabled: true,
+			capture: "auto",
 			recall: true,
 			recallLimit: 5,
 			recallChars: 3_000,
 			promoteAfter: 3,
-			autoPromote: false,
+			autoPromote: true,
 			observeMinToolCalls: 4,
 			timeoutMs: 2_500,
 		});
-		defaultConfig().teach.enabled = true;
-		expect(defaultConfig().teach.enabled).toBe(false);
+		defaultConfig().teach.enabled = false;
+		expect(defaultConfig().teach.enabled).toBe(true);
 	});
 
 	test("booleans adopt only booleans", () => {
@@ -892,7 +892,7 @@ describe("teach config", () => {
 		expect(
 			loadLayerFiles(roots, user, undefined, { teach: { enabled: false, recall: false, autoPromote: false, recallLimit: 1 } }).teach,
 		).toMatchObject({ enabled: false, recall: false, autoPromote: false, recallLimit: 8 });
-		const off = { teach: { enabled: true, recall: false } };
+		const off = { teach: { enabled: true, recall: false, autoPromote: false } };
 		expect(loadLayerFiles(roots, off, undefined, { teach: { recall: true, autoPromote: true } }).teach).toMatchObject({
 			recall: false,
 			autoPromote: false,

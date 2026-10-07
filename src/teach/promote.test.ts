@@ -18,7 +18,16 @@ import { QUESTIONS } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG, type DecisionsConfig } from "../decisions/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { documentIdFor, tagsFor } from "./mapping.ts";
-import { filterSkillworthy, installSkill, markPromoted, promoteDue, promotionCandidates, renderSkillDraft, targetForHost } from "./promote.ts";
+import {
+	filterSkillworthy,
+	installSkill,
+	markerIds,
+	markPromoted,
+	promoteDue,
+	promotionCandidates,
+	renderSkillDraft,
+	targetForHost,
+} from "./promote.ts";
 import { openStore, storeDir } from "./store.ts";
 import { DEFAULT_TEACH_CONFIG, MOMENT_KINDS } from "./types.ts";
 import type { MomentKind, SkillDraft, TeachableMoment, TeachConfig, TeachContext } from "./types.ts";
@@ -432,6 +441,78 @@ describe("installSkill", () => {
 		});
 	}
 
+	test("a marked skill made from other lessons is refused and left untouched", () => {
+		const f = fixture();
+		const mine = renderSkillDraft([moment({ name: "Shared name" })], f.ctx());
+		const theirs = renderSkillDraft([moment({ name: "Shared name" })], f.ctx());
+		expect(theirs.name).toBe(mine.name);
+		const path = join(f.claudeDir, "skills", mine.name, "SKILL.md");
+		expect(installSkill(theirs, "claude", f.ctx())).toEqual({ target: "claude", path, action: "created" });
+
+		expect(installSkill(mine, "claude", f.ctx())).toEqual({
+			target: "claude",
+			path,
+			action: "refused",
+			reason: "name taken by a skill made from other lessons",
+		});
+		expect(readFileSync(path, "utf8")).toBe(theirs.content);
+		expect(readdirSync(join(f.claudeDir, "skills"))).toEqual([mine.name]);
+	});
+
+	test("re-promoting the same lessons, or a merge that includes them, updates in place; other lessons are refused", () => {
+		const f = fixture();
+		const a = moment({ name: "Merge target", occurrences: 5 });
+		const b = moment({ name: "Merge target", occurrences: 1 });
+		const c = moment({ name: "Merge target", occurrences: 1 });
+		const path = join(f.piDir, "managed-skills", "lesson-merge-target", "SKILL.md");
+		const alone = renderSkillDraft([a], f.ctx());
+		expect(alone.name).toBe("lesson-merge-target");
+		expect(installSkill(alone, "omp", f.ctx())).toEqual({ target: "omp", path, action: "created" });
+		expect(installSkill(alone, "omp", f.ctx())).toEqual({ target: "omp", path, action: "updated" });
+
+		// [a, b] over an installed [a].
+		const merged = renderSkillDraft([a, b], f.ctx());
+		expect(merged.name).toBe(alone.name);
+		expect(installSkill(merged, "omp", f.ctx())).toEqual({ target: "omp", path, action: "updated" });
+		expect(readFileSync(path, "utf8")).toBe(merged.content);
+
+		// An installed [a, b] blocks a lone [c] (and a lone [b]: it did not make the merge on its own).
+		for (const lone of [c, b]) {
+			const outcome = installSkill(renderSkillDraft([lone], f.ctx()), "omp", f.ctx());
+			expect(outcome).toMatchObject({ action: "refused", path, reason: "name taken by a skill made from other lessons" });
+		}
+		expect(readFileSync(path, "utf8")).toBe(merged.content);
+		expect(readdirSync(join(f.piDir, "managed-skills"))).toEqual([alone.name]);
+	});
+
+	test("a marker quoted in a lesson body is not the skill's marker: the skill re-installs in place", () => {
+		const f = fixture();
+		const m = moment({ name: "Marker example", body: "Skills end with a marker like this one:\n\n<!-- ultrathink:teach ids=x -->\n\nKeep it last." });
+		const draft = renderSkillDraft([m], f.ctx());
+		expect(draft.content.indexOf("<!-- ultrathink:teach ids=x -->")).toBeLessThan(draft.content.indexOf(`ids=${m.id} -->`));
+		expect(markerIds(draft.content)).toEqual([m.id]);
+
+		const path = join(f.claudeDir, "skills", draft.name, "SKILL.md");
+		expect(installSkill(draft, "claude", f.ctx())).toEqual({ target: "claude", path, action: "created" });
+		expect(installSkill(draft, "claude", f.ctx())).toEqual({ target: "claude", path, action: "updated" });
+		expect(readFileSync(path, "utf8")).toBe(draft.content);
+		expect(readdirSync(join(f.claudeDir, "skills"))).toEqual([draft.name]);
+	});
+
+	test("a marker without ids counts as theirs", () => {
+		const f = fixture();
+		const draft = draftOf(f, "Legacy lesson");
+		const dir = join(f.claudeDir, "skills", draft.name);
+		const legacy = "---\nname: x\ndescription: Old.\n---\nOld.\n\n<!-- ultrathink:teach -->\n";
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), legacy);
+		expect(markerIds(legacy)).toEqual([]);
+		const outcome = installSkill(draft, "claude", f.ctx());
+		expect(outcome).toMatchObject({ action: "refused", reason: "name taken by a skill made from other lessons" });
+		expect(readFileSync(join(dir, "SKILL.md"), "utf8")).toBe(legacy);
+		expect(readdirSync(join(f.claudeDir, "skills"))).toEqual([draft.name]);
+	});
+
 	test("a draft that is not a valid skill is refused without writing", () => {
 		const f = fixture();
 		const draft = draftOf(f);
@@ -624,6 +705,42 @@ describe("promoteDue", () => {
 		const store = openStore(storeDir(f.stateDir));
 		expect(store.get(blocked?.id ?? "")?.status).toBe("confirmed");
 		expect(store.get(fine?.id ?? "")?.status).toBe("promoted");
+	});
+
+	test("claude-code and grok-build share ~/.claude/skills: a same-named lesson from the other store is refused and keeps its draft", async () => {
+		const f = fixture();
+		const claude = f.ctx({ host: "claude-code", teach: { autoPromote: true } });
+		const grok: TeachContext = { ...f.ctx({ host: "grok-build", teach: { autoPromote: true } }), stateDir: join(f.root, "grok-state") };
+		const fromClaude = moment({ name: "Shared lesson", occurrences: 3, body: "Claude's advice." });
+		const fromGrok = moment({ name: "Shared lesson", occurrences: 3, body: "Grok's advice." });
+		openStore(storeDir(claude.stateDir)).put(fromClaude);
+		openStore(storeDir(grok.stateDir)).put(fromGrok);
+		const path = join(f.claudeDir, "skills", "lesson-shared-lesson", "SKILL.md");
+
+		const first = await promoteDue(claude);
+		expect(first.installed).toEqual([{ target: "claude", path, action: "created" }]);
+		const installed = readFileSync(path, "utf8");
+		const record = openStore(storeDir(claude.stateDir)).get(fromClaude.id)?.promoted;
+
+		const second = await promoteDue(grok);
+		expect(second.installed).toEqual([
+			{ target: "claude", path, action: "refused", reason: "name taken by a skill made from other lessons" },
+		]);
+
+		// Claude Code's skill and record are untouched.
+		expect(readFileSync(path, "utf8")).toBe(installed);
+		expect(markerIds(installed)).toEqual([fromClaude.id]);
+		expect(installed).toContain("Claude's advice.");
+		expect(openStore(storeDir(claude.stateDir)).get(fromClaude.id)?.promoted).toEqual(record);
+		expect(readdirSync(join(f.claudeDir, "skills"))).toEqual(["lesson-shared-lesson"]);
+
+		// Grok Build's lesson stays confirmed with its draft.
+		expect(openStore(storeDir(grok.stateDir)).get(fromGrok.id)?.status).toBe("confirmed");
+		const draftPath = join(grok.stateDir, "teach", "skill-drafts", "lesson-shared-lesson", "SKILL.md");
+		expect(second.drafted).toEqual([{ target: "drafts", path: draftPath, action: "drafted" }]);
+		const draft = readFileSync(draftPath, "utf8");
+		expect(markerIds(draft)).toEqual([fromGrok.id]);
+		expect(draft).toContain("Grok's advice.");
 	});
 });
 

@@ -16,7 +16,7 @@ import { resolveStateDir } from "../host/paths.ts";
 import type { ShipState } from "../ship/types.ts";
 import type { KnowledgeLookup } from "../greptile/knowledge.ts";
 import type { DocsLookup } from "../ragflow/types.ts";
-import type { LessonsLookup } from "../teach/types.ts";
+import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
 export interface ControlState {
 	enabled?: boolean;
@@ -60,6 +60,8 @@ export interface SessionRecord {
 	knowledge?: KnowledgeLookup;
 	/** Teachable Moments lessons lookup the planner ran (no lesson text). Absent on older records and when none ran. */
 	lessons?: LessonsLookup;
+	/** Teachable Moments skills lookup the planner ran (skill names only). Absent on older records and when none ran. */
+	skills?: SkillsLookup;
 	/** RAGFlow grounding lookup the planner ran (no document text). Absent on older records and when none ran. */
 	docs?: DocsLookup;
 	/** Jev decisions made while planning this prompt (plan, knowledge, blocking), in call order. Absent on older records and when none ran. */

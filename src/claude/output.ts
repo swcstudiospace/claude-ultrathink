@@ -24,7 +24,7 @@ import { shellArg } from "../track/gateway.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { UpliftResult } from "../types.ts";
 import type { DocsLookup } from "../ragflow/types.ts";
-import type { LessonsLookup } from "../teach/types.ts";
+import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
 /** Generous ceiling; the spec is normally far smaller. Over budget, RATIONALE bodies go first, then the tail. */
 export const DEFAULT_CONTEXT_CHARS = 90_000;
@@ -197,6 +197,8 @@ export interface PromptContextInput {
 	lessons?: string;
 	/** RAGFlow excerpts, already formatted by formatDocsSection (carries its own header); empty or absent adds nothing. */
 	docs?: string;
+	/** Recalled skills, already formatted by formatSkillsSection (carries its own header); empty or absent adds nothing. */
+	skills?: string;
 }
 
 /**
@@ -339,8 +341,9 @@ export function formatPromptContext(input: PromptContextInput): string {
 	const briefParts = brief ? [SUBSTRATE_CONTEXT_HEADER, brief] : [];
 	const lessons = input.lessons?.trim() || undefined;
 	const docs = input.docs?.trim() || undefined;
+	const skills = input.skills?.trim() || undefined;
 	// Evidence the plan should see sits after the brief and before the specification; a handoff places it in fitHandoff.
-	if (!input.handoff) parts.push(...briefParts, ...(lessons ? [lessons] : []), ...(docs ? [docs] : []));
+	if (!input.handoff) parts.push(...briefParts, ...(lessons ? [lessons] : []), ...(docs ? [docs] : []), ...(skills ? [skills] : []));
 
 	const tail: string[] = [];
 	if (input.graph) {
@@ -400,7 +403,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 		);
 	}
 
-	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
+	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, skills, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
 	const budget = Math.max(2_000, maxChars - fixed);
 	parts.push(truncateXml(input.result.xml, budget, input.specPath));
@@ -421,8 +424,9 @@ function cutSection(section: string, room: number, marker: string): string {
 /**
  * Joins a handoff under `limit` so no section can fall into the part Hermes drops. The fixed sections (header, paths,
  * orchestration, clarifications, kickoff, ship) always stay. Order of sacrifice: the Linked issues list gives way
- * first, to a pointer at the spec's ISSUES block that holds the same lines; then the RAGFlow excerpts shrink (dropped
- * when under DOCS_MIN_CHARS would remain); then the lessons shrink (never below LESSONS_MIN_CHARS, else dropped); the
+ * first, to a pointer at the spec's ISSUES block that holds the same lines; then the skills pointers are dropped
+ * outright (re-readable from disk, so no shrink step); then the RAGFlow excerpts shrink (dropped when under
+ * DOCS_MIN_CHARS would remain); then the lessons shrink (never below LESSONS_MIN_CHARS, else dropped); the
  * substrate brief is saved nowhere else, so it is cut last.
  */
 function fitHandoff(
@@ -430,6 +434,7 @@ function fitHandoff(
 	briefParts: string[],
 	lessons: string | undefined,
 	docs: string | undefined,
+	skills: string | undefined,
 	tail: string[],
 	linked: string | undefined,
 	limit: number,
@@ -439,24 +444,32 @@ function fitHandoff(
 	const compose = (evidence: Array<string | undefined>, rest: string[]): string =>
 		join([...parts, ...evidence.filter((section): section is string => Boolean(section)), ...rest]);
 	const [header, brief] = briefParts;
-	const withEvidence = (l: string | undefined, d: string | undefined): Array<string | undefined> => [...briefParts, l, d];
+	const withEvidence = (l: string | undefined, d: string | undefined, s: string | undefined): Array<string | undefined> => [
+		...briefParts,
+		l,
+		d,
+		s,
+	];
 
-	const full = compose(withEvidence(lessons, docs), tail);
+	const full = compose(withEvidence(lessons, docs, skills), tail);
 	if (full.length <= limit) return full;
-	const pointed = compose(withEvidence(lessons, docs), body);
+	const pointed = compose(withEvidence(lessons, docs, skills), body);
 	if (pointed.length <= limit) return pointed;
 
-	const noDocs = compose(withEvidence(lessons, undefined), body);
+	const noSkills = compose(withEvidence(lessons, docs, undefined), body);
+	if (noSkills.length <= limit) return noSkills;
+
+	const noDocs = compose(withEvidence(lessons, undefined, undefined), body);
 	if (docs) {
 		const room = limit - noDocs.length - 2;
-		if (room >= DOCS_MIN_CHARS) return compose(withEvidence(lessons, cutSection(docs, room, DOCS_CUT)), body);
+		if (room >= DOCS_MIN_CHARS) return compose(withEvidence(lessons, cutSection(docs, room, DOCS_CUT), undefined), body);
 	}
 	if (noDocs.length <= limit) return noDocs;
 
 	const noLessons = compose(briefParts, body);
 	if (lessons) {
 		const room = limit - noLessons.length - 2;
-		if (room >= LESSONS_MIN_CHARS) return compose(withEvidence(cutSection(lessons, room, LESSONS_CUT), undefined), body);
+		if (room >= LESSONS_MIN_CHARS) return compose(withEvidence(cutSection(lessons, room, LESSONS_CUT), undefined, undefined), body);
 	}
 	if (noLessons.length <= limit) return noLessons;
 
@@ -479,6 +492,13 @@ function lessonsBit(lookup: LessonsLookup | undefined): string | undefined {
 function docsBit(lookup: DocsLookup | undefined): string | undefined {
 	if (lookup?.status === "used") return `Docs · ${lookup.count} excerpt${lookup.count === 1 ? "" : "s"} (RAGFlow)`;
 	if (lookup?.status === "error") return `Docs · error${lookup.reason ? ` (${lookup.reason})` : ""}`;
+	return undefined;
+}
+
+/** Summary bit for the skills lookup; undefined when none ran, it was off, or it found nothing. */
+function skillsBit(lookup: SkillsLookup | undefined): string | undefined {
+	if (lookup?.outcome === "used") return `Skills · ${lookup.count} recalled`;
+	if (lookup?.outcome === "error") return `Skills · error${lookup.reason ? ` (${lookup.reason})` : ""}`;
 	return undefined;
 }
 
@@ -508,6 +528,8 @@ export function formatSummary(input: {
 	lessons?: LessonsLookup;
 	/** RAGFlow grounding lookup; absent when none ran. */
 	docs?: DocsLookup;
+	/** Skills lookup (Teachable Moments); absent when none ran. */
+	skills?: SkillsLookup;
 	/** Jev decisions of this prompt (plan, knowledge, blocking); absent or empty leaves the summary unchanged. */
 	decisions?: readonly DecisionRecord[];
 }): string {
@@ -523,6 +545,8 @@ export function formatSummary(input: {
 	if (lessonsPart) bits.push(lessonsPart);
 	const docsPart = docsBit(input.docs);
 	if (docsPart) bits.push(docsPart);
+	const skillsPart = skillsBit(input.skills);
+	if (skillsPart) bits.push(skillsPart);
 	if (input.clarifications?.length) {
 		const open = input.clarifications.filter((c) => !c.answer).length;
 		bits.push(`HITL · ${open} question(s)`);

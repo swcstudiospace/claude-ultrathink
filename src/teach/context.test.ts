@@ -40,7 +40,7 @@ function sandbox(extraEnv: NodeJS.ProcessEnv = {}) {
 }
 
 describe("teachContext defaults", () => {
-	test("with no config files Teachable Moments and Hindsight are off and the state lives in the host's directory", () => {
+	test("with no config files Teachable Moments is on, Hindsight is off, and the state lives in the host's directory", () => {
 		const { root, cwd, env } = sandbox();
 		const ctx = teachContext({ cwd, env });
 		expect(ctx.host).toBe("claude-code");
@@ -49,7 +49,7 @@ describe("teachContext defaults", () => {
 		expect(ctx.config.hindsight).toEqual(DEFAULT_HINDSIGHT_CONFIG);
 		expect(ctx.stateDir).toBe(join(root, "claude", "ultrathink"));
 		expect(ctx.storePath).toBe(join(root, "credentials.json"));
-		expect(teachEnabled(ctx)).toBe(false);
+		expect(teachEnabled(ctx)).toBe(true);
 		expect(ctx.now).toBeUndefined();
 		expect(ctx.hindsight).toBeUndefined();
 	});
@@ -97,8 +97,9 @@ describe("teachEnabled and config layers", () => {
 		expect(teachEnabled(teachContext({ cwd, env: { ...env, ULTRATHINK_TEACH: "1" } }))).toBe(true);
 	});
 
-	test("a project file can switch it off but never on", () => {
+	test("a project file can switch it off but cannot override an explicit off", () => {
 		const { cwd, env, writeJson } = sandbox();
+		writeJson(join(env.XDG_CONFIG_HOME ?? "", "ultrathink", "config.json"), { teach: { enabled: false } });
 		writeJson(join(cwd, ".claude", "ultrathink.json"), { teach: { enabled: true } });
 		expect(teachEnabled(teachContext({ cwd, env }))).toBe(false);
 

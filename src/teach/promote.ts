@@ -5,10 +5,13 @@
  * strictest skill rules among the hosts: Hermes' (new-skill description of at most 60 characters, one sentence, trigger
  * first; at most 100 000 characters) and Omp's managed skills (name `[a-z0-9][a-z0-9-]{0,63}`, at most 64 000 bytes).
  *
- * Installing never overwrites a skill somebody else wrote: Omp and Claude Code files are only touched when they carry
- * the `ultrathink:teach` marker comment, and symlinked skill directories or files are refused. Hermes and unknown hosts
- * only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through `skill_manage` so its
- * `skills.write_approval` gate applies, and ultrathink never writes `~/.hermes/skills`.
+ * Installing never overwrites a skill somebody else wrote: Omp and Claude Code files are only touched when their last
+ * line is the `ultrathink:teach` marker comment `renderSkillDraft` generates, and symlinked skill directories or files
+ * are refused. A marked file is only replaced when every moment id in its marker is among the lessons being installed
+ * (a re-install, or a merge that includes them): Claude Code and Grok Build keep separate lesson stores but share
+ * `~/.claude/skills`, so a name held by a skill made from other lessons is refused and the lesson keeps only its draft.
+ * Hermes and unknown hosts only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through
+ * `skill_manage` so its `skills.write_approval` gate applies, and ultrathink never writes `~/.hermes/skills`.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -38,10 +41,11 @@ const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 /** Hermes' limit for the description of a new skill. */
 const DESCRIPTION_MAX = 60;
 /** Omp refuses managed skills over 64 000 bytes; leave headroom. */
-const CONTENT_MAX_BYTES = 60_000;
+export const CONTENT_MAX_BYTES = 60_000;
 const NAME_MAX = 48;
 const TRIGGER = "Use when ";
-const MARKER_RE = /<!--\s*ultrathink:teach\b/;
+/** The generated marker line, with or without ids (older skills carry none). */
+const MARKER_RE = /^<!--\s*ultrathink:teach(?:\s+ids=([^\s>]*))?\s*-->$/;
 const EVIDENCE_ARTIFACTS = 20;
 
 const HOST_TARGETS: Record<string, SkillTarget> = {
@@ -107,6 +111,30 @@ function slugOf(text: string): string {
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "");
+}
+
+/** A moment id as the `ultrathink:teach ids=` marker writes it. */
+function markerId(id: string): string {
+	return id.replace(/[^A-Za-z0-9_.:-]/g, "");
+}
+
+/** The generated marker: `renderSkillDraft` writes it as the file's last line, so a marker quoted in a lesson body never counts. */
+function generatedMarker(text: string): RegExpMatchArray | null {
+	const trimmed = text.trimEnd();
+	return trimmed.slice(trimmed.lastIndexOf("\n") + 1).trim().match(MARKER_RE);
+}
+
+function idsOf(marker: RegExpMatchArray): string[] {
+	return (marker[1] ?? "")
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
+
+/** Moment ids in a skill's generated `<!-- ultrathink:teach ids=… -->` marker (its last line); empty when there is none. */
+export function markerIds(text: string): string[] {
+	const marker = generatedMarker(text);
+	return marker ? idsOf(marker) : [];
 }
 
 /** Cuts at a word boundary within `max` characters (code points), then drops trailing punctuation. */
@@ -202,7 +230,7 @@ export function renderSkillDraft(moments: TeachableMoment[], ctx: TeachContext):
 
 	const phases = unique(ordered.map((m) => red(m.sourcePhase).trim()));
 	const artifacts = unique(ordered.flatMap((m) => m.sourceArtifacts.map((a) => red(a).trim())));
-	const ids = ordered.map((m) => m.id.replace(/[^A-Za-z0-9_.:-]/g, ""));
+	const ids = ordered.map((m) => markerId(m.id));
 	const evidence = [
 		`- Occurrences: ${ordered.reduce((sum, m) => sum + m.occurrences, 0)}`,
 		`- Project: ${unique(ordered.map((m) => m.project)).join(", ")}`,
@@ -285,27 +313,45 @@ function installDraft(draft: SkillDraft, stateDir: string, target: SkillTarget):
 		: { target, path, action: "drafted" };
 }
 
-function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): InstallOutcome {
-	const dir = join(root, draft.name);
+/** What a host skill slot holds for an install of the lessons `ids`: only free and ours slots are written. */
+type Slot = "free" | "ours" | "theirs" | { refused: string };
+
+function slotOf(dir: string, path: string, ids: ReadonlySet<string>): Slot {
+	try {
+		const dirStat = lstatOrUndefined(dir);
+		if (!dirStat) return "free";
+		if (dirStat.isSymbolicLink()) return { refused: "skill directory is a symlink" };
+		if (!dirStat.isDirectory()) return { refused: "skill path is not a directory" };
+		const fileStat = lstatOrUndefined(path);
+		if (!fileStat) return "free";
+		if (fileStat.isSymbolicLink()) return { refused: "SKILL.md is a symlink" };
+		if (!fileStat.isFile()) return { refused: "SKILL.md is not a regular file" };
+	} catch (error) {
+		return { refused: failure(error) };
+	}
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch {
+		// Unreadable: it may be anybody's, so it is theirs.
+		return "theirs";
+	}
+	const marker = generatedMarker(text);
+	if (!marker) return { refused: "a skill with this name exists and was not written by ultrathink" };
+	// Ours only when it was made from lessons this install includes; a marker without ids is theirs.
+	const held = idsOf(marker);
+	return held.length > 0 && held.every((id) => ids.has(id)) ? "ours" : "theirs";
+}
+
+function writeHostSkill(draft: SkillDraft, target: SkillTarget, dir: string, replace: boolean): InstallOutcome {
 	const path = join(dir, "SKILL.md");
 	const refuse = (reason: string): InstallOutcome => ({ target, path, action: "refused", reason });
 	let tmp: string | undefined;
 	let placeholder = false;
 	try {
-		const dirStat = lstatOrUndefined(dir);
-		if (dirStat?.isSymbolicLink()) return refuse("skill directory is a symlink");
-		if (dirStat && !dirStat.isDirectory()) return refuse("skill path is not a directory");
-		if (!dirStat) mkdirSync(dir, { recursive: true, mode: 0o755 });
-
-		const fileStat = lstatOrUndefined(path);
-		if (fileStat?.isSymbolicLink()) return refuse("SKILL.md is a symlink");
-		if (fileStat && !fileStat.isFile()) return refuse("SKILL.md is not a regular file");
-		if (fileStat && !MARKER_RE.test(readFileSync(path, "utf8"))) {
-			return refuse("a skill with this name exists and was not written by ultrathink");
-		}
-
+		if (!replace) mkdirSync(dir, { recursive: true, mode: 0o755 });
 		tmp = stage(dir, draft.content, 0o644);
-		if (!fileStat) {
+		if (!replace) {
 			// O_EXCL claims the name, so a skill that appeared since the lstat is never replaced.
 			closeSync(openSync(path, "wx", 0o644));
 			placeholder = true;
@@ -313,7 +359,7 @@ function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): 
 		renameSync(tmp, path);
 		tmp = undefined;
 		placeholder = false;
-		return { target, path, action: fileStat ? "updated" : "created" };
+		return { target, path, action: replace ? "updated" : "created" };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") return refuse("a skill with this name appeared meanwhile");
 		return refuse(failure(error));
@@ -321,6 +367,15 @@ function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): 
 		if (tmp) rmSync(tmp, { force: true });
 		if (placeholder) rmSync(path, { force: true });
 	}
+}
+
+function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): InstallOutcome {
+	const dir = join(root, draft.name);
+	const path = join(dir, "SKILL.md");
+	const slot = slotOf(dir, path, new Set(draft.sourceIds.map(markerId)));
+	if (slot === "theirs") return { target, path, action: "refused", reason: "name taken by a skill made from other lessons" };
+	if (typeof slot === "object") return { target, path, action: "refused", reason: slot.refused };
+	return writeHostSkill(draft, target, dir, slot === "ours");
 }
 
 export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachContext): InstallOutcome {
