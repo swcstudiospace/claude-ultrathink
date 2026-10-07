@@ -17,6 +17,11 @@ describe("requestFrom", () => {
 		expect(requestFrom({ host: "omp", model: null }).model).toBeUndefined();
 	});
 
+	test("a blank model means unknown, never a model id", () => {
+		expect(requestFrom({ host: "omp", model: "" }).model).toBeUndefined();
+		expect(requestFrom({ host: "hermes", model: "   " }).model).toBeUndefined();
+	});
+
 	test("keeps the existing field aliases", () => {
 		expect(
 			requestFrom({

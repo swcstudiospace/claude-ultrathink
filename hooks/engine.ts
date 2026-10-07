@@ -16,6 +16,8 @@ export function requestFrom(value: unknown): PlanRequest {
 	const record = value as Record<string, unknown>;
 	const host = typeof record.host === "string" && isHostId(record.host) ? record.host : undefined;
 	const text = (key: string): string | undefined => (typeof record[key] === "string" ? (record[key] as string) : undefined);
+	const rawModel = text("model");
+	const model = rawModel?.trim() ? rawModel.trim() : undefined;
 	return {
 		host,
 		session_id: text("session_id") ?? text("sessionId"),
@@ -26,7 +28,8 @@ export function requestFrom(value: unknown): PlanRequest {
 		platform: text("platform"),
 		// Hermes forwards its hook payload's model and Omp its session file's last model_change entry;
 		// under think.engine auto the planner follows it instead of the host default.
-		model: text("model"),
+		// Blank (the old senders' unknown marker) means unknown, never a model id.
+		model,
 	};
 }
 
