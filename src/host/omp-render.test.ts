@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import type { ModelResolution } from "./engine.ts";
 import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
 import type { PlanView } from "./view.ts";
@@ -253,6 +254,44 @@ describe("ship card", () => {
 	test("malformed details fall back to Omp's default card", () => {
 		for (const details of [undefined, "x", null, { branch: "b", base: "m" }, { branch: "b", base: 1, ahead: 2 }, { branch: "b", base: "m", ahead: "2" }]) {
 			expect(renderShip({ content: "nudge", details }, { expanded: false }, theme)).toBeUndefined();
+		}
+	});
+});
+
+describe("plan card model row (§9 path 5)", () => {
+	const DETECTED: ModelResolution = {
+		version: "1.0.0",
+		state: "detected",
+		host: "omp",
+		transport: "omp-native",
+		source: "ctx.model",
+		reason: "live-model",
+		engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		provider: "acme",
+		modelId: "sol-1",
+		modelKnown: true,
+		label: "omp-native:acme/sol-1 [detected]",
+	};
+
+	test("a recorded resolution adds one model row: label, reason and engine request", () => {
+		const withRecord = planCard({ ...small, modelResolution: DETECTED }, false, 200).plain;
+		expect(withRecord.join("\n")).toContain("model omp-native:acme/sol-1 [detected] · reason live-model · engine auto (config)");
+		expect(withRecord.length).toBe(planCard(small, false, 200).plain.length + 1);
+	});
+
+	test("no record, no row; an unsafe record shows the opaque marker and none of its text", () => {
+		expect(planCard(small, true, 200).plain.join("\n")).not.toContain("· reason");
+		const unsafe = planCard({ ...small, modelResolution: { ...DETECTED, label: "omp-native:https://SECRET.invalid [detected]" } }, true, 200).plain.join("\n");
+		expect(unsafe).toContain("model <opaque-model> · reason live-model · engine auto (config)");
+		expect(unsafe).not.toContain("SECRET");
+	});
+
+	test("every row keeps the render width with a record", () => {
+		for (const [name, cardTheme] of Object.entries(themes)) {
+			for (const width of [8, 40, 80, 160]) {
+				const { rows } = planCard({ ...small, modelResolution: DETECTED }, true, width, cardTheme);
+				expect({ name, width, widths: rows.map(visibleWidth) }).toEqual({ name, width, widths: rows.map(() => width) });
+			}
 		}
 	});
 });

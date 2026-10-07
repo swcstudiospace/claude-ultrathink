@@ -2,8 +2,9 @@
 // Copyright (C) 2026 SWC Studio
 import { type GraphIssue, type GraphModel, type GraphNodeModel, NODE_STAGGER_MS, renderGraph } from "./omp-graph.ts";
 import { formatElapsed, type Paint, paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
+import type { ModelResolution } from "./engine.ts";
 import type { ProgressEvent, StageName } from "./progress.ts";
-import type { PlanView } from "./view.ts";
+import { type PlanView, projectResolution } from "./view.ts";
 
 /** How long the live graph panel stays open after the plan is delivered. */
 export const LINGER_MS = 2500;
@@ -30,6 +31,11 @@ export interface BarState {
 	model?: GraphModel;
 	/** Skill the planned prompt invoked (from the `begin` event). */
 	skill?: string;
+	/**
+	 * This planning's safe selection record (§9 path 4), projected: from `begin`, an unresolved `end` or the delivered
+	 * view. Shown with its reason next to the engine; a new planning starts without it until its own `begin`.
+	 */
+	resolution?: ModelResolution;
 }
 
 export interface BarStore {
@@ -117,6 +123,7 @@ export function createBarStore(): BarStore {
 						tracking: event.track,
 						skill: event.skill,
 						model: undefined,
+						resolution: projectResolution(event.modelResolution) ?? state.resolution,
 						startedAt: state.phase === "planning" ? (state.startedAt ?? event.at) : event.at,
 					});
 					return;
@@ -177,11 +184,15 @@ export function createBarStore(): BarStore {
 				case "issue":
 					if (state.model) set({ ...state, model: attachIssue(state.model, event) });
 					return;
-				case "end":
+				case "end": {
+					// An unresolved end carries its safe reason although no begin or inference happened.
+					const resolution = projectResolution(event.modelResolution);
+					if (resolution) state = { ...state, resolution };
 					if (event.outcome === "skipped") finish("skipped", event.detail ?? "skipped", event.at);
 					else if (event.outcome === "failed") finish("failed", event.detail ?? "failed", event.at);
 					else set({ ...state, finishedAt: event.at });
 					return;
+				}
 			}
 		},
 		delivered(how, view, now) {
@@ -200,7 +211,8 @@ export function createBarStore(): BarStore {
 			const base = state.model?.nodes.length ? state.model : view ? modelFromView(view) : state.model;
 			// a stage aborted mid-fill never emits `done`; a finished plan must not keep a spinner
 			const model = base && { nodes: base.nodes.map((node): GraphNodeModel => (node.status === "running" ? { ...node, status: "fallback" } : node)) };
-			set({ ...state, phase: "delivered", delivery: how, finishedAt: now, last, model, engine: view?.engine ?? state.engine });
+			const resolution = projectResolution(view?.modelResolution) ?? state.resolution;
+			set({ ...state, phase: "delivered", delivery: how, finishedAt: now, last, model, engine: view?.engine ?? state.engine, resolution });
 		},
 		pending() {
 			set({ ...state, delivery: "pending" });
@@ -269,7 +281,17 @@ function planningSegments(state: BarState, p: Paint, now: number): string[] {
 	if (state.delivery === "pending") segments.push(p.fg("warning", "→ plan arrives as aside"));
 	segments.push(...rest);
 	if (state.startedAt !== undefined) segments.push(formatElapsed(now - state.startedAt));
+	// The model this planning runs on, once its own `begin` (or unresolved `end`) named it; the first segment dropped when narrow.
+	const model = state.resolution && modelText(state);
+	if (model) segments.push(p.fg("statusLineModel", model));
 	return segments;
+}
+
+/** The planning model: the safe record's label with its reason unless the label already shows it, else the engine label. */
+function modelText(state: BarState): string | undefined {
+	const record = state.resolution;
+	if (!record) return state.engine;
+	return record.label.includes(`[${record.reason}]`) ? record.label : `${record.label} · ${record.reason}`;
 }
 
 /** Last delivered plan: root, tracker rows (or the kickoff hint when the planner tracked nothing), elapsed. */
@@ -291,7 +313,8 @@ function readinessSegments(state: BarState, p: Paint): string[] {
 	const segments: string[] = [];
 	const mcp = mcpSegment(p, state.mcp);
 	if (mcp) segments.push(mcp);
-	if (state.engine) segments.push(p.fg("statusLineModel", state.engine));
+	const model = modelText(state);
+	if (model) segments.push(p.fg("statusLineModel", model));
 	return segments;
 }
 

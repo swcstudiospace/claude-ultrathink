@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import { formatModelSelection } from "../claude/output.ts";
 import { type GraphModel, renderGraph } from "./omp-graph.ts";
 import { formatElapsed, type Paint, paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
-import type { PlanView } from "./view.ts";
+import { type PlanView, projectResolution } from "./view.ts";
 
 export const PLAN_TYPE = "ultrathink-plan";
 export const PENDING_TYPE = "ultrathink-pending";
@@ -129,6 +130,10 @@ function planRows(view: PlanView, graph: GraphModel, expanded: boolean, p: Paint
 		}
 		if (notionTaskUrl) body.push(`${p.fg("dim", "notion")} ${p.fg("muted", notionTaskUrl)}`);
 	}
+	// The planning model's safe record (details are untrusted session data, so it is projected again): label, reason and
+	// engine request, e.g. `omp-native:openai-codex/gpt-6.1-sol [detected] · reason live-model · engine auto (config)`.
+	const resolution = projectResolution(view.modelResolution);
+	if (resolution) body.push(`${p.fg("dim", "model")} ${p.fg("muted", formatModelSelection(resolution))}`);
 	return [header, "", ...body];
 }
 
