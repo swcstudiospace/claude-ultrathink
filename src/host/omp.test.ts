@@ -9,7 +9,7 @@ import type { TrackPlan } from "../track/types.ts";
 import { DEFAULT_SHIP_CONFIG, type ShipConfig } from "../ship/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachDigest } from "../teach/types.ts";
-import { createOmpExtension, type ExtensionAPI, NO_PLAN, type OmpPlan, type OmpPlanner, QUICK_USAGE, type ShipPrecheck } from "./omp.ts";
+import { createOmpExtension, encodeEngineRequest, type ExtensionAPI, NO_PLAN, type OmpPlan, type OmpPlanner, QUICK_USAGE, type ShipPrecheck } from "./omp.ts";
 import type { ProgressEvent } from "./progress.ts";
 import type { PlanView } from "./view.ts";
 
@@ -428,6 +428,26 @@ describe("omp extension", () => {
 		const { run } = setup(plan, 1_000, { readSessionModel: () => undefined }, { sessionManager: { getSessionId: () => "s1" } });
 		await run("do it");
 		expect(seen && "model" in seen).toBe(false);
+	});
+});
+
+describe("encodeEngineRequest", () => {
+	test("a known model rides the engine payload", () => {
+		expect(
+			encodeEngineRequest({ prompt: "do it", cwd: "/repo", sessionId: "s1", model: "muse-code/muse-spark-1.3-contributor" }),
+		).toEqual({
+			host: "omp",
+			prompt: "do it",
+			cwd: "/repo",
+			session_id: "s1",
+			model: "muse-code/muse-spark-1.3-contributor",
+		});
+	});
+
+	test("an unknown model stays absent from the engine payload", () => {
+		const payload = encodeEngineRequest({ prompt: "do it", cwd: "/repo", sessionId: "s1" });
+		expect(payload).toEqual({ host: "omp", prompt: "do it", cwd: "/repo", session_id: "s1" });
+		expect("model" in payload).toBe(false);
 	});
 });
 

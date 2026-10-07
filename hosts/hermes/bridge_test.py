@@ -407,7 +407,7 @@ def test_session_model_reaches_the_engine_request():
 			plan({"user_message": "add a widget", "session_id": "s1"}, env={"BUN": str(fake)})
 			== "planned:add a widget"
 		)
-		assert bun_requests(fake)[-1]["model"] == ""
+		assert "model" not in bun_requests(fake)[-1]
 
 
 def test_a_jev_skip_from_the_engine_returns_empty():
