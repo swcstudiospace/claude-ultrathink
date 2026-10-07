@@ -6,15 +6,18 @@
  * `<stateDir>/teach/skill-drafts` (every promotion writes one; Hermes, Muse and unknown hosts never install, so their
  * skills live only there). A draft counts only while every moment it was made from is still live (confirmed or
  * promoted), and its project scope is the projects of those moments, never the draft text. Matching mirrors the lessons
- * lookup (weighted token overlap on name and description, same project rule); the section carries pointers (name,
- * trigger, path), never skill bodies, because the lesson text recalls separately. The scan is async, bounded and
- * abortable, and never throws: a plan must not wait on, or fail because of, a memory lookup.
+ * lookup (weighted token overlap on name and description, same project rule); a draft scores on its name, its trigger
+ * and its live source lessons' text, never on the sections the renderer generates (evidence, project, dates). A
+ * promotion record counts only while its install path is still a regular file, so a removed skill falls back to its
+ * draft. The section carries pointers (name, trigger, path), never skill bodies, because the lesson text recalls
+ * separately. The scan is async, bounded and abortable, and never throws: a plan must not wait on, or fail because of,
+ * a memory lookup.
  */
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { teachEnabled, tryStore } from "./context.ts";
 import { projectOf } from "./mapping.ts";
-import { CONTENT_MAX_BYTES } from "./promote.ts";
+import { CONTENT_MAX_BYTES, markerIds } from "./promote.ts";
 import { redactLine } from "./redact.ts";
 import { queryTokens, tokenOverlap } from "./recall.ts";
 import { listRecentMoments, readMoment, storeDir } from "./store.ts";
@@ -73,7 +76,6 @@ function positiveInt(text: string | undefined, fallback: number): number {
 interface DraftSkill {
 	name: string;
 	description: string;
-	body: string;
 	path: string;
 	sourceIds: string[];
 	occurrences: number;
@@ -128,7 +130,7 @@ async function draftFiles(draftsDir: string, signal: AbortSignal | undefined): P
 	return files.slice(0, MAX_SCANNED_DRAFTS).map((file) => file.path);
 }
 
-/** The whole draft at `path`: undefined unless it is within the size cap and has frontmatter with a usable name. */
+/** A draft's name, trigger, source ids and occurrences: undefined unless within the size cap with frontmatter and a usable name. */
 async function readDraft(path: string): Promise<DraftSkill | undefined> {
 	try {
 		const bytes = await readFile(path);
@@ -138,13 +140,11 @@ async function readDraft(path: string): Promise<DraftSkill | undefined> {
 		if (lines[0] !== "---") return undefined;
 		const name = frontmatterField(lines, "name");
 		if (name === "" || name.length > 64) return undefined;
-		const ids = text.match(/<!--\s*ultrathink:teach ids=([^\s>]+)\s*-->/)?.[1] ?? "";
 		return {
 			name,
 			description: frontmatterField(lines, "description"),
-			body: text,
 			path,
-			sourceIds: ids.split(",").map((id) => id.trim()).filter(Boolean),
+			sourceIds: markerIds(text),
 			occurrences: positiveInt(text.match(/^- Occurrences: (\d+)/m)?.[1], 1),
 		};
 	} catch {
@@ -154,7 +154,7 @@ async function readDraft(path: string): Promise<DraftSkill | undefined> {
 
 interface Candidate {
 	skill: RecalledSkill;
-	/** Extra match text beyond the skill name and description (the lesson body for promoted moments, the draft for drafts). */
+	/** Extra match text beyond the skill name and description: the lesson text of its moment(s), never generated sections. */
 	body: string;
 	/**
 	 * Projects the skill belongs to: its moment's, or the live source moments' for a draft. Moments carry no "global"
@@ -260,14 +260,16 @@ export const recallSkills = async (request: RecallRequest, ctx: TeachContext): P
 		const best = new Map<string, Ranked>();
 		// Project and score first, then one entry per skill name: a sibling that belongs elsewhere or does not match never
 		// hides the one that does. The entry ranks by the best match; its pointer is a promotion record when one matched.
-		const consider = (candidate: Candidate): void => {
-			if (project !== "*" && !candidate.projects.includes(project)) return;
+		const scoreOf = (candidate: Candidate): number => {
+			if (project !== "*" && !candidate.projects.includes(project)) return 0;
 			const overlap =
 				3 * tokenOverlap(wanted, candidate.skill.name) +
 				2 * tokenOverlap(wanted, candidate.skill.description) +
 				tokenOverlap(wanted, candidate.body);
-			if (overlap <= 0) return;
-			const score = overlap + 0.1 * Math.log(Math.max(1, candidate.skill.occurrences));
+			return overlap <= 0 ? 0 : overlap + 0.1 * Math.log(Math.max(1, candidate.skill.occurrences));
+		};
+		const consider = (candidate: Candidate, score: number): void => {
+			if (score <= 0) return;
 			const key = candidate.skill.name.toLowerCase();
 			const held = best.get(key);
 			if (!held) {
@@ -285,7 +287,27 @@ export const recallSkills = async (request: RecallRequest, ctx: TeachContext): P
 		const store = tryStore(ctx);
 		const moments = store ? await listRecentMoments(store.dir, { max: MAX_SCANNED_MOMENTS, maxBytes: MOMENT_MAX_BYTES, signal: ctx.signal }) : [];
 		if (ctx.signal?.aborted) return aborted();
-		for (const candidate of promotedCandidates(moments)) consider(candidate);
+		// A promotion record points at its install only while that is still a regular file (lstat: a symlink does not
+		// count); a removed or moved skill drops the record, and the live draft of the same skill takes its place.
+		const installed = new Map<string, boolean>();
+		for (const candidate of promotedCandidates(moments)) {
+			const score = scoreOf(candidate);
+			if (score <= 0) continue;
+			const path = candidate.skill.path;
+			if (path !== undefined) {
+				if (ctx.signal?.aborted) return aborted();
+				let present = installed.get(path);
+				if (present === undefined) {
+					present = await lstat(path).then(
+						(stat) => stat.isFile(),
+						() => false,
+					);
+					installed.set(path, present);
+				}
+				if (!present) continue;
+			}
+			consider(candidate, score);
+		}
 
 		// A forgotten moment's file is gone and a superseded one keeps its file: either way its drafts stop counting.
 		const known = new Map<string, TeachableMoment | undefined>(moments.map((moment) => [moment.id, moment] as const));
@@ -296,6 +318,8 @@ export const recallSkills = async (request: RecallRequest, ctx: TeachContext): P
 			const draft = await readDraft(path);
 			if (!draft || draft.sourceIds.length === 0) continue;
 			const projects = new Set<string>();
+			// Match text is the live lessons' own words: the renderer's generated sections would match any prompt about them.
+			const lessons: string[] = [];
 			let live = true;
 			for (const id of draft.sourceIds) {
 				if (!known.has(id) && store && lookups < MAX_SOURCE_LOOKUPS) {
@@ -308,9 +332,10 @@ export const recallSkills = async (request: RecallRequest, ctx: TeachContext): P
 					break;
 				}
 				if (source.project) projects.add(source.project);
+				lessons.push(source.name, source.description, source.body);
 			}
 			if (!live) continue;
-			consider({
+			const candidate: Candidate = {
 				skill: {
 					name: draft.name,
 					description: draft.description || draft.name,
@@ -319,10 +344,11 @@ export const recallSkills = async (request: RecallRequest, ctx: TeachContext): P
 					sourceIds: draft.sourceIds,
 					occurrences: draft.occurrences,
 				},
-				body: draft.body,
+				body: lessons.join("\n"),
 				projects: [...projects],
 				promoted: false,
-			});
+			};
+			consider(candidate, scoreOf(candidate));
 		}
 		if (ctx.signal?.aborted) return aborted();
 

@@ -3,10 +3,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { captureMoment, forgetMoment } from "./capture.ts";
-import { installSkill, renderSkillDraft } from "./promote.ts";
+import { installSkill, markPromoted, renderSkillDraft } from "./promote.ts";
 import { formatSkillsSection, MAX_SCANNED_DRAFTS, MAX_SCANNED_MOMENTS, recallSkills, skillsLookup, SKILL_SECTION_CHARS } from "./skills.ts";
 import { openStore, storeDir } from "./store.ts";
 import { DEFAULT_TEACH_CONFIG, type RecalledSkill, type SkillRecallOutcome, type TeachableMoment, type TeachContext } from "./types.ts";
@@ -49,10 +49,14 @@ function moment(id: string, overrides: Partial<TeachableMoment> = {}): Teachable
 	};
 }
 
+/** A promoted moment whose install path is a real SKILL.md: a record recalls only while its file is there. */
 function promoted(id: string, skill: string, overrides: Partial<TeachableMoment> = {}): TeachableMoment {
+	const path = join(tempDir(), skill, "SKILL.md");
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `---\nname: ${skill}\ndescription: Use when testing.\n---\n`);
 	return moment(id, {
 		status: "promoted",
-		promoted: { at: "2026-02-01T00:00:00.000Z", skill, target: "omp", path: `/skills/${skill}/SKILL.md` },
+		promoted: { at: "2026-02-01T00:00:00.000Z", skill, target: "omp", path },
 		...overrides,
 	});
 }
@@ -164,7 +168,8 @@ describe("recallSkills: promoted moments", () => {
 		expect(outcome.status).toBe("used");
 		expect(outcome.skills.map((skill) => skill.name).sort()).toEqual(["lesson-bun", "lesson-ci", "lesson-lock"]);
 		const bun = outcome.skills.find((skill) => skill.name === "lesson-bun")!;
-		expect(bun).toMatchObject({ target: "omp", path: "/skills/lesson-bun/SKILL.md", sourceIds: ["a1"], occurrences: 1 });
+		expect(bun).toMatchObject({ target: "omp", sourceIds: ["a1"], occurrences: 1 });
+		expect(bun.path).toEndWith(join("lesson-bun", "SKILL.md"));
 	});
 
 	test("other projects are skipped unless the query asks for every project", async () => {
@@ -185,6 +190,30 @@ describe("recallSkills: promoted moments", () => {
 		const outcome = await recallSkills({ query: "bun test" }, ctx);
 		expect(outcome.skills).toHaveLength(1);
 		expect(outcome.skills[0]).toMatchObject({ name: "lesson-bun", target: "omp", occurrences: 5 });
+	});
+
+	test("a removed or replaced install falls back to the live draft of the same skill", async () => {
+		const { ctx, root } = setup();
+		const host = { ...ctx, env: { ...ctx.env, PI_CODING_AGENT_DIR: join(root, "pi") } };
+		const source = moment("m1", { name: "flaky fetch needs retries", body: "Wrap the fetch in a retry with backoff." });
+		openStore(storeDir(ctx.stateDir)).put(source);
+		const draft = renderSkillDraft([source], ctx);
+		const drafted = installSkill(draft, "drafts", ctx);
+		const installed = installSkill(draft, "omp", host);
+		expect(installed.action).toBe("created");
+		markPromoted([source.id], { skill: draft.name, target: "omp", path: installed.path }, ctx);
+		expect((await recallSkills({ query: "flaky fetch" }, ctx)).skills).toMatchObject([{ name: draft.name, target: "omp", path: installed.path }]);
+
+		rmSync(installed.path);
+		expect((await recallSkills({ query: "flaky fetch" }, ctx)).skills).toMatchObject([{ name: draft.name, target: "drafts", path: drafted.path }]);
+
+		// A symlink in its place is not the installed file either.
+		symlinkSync(drafted.path, installed.path);
+		expect((await recallSkills({ query: "flaky fetch" }, ctx)).skills).toMatchObject([{ name: draft.name, target: "drafts", path: drafted.path }]);
+
+		// Without a draft, a missing install recalls nothing.
+		rmSync(dirname(drafted.path), { recursive: true });
+		expect((await recallSkills({ query: "flaky fetch" }, ctx)).status).toBe("none");
 	});
 
 	test("respects the limit", async () => {
@@ -230,6 +259,21 @@ describe("recallSkills: drafts", () => {
 		symlinkSync(join(dir, "real", "SKILL.md"), join(dir, "linked-file", "SKILL.md"));
 		const outcome = await recallSkills({ query: "testing drafts" }, ctx);
 		expect(outcome.skills.map((skill) => skill.name)).toEqual(["lesson-real"]);
+	});
+
+	test("a draft matches on its lesson text, never on the sections the renderer generates", async () => {
+		const { ctx } = setup();
+		const source = moment("m1", { name: "flaky fetch needs retries", body: "Wrap the fetch in a retry with backoff." });
+		openStore(storeDir(ctx.stateDir)).put(source);
+		const draft = renderSkillDraft([source], ctx);
+		for (const generated of ["## Pitfall", "## Evidence", "- Project: proj", "- First seen:", "- Last seen:", "- Occurrences: 1", "- Moments: m1"]) {
+			expect(draft.content).toContain(generated);
+		}
+		installSkill(draft, "drafts", ctx);
+		const words = "rename the project evidence pitfall first last seen occurrences moments ultrathink teach ids";
+		expect((await recallSkills({ query: words }, ctx)).status).toBe("none");
+		// "backoff" is only in the lesson body.
+		expect((await recallSkills({ query: "backoff" }, ctx)).skills.map((skill) => skill.name)).toEqual([draft.name]);
 	});
 });
 

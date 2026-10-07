@@ -310,12 +310,14 @@ export interface SkillDraft {
 	warnings: string[];
 }
 
-/** drafted: written under `<stateDir>/teach/skill-drafts`. created/updated: written into the host's skill directory. refused: nothing written (name taken by an authored skill, symlink, invalid draft). */
+/** drafted: written under `<stateDir>/teach/skill-drafts`. created/updated: written into the host's skill directory. refused: nothing written (name taken by an authored skill, symlink, invalid draft, every fallback name taken). */
 export interface InstallOutcome {
 	target: SkillTarget;
 	path: string;
 	action: "drafted" | "created" | "updated" | "refused";
 	reason?: string;
+	/** The name a host install used when it is not the draft's: a marked skill made from other lessons held that one. */
+	skill?: string;
 }
 
 export type OutboxOp =

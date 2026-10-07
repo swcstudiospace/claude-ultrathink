@@ -6,8 +6,11 @@
  * first; at most 100 000 characters) and Omp's managed skills (name `[a-z0-9][a-z0-9-]{0,63}`, at most 64 000 bytes).
  *
  * Installing never overwrites a skill somebody else wrote: Omp and Claude Code files are only touched when they carry
- * the `ultrathink:teach` marker comment, and symlinked skill directories or files are refused. Hermes and unknown hosts
- * only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through `skill_manage` so its
+ * the `ultrathink:teach` marker comment, and symlinked skill directories or files are refused. A marked file is only
+ * replaced when every moment id in its marker is among the lessons being installed (a re-install, or a merge that
+ * includes them): Claude Code and Grok Build keep separate lesson stores but share `~/.claude/skills`, so a marked
+ * skill made from other lessons keeps its name and the install takes the next free `<name>-2` … `<name>-9`. Hermes and
+ * unknown hosts only get a draft under `<stateDir>/teach/skill-drafts`: Hermes installs through `skill_manage` so its
  * `skills.write_approval` gate applies, and ultrathink never writes `~/.hermes/skills`.
  */
 import { randomBytes } from "node:crypto";
@@ -42,6 +45,9 @@ export const CONTENT_MAX_BYTES = 60_000;
 const NAME_MAX = 48;
 const TRIGGER = "Use when ";
 const MARKER_RE = /<!--\s*ultrathink:teach\b/;
+const MARKER_IDS_RE = /<!--\s*ultrathink:teach ids=([^\s>]+)\s*-->/;
+/** A host install tries the draft's name, then `-2` … `-9`. */
+const MAX_NAME_SUFFIX = 9;
 const EVIDENCE_ARTIFACTS = 20;
 
 const HOST_TARGETS: Record<string, SkillTarget> = {
@@ -107,6 +113,30 @@ function slugOf(text: string): string {
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "");
+}
+
+/** A moment id as the `ultrathink:teach ids=` marker writes it. */
+function markerId(id: string): string {
+	return id.replace(/[^A-Za-z0-9_.:-]/g, "");
+}
+
+/** Moment ids in a skill's `<!-- ultrathink:teach ids=… -->` marker; empty when there is none. */
+export function markerIds(text: string): string[] {
+	const raw = text.match(MARKER_IDS_RE)?.[1] ?? "";
+	return raw
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
+
+/** `draft` under `name` (frontmatter included). */
+function renamed(draft: SkillDraft, name: string): SkillDraft {
+	return { ...draft, name, content: draft.content.replace(`\nname: ${draft.name}\n`, `\nname: ${name}\n`) };
+}
+
+function suffixed(name: string, n: number): string {
+	const suffix = `-${n}`;
+	return `${name.slice(0, 64 - suffix.length).replace(/-+$/, "")}${suffix}`;
 }
 
 /** Cuts at a word boundary within `max` characters (code points), then drops trailing punctuation. */
@@ -202,7 +232,7 @@ export function renderSkillDraft(moments: TeachableMoment[], ctx: TeachContext):
 
 	const phases = unique(ordered.map((m) => red(m.sourcePhase).trim()));
 	const artifacts = unique(ordered.flatMap((m) => m.sourceArtifacts.map((a) => red(a).trim())));
-	const ids = ordered.map((m) => m.id.replace(/[^A-Za-z0-9_.:-]/g, ""));
+	const ids = ordered.map((m) => markerId(m.id));
 	const evidence = [
 		`- Occurrences: ${ordered.reduce((sum, m) => sum + m.occurrences, 0)}`,
 		`- Project: ${unique(ordered.map((m) => m.project)).join(", ")}`,
@@ -285,27 +315,44 @@ function installDraft(draft: SkillDraft, stateDir: string, target: SkillTarget):
 		: { target, path, action: "drafted" };
 }
 
-function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): InstallOutcome {
-	const dir = join(root, draft.name);
+/** What a host skill slot holds for an install of the lessons `ids`: refused slots are never written. */
+type Slot = "free" | "ours" | "theirs" | { refused: string };
+
+function slotOf(dir: string, path: string, ids: ReadonlySet<string>): Slot {
+	try {
+		const dirStat = lstatOrUndefined(dir);
+		if (!dirStat) return "free";
+		if (dirStat.isSymbolicLink()) return { refused: "skill directory is a symlink" };
+		if (!dirStat.isDirectory()) return { refused: "skill path is not a directory" };
+		const fileStat = lstatOrUndefined(path);
+		if (!fileStat) return "free";
+		if (fileStat.isSymbolicLink()) return { refused: "SKILL.md is a symlink" };
+		if (!fileStat.isFile()) return { refused: "SKILL.md is not a regular file" };
+	} catch (error) {
+		return { refused: failure(error) };
+	}
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch {
+		// Unreadable: it may be anybody's, so it is taken.
+		return "theirs";
+	}
+	if (!MARKER_RE.test(text)) return { refused: "a skill with this name exists and was not written by ultrathink" };
+	// Ours only when it was made from lessons this install includes; a marker without ids is taken.
+	const held = markerIds(text);
+	return held.length > 0 && held.every((id) => ids.has(id)) ? "ours" : "theirs";
+}
+
+function writeHostSkill(draft: SkillDraft, target: SkillTarget, dir: string, replace: boolean): InstallOutcome {
 	const path = join(dir, "SKILL.md");
 	const refuse = (reason: string): InstallOutcome => ({ target, path, action: "refused", reason });
 	let tmp: string | undefined;
 	let placeholder = false;
 	try {
-		const dirStat = lstatOrUndefined(dir);
-		if (dirStat?.isSymbolicLink()) return refuse("skill directory is a symlink");
-		if (dirStat && !dirStat.isDirectory()) return refuse("skill path is not a directory");
-		if (!dirStat) mkdirSync(dir, { recursive: true, mode: 0o755 });
-
-		const fileStat = lstatOrUndefined(path);
-		if (fileStat?.isSymbolicLink()) return refuse("SKILL.md is a symlink");
-		if (fileStat && !fileStat.isFile()) return refuse("SKILL.md is not a regular file");
-		if (fileStat && !MARKER_RE.test(readFileSync(path, "utf8"))) {
-			return refuse("a skill with this name exists and was not written by ultrathink");
-		}
-
+		if (!replace) mkdirSync(dir, { recursive: true, mode: 0o755 });
 		tmp = stage(dir, draft.content, 0o644);
-		if (!fileStat) {
+		if (!replace) {
 			// O_EXCL claims the name, so a skill that appeared since the lstat is never replaced.
 			closeSync(openSync(path, "wx", 0o644));
 			placeholder = true;
@@ -313,7 +360,7 @@ function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): 
 		renameSync(tmp, path);
 		tmp = undefined;
 		placeholder = false;
-		return { target, path, action: fileStat ? "updated" : "created" };
+		return { target, path, action: replace ? "updated" : "created" };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") return refuse("a skill with this name appeared meanwhile");
 		return refuse(failure(error));
@@ -323,7 +370,37 @@ function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string): 
 	}
 }
 
-export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachContext): InstallOutcome {
+/**
+ * Installs under the draft's name, or the first of `<name>-2` … `<name>-9` that is free or already holds these lessons,
+ * skipping `avoid`. The draft's own name refuses a symlink or an authored skill as before; a fallback name that is not
+ * usable is simply taken.
+ */
+function installIntoHost(draft: SkillDraft, target: SkillTarget, root: string, avoid: ReadonlySet<string>): InstallOutcome {
+	const ids = new Set(draft.sourceIds.map(markerId));
+	for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
+		const name = n === 1 ? draft.name : suffixed(draft.name, n);
+		if (avoid.has(name)) continue;
+		const dir = join(root, name);
+		const slot = slotOf(dir, join(dir, "SKILL.md"), ids);
+		if (slot === "theirs") continue;
+		if (typeof slot === "object") {
+			if (n === 1) return { target, path: join(dir, "SKILL.md"), action: "refused", reason: slot.refused };
+			continue;
+		}
+		const outcome = writeHostSkill(n === 1 ? draft : renamed(draft, name), target, dir, slot === "ours");
+		if (n === 1 || outcome.action === "refused") return outcome;
+		return { ...outcome, skill: name, reason: `${draft.name} is a skill made from other lessons` };
+	}
+	return {
+		target,
+		path: join(root, draft.name, "SKILL.md"),
+		action: "refused",
+		reason: `every name from ${draft.name} to ${suffixed(draft.name, MAX_NAME_SUFFIX)} is taken by another skill`,
+	};
+}
+
+/** `avoid`: names a host install must not take (promoteDue passes the names its own store already promoted). */
+export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachContext, avoid: ReadonlySet<string> = new Set()): InstallOutcome {
 	if (!SKILL_NAME_RE.test(draft.name) || draft.content.trim() === "") {
 		return { target, path: "", action: "refused", reason: "invalid skill draft" };
 	}
@@ -334,10 +411,10 @@ export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachC
 	const home = ctx.env.HOME?.trim() || homedir();
 	if (target === "omp") {
 		const piDir = ctx.env.PI_CODING_AGENT_DIR?.trim() || join(home, ".omp", "agent");
-		return installIntoHost(draft, target, join(piDir, "managed-skills"));
+		return installIntoHost(draft, target, join(piDir, "managed-skills"), avoid);
 	}
 	const claudeDir = ctx.env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
-	return installIntoHost(draft, target, join(claudeDir, "skills"));
+	return installIntoHost(draft, target, join(claudeDir, "skills"), avoid);
 }
 
 export function markPromoted(
@@ -369,14 +446,8 @@ export function markPromoted(
 function freeName(draft: SkillDraft, taken: Set<string>): SkillDraft {
 	if (!taken.has(draft.name)) return draft;
 	for (let n = 2; ; n++) {
-		const suffix = `-${n}`;
-		const name = `${draft.name.slice(0, 64 - suffix.length)}${suffix}`;
-		if (taken.has(name)) continue;
-		return {
-			...draft,
-			name,
-			content: draft.content.replace(`\nname: ${draft.name}\n`, `\nname: ${name}\n`),
-		};
+		const name = suffixed(draft.name, n);
+		if (!taken.has(name)) return renamed(draft, name);
 	}
 }
 
@@ -398,15 +469,18 @@ export async function promoteDue(ctx: TeachContext): Promise<{ drafted: InstallO
 	}
 	for (const moment of await filterSkillworthy(promotionCandidates(ctx), ctx)) {
 		try {
-			const draft = freeName(renderSkillDraft([moment], ctx), taken);
+			const rendered = renderSkillDraft([moment], ctx);
+			// The host install picks the name first (another host's lessons may hold it), so the draft and the promotion
+			// record carry the name the skill really has. Nothing installed: the draft keeps a name unique in this store.
+			const outcome = target === "hermes" || target === "drafts" ? undefined : installSkill(rendered, target, ctx, taken);
+			const installed = outcome?.action === "created" || outcome?.action === "updated";
+			let draft = freeName(rendered, taken);
+			if (installed) draft = outcome?.skill ? renamed(rendered, outcome.skill) : rendered;
 			taken.add(draft.name);
 			result.drafted.push(installSkill(draft, "drafts", ctx));
-			if (target === "hermes" || target === "drafts") continue;
-			const outcome = installSkill(draft, target, ctx);
+			if (!outcome) continue;
 			result.installed.push(outcome);
-			if (outcome.action === "created" || outcome.action === "updated") {
-				markPromoted([moment.id], { skill: draft.name, target, path: outcome.path }, ctx);
-			}
+			if (installed) markPromoted([moment.id], { skill: draft.name, target, path: outcome.path }, ctx);
 		} catch {
 			// One unrenderable lesson must not stop the others.
 		}

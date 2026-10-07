@@ -586,7 +586,8 @@ async function promote(ctx: TeachContext, p: Parsed): Promise<CliResult> {
 	const outcome = p.has("install") ? installSkill(draft, chosen, ctx) : null;
 	let promoted: string[] = [];
 	if (outcome && (outcome.action === "created" || outcome.action === "updated")) {
-		promoted = markPromoted(ids, { skill: draft.name, target: chosen, path: outcome.path }, ctx).map((moment) => moment.id);
+		const skill = outcome.skill ?? draft.name;
+		promoted = markPromoted(ids, { skill, target: chosen, path: outcome.path }, ctx).map((moment) => moment.id);
 	}
 	const value = {
 		draft: { name: draft.name, description: draft.description, content: draft.content, warnings: draft.warnings },
