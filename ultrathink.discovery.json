@@ -1,0 +1,102 @@
+{
+  "$schema": "./ultrathink.discovery.schema.json",
+  "schemaVersion": "1.0.0",
+  "identity": {
+    "repository": "claude-ultrathink",
+    "repositoryUrl": "https://github.com/swcstudiospace/claude-ultrathink",
+    "package": "ultrathink",
+    "plugin": "ultrathink",
+    "marketplace": "ultrathink"
+  },
+  "description": "claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Existing adapters are listed from repository sources; Grok Bot and GPT Dot integration contracts remain pending and compatibility is not verified.",
+  "capabilities": [
+    "prompt-uplift",
+    "graph-of-thought",
+    "chain-of-thought",
+    "hitl-clarifications",
+    "local-plan-artifact-handoff",
+    "planning-controls",
+    "tracker-mcp-relay"
+  ],
+  "hosts": {
+    "claude-code": {
+      "status": "source-present",
+      "entrypoints": [
+        ".claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+        "hooks/hooks.json",
+        "hooks/uplift.ts"
+      ],
+      "delivery": "hook-additional-context"
+    },
+    "grok-build": {
+      "status": "source-present",
+      "entrypoints": [
+        "hooks/uplift.ts",
+        "scripts/setup.ts",
+        "hosts/grok/ultrathink.md"
+      ],
+      "delivery": "local-plan-carrier"
+    },
+    "hermes": {
+      "status": "source-present",
+      "entrypoints": [
+        "hosts/hermes/plugin.yaml",
+        "hosts/hermes/__init__.py",
+        "hosts/hermes/bridge.py",
+        "hooks/engine.ts"
+      ],
+      "delivery": "pre-llm-plan-handoff"
+    },
+    "muse": {
+      "status": "source-present",
+      "entrypoints": [
+        ".muse-plugin/plugin.json",
+        "hooks/muse-prompt",
+        "hooks/uplift.ts"
+      ],
+      "delivery": "hook-additional-context"
+    },
+    "omp": {
+      "status": "source-present",
+      "entrypoints": [
+        "package.json",
+        ".omp-plugin/marketplace.json",
+        "src/host/omp.ts"
+      ],
+      "delivery": "extension-inline-or-deferred-aside"
+    }
+  },
+  "interfaces": {
+    "jsonPlanner": {
+      "transport": "json-stdin-stdout",
+      "launcher": "bin/run-bun",
+      "entrypoint": "hooks/engine.ts",
+      "responseType": "PlanResponse"
+    },
+    "controls": {
+      "entrypoint": "bin/ultrathink",
+      "canPlan": false
+    },
+    "trackerMcp": {
+      "transport": "mcp-stdio-relay",
+      "entrypoint": "bin/ultrathink-mcp",
+      "providers": ["notion", "linear", "greptile"],
+      "canPlan": false
+    }
+  },
+  "externalIntegrations": {
+    "grok-bot": {
+      "identity": "documented-product",
+      "status": "pending-contract",
+      "adapterPresent": false,
+      "compatibilityVerified": false
+    },
+    "gpt-dot": {
+      "identity": "unverified",
+      "status": "pending-identity-and-contract",
+      "adapterPresent": false,
+      "compatibilityVerified": false
+    }
+  }
+}
