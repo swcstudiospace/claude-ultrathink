@@ -4,7 +4,10 @@
  * Agent Substrate client — an optional integration.
  *
  * Fetches the cross-agent briefing before the Graph of Thought is built, so the
- * graph is planned knowing what other agents already did in this repo.
+ * graph is planned knowing what other agents already did in this repo, and
+ * reports the plan back once it exists: `emitEvent` appends one `note` event
+ * carrying the Graph ID, which the substrate adopts unchanged as its
+ * correlation key (the caller is `runPromptSubmit`).
  *
  * Opt-in: nothing is contacted unless a server URL is set, either through the
  * `SUBSTRATE_URL` environment variable or `substrate.url` in the ultrathink
@@ -106,16 +109,19 @@ export interface EmitInput {
 
 /**
  * Append an event. Returns whether it landed; callers are expected to ignore that.
- * Same opt-in rule as {@link fetchBrief}: no URL, no request.
+ * Same opt-in rule as {@link fetchBrief}: no URL, no request. The optional `signal` (the caller's own budget) cuts the
+ * request short, or skips it when already aborted, on top of the substrate timeout.
  */
 export async function emitEvent(
 	input: EmitInput,
 	env: Record<string, string | undefined> = process.env,
 	url = "",
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	const target = resolveSubstrate(env, url);
-	if (!target) return false;
+	if (!target || signal?.aborted) return false;
 	try {
+		const timeout = AbortSignal.timeout(timeoutMs(env));
 		const response = await fetch(`${target.url}/events`, {
 			method: "POST",
 			headers: { "content-type": "application/json", ...authHeaders(env) },
@@ -130,7 +136,7 @@ export async function emitEvent(
 				branch: input.branch,
 				payload: input.payload,
 			}),
-			signal: AbortSignal.timeout(timeoutMs(env)),
+			signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
 		});
 		return response.ok;
 	} catch {

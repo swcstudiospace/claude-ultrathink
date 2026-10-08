@@ -261,13 +261,13 @@ The merge gate never weakens, and `judge: "advisory"` does not change it: a comp
 
 ### `substrate`: Agent Substrate brief
 
-Agent Substrate is an optional service that tells the planner what other agents already did in the repository. ultrathink asks it for a brief before it builds the Graph of Thought, and adds the answer to the plan under `## Agent Substrate brief`. Nothing is requested unless a URL is set.
+Agent Substrate is an optional service that tells the planner what other agents already did in the repository. ultrathink asks it for a brief before it builds the Graph of Thought, and adds the answer to the plan under `## Agent Substrate brief`. Once the plan and its session record are written, ultrathink tells the substrate the plan exists: one `note` event carrying the Graph ID, which the substrate adopts as its correlation key, so work other agents do under that Graph ID joins the same trail. The event holds no text of your prompt, the spec or the plan (see [Privacy](privacy.md)). Nothing is requested unless a URL is set.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | http(s) URL | `""` | Base URL of your Agent Substrate server. ultrathink sends `POST <url>/brief` with the repository (`owner/repo`), the branch and the host name. `""` means the service is never contacted. `SUBSTRATE_URL` wins over this key, and `SUBSTRATE_DISABLED=1` turns both off. |
+| `url` | http(s) URL | `""` | Base URL of your Agent Substrate server. ultrathink sends `POST <url>/brief` with the repository (`owner/repo`), the branch and the host name, and, after planning, `POST <url>/events` with the Graph ID, the session id, the host name, the repository, the branch and the node count. `""` means the service is never contacted. `SUBSTRATE_URL` wins over this key, and `SUBSTRATE_DISABLED=1` turns both off. |
 
-The request times out after 1.5 seconds (`SUBSTRATE_TIMEOUT_MS` changes that). A missing, slow or failing server never blocks a prompt: the plan is built without the brief. `bin/ultrathink status` shows the `Substrate:` line with the URL in use and where it came from.
+Each request times out after 1.5 seconds (`SUBSTRATE_TIMEOUT_MS` changes that). A missing, slow or failing server never blocks a prompt: the plan is built without the brief, and a refused or lost event is dropped. The event goes out after planning, so a server that accepts the connection and never answers adds up to one timeout before the plan is returned. `bin/ultrathink status` shows the `Substrate:` line with the URL in use and where it came from.
 
 ### `decisions`: Jev decisions (OpenRouter Decisions API)
 

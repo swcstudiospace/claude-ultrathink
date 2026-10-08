@@ -310,7 +310,7 @@ export interface SkillDraft {
 	warnings: string[];
 }
 
-/** drafted: written under `<stateDir>/teach/skill-drafts`. created/updated: written into the host's skill directory. refused: nothing written (name taken by an authored skill, symlink, invalid draft). */
+/** drafted: written under `<stateDir>/teach/skill-drafts`. created/updated: written into the host's skill directory. refused: nothing written (name taken by an authored skill or by a skill made from other lessons, symlink, invalid draft). */
 export interface InstallOutcome {
 	target: SkillTarget;
 	path: string;

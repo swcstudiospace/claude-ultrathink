@@ -19,7 +19,7 @@ import { normalizeQuestion, type RunClarifyOptions, runClarify } from "../hitl/p
 import type { Clarification } from "../hitl/types.ts";
 import { runThink } from "../think/pipeline.ts";
 import type { ThoughtGraph } from "../think/types.ts";
-import { fetchBrief } from "../substrate/brief.ts";
+import { type EmitInput, emitEvent, fetchBrief } from "../substrate/brief.ts";
 import { resolveBranch, resolveRepoSlug } from "../track/git.ts";
 import { buildTrackPlan } from "../track/plan.ts";
 import type { Tracker } from "../track/gateway.ts";
@@ -80,7 +80,14 @@ export interface HookDeps {
 	conversation?: (transcriptPath?: string) => string;
 	/** Test seam for the Agent Substrate brief; defaults to the real fail-open HTTP call against `config.substrate.url`. */
 	brief?: (input: { repo?: string; branch?: string; surface?: string; signal?: AbortSignal }) => Promise<string>;
-	/** Host that asked for the brief. Defaults to Claude so existing callers stay stable. */
+	/**
+	 * Test seam for the Agent Substrate plan event: the one `note` a planned prompt leaves in the ledger, carrying the
+	 * Graph ID the substrate adopts as its correlation key. Defaults to the real fail-open `emitEvent` against
+	 * `config.substrate.url`, with the env the host injected (`decisionsDeps.env`) or else `process.env`. Called once,
+	 * after the session record is written; its answer, a rejection or a throw never changes the result.
+	 */
+	emit?: (event: EmitInput, signal?: AbortSignal) => Promise<boolean>;
+	/** Host that asked for the brief and is named on the plan event. Defaults to Claude so existing callers stay stable. */
 	surface?: string;
 	now?: () => number;
 	log?: (message: string) => void;
@@ -295,6 +302,52 @@ function startSkills(
 		input.parent,
 		(reason) => ({ status: "error", skills: [], chars: 0, ms: input.now() - started, reason }),
 	);
+}
+
+/**
+ * Tells the Agent Substrate a prompt was planned: one `note` event keyed by the Graph ID, which the substrate adopts
+ * unchanged as the correlation key for the run. It names the graph, its size and the host, never anything the user wrote
+ * or the engine produced. Its `sessionId` is `<hostSessionId>:<graphId>`: the substrate chains events per session id, so each
+ * planned graph gets its own chain. Never rejects: no URL, a refusal, a timeout or a throwing seam all leave the prompt as it was.
+ */
+async function announcePlan(
+	deps: HookDeps,
+	input: {
+		plan: TrackPlan;
+		sessionId: string;
+		host: string;
+		skill?: string;
+		repo?: string;
+		branch?: string;
+		/** The planning budget: once it fires there is no point telling the substrate, so the request is skipped or cut short. */
+		signal: AbortSignal;
+	},
+): Promise<void> {
+	try {
+		if (input.signal.aborted) return;
+		const { plan, host } = input;
+		const nodes = plan.issues.length;
+		// The host's own env when it injected one (planPrompt does, for the brief too), else the process's.
+		const env = deps.decisionsDeps?.env ?? process.env;
+		const send =
+			deps.emit ??
+			((event: EmitInput, signal?: AbortSignal) => emitEvent(event, env, deps.config.substrate.url, signal));
+		await send(
+			{
+				kind: "note",
+				summary: `ultrathink planned graph ${plan.graphId} (${nodes} nodes)`,
+				surface: host,
+				sessionId: `${input.sessionId}:${plan.graphId}`,
+				graphId: plan.graphId,
+				repo: input.repo,
+				branch: input.branch,
+				payload: { ultrathink: "plan", nodes, host, ...(input.skill ? { skill: input.skill } : {}) },
+			},
+			input.signal,
+		);
+	} catch {
+		// fail-open: the substrate records a plan, it never gates one
+	}
 }
 
 export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps): Promise<PromptSubmitResult> {
@@ -717,6 +770,20 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				}),
 			},
 		};
+		// One event, after every fallible step, for a plan that exists and whose record is on disk, in a session the
+		// substrate can chain on: a skip, a fallback spec, a failed state write or an unknown session leaves nothing behind.
+		// Bounded by the planning budget, and ahead of the summary so the elapsed time it shows includes the attempt.
+		if (plan?.graphId && statePath && sessionId !== "unknown") {
+			await announcePlan(deps, {
+				plan,
+				sessionId,
+				host: surfaceId,
+				skill: skill?.name,
+				repo: git.repo,
+				branch: git.branch,
+				signal: lifetime,
+			});
+		}
 		if (deps.config.claude.echo) {
 			output.systemMessage = formatSummary({
 				result,
