@@ -171,3 +171,33 @@ export function recordRefs(statePath: string, refs: RealRefs, now = Date.now()):
 	write(statePath.replace(/\.json$/, ".xml"), xml);
 	return { tracking, todos: formatTrackingTodos(plan, tracking) };
 }
+
+/**
+ * The upstream kickoff skill's optional `graph_register` call (Agent Substrate), built from the tracking refs with absent
+ * fields left out. Desk Lead sends it through its desk gateway (`desk_graph_register`). `nodes`/`steps` are omitted
+ * unless asked for: the desk gateway currently rejects them (see FULL-REVIEW.md), and the call is idempotent by graph_id.
+ */
+export function graphRegisterPayload(record: SessionRecord, options: { surface?: string; withNodes?: boolean } = {}): Record<string, unknown> {
+	const plan = record.plan;
+	if (!plan) throw new Error("session record has no plan");
+	const t = record.tracking;
+	const task = plan.task as { repo?: string; branch?: string; status?: string };
+	const payload: Record<string, unknown> = { graph_id: plan.graphId, surface: options.surface ?? "grok-bot" };
+	if (t?.notion.taskUrl) payload.notion_task_page = t.notion.taskUrl;
+	if (task.repo) payload.repo = task.repo;
+	if (task.branch) payload.branch = task.branch;
+	if (task.status) payload.status = task.status;
+	if (options.withNodes && t) {
+		const clean = (o: Record<string, unknown>) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== ""));
+		payload.nodes = plan.issues.map((issue) => {
+			const ref = t.linear.nodes[issue.nodeId];
+			return clean({ node_id: issue.nodeId, linear_issue_id: ref?.id, linear_identifier: ref?.identifier, linear_url: ref?.url, notion_page: t.notion.nodes[issue.nodeId] });
+		});
+		payload.steps = plan.subIssues.map((sub) => {
+			const key = `${sub.nodeId}.${sub.step}`;
+			const ref = t.linear.steps[key];
+			return clean({ node_id: sub.nodeId, step: sub.step, linear_sub_issue_id: ref?.id, linear_identifier: ref?.identifier, linear_url: ref?.url, notion_page: t.notion.steps[key] });
+		});
+	}
+	return payload;
+}

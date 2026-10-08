@@ -32,26 +32,33 @@ import {
 	runGrokbotPlan,
 	storeAnswer,
 } from "./grokbot.ts";
-import { buildTrackPayloads, recordRefs } from "./grokbot-track.ts";
+import { buildTrackPayloads, graphRegisterPayload, recordRefs } from "./grokbot-track.ts";
 import { buildCloudPrompt, type UnitDispatch, validateCloudPrompt } from "./grokbot-prompts.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
+import { parseAnswersInput, recordAnswers } from "./grokbot-hitl.ts";
+import { DEFAULT_INSTALLED_SKILLS, skillsStatus } from "./grokbot-skills.ts";
+import { GROKBOT_TEACH_HOST, grokbotDigest } from "./grokbot-teach.ts";
 
 const USAGE = `usage: ultrathink-grokbot <command>
   plan --session S (--prompt-file F | --stdin) [--transcript F] [--cwd D] [--replan]   run/resume the planner; prints pending requests
   pending --session S                         list unanswered requests (key, stage, node)
   show --session S <key> [--part system|user] print one pending request for the host model to answer
   answer --session S <key> (--file F | --stdin) [--replace]   validate + store an answer (never stored when invalid)
+  answers --session S (--file F | --stdin)    fold Ming's replies ({"answers":{"q1"|question: answer}}) into the clarifications + spec
   status --session S                          journal status, plan check (nodes, steps, density band)
   deepen --session S                          nodes to deepen when a BUILD/CHANGE plan is below its density band
   summary --session S                         graph summary: nodes, steps per node, total, waves, questions, spec path
   track payloads --session S [--out F] [--project P] [--agent A]   dry-run tracker calls (Linear + Notion), placeholders only
   track record --session S --refs F           write real refs (from Desk Lead's connector results) into state + spec
+  track register --session S [--with-nodes]   graph_register payload (graph id, Notion task, surface, status; nodes/steps opt-in)
   review read --repo owner/name --pr N [--from-dir D]   read-only Greptile score + open threads (public GitHub API)
   prompts [uplift|graph|cot|clarify|distill]  print the plugin's system prompts
   prompts build --session S --units units.json [--out-dir D]   cloud-agent prompts per graph node (validated; never launched)
   ctl <status|on|off|skip|last|track ..|think ..|hitl ..|grok ..>   planner controls (grok-bot state dir)
   decisions check | probe <point> <cases.json>
-  teach <subcommand…>                         Teachable Moments (promote: --target drafts only, never --install)
+  teach <subcommand…>                         Teachable Moments (host grok-bot; promote: --target drafts only, never --install)
+  teach digest --session S --transcript F [--outcome completed|failed|interrupted]   TeachDigest JSON for teach observe --stdin
+  skills status [--installed DIR]             read-only drift check: staged hosts/grok-bot/skills vs installed copies
   hindsight … | ragflow …`;
 
 type Out = { code: number; text: string };
@@ -89,6 +96,23 @@ export function promoteGuard(argv: string[]): string | undefined {
 	const i = argv.indexOf("--target");
 	if (i < 0 || argv[i + 1] !== "drafts") return "teach promote needs --target drafts for grok-bot";
 	return undefined;
+}
+
+/** The plugin's status names the Grok CLI and its OAuth login, which grok-bot never uses: say so instead. */
+export function grokbotStatusLines(text: string): string {
+	const lines = text.split("\n");
+	if (!lines.some((line) => /^(?:Grok: |SuperGrok OAuth: )/.test(line))) return text;
+	const out: string[] = [];
+	let noted = false;
+	for (const line of lines) {
+		if (/^(?:Grok: |SuperGrok OAuth: )/.test(line)) {
+			if (!noted) out.push("Grok CLI: not used (grok-bot host: Desk Lead answers every planner request)");
+			noted = true;
+			continue;
+		}
+		out.push(line);
+	}
+	return out.join("\n");
 }
 
 export async function summarize(stateDir: string, sessionId: string): Promise<Record<string, unknown>> {
@@ -222,6 +246,21 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			const result = storeAnswer(dir, key, raw, { replace: rest.includes("--replace") });
 			return { code: result.ok ? 0 : 1, text: json(result) };
 		}
+		case "answers": {
+			const id = session(rest);
+			const file = flag(rest, "--file");
+			const raw = file ? readFileSync(file, "utf8") : rest.includes("--stdin") ? await readStdin() : undefined;
+			if (raw === undefined) return { code: 2, text: "answers needs --file F or --stdin" };
+			const outcome = recordAnswers(statePathFor(stateDir, id), parseAnswersInput(JSON.parse(raw)));
+			if (outcome.unknownIds.length) return { code: 1, text: `unknown question id(s): ${outcome.unknownIds.join(", ")} (nothing recorded)` };
+			return { code: 0, text: `HITL · ${outcome.matched.length} answer(s) recorded\n${json(outcome.list.map(({ id, question, answer, default: def, blocking }) => ({ id, question, blocking, ...(answer ? { answer } : { default: def }) })))}` };
+		}
+		case "skills": {
+			if (rest[0] !== "status") return { code: 2, text: "skills status [--installed DIR] (read-only; installs need Ming's approval)" };
+			const staged = resolve(import.meta.dir, "../../hosts/grok-bot/skills");
+			const report = skillsStatus(staged, resolve(flag(rest, "--installed") ?? DEFAULT_INSTALLED_SKILLS));
+			return { code: report.counts.drift || report.counts["not-installed"] ? 1 : 0, text: json(report) };
+		}
 		case "status": {
 			const id = session(rest);
 			const dir = journalDir(stateDir, id);
@@ -262,7 +301,8 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 				const { tracking, todos } = recordRefs(path, JSON.parse(readFileSync(refsFile, "utf8")));
 				return { code: tracking.status === "failed" ? 1 : 0, text: `tracking ${tracking.status} · graph ${tracking.graphId}\n\n${todos}` };
 			}
-			return { code: 2, text: "track payloads|record" };
+			if (sub === "register") return { code: 0, text: json(graphRegisterPayload(record, { withNodes: rest.includes("--with-nodes") })) };
+			return { code: 2, text: "track payloads|record|register" };
 		}
 		case "review": {
 			if (rest[0] !== "read") return { code: 2, text: "review read --repo owner/name --pr N (read-only; never retriggers)" };
@@ -297,7 +337,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			return { code: 0, text: Object.entries(all).map(([k, v]) => `## ${k}\n${v}`).join("\n\n") };
 		}
 		case "ctl":
-			return { code: 0, text: await runControl(rest, { stateDir, cwd, host: GROKBOT_ENGINE_HOST, modelResolution: hostResolution() }) };
+			return { code: 0, text: grokbotStatusLines(await runControl(rest, { stateDir, cwd, host: GROKBOT_ENGINE_HOST, modelResolution: hostResolution() })) };
 		case "decisions":
 			return await runDecisionsCommand(rest, { cwd });
 		case "hindsight":
@@ -305,10 +345,21 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 		case "ragflow":
 			return await runRagflowCommand(rest, { cwd, env });
 		case "teach": {
+			if (rest[0] === "digest") {
+				const transcript = flag(rest, "--transcript");
+				if (!transcript) return { code: 2, text: "teach digest needs --session S --transcript F" };
+				const outcome = flag(rest, "--outcome");
+				if (outcome !== undefined && !["completed", "failed", "interrupted"].includes(outcome)) return { code: 2, text: "--outcome must be completed, failed or interrupted" };
+				const digest = grokbotDigest(resolve(transcript), { sessionId: session(rest), cwd, ...(outcome ? { outcome: outcome as "completed" } : {}) });
+				return digest ? { code: 0, text: json(digest) } : { code: 1, text: "transcript has no user/assistant turns" };
+			}
 			const blocked = promoteGuard(rest);
 			if (blocked) return { code: 2, text: blocked };
 			const journal = createJournalCompleter({ dir: journalDir(stateDir, "teach") });
-			const result = await runTeachCommand(rest, { cwd, env, stateDir, stdin: readStdin, complete: journal.complete });
+			// Moments are captured as host grok-bot; an unknown host's promotion target is drafts, so even with
+			// teach.autoPromote on nothing is installed into another host's skill directory.
+			const teachEnv = { ...env, ULTRATHINK_HOST: GROKBOT_TEACH_HOST };
+			const result = await runTeachCommand(rest, { cwd, env: teachEnv, stateDir, stdin: readStdin, complete: journal.complete });
 			const missed = journal.missed();
 			if (missed.length === 0) return result;
 			return { code: result.code, text: `${result.text}\n${json({ needsModel: missed.map(({ key, stage }) => ({ key, stage, session: "teach" })) })}` };

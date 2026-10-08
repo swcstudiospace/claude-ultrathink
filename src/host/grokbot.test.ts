@@ -25,9 +25,18 @@ import {
 	validateNodeFill,
 	validateUplift,
 } from "./grokbot.ts";
-import { buildTrackPayloads, recordRefs } from "./grokbot-track.ts";
-import { buildCloudPrompt, DEFAULT_DESK_RULES, validateCloudPrompt, wellFormed } from "./grokbot-prompts.ts";
-import { dirFetcher, promoteGuard, reviewRead } from "./grokbot-cli.ts";
+import { buildTrackPayloads, graphRegisterPayload, recordRefs } from "./grokbot-track.ts";
+import { buildCloudPrompt, DEFAULT_DESK_RULES, unitSubissueCount, untrackedSpec, validateCloudPrompt, wellFormed } from "./grokbot-prompts.ts";
+import { dirFetcher, grokbotStatusLines, main, promoteGuard, reviewRead } from "./grokbot-cli.ts";
+import { normalizeTranscript } from "./grokbot.ts";
+import { parseAnswersInput, recordAnswers } from "./grokbot-hitl.ts";
+import { skillsStatus } from "./grokbot-skills.ts";
+import { grokbotDigest } from "./grokbot-teach.ts";
+import { conversationFromJsonl } from "../claude/transcript.ts";
+import { injectTrackingXml, stripTrackingXml } from "../track/render.ts";
+import { parseDigest } from "../teach/digest.ts";
+import { mkdirSync } from "node:fs";
+import { MAX_STEPS } from "../think/types.ts";
 import { writeFileSync } from "node:fs";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../uplift/prompt.ts";
@@ -345,5 +354,175 @@ describe("grok-bot prompts build", () => {
 		expect(validateCloudPrompt(buildCloudPrompt(record, follow), follow, PROMPT).errors.join()).toMatch(/agent id/);
 		const leaky = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b", notes: ["key sk-or-abcdefghijklmnop"] };
 		expect(validateCloudPrompt(buildCloudPrompt(record, leaky), leaky, PROMPT).errors.join()).toMatch(/secret-like/);
+	});
+});
+
+/** Fake connector results for every recorded create, keyed like Desk Lead's refs.json. */
+async function kickoff(statePath: string) {
+	const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+	const payloads = await buildTrackPayloads(record, { linearTeam: "Team", notionDataSource: "collection://abc", project: "Kanban", agent: "grok-bot" });
+	const linear: Record<string, { id: string; identifier: string; url: string; title: string }> = {};
+	payloads.calls.filter((c) => c.tool === "save_issue").forEach((c, i) => {
+		linear[c.keys[0] as string] = { id: `id${i}`, identifier: `SPE-${9000 + i}`, url: `https://linear.app/x/issue/SPE-${9000 + i}/t`, title: String(c.args.title) };
+	});
+	const notion: Record<string, string> = {};
+	payloads.calls.filter((c) => c.tool === "notion-create-pages").forEach((c) => c.keys.forEach((k, i) => (notion[k] = `https://www.notion.so/real${k.replace(/\W/g, "")}${i}`)));
+	recordRefs(statePath, { linear, notion });
+	return JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+}
+
+describe("grok-bot prompts build after kickoff", () => {
+	test("rebuilds the same prompt with real Linear/Notion refs; SUBISSUEs in the embedded spec are not counted", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(7));
+		const statePath = result.response?.statePath as string;
+		const before = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		const dispatch = { unit: "n2", mode: "followup" as const, agentId: "bc-test", repo: "o/r", pr: 14, branch: "b" };
+		const pre = buildCloudPrompt(before, dispatch);
+		expect(validateCloudPrompt(pre, dispatch, PROMPT).errors).toEqual([]);
+
+		const after = await kickoff(statePath);
+		expect(after.result.xml).not.toBe(before.result.xml);
+		const post = buildCloudPrompt(after, dispatch);
+		expect(unitSubissueCount(post)).toBe(7);
+		expect(validateCloudPrompt(post, dispatch, PROMPT).errors).toEqual([]);
+		// Regression: with the tracked spec embedded (the old builder), a whole-document count saw the spec's
+		// <ISSUES> block too (5 nodes x 7 steps on top of the unit's 7) and rejected the prompt; the unit-scoped count does not.
+		const tracked = post.replace(untrackedSpec(after.result.xml), after.result.xml);
+		expect((tracked.match(/<SUBISSUE /g) ?? []).length).toBeGreaterThan(MAX_STEPS);
+		expect(validateCloudPrompt(tracked, dispatch, PROMPT).errors).toEqual([]);
+
+		const n2 = after.tracking?.linear.nodes.n2;
+		expect(post).toContain(`<UNIT id="n2" kind="decompose" title="Parser design" issue="${n2?.identifier}" url="${n2?.url}" notion="${after.tracking?.notion.nodes.n2}">`);
+		expect(post).toContain(`<SUBISSUE step="3" issue="${after.tracking?.linear.steps["n2.3"]?.identifier}" url="${after.tracking?.linear.steps["n2.3"]?.url}" notion="${after.tracking?.notion.steps["n2.3"]}" title=`);
+		expect(post).toContain(`<ISSUE node="n2" ref="${n2?.identifier}" url="${n2?.url}" notion="${after.tracking?.notion.nodes.n2}">`);
+		// Same content: dropping the ref attributes gives back the pre-kickoff prompt byte for byte.
+		const unref = post
+			.replace(/ issue="SPE-\d+" url="[^"]*" notion="[^"]*"/g, ' issue="pending kickoff"')
+			.replace(/ ref="SPE-\d+" url="[^"]*" notion="[^"]*"/g, ' ref="pending kickoff"');
+		expect(unref).toBe(pre);
+	});
+
+	test("stripTrackingXml undoes injectTrackingXml", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(5));
+		const statePath = result.response?.statePath as string;
+		const before = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		const after = await kickoff(statePath);
+		expect(after.result.xml).toContain("<ISSUES graphId=");
+		expect(stripTrackingXml(after.result.xml)).toBe(before.result.xml);
+		expect(untrackedSpec(before.result.xml)).toBe(before.result.xml);
+		const again = injectTrackingXml(stripTrackingXml(after.result.xml), after.plan!, after.tracking!);
+		expect(again).toBe(after.result.xml);
+	});
+});
+
+describe("grok-bot transcript", () => {
+	test("simple role/content lines reach the planner's transcript reader", () => {
+		const root = tmp();
+		const src = join(root, "t.jsonl");
+		writeFileSync(src, [
+			JSON.stringify({ role: "user", content: "We use pnpm and Vitest in this repo." }),
+			"not json",
+			JSON.stringify({ role: "assistant", content: [{ type: "text", text: "Noted: pnpm + Vitest." }] }),
+			JSON.stringify({ type: "user", message: { role: "user", content: "Claude-shaped line" } }),
+			JSON.stringify({ role: "system", content: "ignored" }),
+		].join("\n"));
+		// The plugin's reader ignores the simple shape on its own.
+		expect(conversationFromJsonl(readFileSync(src, "utf8"))).toBe("User: Claude-shaped line");
+		const path = normalizeTranscript(src, join(root, "journal"));
+		expect(conversationFromJsonl(readFileSync(path, "utf8"))).toBe("User: We use pnpm and Vitest in this repo.\n\nAssistant: Noted: pnpm + Vitest.\n\nUser: Claude-shaped line");
+		expect(readFileSync(normalizeTranscript(join(root, "missing.jsonl"), join(root, "journal")), "utf8")).toBe("");
+	});
+});
+
+describe("grok-bot answers", () => {
+	test("folds Ming's replies into the clarifications, the spec and later prompts", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(6));
+		const statePath = result.response?.statePath as string;
+		expect(recordAnswers(statePath, parseAnswersInput({ answers: { q9: "x" } })).unknownIds).toEqual(["q9"]);
+		const outcome = recordAnswers(statePath, parseAnswersInput({ q1: "JSON lines" }), 1_700_000_000_000);
+		expect(outcome.matched.map((c) => c.id)).toEqual(["q1"]);
+		const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		expect(record.clarifications?.[0]).toMatchObject({ answer: "JSON lines", source: "user", answeredAt: 1_700_000_000_000 });
+		expect(readFileSync(statePath.replace(/\.json$/, ".xml"), "utf8")).toContain("JSON lines");
+		const dispatch = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b" };
+		expect(buildCloudPrompt(record, dispatch)).toContain("answered: JSON lines");
+		expect(() => parseAnswersInput({ answers: {} })).toThrow(/no answers/);
+		expect(() => parseAnswersInput({ q1: 3 })).toThrow(/string/);
+	});
+});
+
+describe("grok-bot teach digest and host", () => {
+	test("builds a valid TeachDigest from Grok Bot turns", () => {
+		const root = tmp();
+		const src = join(root, "run.jsonl");
+		writeFileSync(src, [
+			JSON.stringify({ role: "user", content: "Fix the flaky fetch test." }),
+			JSON.stringify({ role: "assistant", content: "The test raced the mock server; awaiting listen() fixed it." }),
+		].join("\n"));
+		const digest = grokbotDigest(src, { sessionId: "s1", cwd: root, outcome: "completed", now: () => 0 });
+		expect(digest?.host).toBe("grok-bot");
+		expect(digest?.turns.map((t) => t.role)).toEqual(["user", "assistant"]);
+		expect(parseDigest(JSON.parse(JSON.stringify(digest)))).toBeDefined();
+		writeFileSync(src, [
+			JSON.stringify({ role: "user", content: "Fix it." }),
+			JSON.stringify({ role: "tool", name: "Shell", input: { command: "bun test" }, content: "1 fail", isError: true }),
+			JSON.stringify({ role: "tool", name: "Shell", input: { command: "bun test" }, content: "3 pass" }),
+		].join("\n"));
+		const tools = grokbotDigest(src, { sessionId: "s2", cwd: root });
+		expect(tools?.toolCalls).toBe(2);
+		expect(tools?.turns.filter((t) => t.role === "tool").map((t) => [t.tool, t.isError ?? false])).toEqual([["Shell", true], ["Shell", false]]);
+	});
+
+	test("teach captures are host grok-bot", async () => {
+		const root = tmp();
+		const env = { ...testEnv(root), ULTRATHINK_STATE_DIR: join(root, "state"), ULTRATHINK_HINDSIGHT: "0" } as NodeJS.ProcessEnv;
+		const captured = await main(["teach", "capture", "--name", "await listen", "--body", "Await server.listen() before fetch in tests.", "--json"], env);
+		expect(captured.text).toContain('"ok"');
+		expect(captured.code).toBe(0);
+		const listed = await main(["teach", "list", "--json"], env);
+		expect(listed.text).toContain('"grok-bot"');
+	});
+});
+
+describe("grok-bot skills status and status lines", () => {
+	test("reports in-sync, drift and not-installed without writing", () => {
+		const root = tmp();
+		const staged = join(root, "staged");
+		const installed = join(root, "installed");
+		for (const [dir, name, body] of [[staged, "a", "x"], [staged, "b", "y"], [staged, "c", "z"], [installed, "a", "x"], [installed, "b", "changed"]] as const) {
+			mkdirSync(join(dir, name), { recursive: true });
+			writeFileSync(join(dir, name, "SKILL.md"), body);
+		}
+		const report = skillsStatus(staged, installed);
+		expect(report.skills.map((s) => [s.name, s.state])).toEqual([["a", "in-sync"], ["b", "drift"], ["c", "not-installed"]]);
+		expect(existsSync(join(installed, "c"))).toBe(false);
+	});
+
+	test("replaces the Grok CLI lines in ctl status", () => {
+		const text = "Prompt Uplift on\nGrok: grok-4.7 @ xhigh · transport http\nSuperGrok OAuth: not logged in (run grok login)\nGraph of Thought on";
+		expect(grokbotStatusLines(text)).toBe("Prompt Uplift on\nGrok CLI: not used (grok-bot host: Desk Lead answers every planner request)\nGraph of Thought on");
+		expect(grokbotStatusLines("HITL on")).toBe("HITL on");
+	});
+});
+
+describe("grok-bot graph_register payload", () => {
+	test("carries graph id, Notion task and surface; nodes and steps only on request", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(5));
+		const statePath = result.response?.statePath as string;
+		const pre = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		expect(graphRegisterPayload(pre)).toEqual(expect.objectContaining({ graph_id: pre.plan?.graphId, surface: "grok-bot" }));
+		expect(graphRegisterPayload(pre).notion_task_page).toBeUndefined();
+		const after = await kickoff(statePath);
+		const bare = graphRegisterPayload(after);
+		expect(bare.notion_task_page).toBe(after.tracking?.notion.taskUrl);
+		expect(bare.nodes).toBeUndefined();
+		const full = graphRegisterPayload(after, { withNodes: true }) as { nodes: Array<Record<string, unknown>>; steps: Array<Record<string, unknown>> };
+		expect(full.nodes).toHaveLength(5);
+		expect(full.steps).toHaveLength(25);
+		expect(full.steps[0]).toEqual({ node_id: "n1", step: 1, linear_sub_issue_id: expect.any(String), linear_identifier: expect.stringMatching(/^SPE-/), linear_url: expect.any(String), notion_page: expect.any(String) });
 	});
 });

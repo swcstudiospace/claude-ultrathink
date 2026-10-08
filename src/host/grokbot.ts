@@ -395,6 +395,45 @@ export function checkRecord(record: SessionRecord): PlanCheck {
 	return { ok: errors.length === 0, errors, root, nodes: nodes.length, stepsPerNode, totalSteps, ...(band ? { band } : {}), belowBand, degraded };
 }
 
+/**
+ * Grok Bot keeps recent turns as simple `{"role":"user"|"assistant","content":"..."}` lines; the plugin's transcript
+ * reader only takes Claude Code entries (`{"type":"user","message":{"role","content"}}`) and silently ignores anything
+ * else. Writes a Claude-shaped copy into the session journal and returns its path; Claude-shaped lines pass through.
+ * An unreadable file yields an empty copy (no conversation context, as the plugin does).
+ */
+export function normalizeTranscript(source: string, dir: string): string {
+	let text = "";
+	try {
+		text = readFileSync(source, "utf8");
+	} catch {
+		text = "";
+	}
+	const out: string[] = [];
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const rec = entry as { type?: unknown; role?: unknown; content?: unknown; message?: unknown };
+		if ((rec.type === "user" || rec.type === "assistant") && rec.message && typeof rec.message === "object") {
+			out.push(trimmed);
+			continue;
+		}
+		if ((rec.role === "user" || rec.role === "assistant") && (typeof rec.content === "string" || Array.isArray(rec.content))) {
+			out.push(JSON.stringify({ type: rec.role, message: { role: rec.role, content: rec.content } }));
+		}
+	}
+	mkdirSync(dir, { recursive: true });
+	const path = join(dir, "transcript.claude.jsonl");
+	writeFileSync(path, out.length ? `${out.join("\n")}\n` : "");
+	return path;
+}
+
 export interface GrokbotPlanInput {
 	sessionId: string;
 	prompt: string;
@@ -438,7 +477,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 	let response: PlanResponse;
 	try {
 		response = await planPrompt(
-			{ host: GROKBOT_ENGINE_HOST, session_id: input.sessionId, prompt: input.prompt, cwd: input.cwd, ...(input.transcriptPath ? { transcript_path: input.transcriptPath } : {}) },
+			{ host: GROKBOT_ENGINE_HOST, session_id: input.sessionId, prompt: input.prompt, cwd: input.cwd, ...(input.transcriptPath ? { transcript_path: normalizeTranscript(input.transcriptPath, dir) } : {}) },
 			env,
 			{
 				stateDir,
