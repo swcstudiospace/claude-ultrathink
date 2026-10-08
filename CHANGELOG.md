@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Grok Bot skill-protocol adapter in `hosts/grok-bot`. Grok Bot has no prompt hook and does not run the engine: the bot performs the method itself from `ultrathink-protocol`, and each file in `commands/*.md` is a conversation preference (`hosts/grok-bot/commands/<name>/SKILL.md`). `ultrathink.discovery.json` records `grok-bot` with status `skill-adapter`, `adapterPresent` true, `compatibilityVerified` false and delivery `skill-protocol`. Compatibility stays unverified until a recorded live Grok Bot run. GPT Dot is unchanged. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
+
 ## [1.4.0] - 2026-10-08
 
 ### Added

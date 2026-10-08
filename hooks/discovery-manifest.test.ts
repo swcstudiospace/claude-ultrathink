@@ -256,7 +256,12 @@ describe("descriptor negative vectors", () => {
 			(d) => Object.assign(d.interfaces.jsonPlanner, { transport: "mcp-streamable-http" }),
 			'shape: /interfaces/jsonPlanner/transport must be "json-stdin-stdout"',
 		],
-		["Grok Bot adapterPresent true", (d) => Object.assign(d.externalIntegrations["grok-bot"], { adapterPresent: true }), "shape: /externalIntegrations/grok-bot/adapterPresent must be false"],
+		["Grok Bot adapterPresent false", (d) => Object.assign(d.externalIntegrations["grok-bot"], { adapterPresent: false }), "shape: /externalIntegrations/grok-bot/adapterPresent must be true"],
+		[
+			"a Grok Bot delivery that is not the skill protocol",
+			(d) => Object.assign(d.externalIntegrations["grok-bot"], { delivery: "hook-additional-context" }),
+			'shape: /externalIntegrations/grok-bot/delivery must be "skill-protocol"',
+		],
 		[
 			"Grok Bot compatibilityVerified true",
 			(d) => Object.assign(d.externalIntegrations["grok-bot"], { compatibilityVerified: true }),
@@ -271,7 +276,7 @@ describe("descriptor negative vectors", () => {
 		[
 			"a Grok Bot contract claimed as settled",
 			(d) => Object.assign(d.externalIntegrations["grok-bot"], { status: "compatible" }),
-			'shape: /externalIntegrations/grok-bot/status must be "pending-contract"',
+			'shape: /externalIntegrations/grok-bot/status must be "skill-adapter"',
 		],
 		[
 			"an invented GPT Dot identity",
@@ -291,6 +296,14 @@ describe("descriptor negative vectors", () => {
 		const descriptor = approved();
 		descriptor.hosts.muse.entrypoints[1] = path;
 		expect(descriptorFindings(descriptor)).toContain(`path: /hosts/muse/entrypoints/1 ${problem}`);
+	});
+
+	test.each(BAD_PATHS)("%s as a Grok Bot entrypoint fails the path rules", (_label, path, problem) => {
+		const descriptor = approved();
+		const entrypoints = descriptor.externalIntegrations["grok-bot"]?.entrypoints;
+		if (!entrypoints) throw new Error("the approved grok-bot record has no entrypoints");
+		entrypoints[0] = path;
+		expect(descriptorFindings(descriptor)).toContain(`path: /externalIntegrations/grok-bot/entrypoints/0 ${problem}`);
 	});
 });
 
@@ -463,9 +476,14 @@ describe("schema negative vectors", () => {
 			"schema: /properties/identity/required must list exactly its properties",
 		],
 		[
-			"Grok Bot allowed an adapter",
-			(s) => Object.assign(node(s, "properties", "externalIntegrations", "properties", "grok-bot", "properties", "adapterPresent"), { const: true }),
-			"schema: /properties/externalIntegrations/properties/grok-bot/properties/adapterPresent/const must be false",
+			"Grok Bot denied an adapter",
+			(s) => Object.assign(node(s, "properties", "externalIntegrations", "properties", "grok-bot", "properties", "adapterPresent"), { const: false }),
+			"schema: /properties/externalIntegrations/properties/grok-bot/properties/adapterPresent/const must be true",
+		],
+		[
+			"Grok Bot left on the pending contract",
+			(s) => Object.assign(node(s, "properties", "externalIntegrations", "properties", "grok-bot", "properties", "status"), { const: "pending-contract" }),
+			'schema: /properties/externalIntegrations/properties/grok-bot/properties/status/const must be "skill-adapter"',
 		],
 		[
 			"GPT Dot allowed verified compatibility",
