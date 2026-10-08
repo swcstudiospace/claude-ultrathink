@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,20 +15,24 @@ const PROTOCOL = join(GROK_ROOT, "ultrathink-protocol/SKILL.md");
 
 type Frontmatter = { keys: string[]; values: Record<string, string>; body: string };
 
+/** PyYAML, not a first-colon split: an unquoted colon in `description` must fail this parse. */
 function frontmatter(text: string, file: string): Frontmatter {
 	const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(text);
 	if (!match?.[1] || match[2] === undefined) throw new Error(`${file} is missing YAML frontmatter`);
-	const keys: string[] = [];
+	const parsed = spawnSync("python3", ["-c", "import json,sys,yaml; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout)"], {
+		input: match[1],
+		encoding: "utf8",
+	});
+	if (parsed.status !== 0) throw new Error(`${file} frontmatter is not valid YAML: ${parsed.stderr}`);
+	const doc: unknown = JSON.parse(parsed.stdout);
+	if (doc === null || typeof doc !== "object" || Array.isArray(doc)) throw new Error(`${file} frontmatter is not a YAML mapping`);
+	const record = doc as Record<string, unknown>;
 	const values: Record<string, string> = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		if (line.trim() === "") continue;
-		const sep = line.indexOf(":");
-		if (sep <= 0) throw new Error(`${file} has a frontmatter line without a key`);
-		const key = line.slice(0, sep).trim();
-		keys.push(key);
-		values[key] = line.slice(sep + 1).trim().replace(/^["']|["']$/g, "");
+	for (const [key, value] of Object.entries(record)) {
+		if (typeof value !== "string") throw new Error(`${file} frontmatter key ${key} is not a string`);
+		values[key] = value;
 	}
-	return { keys, values, body: match[2] };
+	return { keys: Object.keys(record), values, body: match[2] };
 }
 
 function skillFiles(): string[] {
@@ -78,11 +83,22 @@ describe("Grok Bot skills", () => {
 			"any CLI planner",
 			"outside service",
 			"<ORIGINAL>",
+			"always runs this full protocol",
+			"bare `/ultrathink-quick`",
+			"`raw:`",
+			"<SCOPE>",
+			"<CONSTRAINTS>",
+			"<ACCEPTANCE_CRITERIA>",
+			"<OUT_OF_SCOPE>",
+			"do not invent repository facts",
 			"5 to 8",
 			"<WORKFLOW>",
 			"Verify:",
 			"at most 4",
 			"ultrathink graph <graphId> · node <nodeId>",
+			"Linear is the default",
+			"Notion is optional",
+			"`Level` = `Task`",
 			"Greptile",
 		]) {
 			expect(parsed.body).toContain(phrase);

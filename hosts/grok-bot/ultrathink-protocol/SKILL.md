@@ -1,6 +1,6 @@
 ---
 name: ultrathink-protocol
-description: When to use it: the user asks to plan, uplift, or think through non-trivial work, or invokes /ultrathink-protocol, before a multi-step build, fix, or refactor.
+description: "When to use it: the user asks to plan, uplift, or think through non-trivial work, or invokes /ultrathink-protocol, before a multi-step build, fix, or refactor."
 ---
 
 # ultrathink-protocol
@@ -11,11 +11,14 @@ There is no prompt hook. A message is planned only when you follow this skill. P
 
 ## Skip rules
 
+An invoked `/ultrathink-protocol`, or another skill chaining to it, always runs this full protocol. Take the text after the invocation as the task. A bare invocation plans the surrounding request. That invocation is never a skip.
+
 Answer directly, with no spec, no graph, no questions and no tracker rows, when any of these hold:
 
 - The message is empty, or it is only `raw:` / `uplift:` with nothing after the prefix.
-- It starts with `raw:` (any case). Carry out the text after the prefix as typed.
-- It is a slash command, including `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-status` and `/ultrathink-track`. Those commands have their own skills.
+- It starts with `raw:` (any case). Carry out the text after the prefix as typed. A `raw:` message skips this protocol.
+- It is `/ultrathink-quick`, with or without text after it, including a bare `/ultrathink-quick`. Answer that message and skip this protocol. `/ultrathink-quick` and `raw:` are the only command forms that skip it.
+- It is `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-skip`, `/ultrathink-status` or `/ultrathink-track`. Those commands have their own skills and are not plans. Any other slash command is not a plan either. `/ultrathink-protocol` is not in this list.
 - It is already one uplift document whose root tag is `BUILD_PROMPT`, `FIX_PROMPT`, `RESEARCH_PROMPT`, `CHANGE_PROMPT`, `UPLIFTED_PROMPT`, `uplifted` or `ultrathink`.
 - It names an existing plan as `graph ut-<id>-<8 hex>` (the same shape as `graph ut-mugl6r87-70da50da`), unless it starts with `uplift:`.
 - This conversation is remembering a one-shot skip. Use that skip up, then clear it.
@@ -26,7 +29,17 @@ Answer directly, with no spec, no graph, no questions and no tracker rows, when 
 
 ## Uplift
 
-Rewrite the message into one XML document with a single root. Use `BUILD_PROMPT` for a build, `FIX_PROMPT` for a fix, `RESEARCH_PROMPT` for research, `CHANGE_PROMPT` for a change, and `UPLIFTED_PROMPT` when none of those fits. Put the user's words verbatim in `<ORIGINAL>`, with XML metacharacters escaped. Do not show the document.
+Rewrite the message into one XML document with a single root. Use `BUILD_PROMPT` for a build, `FIX_PROMPT` for a fix, `RESEARCH_PROMPT` for research, `CHANGE_PROMPT` for a change, and `UPLIFTED_PROMPT` when none of those fits. Do not show the document.
+
+Every root has these children. A root that holds only `<ORIGINAL>` is not a spec.
+
+- `<ORIGINAL>` — the user's words verbatim, with XML metacharacters escaped. Do not paraphrase them.
+- `<SYSTEM_ROLE>` — the coding-agent stance for this work.
+- `<CONTEXT>` or `<APP_CONTEXT>` — one of these.
+- `<SCOPE>` — what to implement now.
+- `<CONSTRAINTS>` — quality, consistency, and hard limits. Always include: do not invent repository facts (paths, versions, package names, component names, schemas, or routes) unless they are in the user's text.
+- `<ACCEPTANCE_CRITERIA>` — observable, testable outcomes.
+- `<OUT_OF_SCOPE>` — adjacent work that is not this task.
 
 ## Graph of Thought
 
@@ -51,7 +64,21 @@ Ask at most 4 clarifying questions. Each has a recommended default. Ask every bl
 
 ## Tracking
 
-Create rows only when this conversation remembers tracking as on (the default) and Linear or Notion tools are already connected here. Do not open a connection. Do not paste the conversation or the XML into a tracker. One Linear issue per node, and one sub-issue per rationale step. End each description with the footer `ultrathink graph <graphId> · node <nodeId>`, and add ` · step <n>` on a sub-issue. Mint `<graphId>` as `ut-` + a base-36 timestamp + `-` + 8 hex characters. Reuse an issue that already ends with that footer. If those tools are not connected, skip tracking and continue.
+Create rows only when this conversation remembers tracking as on (the default) and a tracker tool is already connected here. Do not open a connection. Do not paste the conversation or the XML into a tracker. Mint `<graphId>` as `ut-` + a base-36 timestamp + `-` + 8 hex characters. If no tracker tool is connected, skip tracking and continue.
+
+Linear is the default. When Linear tools are connected:
+
+- One issue per node, and one sub-issue per rationale step.
+- End each description with the footer `ultrathink graph <graphId> · node <nodeId>`, and add ` · step <n>` on a sub-issue.
+- Reuse an issue that already ends with that footer.
+
+Notion is optional. When Notion tools are connected, use the data source already available in this conversation. If several are connected, ask once which one. If none are, skip Notion.
+
+- Read that data source's fields once, and send only fields it already has.
+- One Task row: `Level` = `Task`, `Graph ID` = `<graphId>`.
+- One Issue row per node: `Level` = `Issue`, `Parent Item` = the Task, `Graph ID` = `<graphId>`.
+- One Sub-Issue row per rationale step: `Level` = `Sub-Issue`, `Parent Item` = that node's Issue, `Step` = the step number, `Graph ID` = `<graphId>`. Do not collapse steps.
+- Reuse a row that already has the same `Graph ID`, `Level`, and node or step.
 
 ## Shipping
 
