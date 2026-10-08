@@ -138,7 +138,7 @@ export function buildPlanView(record: SessionRecord, elapsedMs: number): PlanVie
 	return {
 		root: record.result.root,
 		source: record.result.source,
-		...(modelResolution ? { engine: modelResolution.label, modelResolution } : record.engine ? { engine: record.engine } : {}),
+		...(modelResolution ? { engine: modelResolution.label, modelResolution } : record.engine ? { engine: displayLabel(record.engine) } : {}),
 		...(record.skill ? { skill: record.skill.name } : {}),
 		...(plan?.graphId ? { graphId: plan.graphId } : {}),
 		...(graph?.goal ? { goal: graph.goal } : {}),

@@ -64,13 +64,13 @@ const USAGE = `usage:
   teach sync [--json]
   teach observe (--stdin | --file <path>) [--json]
   teach promote --due [--json]
-  teach promote <id>... [--target hermes|omp|claude|drafts] [--install] [--json]
+  teach promote <id>... [--target hermes|omp|claude|prime-agent|drafts] [--install] [--json]
   teach promote <id>... --mark-promoted --skill <name> --target <t> [--path P] [--json]
   teach export --a2a [<id>...]`;
 
 const MAX_INPUT_CHARS = 2_000_000;
 const ID_PREFIX_MIN = 4;
-const SKILL_TARGETS: readonly SkillTarget[] = ["hermes", "omp", "claude", "drafts"];
+const SKILL_TARGETS: readonly SkillTarget[] = ["hermes", "omp", "claude", "prime-agent", "drafts"];
 const SKILL_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 /** The store's id alphabet, without a leading dot, so an id can never name a path. */
 const ID_TOKEN = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}$/;

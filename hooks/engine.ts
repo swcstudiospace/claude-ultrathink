@@ -3,10 +3,11 @@
 // Copyright (C) 2026 SWC Studio
 /**
  * Host-neutral JSON plan entry: one JSON object on stdin, one `PlanResponse` JSON line on stdout. Always exits 0.
- * Hermes plans through it (hosts/hermes/bridge.py); Claude Code, Grok Build and Muse use hooks/uplift.ts instead.
+ * Hermes (hosts/hermes/bridge.py) and Prime Agent (hosts/prime-agent, the `ultrathink` kernel skill) plan through it;
+ * Claude Code, Grok Build and Muse use hooks/uplift.ts instead.
  * Only the string fields below cross: no Model, auth, resolver, registry or callable is ever read from the JSON.
  *
- *   { "host": "hermes", "session_id": "...", "prompt": "...", "cwd": "...", "model": "...", "provider": "..." }
+ *   { "host": "hermes" | "prime-agent", "session_id": "...", "prompt": "...", "cwd": "...", "model": "...", "provider": "..." }
  */
 import { planPrompt, type PlanRequest } from "../src/host/plan.ts";
 import { createFdProgressSink } from "../src/host/progress.ts";
@@ -63,13 +64,23 @@ async function main(): Promise<void> {
 	// The environment only fills an absent host; it never overrides the unsupported-host diagnostic.
 	if (!request.host && !request.invalidHost && forced && isHostId(forced)) request.host = forced;
 	const result = await planPrompt(request, process.env, { progress: createFdProgressSink() });
-	process.stdout.write(`${JSON.stringify(result)}\n`);
+	await emit(result);
+}
+
+/**
+ * Writes the response line and waits for it to reach the pipe. A `process.stdout.write` followed by `process.exit`
+ * (even from the write callback) drops everything past the 128 KiB pipe buffer under Bun, and a full plan response
+ * (context plus view) is larger than that: the caller would read a truncated JSON line.
+ */
+export async function emit(response: unknown): Promise<void> {
+	await Bun.write(Bun.stdout, `${JSON.stringify(response)}\n`);
 }
 
 if (import.meta.main) {
 	main()
+		.catch(() => emit({ context: "", skipped: "engine-error" }))
 		.catch(() => {
-			process.stdout.write(`${JSON.stringify({ context: "", skipped: "engine-error" })}\n`);
+			// fail-open: nothing left to say
 		})
 		.finally(() => {
 			process.exit(0);

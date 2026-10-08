@@ -55,6 +55,14 @@ describe("requestFrom", () => {
 		for (const value of [null, undefined, "model", 42, true, [], [{ host: "omp", prompt: "hi" }]]) expect(requestFrom(value)).toEqual({});
 	});
 
+	test("the Prime Agent kernel skill's request is a supported host with the session and platform it sends", () => {
+		expect(isHostId("prime-agent")).toBe(true);
+		const request = requestFrom({ host: "prime-agent", session_id: "01a1-session", prompt: "plan this", cwd: "/repo", platform: "prime-agent" });
+		expect(request).toMatchObject({ host: "prime-agent", session_id: "01a1-session", prompt: "plan this", cwd: "/repo", platform: "prime-agent" });
+		expect(request.invalidHost).toBeUndefined();
+		expect(request.model).toBeUndefined();
+	});
+
 	test("an unknown host is omitted and flagged; the rest of the request still parses", () => {
 		expect(requestFrom({ host: "wat", model: "muse-spark" })).toEqual({
 			host: undefined,
@@ -184,6 +192,28 @@ describe("Claude Code transport under the hook entries' selection context (D-10,
 			expect(plain.argv).toEqual([...BASE_ARGV, ...tail]);
 			expect(plain.stdin).toBe("USER payload");
 			expect(await transport(model, evidence)).toEqual(plain);
+		}
+	});
+});
+
+describe("emit", () => {
+	test("a response larger than the 128 KiB pipe buffer reaches the caller intact before the process exits", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-emit-"));
+		try {
+			const script = join(dir, "big.ts");
+			// The entry's own exit pattern: emit, then process.exit in finally. The caller must get one complete JSON line.
+			writeFileSync(
+				script,
+				`import { emit } from ${JSON.stringify(join(import.meta.dir, "engine.ts"))};\n` +
+					`emit({ context: "x".repeat(300_000) }).finally(() => process.exit(0));\n`,
+			);
+			const proc = Bun.spawn(["bun", "--no-env-file", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, ULTRATHINK_HOST: "prime-agent" } });
+			const out = await new Response(proc.stdout).text();
+			expect(await proc.exited).toBe(0);
+			expect(out.endsWith("\n")).toBe(true);
+			expect((JSON.parse(out) as { context: string }).context).toHaveLength(300_000);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

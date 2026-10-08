@@ -234,7 +234,7 @@ function mergeClaude(claude: Record<string, unknown> | undefined, defaults: Clau
 		typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 	return {
 		bin: typeof claude.bin === "string" && claude.bin.trim() ? claude.bin.trim() : defaults.bin,
-		model: typeof claude.model === "string" ? claude.model.trim() : defaults.model,
+		model: selectorField(claude.model) ?? defaults.model,
 		thinking: typeof claude.thinking === "boolean" ? claude.thinking : defaults.thinking,
 		settingSources: typeof claude.settingSources === "string" ? claude.settingSources.trim() : defaults.settingSources,
 		callTimeoutMs: nonNegativeMs(claude.callTimeoutMs, defaults.callTimeoutMs),
@@ -253,7 +253,7 @@ function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConf
 	return {
 		enabled: typeof grok.enabled === "boolean" ? grok.enabled : defaults.enabled,
 		baseUrl: nonEmpty(grok.baseUrl, defaults.baseUrl).replace(/\/+$/, "") || defaults.baseUrl,
-		model: nonEmpty(grok.model, defaults.model),
+		model: selectorField(grok.model) || defaults.model,
 		reasoningEffort: GROK_EFFORTS.includes(grok.reasoningEffort as GrokEffort)
 			? (grok.reasoningEffort as GrokEffort)
 			: defaults.reasoningEffort,
@@ -263,7 +263,7 @@ function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConf
 		callTimeoutMs: nonNegativeMs(grok.callTimeoutMs, defaults.callTimeoutMs),
 		fallbackToClaude: typeof grok.fallbackToClaude === "boolean" ? grok.fallbackToClaude : defaults.fallbackToClaude,
 		shuntBaseUrl: httpUrl(grok.shuntBaseUrl, defaults.shuntBaseUrl),
-		shuntModel: nonEmpty(grok.shuntModel, defaults.shuntModel),
+		shuntModel: selectorField(grok.shuntModel) || defaults.shuntModel,
 		shuntMaxTokens:
 			typeof grok.shuntMaxTokens === "number" && Number.isInteger(grok.shuntMaxTokens) && grok.shuntMaxTokens > 0
 				? grok.shuntMaxTokens
@@ -276,7 +276,7 @@ function mergeMuse(muse: Record<string, unknown> | undefined, defaults: MuseConf
 	if (!muse) return defaults;
 	return {
 		bin: nonEmpty(muse.bin, defaults.bin),
-		model: typeof muse.model === "string" ? muse.model.trim() : defaults.model,
+		model: selectorField(muse.model) ?? defaults.model,
 		reasoningEffort: MUSE_EFFORTS.includes(muse.reasoningEffort as MuseEffort)
 			? (muse.reasoningEffort as MuseEffort)
 			: defaults.reasoningEffort,
@@ -292,15 +292,21 @@ export function hasControlCharacter(value: string): boolean {
 	return CONTROL_CHARACTER.test(value);
 }
 
+/** Shared selector string normalization: blanks stay absent; nonblank controls stay raw so selection can reject them before trim. */
+export function normalizeSelectorField(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	return hasControlCharacter(value) ? value : trimmed;
+}
+
 /**
- * A `models` string field after the merge truth table: undefined for a wrong type (the lower layer stays), "" for a blank
- * (a deliberate reset), otherwise trimmed of surrounding whitespace only. A string carrying a control character is kept
- * as written, so resolution can diagnose it before a trim could hide it.
+ * A model/provider selector after normalization: undefined for a wrong type, "" for an entirely-whitespace blank,
+ * otherwise trimmed of surrounding whitespace only. Nonblank strings carrying controls stay as written so resolution
+ * can diagnose them before trim hides them; each merge consumer applies its existing blank/reset rule.
  */
 function selectorField(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
-	if (!value.trim()) return "";
-	return hasControlCharacter(value) ? value : value.trim();
+	return normalizeSelectorField(value);
 }
 
 /** Provider keys never merged into a dictionary, in any layer (prototype pollution, T-15-01). An object lookup would hit the prototype itself. */
@@ -315,7 +321,7 @@ function providerDictionary(entries: Readonly<Record<string, string>>): Record<s
 
 /**
  * Per-entry merge of `models` (D-05): a wrong type keeps the lower value, a blank host field clears it, a blank provider
- * default removes the lower selector (exposing the host-catalog tier), and unknown hosts and prototype keys are ignored.
+ * default removes the lower selector (exposing the host-catalog tier), and unknown hosts, prototype keys and inherited fields are ignored.
  */
 function mergeModels(models: Record<string, unknown> | undefined, defaults: ModelsConfig): ModelsConfig {
 	if (!models) return defaults;
@@ -323,8 +329,8 @@ function mergeModels(models: Record<string, unknown> | undefined, defaults: Mode
 	for (const [host, entry] of Object.entries(asRecord(models.hosts) ?? {})) {
 		const fields = asRecord(entry);
 		if (!fields || !isHostId(host)) continue;
-		const provider = selectorField(fields.provider);
-		const model = selectorField(fields.model);
+		const provider = Object.hasOwn(fields, "provider") ? selectorField(fields.provider) : undefined;
+		const model = Object.hasOwn(fields, "model") ? selectorField(fields.model) : undefined;
 		if (provider === undefined && model === undefined) continue;
 		const lower = hosts[host];
 		hosts[host] = { provider: provider ?? lower?.provider ?? "", model: model ?? lower?.model ?? "" };

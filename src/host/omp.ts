@@ -12,10 +12,12 @@
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, Context, Effort, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type { ClaudeCompleter } from "../claude/complete.ts";
 import { type ControlState, readControl, readSession, type SessionRecord, sessionPath } from "../claude/state.ts";
-import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
+import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
+import type { LegacyModelProvenance, UltrathinkConfig } from "../config.ts";
+import { DEFAULT_GROK_CONFIG } from "../grok/types.ts";
 import { shipNudge } from "../ship/nudge.ts";
 import { shipApplies } from "../ship/policy.ts";
 import { shipPrecheck } from "../ship/precheck.ts";
@@ -115,6 +117,9 @@ type LifecycleEvent =
 	| "tool_execution_start"
 	| "tool_execution_end";
 
+/** Omp's public ThinkingLevel shape, using the provider's effort type without loading the agent runtime. */
+type SessionThinkingLevel = Effort | "off" | "inherit";
+
 export interface ExtensionAPI {
 	on(
 		event: "before_agent_start",
@@ -131,6 +136,8 @@ export interface ExtensionAPI {
 	sendMessage(message: CustomMessage, options: { deliverAs: "aside" }): void;
 	/** Starts a turn when idle; the message runs through `before_agent_start` like typed input. */
 	sendUserMessage?(content: string): void;
+	/** Optional for older hosts; a native flight snapshots this session setting once (AD-5). */
+	getThinkingLevel?(): SessionThinkingLevel | undefined;
 	/** Omp matches `/name args` on the first space against registered names. */
 	registerCommand?(
 		name: string,
@@ -153,6 +160,8 @@ export interface OmpPlanRequest {
 	modelSource?: "ctx.model" | "ctx.models.current";
 	/** In-process host capabilities; absent means native planning is unavailable, never a fabricated fallback. */
 	native?: OmpNativeRuntime;
+	/** Captured session thinking level for every native stage; absent/inherit leaves provider options unset. */
+	thinkingLevel?: SessionThinkingLevel;
 	/** This flight's captured config, control and state directory, used as given. */
 	config?: UltrathinkConfig;
 	control?: ControlState;
@@ -326,6 +335,10 @@ function httpStatus(result: AssistantMessage): string {
  * is an `AbortError`.
  */
 export function createNativeEngineSelector(request: OmpPlanRequest, flightSignal: AbortSignal, deps: NativeEngineDeps = {}): NativeEngineSelector {
+	// Match Omp's toReasoningEffort/shouldDisableReasoning convention, once for this native binding.
+	const level = request.thinkingLevel;
+	const thinking: Pick<SimpleStreamOptions, "reasoning" | "disableReasoning"> =
+		level === "off" ? { disableReasoning: true } : level === undefined || level === "inherit" ? {} : { reasoning: level };
 	return async (intent, signal) => {
 		const runtime = request.native;
 		if (!runtime) throw nativeFailure("omp-native runtime unavailable");
@@ -360,7 +373,7 @@ export function createNativeEngineSelector(request: OmpPlanRequest, flightSignal
 				const context: Context = { systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] };
 				let result: AssistantMessage;
 				try {
-					result = await complete(snapshot, context, { apiKey, signal: lifetime, ...(sessionId ? { sessionId } : {}) });
+					result = await complete(snapshot, context, { apiKey, signal: lifetime, ...thinking, ...(sessionId ? { sessionId } : {}) });
 				} catch (error) {
 					// AbortSignal.timeout's TimeoutError is cancellation too; any other rejection stays a rejection with a safe message.
 					if (lifetime.aborted || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))) throw cancelled();
@@ -574,26 +587,65 @@ function trackQuery(models: OmpNativeRuntime["models"]): TrackedQuery {
 	};
 }
 
-/** What a reentry compares besides the live Model: the engine request and the native selectors, never skip-once or display state. */
+/** A legacy wire model and its config provenance, copied by value for private reentry comparison only. */
+interface LegacyFlightTarget {
+	model: string;
+	provenance: LegacyModelProvenance;
+}
+
+/** What a reentry compares besides the live Model: effective route/selector intent, not the whole config or display state. */
 interface FlightIntent {
 	engine: string;
 	source: "control" | "config";
 	override: { provider: string; model: string };
 	providerDefaults: [string, string][];
+	legacy?: LegacyFlightTarget;
+	grok?: {
+		enabled: boolean;
+		transport: UltrathinkConfig["grok"]["transport"];
+		/** Effective fetch target, normalized like the completer; private and never projected into resolution/display. */
+		endpoint?: string;
+		shuntModel?: string;
+		fallbackToClaude: boolean;
+		fallback?: LegacyFlightTarget;
+	};
 }
 
 function intentOf(config: UltrathinkConfig, control: ControlState): FlightIntent {
 	const override = config.models.hosts.omp;
+	const engine = control.engine ?? config.think.engine;
+	const grok = engine === "grok" ? config.grok : undefined;
+	const shuntModel = grok?.transport === "shunt" ? normalizeSelectorField(grok.shuntModel) : undefined;
+	const legacy =
+		engine !== "auto" && !override?.provider && !override?.model && (!grok || (grok.enabled && !shuntModel))
+			? { model: config[engine].model, provenance: config.modelProvenance[engine] }
+			: undefined;
 	return {
-		engine: control.engine ?? config.think.engine,
+		engine,
 		source: control.engine === undefined ? "config" : "control",
 		override: { provider: override?.provider ?? "", model: override?.model ?? "" },
 		providerDefaults: Object.entries(config.models.providerDefaults),
+		legacy,
+		...(grok ? {
+			grok: {
+				enabled: grok.enabled,
+				transport: grok.transport,
+				endpoint: grok.enabled && grok.transport !== "cli"
+					? (grok.transport === "shunt" ? grok.shuntBaseUrl.trim() : grok.baseUrl.trim() || DEFAULT_GROK_CONFIG.baseUrl).replace(/\/+$/, "")
+					: undefined,
+				shuntModel,
+				fallbackToClaude: grok.fallbackToClaude,
+				...(!grok.enabled || (grok.transport !== "shunt" && grok.fallbackToClaude)
+					? { fallback: { model: config.claude.model, provenance: config.modelProvenance.claude } }
+					: {}),
+			},
+		} : {}),
 	};
 }
 
 const SUPERSEDED = "superseded by a newer prompt";
 const MODEL_CHANGED = "superseded: the session model changed";
+const THINKING_CHANGED = "superseded: the session thinking level changed";
 const SESSION_ENDED = "cancelled: the session ended or switched";
 
 export function createOmpExtension(
@@ -642,6 +694,8 @@ export function createOmpExtension(
 			/** Private target identity: the live Model snapshot and the engine request, compared at reentry. */
 			live?: LiveTarget;
 			intent?: FlightIntent;
+			/** Native effort snapshot, compared only at reentry; stages never reread or adopt a new level. */
+			thinkingLevel?: SessionThinkingLevel;
 			/** The flight's view of `ctx.models`, for revalidating resolved selectors at reentry. */
 			selectors?: TrackedQuery;
 			/** The context the flight observes the live model through at call and delivery boundaries. */
@@ -734,12 +788,25 @@ export function createOmpExtension(
 			guard(() => flight.controller.abort());
 			if (!flight.settled) barWrite(flight.generation, () => store.skipped(note, now()));
 		};
-		/** Ownership plus the lazily read live model, at native call and delivery boundaries; a changed target cancels. */
+		/** Ownership plus the lazily read live model, at lifecycle, native call and delivery boundaries; a changed target cancels. */
 		const current = (flight: Flight): boolean => {
 			if (!owns(flight)) return false;
 			if (sameLive(flight.live, observeLive(flight.ctx))) return true;
 			cancel(flight, MODEL_CHANGED);
 			return false;
+		};
+		/** Observe the active session before a paused planner can resume into tracking or persistence. */
+		const observeFlights = (ctx: ExtensionContext): void => {
+			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			const cwd = ctx?.cwd || process.cwd();
+			for (const flight of flights.values()) {
+				if (flight.sessionId !== sessionId || flight.cwd !== cwd) {
+					cancel(flight, SESSION_ENDED);
+				} else {
+					flight.ctx = ctx;
+					current(flight);
+				}
+			}
 		};
 		const observe = (sessionId: string, record: unknown): void => {
 			const projected = projectResolution(record);
@@ -781,11 +848,15 @@ export function createOmpExtension(
 			guard(endFlights);
 		});
 		for (const event of ["agent_start", "agent_end", "turn_end", "tool_execution_start", "tool_execution_end"] as const) {
-			pi.on(event, scheduleMount);
+			pi.on(event, (_event, ctx) => {
+				guard(() => observeFlights(ctx));
+				scheduleMount();
+			});
 		}
 		pi.on("turn_start", (_event, ctx) => {
 			scheduleMount();
 			guard(() => {
+				observeFlights(ctx);
 				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
 				turns.set(sessionId, (turns.get(sessionId) ?? 0) + 1);
 			});
@@ -958,6 +1029,7 @@ export function createOmpExtension(
 				submission,
 				prompt: request.prompt,
 				...identity,
+				thinkingLevel: request.thinkingLevel,
 				ctx,
 				controller: new AbortController(),
 				result: outcome.promise,
@@ -974,14 +1046,15 @@ export function createOmpExtension(
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
 				guard(() => {
-					if (!owns(flight)) return;
+					if (flight.timedOut || flight.settled || !owns(flight)) return;
 					if ((event.type === "begin" || event.type === "end") && event.modelResolution) observe(flight.sessionId, event.modelResolution);
 					barWrite(generation, () => store.apply(event));
 					if (event.type === "end" && event.detail) flight.endDetail = event.detail;
 				});
-			// The outer limit cancels the flight; the inline race below never does.
+			// The deadline settles independently of provider cooperation; only the inline race keeps the flight running.
 			const timer = setTimeout(() => {
 				flight.timedOut = true;
+				finish({ context: "" });
 				guard(() => flight.controller.abort());
 			}, maxRunMs);
 			// Like the AbortSignal.timeout it replaces, the limit alone never keeps a process alive.
@@ -992,19 +1065,20 @@ export function createOmpExtension(
 			};
 			void flight.result.then((result) => settle(flight, result));
 			try {
-				plan({ ...request, isCurrent: () => current(flight) }, flight.controller.signal, onEvent).then(finish, () => finish({ context: "" }));
+				plan({ ...request, isCurrent: () => !flight.timedOut && !flight.settled && current(flight) }, flight.controller.signal, onEvent).then(finish, () => finish({ context: "" }));
 			} catch {
 				finish({ context: "" });
 			}
 			return flight;
 		};
 
-		/** A new flight on this prompt: one live Model snapshot, the captured config and control, and the host runtime. */
+		/** A new flight: one live Model and thinking-level snapshot, captured config/control, and the host runtime. */
 		const launch = (
 			ctx: ExtensionContext | undefined,
 			base: { prompt: string; cwd: string; sessionId: string; stateDir: string },
 			submission: number,
 			live: LiveTarget | undefined,
+			thinkingLevel: SessionThinkingLevel | undefined,
 			captured: { config?: UltrathinkConfig; control?: ControlState; intent?: FlightIntent },
 		): Flight => {
 			let snapshot: LiveTarget | undefined;
@@ -1019,6 +1093,7 @@ export function createOmpExtension(
 			const request: OmpPlanRequest = {
 				...base,
 				...(snapshot ? { model: snapshot.model, modelSource: snapshot.source } : {}),
+				...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
 				...(runtime && selectors ? { native: { models: selectors.models, modelRegistry: runtime.modelRegistry } } : {}),
 				...(captured.config ? { config: captured.config } : {}),
 				...(captured.control ? { control: captured.control } : {}),
@@ -1053,25 +1128,29 @@ export function createOmpExtension(
 				} catch {
 					// fail-open: the planner loads its own config and control
 				}
+				// Named legacy routes retain their own effort settings; only native planning inherits the session level.
+				const namedEngine = captured.intent && captured.intent.engine !== "auto";
+				const thinkingLevel = namedEngine ? undefined : pi.getThinkingLevel?.();
 				const live = observeLive(ctx);
 				const existing = flights.get(sessionId);
 				let same = existing?.submission === submission && existing.prompt === prompt && existing.cwd === cwd ? existing : undefined;
-				// Reuse only an unchanged target: the whole live Model, the engine request, the native selectors and what
-				// they resolve to now. Otherwise the old flight is cancelled and suppressed, and this prompt plans afresh.
+				// Reuse only an unchanged target: the whole live Model, session effort, effective route/provenance and
+				// native selector results. Otherwise the old flight is suppressed and this prompt plans afresh.
 				if (same) {
 					const runtime = nativeRuntime(ctx);
 					const unchanged =
 						sameLive(same.live, live) &&
+						same.thinkingLevel === thinkingLevel &&
 						sameData(same.intent, captured.intent) &&
 						(!same.selectors || (runtime !== undefined && !same.selectors.changed(runtime.models)));
 					if (!unchanged) {
-						cancel(same, MODEL_CHANGED);
+						cancel(same, same.thinkingLevel !== thinkingLevel ? THINKING_CHANGED : MODEL_CHANGED);
 						same = undefined;
 					}
 				}
 				if (same?.deferred) return same.settled ? undefined : { message: pendingMessage() };
 				if (same?.settled) return same.content ? { message: planMessage(same.content, same.view) } : undefined;
-				const flight = same ?? launch(ctx, { prompt, cwd, sessionId, stateDir: dir }, submission, live, captured);
+				const flight = same ?? launch(ctx, { prompt, cwd, sessionId, stateDir: dir }, submission, live, thinkingLevel, captured);
 				const timeout = Promise.withResolvers<null>();
 				const timer = setTimeout(() => timeout.resolve(null), raceMs);
 				let result: OmpPlan | null;
@@ -1087,7 +1166,7 @@ export function createOmpExtension(
 					barWrite(flight.generation, () => store.pending());
 					return { message: pendingMessage() };
 				}
-				if (!result.context) return;
+				if (!result.context) return flight.timedOut ? { message: planMessage(NO_PLAN) } : undefined;
 				barWrite(flight.generation, () => store.delivered("inline", result.view, now()));
 				return { message: planMessage(result.context, result.view) };
 			} catch {

@@ -9,6 +9,8 @@
  * `CLAUDE_*` aliases, so the Grok markers win when both are present. Muse gives
  * every tool child `MUSE_TOOL_USE_ID` and its plugin processes `MUSE_PLUGIN_ID`
  * (next to `CLAUDE_PLUGIN_ROOT`), so `bin/ultrathink` run from Muse's shell is Muse.
+ * Prime Agent's kernel and its `bash()` children carry `PRIME_AGENT_CODING_AGENT_DIR`
+ * and `RLM_SESSION_DIR`; neither reaches another host's hook process.
  */
 import { isHostId, type HostId } from "./types.ts";
 
@@ -19,5 +21,6 @@ export function detectHost(env: Record<string, string | undefined> = process.env
 		return "grok-build";
 	}
 	if (env.MUSE_TOOL_USE_ID?.trim() || env.MUSE_PLUGIN_ID?.trim()) return "muse";
+	if (env.PRIME_AGENT_CODING_AGENT_DIR?.trim() || env.RLM_SESSION_DIR?.trim()) return "prime-agent";
 	return "claude-code";
 }

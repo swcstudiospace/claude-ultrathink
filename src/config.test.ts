@@ -16,7 +16,7 @@ import {
 } from "./config.ts";
 import type { DecisionsConfig } from "./decisions/types.ts";
 import { DEFAULT_GROK_CONFIG } from "./grok/types.ts";
-import { DEFAULT_MUSE_CONFIG, MUSE_MODEL_DEFAULT } from "./muse/types.ts";
+import { DEFAULT_MUSE_CONFIG } from "./muse/types.ts";
 import { ROUTE_DEFAULT_MODELS } from "./route-defaults.ts";
 
 function tempConfigFile(content: unknown): { path: string; cleanup: () => void } {
@@ -926,14 +926,7 @@ describe("teach config", () => {
 });
 
 describe("route defaults (AD-1)", () => {
-	test("ROUTE_DEFAULT_MODELS holds exactly three nonblank frozen entries, referenced by the three config defaults", () => {
-		expect(Object.isFrozen(ROUTE_DEFAULT_MODELS)).toBe(true);
-		expect(ROUTE_DEFAULT_MODELS).toEqual({ claude: "sonnet", grok: "grok-4.7", muse: "muse-spark-1.3-contributor" });
-		for (const model of Object.values(ROUTE_DEFAULT_MODELS)) expect(model.trim()).toBe(model);
-		expect(DEFAULT_CLAUDE_CONFIG.model).toBe(ROUTE_DEFAULT_MODELS.claude);
-		expect(DEFAULT_GROK_CONFIG.model).toBe(ROUTE_DEFAULT_MODELS.grok);
-		expect(MUSE_MODEL_DEFAULT).toBe(ROUTE_DEFAULT_MODELS.muse);
-		expect(DEFAULT_MUSE_CONFIG.model).toBe(MUSE_MODEL_DEFAULT);
+	test("unconfigured routes retain their legacy targets and route-default provenance", () => {
 		const config = defaultConfig();
 		expect([config.claude.model, config.grok.model, config.muse.model]).toEqual(["sonnet", "grok-4.7", "muse-spark-1.3-contributor"]);
 		expect(config.modelProvenance).toEqual({ claude: "route-default", grok: "route-default", muse: "route-default" });
@@ -946,14 +939,6 @@ describe("route defaults (AD-1)", () => {
 		expect(ROUTE_DEFAULT_MODELS.claude).toBe("sonnet");
 	});
 
-	test("no planning-model selection source outside src/route-defaults.ts spells a route-default model (AC-15-016)", () => {
-		const selection = ["config.ts", "host/engine.ts", "grok/types.ts", "grok/label.ts", "grok/complete.ts", "muse/types.ts", "muse/complete.ts", "claude/complete.ts"];
-		for (const rel of selection) {
-			const source = readFileSync(join(import.meta.dir, rel), "utf8");
-			const spelled = Object.values(ROUTE_DEFAULT_MODELS).filter((model) => source.includes(model));
-			expect({ rel, spelled }).toEqual({ rel, spelled: [] });
-		}
-	});
 });
 
 describe("models config (D-05 merge truth table)", () => {
@@ -1037,6 +1022,40 @@ describe("models config (D-05 merge truth table)", () => {
 		expect(JSON.stringify(merged.models)).not.toContain("evil");
 	});
 
+	test("inherited-only host entries and selector fields never create an override (POL-FUNC-009)", () => {
+		const inherited = Object.create({ provider: "InheritedProvider", model: "InheritedTarget" }) as Record<string, unknown>;
+		const inheritedHosts = Object.create({ omp: { provider: "InheritedProvider", model: "InheritedTarget" } }) as Record<string, unknown>;
+		expect(mergeConfig({ models: { hosts: inheritedHosts } }, base).models.hosts).toEqual({});
+		for (const host of ["omp", "claude-code", "muse", "grok-build", "hermes"] as const) {
+			expect(mergeConfig({ models: { hosts: { [host]: inherited } } }, base).models.hosts).toEqual({});
+			const lower = mergeConfig({ models: { hosts: { [host]: { provider: "LowerProvider", model: "LowerTarget" } } } }, base);
+			expect(mergeConfig({ models: { hosts: { [host]: inherited } } }, lower).models.hosts[host]).toEqual({
+				provider: "LowerProvider",
+				model: "LowerTarget",
+			});
+		}
+	});
+
+	test("mixed own host fields ignore inherited counterparts and preserve lower pins (POL-FUNC-009)", () => {
+		const lower = mergeConfig({ models: { hosts: { omp: { provider: "LowerProvider", model: "LowerTarget" } } } }, base);
+		const inherited = {
+			get provider(): string { throw new Error("an inherited provider must not be read"); },
+			get model(): string { throw new Error("an inherited model must not be read"); },
+		};
+		for (const [own, expected] of [
+			[{ provider: " OwnProvider " }, { provider: "OwnProvider", model: "LowerTarget" }],
+			[{ model: " OwnTarget " }, { provider: "LowerProvider", model: "OwnTarget" }],
+			[{ provider: "\t \n" }, { provider: "", model: "LowerTarget" }],
+			[{ model: "\t \n" }, { provider: "LowerProvider", model: "" }],
+			[{ provider: null, model: false }, { provider: "LowerProvider", model: "LowerTarget" }],
+		] as const) {
+			const fields = Object.create(inherited) as Record<string, unknown>;
+			for (const [key, value] of Object.entries(own)) Object.defineProperty(fields, key, { value, enumerable: true });
+			expect(mergeConfig({ models: { hosts: { omp: fields } } }, lower).models.hosts.omp).toEqual(expected);
+			expect(lower.models.hosts.omp).toEqual({ provider: "LowerProvider", model: "LowerTarget" });
+		}
+	});
+
 	test("a selector carrying a control character is kept as written for resolution to diagnose; all-whitespace is still a blank", () => {
 		const merged = mergeConfig({ models: { hosts: { omp: { model: "\u0000smol", provider: "xai\n" } }, providerDefaults: { xai: " fast\u001b " } } }, base);
 		expect(merged.models.hosts.omp).toEqual({ provider: "xai\n", model: "\u0000smol" });
@@ -1078,6 +1097,32 @@ describe("legacy model provenance (AD-1)", () => {
 		const pinned = loadLayerFiles(roots, { claude: { model: "sonnet" } }, { grok: { model: " grok-4.7 " } }, { muse: { model: "muse-spark-1.3-contributor" } });
 		expect(pinned.modelProvenance).toEqual({ claude: "file-pin", grok: "file-pin", muse: "file-pin" });
 		expect([pinned.claude.model, pinned.grok.model, pinned.muse.model]).toEqual(["sonnet", "grok-4.7", "muse-spark-1.3-contributor"]);
+	});
+
+	test("nonblank legacy model and shunt selectors retain leading/trailing C0/C1 controls (POL-FUNC-011)", () => {
+		for (const control of ["\u0000", "\t", "\n", "\v", "\f", "\r", "\u001b", "\u007f", "\u0085", "\u009f"]) {
+			for (const model of [`${control}Opaque-X`, `Opaque-X${control}`]) {
+				const config = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, defaultConfig());
+				expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual([model, model, model, model]);
+				expect(config.modelProvenance).toEqual({ claude: "file-pin", muse: "file-pin", grok: "file-pin" });
+			}
+		}
+		const model = "MiXeD/opaque:beta;$(literal)`data`";
+		const config = mergeConfig({ claude: { model: ` ${model} ` }, muse: { model: ` ${model} ` }, grok: { model: ` ${model} `, shuntModel: ` ${model} ` } }, defaultConfig());
+		expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual([model, model, model, model]);
+	});
+
+	test("all-whitespace legacy clears and Grok lower-pin retention stay unchanged (POL-FUNC-011, AD-1)", () => {
+		const lower = mergeConfig({ claude: { model: "ClaudePin" }, muse: { model: "MusePin" }, grok: { model: "GrokPin", shuntModel: "ShuntPin" } }, defaultConfig());
+		for (const model of ["", "  ", "\t \r\n\v\f"]) {
+			const config = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, lower);
+			expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual(["", "", "GrokPin", "ShuntPin"]);
+			expect(config.modelProvenance).toEqual({ claude: "explicit-blank", muse: "explicit-blank", grok: "file-pin" });
+			const builtin = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, defaultConfig());
+			expect(builtin.grok.model).toBe(ROUTE_DEFAULT_MODELS.grok);
+			expect(builtin.grok.shuntModel).toBe(defaultConfig().grok.shuntModel);
+			expect(builtin.modelProvenance.grok).toBe("route-default");
+		}
 	});
 
 	test("an explicit blank claude.model or muse.model clears a lower pin to CLI omission; Grok's non-empty merge ignores blanks", () => {

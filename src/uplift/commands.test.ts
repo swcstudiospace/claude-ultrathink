@@ -342,6 +342,72 @@ describe("runControl", () => {
 			expect(lines.some((line) => line.startsWith("Last planned resolution:"))).toBe(false);
 		});
 
+		test.each([
+			["claude-code", "claude"],
+			["muse", "muse"],
+			["grok-build", "grok"],
+			["hermes", "claude"],
+		] as const)("%s static status projects host overrides and engine pins across the whole response", async (host, route) => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			const selectors = [
+				[`https://model.invalid/path?token=${sentinel}`, false],
+				[`sk-${sentinel}_0123456789abcdef`, false],
+				[`user:${sentinel}@model.invalid`, false],
+				[`<model>${sentinel}</model>`, false],
+				[`${sentinel}${"x".repeat(600)}`, false],
+				[`${sentinel}\u001b[31m\nmodel`, true],
+			] as const;
+			for (const [model, invalid] of selectors) {
+				for (const source of ["host-override", "engine-model", ...(route === "grok" ? ["shunt-model"] : [])]) {
+					const grok = { home: join(dir, "grok"), transport: "shunt", shuntBaseUrl: "http://gateway.example" };
+					const extra: Record<string, unknown> = { grok };
+					if (source === "host-override") extra.models = { hosts: { [host]: { model } } };
+					else if (source === "shunt-model") extra.grok = { ...grok, shuntModel: model };
+					else extra[route] = route === "grok" ? { ...grok, model } : { model };
+					projectConfig(extra);
+					for (const args of [["status"], ["grok", "status"]]) {
+						const text = await runControl(args, { ...io, host });
+						expect(text).not.toContain(sentinel);
+						expect(text).not.toContain("model.invalid");
+						expect(text).not.toContain("\u001b");
+						expect(text).not.toContain("</model>");
+						const engine = text.split("\n").find((line) => line.startsWith("Engine:"));
+						expect(engine).toContain(invalid ? "unresolved [selector-invalid]" : "<opaque-model>");
+						expect(engine!.length).toBeLessThanOrEqual(500);
+						if (host === "hermes") expect(engine).toEndWith("(follows session model)");
+					}
+				}
+			}
+		});
+
+		test("Grok HTTP and CLI status never repeat unsafe configured models in the transport line", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			for (const transport of ["http", "cli"]) {
+				projectConfig({ grok: { home: join(dir, "grok"), transport, model: `https://model.invalid/path?token=${sentinel}` } });
+				for (const args of [["status"], ["grok", "status"]]) {
+					const text = await runControl(args, { ...io, host: "grok-build" });
+					expect(text).not.toContain(sentinel);
+					expect(text).not.toContain("model.invalid");
+					expect(text).toContain("Engine: <opaque-model>@xhigh");
+					expect(text).toContain(`Grok: <opaque-model> @ xhigh · transport ${transport}`);
+				}
+			}
+		});
+
+		test("disabled Grok status projects Claude's fallback model without adopting the host selector", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			projectConfig({
+				grok: { home: join(dir, "grok"), enabled: false },
+				claude: { model: `https://model.invalid/path?token=${sentinel}` },
+				models: { hosts: { "grok-build": { model: `ignored-${sentinel}` } } },
+			});
+			for (const args of [["status"], ["grok", "status"]]) {
+				const text = await runControl(args, { ...io, host: "grok-build" });
+				expect(text).toContain("Engine: claude:<opaque-model>");
+				expect(text).not.toContain(sentinel);
+			}
+		});
+
 		test("standalone Omp status says the live model is not observed, never a guessed follows-session-model Claude line", async () => {
 			const lines = await statusLines({ host: "omp" });
 			expect(lines).toContain("Engine: omp-native:auto (live model not observed)");
@@ -385,6 +451,32 @@ describe("runControl", () => {
 			expect(text).toContain("Last planned resolution: <opaque-model> · reason live-model · engine auto (config)");
 			expect(text).not.toContain(sentinel);
 			expect(text).not.toContain("gateway.example");
+		});
+
+		test("unsafe live and saved labels are opaque throughout both status commands", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			for (const label of [
+				`user:${sentinel}@model.invalid`,
+				`omp-native:user:${sentinel}@model.invalid/model [detected]`,
+				`omp-native:/private/${sentinel} [detected]`,
+				`omp-native:https://model.invalid/path?token=${sentinel} [detected]`,
+				`omp-native:Bearer ${sentinel} [detected]`,
+				`omp-native:<model>${sentinel}</model> [detected]`,
+				`omp-native:${sentinel}\nmodel [detected]`,
+				`omp-native:${sentinel}\tmodel [detected]`,
+				`omp-native:${sentinel}\u001b[31m\nmodel [detected]`,
+			]) {
+				const modelResolution = { ...detected, label };
+				savePlan(modelResolution);
+				for (const args of [["status"], ["grok", "status"]]) {
+					const text = await runControl(args, { ...io, host: "omp", modelResolution });
+					expect(text).toContain("Engine: <opaque-model>");
+					expect(text).not.toContain(sentinel);
+					expect(text).not.toContain("model.invalid");
+					expect(text).not.toContain("\u001b");
+					if (args[0] === "status") expect(text).toContain("Last planned resolution: <opaque-model>");
+				}
+			}
 		});
 
 		test("the six commands keep their names (COMPAT-02)", () => {

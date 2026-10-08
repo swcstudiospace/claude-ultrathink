@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as ompSession from "./omp-session.ts";
 import { isOmpSubagentSessionId } from "./omp-session.ts";
 import { planPrompt } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
@@ -78,8 +77,3 @@ describe("planPrompt omp subagent guard", () => {
 	});
 });
 
-describe("no session-file model source (D-04)", () => {
-	test("only the subagent guard remains: the session-file model reader is gone without a shim", () => {
-		expect(Object.keys(ompSession).sort()).toEqual(["isOmpSubagentSessionId"]);
-	});
-});

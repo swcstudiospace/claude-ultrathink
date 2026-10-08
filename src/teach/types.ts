@@ -294,7 +294,7 @@ export interface ObserveOutcome {
 	ms: number;
 }
 
-export type SkillTarget = "hermes" | "omp" | "claude" | "drafts";
+export type SkillTarget = "hermes" | "omp" | "claude" | "prime-agent" | "drafts";
 
 export interface SkillDraft {
 	/** Lowercase `[a-z0-9][a-z0-9-]{0,63}`. */

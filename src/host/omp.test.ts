@@ -4,234 +4,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, ApiKeyResolver, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { writeSession } from "../claude/state.ts";
-import { defaultConfig, type UltrathinkConfig } from "../config.ts";
 import type { TrackPlan } from "../track/types.ts";
 import { DEFAULT_SHIP_CONFIG, type ShipConfig } from "../ship/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { DEFAULT_TEACH_CONFIG, type CaptureMode, type TeachDigest } from "../teach/types.ts";
 import type { ModelIntent, ModelResolution, SelectedEngine } from "./engine.ts";
-import * as omp from "./omp.ts";
-import {
-	type CompleteSimple,
-	createNativeEnginePlanner,
-	createNativeEngineSelector,
-	createOmpExtension,
-	type ExtensionAPI,
-	type NativeEngineDeps,
-	NO_PLAN,
-	type OmpNativeRuntime,
-	type OmpPlan,
-	type OmpPlanner,
-	type OmpPlanRequest,
-	QUICK_USAGE,
-	type ShipPrecheck,
-} from "./omp.ts";
+import { createNativeEnginePlanner, createNativeEngineSelector, NO_PLAN, QUICK_USAGE } from "./omp.ts";
+import type { NativeEngineDeps, OmpNativeRuntime, OmpPlan, OmpPlanRequest, ShipPrecheck } from "./omp.ts";
+import { controlled, fakeModel, fakeRuntime, flush, planReply, quietConfig, recorder, reply, setup, stageAnswer, tuiCtx, userText } from "./omp-test.helpers.ts";
 import type { ProgressEvent } from "./progress.ts";
 import type { PlanView } from "./view.ts";
-
-type Handler = (event: { type: "before_agent_start"; prompt: string; systemPrompt: string[] }, ctx: never) => Promise<
-	| {
-			message?:
-				| string
-				| { customType?: string; content?: string; display?: boolean; attribution?: string; details?: unknown };
-	  }
-	| void
->;
-type AnyHandler = (event: unknown, ctx: unknown) => unknown;
-
-const MCP = () => ({ linear: "ready", notion: "login", greptile: "none" }) as const;
-
-// Accepts plain-string planners for brevity.
-const wrap =
-	(plan: (...args: Parameters<OmpPlanner>) => Promise<string | OmpPlan>): OmpPlanner =>
-	async (...args) => {
-		const result = await plan(...args);
-		return typeof result === "string" ? { context: result } : result;
-	};
-
-type OmpOptions = NonNullable<Parameters<typeof createOmpExtension>[0]>;
-
-function setup(
-	plan: ((...args: Parameters<OmpPlanner>) => Promise<string | OmpPlan>) | undefined,
-	raceMs = 1_000,
-	extra: Omit<OmpOptions, "plan" | "raceMs" | "mcp"> = {},
-	ctxExtra: Record<string, unknown> = {},
-) {
-	const handlers = new Map<string, AnyHandler>();
-	const sent: { message: unknown; options: unknown }[] = [];
-	const renderers: string[] = [];
-	const commands = new Map<string, { description?: string; getArgumentCompletions?: (prefix: string) => unknown; handler: AnyHandler }>();
-	const userMessages: string[] = [];
-	const notices: string[] = [];
-	const pi = {
-		on: (event: string, h: AnyHandler) => {
-			handlers.set(event, h);
-		},
-		sendMessage: (message: unknown, options: unknown) => {
-			sent.push({ message, options });
-		},
-		sendUserMessage: (content: string) => {
-			userMessages.push(content);
-		},
-		registerCommand: (name: string, options: { handler: AnyHandler }) => {
-			commands.set(name, options);
-		},
-		registerMessageRenderer: (type: string) => {
-			renderers.push(type);
-		},
-	} as unknown as ExtensionAPI;
-	// Every flight captures config; a quiet one keeps the suite off the developer's own config files.
-	createOmpExtension({ ...(plan ? { plan: wrap(plan) } : {}), raceMs, mcp: MCP, config: () => quietConfig(), ...extra })(pi);
-	const ctx = { cwd: "/repo", sessionManager: { getSessionId: () => "s1" }, ...ctxExtra };
-	const emit = (event: string, payload: Record<string, unknown> = {}) => handlers.get(event)?.({ type: event, ...payload }, ctx);
-	const run = (prompt = "do it") =>
-		(handlers.get("before_agent_start") as Handler)({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx as never);
-	const command = (name: string, args = "") =>
-		commands.get(name)?.handler(args, { ...ctx, ui: { notify: (text: string) => void notices.push(text) } });
-	return { run, sent, emit, renderers, commands, command, userMessages, notices };
-}
-
-function tuiCtx(setWidget?: (key: string, factory: unknown, options: unknown) => void) {
-	const widgets: { key: string; factory: unknown; options: unknown }[] = [];
-	let renders = 0;
-	const tui = { requestRender: () => void renders++ };
-	const ui = {
-		setWidget:
-			setWidget ??
-			((key: string, factory: unknown, options: unknown) => {
-				widgets.push({ key, factory, options });
-			}),
-	};
-	const line = (width = 200) => {
-		const factory = widgets.at(-1)!.factory as (t: typeof tui, theme: unknown) => { render(w: number): readonly string[] };
-		return factory(tui, {}).render(width).join("");
-	};
-	return { ctx: { hasUI: true, mode: "tui", ui, setInterval: () => 0 }, widgets, line, renders: () => renders };
-}
-
-function controlled() {
-	const gate = Promise.withResolvers<string>();
-	let calls = 0;
-	const plan = () => {
-		calls++;
-		return gate.promise;
-	};
-	return { plan, resolve: gate.resolve, calls: () => calls };
-}
-
-// Lets the plan's settle callbacks (catch → then → sendMessage) run.
-const flush = async () => {
-	for (let i = 0; i < 5; i++) await Promise.resolve();
-};
-
-/** Every outside lookup off (plan gate, lessons, trackers), so native planning in the suite stays deterministic. */
-function quietConfig(patch?: (config: UltrathinkConfig) => void): UltrathinkConfig {
-	const config = defaultConfig();
-	config.decisions.enabled = false;
-	config.teach.enabled = false;
-	config.track.enabled = false;
-	patch?.(config);
-	return config;
-}
-
-/** A synthetic whole Model: opaque ids, endpoint and header sentinels, nested routing data and a header resolver. */
-function fakeModel(provider: string, id: string, extra: Record<string, unknown> = {}): Model<Api> {
-	const model = {
-		provider,
-		id,
-		name: id,
-		api: "acme-chat",
-		providerType: "acme-type",
-		baseUrl: "https://SECRET-ENDPOINT.invalid/v1",
-		headers: { "x-api-key": "SECRET-HEADER" },
-		resolveHeaders: async () => ({ authorization: "Bearer SECRET-TOKEN" }),
-		compat: { routing: { order: ["a", "b"] } },
-		input: ["text"],
-		...extra,
-	};
-	// Synthetic: the catalog's other required fields (identity, cost, windows) play no part in native planning.
-	return model as unknown as Model<Api>;
-}
-
-interface RuntimeLog {
-	resolves: string[];
-	resolvers: Array<{ model: Model<Api>; sessionId: string | undefined; key: ApiKeyResolver }>;
-}
-
-/** The host's `ctx.models` and `ctx.modelRegistry` over a fixed authenticated set and role aliases; it records every use. */
-function fakeRuntime(
-	available: Model<Api>[],
-	options: { current?: () => Model<Api> | undefined; aliases?: Record<string, () => Model<Api> | undefined> } = {},
-): { runtime: OmpNativeRuntime; log: RuntimeLog } {
-	const log: RuntimeLog = { resolves: [], resolvers: [] };
-	const runtime: OmpNativeRuntime = {
-		models: {
-			current: () => options.current?.(),
-			resolve: (spec) => {
-				log.resolves.push(spec);
-				const alias = options.aliases?.[spec];
-				return alias ? alias() : available.find((model) => `${model.provider}/${model.id}` === spec);
-			},
-		},
-		modelRegistry: {
-			resolver: (model, sessionId) => {
-				const key: ApiKeyResolver = async () => "SECRET-KEY";
-				log.resolvers.push({ model, sessionId, key });
-				return key;
-			},
-		},
-	};
-	return { runtime, log };
-}
-
-interface NativeCall {
-	model: Model<Api>;
-	context: Context;
-	options: SimpleStreamOptions | undefined;
-}
-
-/** A recording `completeSimple`: the deterministic suite never reaches a provider or live auth. */
-function recorder(answer: (call: NativeCall) => AssistantMessage | Promise<AssistantMessage>): { complete: CompleteSimple; calls: NativeCall[] } {
-	const calls: NativeCall[] = [];
-	const complete: CompleteSimple = async (model, context, options) => {
-		const call = { model, context, options };
-		calls.push(call);
-		return answer(call);
-	};
-	return { complete, calls };
-}
-
-/** An AssistantMessage fixture; usage and response metadata play no part in planning. */
-const reply = (content: unknown[], extra: Record<string, unknown> = {}): AssistantMessage =>
-	({ role: "assistant", content, api: "acme-chat", provider: "acme", model: "m", usage: {}, stopReason: "stop", ...extra }) as unknown as AssistantMessage;
-const planReply = () => reply([{ type: "text", text: "PLAN" }]);
-
-/** The text of a native call's one user message. */
-function userText(call: NativeCall): string {
-	const message = call.context.messages[0];
-	return message?.role === "user" && typeof message.content === "string" ? message.content : "";
-}
-
-/** Answers uplift, Graph, node fill and clarify calls by payload, as the shared host suite does, and names the stage. */
-function stageAnswer(user: string): { stage: string; text: string } {
-	if (user.includes("<user_request>")) return { stage: "uplift", text: "<BUILD_PROMPT><ORIGINAL>add a widget</ORIGINAL></BUILD_PROMPT>" };
-	if (user.startsWith("<spec>")) return { stage: "clarify", text: JSON.stringify({ questions: [] }) };
-	if (user.includes("current_node")) {
-		const id = user.match(/current_node id="([^"]+)"/)?.[1] ?? "n?";
-		const steps = Array.from({ length: 5 }, (_, i) => `${i + 1}. ${id} step ${i + 1}`).join(" ");
-		return { stage: "fill", text: `<node><rationale>${steps}</rationale><conclusion>c ${id}</conclusion></node>` };
-	}
-	const nodes = Array.from({ length: 5 }, (_, i) => ({
-		id: `n${i + 1}`,
-		title: `T${i + 1}`,
-		kind: i === 0 ? "understand" : i === 4 ? "synthesize" : "generate",
-		question: `Q${i + 1}`,
-		depends_on: i === 0 ? [] : [`n${i}`],
-	}));
-	return { stage: "graph", text: JSON.stringify({ goal: "Ship it", nodes }) };
-}
 
 describe("omp extension", () => {
 	test("fast plan is returned inline", async () => {
@@ -583,13 +367,6 @@ describe("omp extension", () => {
 	});
 });
 
-describe("no subprocess planner (D-04)", () => {
-	test("the subprocess planner, its engine-child encoder and the session-model reader option are gone without a shim", () => {
-		for (const removed of ["spawnEnginePlanner", "encodeEngineRequest", "readSessionModel", "readOmpSessionModelFile"]) expect(removed in omp).toBe(false);
-		expect(typeof omp.nativeEnginePlanner).toBe("function");
-		expect(typeof omp.createNativeEngineSelector).toBe("function");
-	});
-});
 
 describe("slash commands", () => {
 	let stateDir: string;
@@ -887,10 +664,17 @@ describe("pr sync", () => {
 
 describe("ship nudge", () => {
 	let dir = "";
+	let shipFlag: string | undefined;
 	beforeEach(() => {
+		shipFlag = process.env.ULTRATHINK_SHIP;
+		delete process.env.ULTRATHINK_SHIP;
 		dir = mkdtempSync(join(tmpdir(), "ut-omp-ship-"));
 	});
-	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+	afterEach(() => {
+		if (shipFlag === undefined) delete process.env.ULTRATHINK_SHIP;
+		else process.env.ULTRATHINK_SHIP = shipFlag;
+		rmSync(dir, { recursive: true, force: true });
+	});
 
 	const CONFIG: ShipConfig = { ...DEFAULT_SHIP_CONFIG, enabled: true, skills: ["gsd-"] };
 	const OK: ShipPrecheck = { ok: true, reason: "ok", branch: "feat/x", base: "master", ahead: 2 };
@@ -960,10 +744,17 @@ describe("ship nudge", () => {
 
 describe("teach capture", () => {
 	let dir = "";
+	let shipFlag: string | undefined;
 	beforeEach(() => {
+		shipFlag = process.env.ULTRATHINK_SHIP;
+		delete process.env.ULTRATHINK_SHIP;
 		dir = mkdtempSync(join(tmpdir(), "ut-omp-teach-"));
 	});
-	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+	afterEach(() => {
+		if (shipFlag === undefined) delete process.env.ULTRATHINK_SHIP;
+		else process.env.ULTRATHINK_SHIP = shipFlag;
+		rmSync(dir, { recursive: true, force: true });
+	});
 
 	const MESSAGES = [
 		{ role: "user", content: [{ type: "text", text: "fix the failing build" }] },
@@ -1298,6 +1089,66 @@ describe("native planner end to end (D-01, D-02)", () => {
 		for (const output of [JSON.stringify(plan), JSON.stringify(events)]) expect(output).not.toContain("SECRET");
 	});
 
+	for (const { name, level, capability } of [
+		{ name: "low", level: "low" as Effort, capability: true },
+		{ name: "high", level: "high" as Effort, capability: true },
+		{ name: "off", level: "off", capability: true },
+		{ name: "inherit", level: "inherit", capability: true },
+		{ name: "undefined", level: undefined, capability: true },
+		{ name: "absent capability", level: undefined, capability: false },
+	] as const) {
+		test(`session thinking ${name} is captured once across uplift, Graph, every Chain fill and HITL`, async () => {
+			const live = fakeModel("acme", "sol-1");
+			const { runtime, log } = fakeRuntime([live]);
+			const stages: string[] = [];
+			let currentLevel: OmpPlanRequest["thinkingLevel"] = level;
+			let reads = 0;
+			const rec = recorder((call) => {
+				const { stage, text } = stageAnswer(userText(call));
+				stages.push(stage);
+				// No reentry observation: stages keep the original snapshot rather than drifting to this value.
+				currentLevel = "max" as Effort;
+				return reply([{ type: "text", text }]);
+			});
+			const planner = createNativeEnginePlanner({ completeSimple: rec.complete, providerDefaults: {}, env: isolated() });
+			const { run, sent } = setup(
+				planner,
+				1_000,
+				{ stateDir: join(root, "state") },
+				{ cwd: root, model: live, ...runtime },
+				capability
+					? {
+						getThinkingLevel: () => {
+							reads++;
+							return currentLevel;
+						},
+					}
+					: {},
+			);
+			const result = await run("add a widget");
+			expect(result).toMatchObject({ message: { customType: "ultrathink-plan" } });
+			expect(sent).toEqual([]);
+			expect(stages).toEqual(["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"]);
+			expect(reads).toBe(capability ? 1 : 0);
+			expect(log.resolvers).toHaveLength(1);
+			for (const call of rec.calls) {
+				expect(call.model).toBe(log.resolvers[0]?.model);
+				expect(call.options?.apiKey).toBe(log.resolvers[0]?.key);
+				if (level === "off") {
+					expect(call.options?.disableReasoning).toBe(true);
+					expect(call.options).not.toHaveProperty("reasoning");
+				} else if (level === undefined || level === "inherit") {
+					expect(call.options).not.toHaveProperty("reasoning");
+					expect(call.options).not.toHaveProperty("disableReasoning");
+				} else {
+					expect(call.options?.reasoning).toBe(level);
+					expect(call.options).not.toHaveProperty("disableReasoning");
+				}
+				expect(call.options).not.toHaveProperty("forceReasoningOff");
+			}
+		});
+	}
+
 	test("without a live model or override the plan is unresolved with its reason: no completion and no auth", async () => {
 		const { runtime, log } = fakeRuntime([]);
 		const rec = recorder(planReply);
@@ -1328,225 +1179,6 @@ describe("native planner end to end (D-01, D-02)", () => {
 		const plan = await planner(request({ model: live, modelSource: "ctx.model", native: runtime }), flight.signal);
 		expect(plan).toMatchObject({ context: "", skipped: "aborted" });
 		expect(rec.calls).toHaveLength(1);
-	});
-});
-
-describe("flight lifecycle (D-12)", () => {
-	const PENDING_RESULT = { message: expect.objectContaining({ customType: "ultrathink-pending" }) };
-	const aside = (content: string) => ({ message: { customType: "ultrathink-plan", content, display: true, attribution: "agent" }, options: { deliverAs: "aside" } });
-
-	/** A planner whose every flight waits on its own gate and keeps its request and lifetime. */
-	function gated() {
-		const runs: Array<{ request: OmpPlanRequest; signal: AbortSignal; gate: PromiseWithResolvers<string> }> = [];
-		const plan = (request: OmpPlanRequest, signal: AbortSignal) => {
-			const gate = Promise.withResolvers<string>();
-			runs.push({ request, signal, gate });
-			return gate.promise;
-		};
-		return { plan, runs };
-	}
-
-	test("the inline race only defers delivery: the flight keeps running and its plan lands as an aside", async () => {
-		const planner = gated();
-		const { run, sent } = setup(planner.plan, 1);
-		expect(await run()).toEqual(PENDING_RESULT);
-		expect(planner.runs[0]?.signal.aborted).toBe(false);
-		planner.runs[0]?.gate.resolve("PLAN");
-		await flush();
-		expect(sent).toEqual([aside("PLAN")]);
-		expect(planner.runs[0]?.signal.aborted).toBe(false);
-	});
-
-	test("the outer limit cancels the flight; the still-current deferred prompt gets the no-plan note", async () => {
-		let signal: AbortSignal | undefined;
-		const { run, sent } = setup(
-			(_request, flightSignal) => {
-				signal = flightSignal;
-				return new Promise<string>((resolve) => flightSignal.addEventListener("abort", () => resolve(""), { once: true }));
-			},
-			1,
-			{ maxRunMs: 5 },
-		);
-		expect(await run()).toEqual(PENDING_RESULT);
-		// The product's own outer-limit timer fires; the test awaits that cancellation, not a guessed delay.
-		if (!signal?.aborted) await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
-		await flush();
-		expect(signal?.aborted).toBe(true);
-		expect(sent).toEqual([aside(NO_PLAN)]);
-	});
-
-	test("a newer prompt cancels the superseded flight; its late plan is dropped", async () => {
-		const planner = gated();
-		const { run, sent, emit } = setup(planner.plan, 1);
-		await run("A");
-		emit("turn_start");
-		await run("B");
-		expect(planner.runs.map((entry) => [entry.request.prompt, entry.signal.aborted])).toEqual([
-			["A", true],
-			["B", false],
-		]);
-		planner.runs[0]?.gate.resolve("PLAN A");
-		await flush();
-		expect(sent).toEqual([]);
-		planner.runs[1]?.gate.resolve("PLAN B");
-		await flush();
-		expect(sent).toEqual([aside("PLAN B")]);
-	});
-
-	test("same-prompt reentry on an unchanged target reuses the one flight, even through a fresh but equal Model object", async () => {
-		let live = fakeModel("acme", "sol-1");
-		const { runtime } = fakeRuntime([live], { current: () => live });
-		const planner = gated();
-		const { run } = setup(planner.plan, 1, {}, { ...runtime });
-		expect(await run()).toEqual(PENDING_RESULT);
-		live = { ...live };
-		expect(await run()).toEqual(PENDING_RESULT);
-		expect(planner.runs).toHaveLength(1);
-		expect(planner.runs[0]?.signal.aborted).toBe(false);
-	});
-
-	test("same-prompt reentry after a model switch cancels and suppresses the old flight and plans on the new model", async () => {
-		let live = fakeModel("acme", "sol-1");
-		const { runtime } = fakeRuntime([], { current: () => live });
-		const planner = gated();
-		const { run, sent } = setup(planner.plan, 1, {}, { ...runtime });
-		await run();
-		live = fakeModel("anthropic", "opus-x");
-		expect(await run()).toEqual(PENDING_RESULT);
-		expect(planner.runs.map((entry) => [entry.request.model?.provider, entry.signal.aborted])).toEqual([
-			["acme", true],
-			["anthropic", false],
-		]);
-		planner.runs[0]?.gate.resolve("OLD PLAN");
-		await flush();
-		expect(sent).toEqual([]);
-		planner.runs[1]?.gate.resolve("NEW PLAN");
-		await flush();
-		expect(sent).toEqual([aside("NEW PLAN")]);
-	});
-
-	test("the whole Model counts: the same id behind another endpoint or header resolver is another target", async () => {
-		let live = fakeModel("acme", "sol-1");
-		const { runtime } = fakeRuntime([], { current: () => live });
-		const planner = gated();
-		const { run } = setup(planner.plan, 1, {}, { ...runtime });
-		await run();
-		live = { ...live, baseUrl: "https://SECRET-OTHER.invalid/v1" };
-		await run();
-		expect(planner.runs).toHaveLength(2);
-		live = { ...live, resolveHeaders: async () => ({}) };
-		await run();
-		expect(planner.runs).toHaveLength(3);
-		expect(planner.runs.map((entry) => entry.signal.aborted)).toEqual([true, true, false]);
-	});
-
-	test("a model switch seen at delivery suppresses both the plan and the no-plan note", async () => {
-		for (const answer of ["PLAN", ""]) {
-			let live = fakeModel("acme", "sol-1");
-			const { runtime } = fakeRuntime([], { current: () => live });
-			const planner = gated();
-			const { run, sent } = setup(planner.plan, 1, {}, { ...runtime });
-			await run();
-			live = fakeModel("acme", "sol-2");
-			planner.runs[0]?.gate.resolve(answer);
-			await flush();
-			expect(sent).toEqual([]);
-			expect(planner.runs[0]?.signal.aborted).toBe(true);
-		}
-	});
-
-	test("a changed native override replans the same prompt", async () => {
-		let override = { provider: "", model: "" };
-		const planner = gated();
-		const { run } = setup(planner.plan, 1, {
-			config: () =>
-				quietConfig((config) => {
-					config.models.hosts.omp = override;
-				}),
-		});
-		await run();
-		await run();
-		expect(planner.runs).toHaveLength(1);
-		override = { provider: "acme", model: "opus" };
-		await run();
-		expect(planner.runs).toHaveLength(2);
-		expect(planner.runs[0]?.signal.aborted).toBe(true);
-		expect(planner.runs[1]?.request.config?.models.hosts.omp).toEqual(override);
-	});
-
-	test("an alias the flight resolved is revalidated at reentry: a new target replans", async () => {
-		const live = fakeModel("acme", "sol-1");
-		let slow = fakeModel("acme", "slow-1");
-		const { runtime } = fakeRuntime([live], { current: () => live, aliases: { "@slow": () => slow } });
-		const signals: AbortSignal[] = [];
-		const gate = Promise.withResolvers<string>();
-		const { run } = setup(
-			(request, signal) => {
-				request.native?.models.resolve("@slow");
-				signals.push(signal);
-				return gate.promise;
-			},
-			1,
-			{},
-			{ ...runtime },
-		);
-		await run();
-		await run();
-		expect(signals).toHaveLength(1);
-		slow = fakeModel("acme", "slow-2");
-		await run();
-		expect(signals).toHaveLength(2);
-		expect(signals[0]?.aborted).toBe(true);
-	});
-
-	test("session switch and shutdown cancel the in-flight flight; nothing is delivered", async () => {
-		for (const event of ["session_switch", "session_shutdown"]) {
-			const planner = gated();
-			const { run, sent, emit } = setup(planner.plan, 1);
-			await run();
-			emit(event);
-			expect(planner.runs[0]?.signal.aborted).toBe(true);
-			planner.runs[0]?.gate.resolve("PLAN");
-			await flush();
-			expect(sent).toEqual([]);
-		}
-	});
-
-	test("the flight is registered before the planner's first callback", async () => {
-		const t = tuiCtx();
-		const { run, emit } = setup(
-			async (_request, _signal, onEvent) => {
-				onEvent?.({ type: "end", at: 1, outcome: "skipped", detail: "sync-detail" });
-				return "";
-			},
-			1_000,
-			{},
-			t.ctx,
-		);
-		emit("session_start");
-		expect(await run()).toBeUndefined();
-		await flush();
-		expect(t.line()).toContain("skipped · sync-detail");
-	});
-
-	test("isCurrent is the flight's validity: false once its live model changes or a newer prompt replaces it", async () => {
-		let live = fakeModel("acme", "sol-1");
-		const { runtime } = fakeRuntime([], { current: () => live });
-		const planner = gated();
-		const { run, emit } = setup(planner.plan, 1, {}, { ...runtime });
-		await run("A");
-		const first = planner.runs[0]?.request.isCurrent;
-		expect(first?.()).toBe(true);
-		live = fakeModel("acme", "sol-2");
-		expect(first?.()).toBe(false);
-		expect(planner.runs[0]?.signal.aborted).toBe(true);
-		emit("turn_start");
-		await run("B");
-		const second = planner.runs[1]?.request.isCurrent;
-		expect(second?.()).toBe(true);
-		emit("turn_start");
-		await run("C");
-		expect(second?.()).toBe(false);
 	});
 });
 

@@ -9,8 +9,10 @@
  * framed as the user's own request, elaborated by a plugin the user installed.
  */
 import { join } from "node:path";
+import { hasControlCharacter } from "../config.ts";
 import { redactSecrets } from "../grok/auth.ts";
-import { MAX_ENGINE_ERROR_CHARS, type ModelResolution } from "../host/engine.ts";
+import type { ModelResolution } from "../host/engine.ts";
+import { MAX_ENGINE_ERROR_CHARS } from "../host/display-limits.ts";
 import { redactLine } from "../teach/redact.ts";
 import { SHIP_CLI } from "../ship/nudge.ts";
 import { type DecisionRecord, formatP } from "../decisions/types.ts";
@@ -114,24 +116,29 @@ const ID_CHARS = /^[\w.:@+/~-]+$/;
 const MAX_ID_CHARS = 128;
 /** URI, endpoint or user-info shapes in an id: `//`, a leading `/`, or `name:secret@`. */
 const ENDPOINT_LIKE = /\/\/|^\/|:[^/]*@/;
+/** Route punctuation and Grok's shunt suffix are generated syntax, not part of the displayed identifier. */
+const LABEL_ROUTE_PREFIX = /^(?:omp-native|claude|muse|grok):/;
+const SHUNT_LABEL_SUFFIX = /@shunt(?= \[|$)/;
 /** Fixed-vocabulary record values: states, sources, reasons, transports, hosts and engine requests. */
 const DISPLAY_TOKEN = /^[a-z][a-z.-]{0,63}$/;
 
 /**
  * A resolution label for display (§9 safe projection): one line, unchanged when it is plainly a generated label, else the
- * opaque marker. Control, ANSI or markup characters, a URI or endpoint shape (`//`), anything `redactLine` or
+ * opaque marker. Control, ANSI or markup characters, a URI, endpoint or user-info shape, anything `redactLine` or
  * `redactSecrets` would mask, and more than MAX_ENGINE_ERROR_CHARS characters never reach a summary, context, view or
  * status line. Only the display changes; the target used for inference is untouched.
  */
 export function displayLabel(value: unknown): string {
-	if (typeof value !== "string") return OPAQUE_MODEL;
+	if (typeof value !== "string" || hasControlCharacter(value)) return OPAQUE_MODEL;
 	const line = value.replace(/\s+/g, " ").trim();
 	const plain = line.replace(OPAQUE_MARKERS, "");
+	const target = line.replace(LABEL_ROUTE_PREFIX, "");
+	const endpointText = line.startsWith("grok:") ? target.replace(SHUNT_LABEL_SUFFIX, "") : target;
 	const safe =
 		line !== "" &&
 		line.length <= MAX_ENGINE_ERROR_CHARS &&
 		(plain === "" || LABEL_CHARS.test(plain)) &&
-		!line.includes("//") &&
+		!ENDPOINT_LIKE.test(endpointText) &&
 		redactSecrets(redactLine(line, MAX_ENGINE_ERROR_CHARS)) === line;
 	return safe ? line : OPAQUE_MODEL;
 }

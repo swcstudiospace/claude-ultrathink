@@ -56,8 +56,8 @@ export interface PlanResponse {
 	/** Display-only projection for host UIs; the model reads `context`. */
 	view?: PlanView;
 	/**
-	 * Safe selection record (§6) on a planned prompt, a selection skip (unresolved, with the notice as `summary`) and a
-	 * cancellation after selection; absent on deterministic skips decided before an engine was selected.
+	 * Safe selection record (§6) on a planned prompt, a selection skip (unresolved, with the notice as `summary`) and any
+	 * skip, cancellation or error after selection; absent on deterministic skips decided before an engine was selected.
 	 */
 	modelResolution?: ModelResolution;
 }
@@ -237,7 +237,7 @@ export async function planPrompt(
 		);
 		// A flight cancelled once its plan was built delivers nothing: no carrier, no context.
 		if (options.signal?.aborted) return skip("aborted", resolution);
-		if (result.skipped || !result.output) return { ...skip(result.skipped), ...(result.notice ? { summary: result.notice } : {}) };
+		if (result.skipped || !result.output) return { ...skip(result.skipped, resolution), ...(result.notice ? { summary: result.notice } : {}) };
 		const context = result.output.hookSpecificOutput.additionalContext;
 		const specPath = sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml");
 		const statePath = sessionPath(stateDir, sessionId);
@@ -266,9 +266,9 @@ export async function planPrompt(
 			modelResolution: resolution,
 			...(result.record ? { view: buildPlanView(result.record, Date.now() - started) } : {}),
 		};
-	} catch {
-		// Cancellation is caught here, at the fail-open host boundary, with the safe record once selection produced one.
-		if (options.signal?.aborted) return skip("aborted", resolution);
-		return skip("engine-error");
+	} catch (error) {
+		// Provider cancellation need not abort the caller's signal. Preserve it here with only the safe selection record.
+		if (options.signal?.aborted || (typeof error === "object" && error !== null && "name" in error && error.name === "AbortError")) return skip("aborted", resolution);
+		return skip("engine-error", resolution);
 	}
 }

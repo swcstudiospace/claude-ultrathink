@@ -635,6 +635,8 @@ describe("skill invocations", () => {
 		const config = trackedConfig();
 		config.ship.enabled = true;
 		const { deps, cleanup } = baseDeps({ config, complete: smartComplete() });
+		const shipFlag = process.env.ULTRATHINK_SHIP;
+		delete process.env.ULTRATHINK_SHIP;
 		try {
 			const gsd = await runPromptSubmit(skillInput, deps);
 			expect(gsd.output?.hookSpecificOutput.additionalContext).toMatch(
@@ -646,6 +648,8 @@ describe("skill invocations", () => {
 			const plain = await runPromptSubmit(input, deps);
 			expect(plain.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
 		} finally {
+			if (shipFlag === undefined) delete process.env.ULTRATHINK_SHIP;
+			else process.env.ULTRATHINK_SHIP = shipFlag;
 			cleanup();
 		}
 	});
@@ -1981,6 +1985,153 @@ describe("caller cancellation and the resolution record (D-12)", () => {
 		}
 	});
 
+	for (const at of ["uplift", "graph", "fill", "clarify"] as const) {
+		test(`a provider AbortError during ${at} cancels planning while the caller signal stays live`, async () => {
+			const run = await cancelledRun(() => ({}), (phase) => phase === at);
+			const phases: Phase[] = ["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"];
+			expect(run.phases).toEqual(phases.slice(0, phases.indexOf(at) + 1));
+			expect(run).toMatchObject({ name: "AbortError", aborted: false, tracked: 0, written: false });
+			expect(run.events.some((event) => event.type === "stage" && ["plan", "track", "state"].includes(event.stage))).toBe(false);
+			expect(run.events.at(-1)).toEqual(ENDED);
+		});
+	}
+
+	test("an injected clarifier AbortError cancels planning without relying on the completer or caller signal", async () => {
+		const run = await cancelledRun(() => ({
+			clarify: async () => {
+				throw new DOMException("provider cancelled", "AbortError");
+			},
+		}));
+		expect(run).toMatchObject({ name: "AbortError", aborted: false, tracked: 0, written: false });
+		expect(run.events.at(-1)).toEqual(ENDED);
+	});
+
+	test("a provider cancellation aborts pending brief, evidence and knowledge work without waiting for their deadlines", async () => {
+		const config = trackedConfig();
+		config.claude.budgetMs = 0;
+		config.teach.timeoutMs = 60_000;
+		config.ragflow.timeoutMs = 60_000;
+		const controller = new AbortController();
+		const signals: Record<string, AbortSignal | undefined> = {};
+		let reads = 0;
+		let closed = 0;
+		const pending = (name: string, signal: AbortSignal | undefined): Promise<never> => {
+			signals[name] = signal;
+			// Deliberately ignores abort: the hook must release its bounded waiters itself.
+			return Promise.withResolvers<never>().promise;
+		};
+		const { deps, cleanup } = baseDeps({
+			config,
+			signal: controller.signal,
+			complete: async () => {
+				throw new DOMException("provider cancelled", "AbortError");
+			},
+			brief: ({ signal }) => pending("brief", signal),
+			recall: ({ signal }) => pending("recall", signal),
+			ground: ({ signal }) => pending("ground", signal),
+			skills: ({ signal }) => pending("skills", signal),
+			knowledge: {
+				start: ({ signal }) => {
+					signals.knowledge = signal;
+					return {
+						read: async () => {
+							reads++;
+							return noneKnowledge;
+						},
+						close: () => { closed++; },
+					};
+				},
+			},
+		});
+		try {
+			const caught = await runPromptSubmit(input, deps).then(() => undefined, (error: unknown) => error);
+			expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+			expect(controller.signal.aborted).toBe(false);
+			expect(Object.keys(signals).sort()).toEqual(["brief", "ground", "knowledge", "recall", "skills"]);
+			for (const [name, signal] of Object.entries(signals)) expect({ name, aborted: signal?.aborted }).toEqual({ name, aborted: true });
+			expect({ reads, closed }).toEqual({ reads: 0, closed: 1 });
+			expect(existsSync(deps.stateDir)).toBe(false);
+		} finally {
+			controller.abort();
+			cleanup();
+		}
+	});
+
+	for (const honours of [true, false]) {
+		test(`a provider-aborted fill cancels its ${honours ? "signal-honouring" : "signal-ignoring"} sibling and prevents queued fills`, async () => {
+			const config = trackedConfig();
+			config.claude.concurrency = 2;
+			config.claude.budgetMs = 0;
+			const controller = new AbortController();
+			const first = Promise.withResolvers<string>();
+			const sibling = Promise.withResolvers<string>();
+			const siblingStarted = Promise.withResolvers<void>();
+			const calls: string[] = [];
+			const events: ProgressEvent[] = [];
+			let siblingSignal: AbortSignal | undefined;
+			let tracked = 0;
+			const complete = smartComplete();
+			const { deps, cleanup } = baseDeps({
+				config,
+				signal: controller.signal,
+				modelResolution: RESOLUTION,
+				progress: (event) => events.push(event),
+				complete: async (system, user, signal) => {
+					const phase = phaseOf(user);
+					const id = user.match(/current_node id="([^"]+)"/)?.[1];
+					calls.push(id ?? phase);
+					if (phase === "graph") {
+						return JSON.stringify({
+							goal: "Ship it",
+							nodes: Array.from({ length: 5 }, (_, i) => ({
+								id: `n${i + 1}`,
+								title: `T${i + 1}`,
+								kind: i === 0 ? "understand" : i === 4 ? "synthesize" : "generate",
+								question: `Q${i + 1}`,
+								depends_on: i < 3 ? [] : i === 3 ? ["n1", "n2", "n3"] : ["n4"],
+							})),
+						});
+					}
+					if (id === "n1") return first.promise;
+					if (id === "n2") {
+						siblingSignal = signal;
+						if (honours) signal?.addEventListener("abort", () => sibling.reject(new DOMException("aborted", "AbortError")), { once: true });
+						siblingStarted.resolve();
+						return sibling.promise;
+					}
+					return complete(system, user);
+				},
+				track: async () => {
+					tracked++;
+					return undefined;
+				},
+			});
+			try {
+				const running = runPromptSubmit(input, deps).then(() => undefined, (error: unknown) => error);
+				await siblingStarted.promise;
+				expect(siblingSignal?.aborted).toBe(false);
+				first.reject(new DOMException("provider cancelled", "AbortError"));
+				const caught = await running;
+				// A late success from an ignoring provider must not release its worker to start n3.
+				sibling.resolve("<node><rationale>step</rationale><conclusion>late</conclusion></node>");
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+				expect(controller.signal.aborted).toBe(false);
+				expect(siblingSignal?.aborted).toBe(true);
+				expect(calls).toEqual(["uplift", "graph", "n1", "n2"]);
+				expect(events.some((event) => event.type === "node" && event.phase === "done")).toBe(false);
+				expect(events.at(-1)).toEqual(ENDED);
+				expect(tracked).toBe(0);
+				expect(existsSync(deps.stateDir)).toBe(false);
+			} finally {
+				controller.abort();
+				first.resolve("");
+				sibling.resolve("");
+				cleanup();
+			}
+		});
+	}
+
 	test("a cancellation seen by the brief, a lookup, the knowledge base or the tracker ends the flight at the next boundary", async () => {
 		const cases: Array<{ name: string; seams: (controller: AbortController) => Partial<HookDeps>; later: Phase[] }> = [
 			{
@@ -2136,6 +2287,48 @@ describe("caller cancellation and the resolution record (D-12)", () => {
 			cleanup();
 		}
 	});
+
+	for (const at of ["uplift", "fill", "clarify"] as const) {
+		test(`the hook budget expiring during ${at} retains its budget-only result instead of cancelling the flight`, async () => {
+			const config = trackedConfig();
+			config.claude.budgetMs = 30;
+			const controller = new AbortController();
+			const complete = smartComplete();
+			const phases: Phase[] = [];
+			const { deps, cleanup } = baseDeps({
+				config,
+				signal: controller.signal,
+				complete: async (system, user, signal) => {
+					const phase = phaseOf(user);
+					phases.push(phase);
+					if (phase !== at) return complete(system, user);
+					return new Promise<string>((_resolve, reject) => {
+						const abort = (): void => reject(new DOMException("budget expired", "AbortError"));
+						if (signal?.aborted) abort();
+						else signal?.addEventListener("abort", abort, { once: true });
+					});
+				},
+			});
+			try {
+				const result = await runPromptSubmit(input, deps);
+				expect(controller.signal.aborted).toBe(false);
+				expect(phases.at(-1)).toBe(at);
+				if (at === "uplift") {
+					expect(result.skipped).toBe("uplift-failed");
+					expect(result.output).toBeUndefined();
+					expect(existsSync(deps.stateDir)).toBe(false);
+				} else {
+					expect(result.skipped).toBeUndefined();
+					expect(result.output).toBeDefined();
+					expect(result.record?.result.source).toBe("llm");
+					expect(Boolean(result.record?.graph)).toBe(at === "clarify");
+					expect(readSession(deps.stateDir, "s1")).toBeDefined();
+				}
+			} finally {
+				cleanup();
+			}
+		});
+	}
 
 	test("the safe record reaches begin, end and the persisted plan; skips and Jev skips persist nothing", async () => {
 		const events: ProgressEvent[] = [];

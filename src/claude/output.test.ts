@@ -7,13 +7,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { defaultConfig, mergeConfig, type UltrathinkConfig } from "../config.ts";
 import type { Clarification } from "../hitl/types.ts";
 import {
-	MAX_ENGINE_ERROR_CHARS,
 	type ModelIntent,
 	type ModelResolution,
 	type NativeModelQuery,
 	selectEngine,
 	selectNativeEngine,
 } from "../host/engine.ts";
+import { MAX_ENGINE_ERROR_CHARS } from "../host/display-limits.ts";
 import type { HostId } from "../host/types.ts";
 import { FALLBACK_GRAPH } from "../think/types.ts";
 import type { DecisionPoint, DecisionRecord, DecisionsErrorKind } from "../decisions/types.ts";

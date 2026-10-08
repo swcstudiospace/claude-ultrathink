@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -18,6 +18,10 @@ import {
 	mergeBlock,
 	readSetupState,
 	repoRootFromModule,
+	installPrimeAgent,
+	linkDir,
+	primeAgentReport,
+	removePrimeAgent,
 	rollback,
 	rollbackReport,
 	setupStatePath,
@@ -31,6 +35,14 @@ const RULE = "<!-- ultrathink:start -->\nRead the ultrathink plan.\n<!-- ultrath
 function writeRepo(root: string): void {
 	mkdirSync(join(root, "hooks"), { recursive: true });
 	mkdirSync(join(root, "hosts", "grok"), { recursive: true });
+	mkdirSync(join(root, "hosts", "prime-agent"), { recursive: true });
+	writeFileSync(join(root, "hosts", "prime-agent", "SKILL.md"), "---\nname: ultrathink\n---\n");
+	for (const name of ["ultrathink-kickoff", "ultrathink-sync"]) {
+		mkdirSync(join(root, "skills", name), { recursive: true });
+		writeFileSync(join(root, "skills", name, "SKILL.md"), `---\nname: ${name}\n---\n`);
+	}
+	mkdirSync(join(root, "hosts", "prime-agent", "commands", "ultrathink-status"), { recursive: true });
+	writeFileSync(join(root, "hosts", "prime-agent", "commands", "ultrathink-status", "SKILL.md"), "---\nname: ultrathink-status\n---\n");
 	const handler = (script: string, timeout: number) => ({
 		type: "command",
 		command: `"\${CLAUDE_PLUGIN_ROOT}/bin/run-bun" "\${CLAUDE_PLUGIN_ROOT}/hooks/${script}"`,
@@ -50,16 +62,29 @@ function writeRepo(root: string): void {
 }
 
 /** Temp Claude config dir, Grok home and plugin checkout; nothing touches the real home. */
-function tempSetup(): { env: Record<string, string>; repo: string; rulePath: string; hooksPath: string; cleanup: () => void } {
+function tempSetup(): {
+	env: Record<string, string>;
+	repo: string;
+	rulePath: string;
+	hooksPath: string;
+	primeSkillPath: string;
+	agentSkillsDir: string;
+	cleanup: () => void;
+} {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-setup-"));
 	const repo = join(dir, "repo");
 	writeRepo(repo);
 	const grok = join(dir, "grok");
+	const prime = join(dir, "prime-agent");
+	const agentSkills = join(dir, "agent-skills");
 	return {
-		env: { CLAUDE_CONFIG_DIR: join(dir, "claude"), GROK_HOME: grok },
+		// Every host directory is scoped to the temp dir, so a test never links into the real ~/.prime or ~/.agents.
+		env: { CLAUDE_CONFIG_DIR: join(dir, "claude"), GROK_HOME: grok, PRIME_AGENT_CODING_AGENT_DIR: prime, ULTRATHINK_AGENT_SKILLS_DIR: agentSkills },
 		repo,
 		rulePath: join(grok, "rules", "ultrathink.md"),
 		hooksPath: join(grok, "hooks", "ultrathink.json"),
+		primeSkillPath: join(prime, "skills", "ultrathink"),
+		agentSkillsDir: agentSkills,
 		cleanup: () => rmSync(dir, { recursive: true, force: true }),
 	};
 }
@@ -262,7 +287,7 @@ describe("apply / status / rollback", () => {
 	});
 
 	test("without the claude CLI, apply skips every Claude step but still installs Grok; status says so", () => {
-		const { env, repo, rulePath, hooksPath, cleanup } = tempSetup();
+		const { env, repo, rulePath, hooksPath, primeSkillPath, cleanup } = tempSetup();
 		const run = fakeRun(noClaude);
 		try {
 			const applied = apply(repo, run, env);
@@ -278,6 +303,7 @@ describe("apply / status / rollback", () => {
 				"Claude Code: claude CLI not found",
 				`Grok rule: installed (${rulePath})`,
 				`Grok hooks: installed (${hooksPath})`,
+				`Prime Agent skill: installed (${primeSkillPath})`,
 			]);
 		} finally {
 			cleanup();
@@ -571,8 +597,15 @@ describe("any checkout path", () => {
 		try {
 			const repo = join(dir, "my clone");
 			writeRepo(repo);
-			const env = { CLAUDE_CONFIG_DIR: join(dir, "claude"), GROK_HOME: join(dir, "grok"), HERMES_HOME: join(dir, "hermes home") };
+			const env = {
+				CLAUDE_CONFIG_DIR: join(dir, "claude"),
+				GROK_HOME: join(dir, "grok"),
+				HERMES_HOME: join(dir, "hermes home"),
+				PRIME_AGENT_CODING_AGENT_DIR: join(dir, "prime agent"),
+				ULTRATHINK_AGENT_SKILLS_DIR: join(dir, "agent skills"),
+			};
 			const result = apply(repo, fakeRun(() => ({ stdout: "", stderr: "", code: 0 })), env);
+			expect(readlinkSync(result.primeAgent.skill.path)).toBe(`${repo}/hosts/prime-agent`);
 			const hooks = readFileSync(result.grok.hooks.path, "utf8");
 			expect(hooks).toContain(`${repo}/hooks/uplift.ts`);
 			expect(hooks).not.toContain("%20");
@@ -689,6 +722,86 @@ describe("installGrokRule", () => {
 			expect(existsSync(dirname(rulePath))).toBe(false);
 			expect(installGrokRule(repo, dirname(rulePath))).toEqual({ path: rulePath, changed: true });
 			expect(readFileSync(rulePath, "utf8")).toBe(RULE);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("prime agent host", () => {
+	test("apply links the kernel skill and the agent skills, re-apply reports them already linked, rollback unlinks only ours", () => {
+		const { env, repo, primeSkillPath, agentSkillsDir, cleanup } = tempSetup();
+		const run = fakeRun(noClaude);
+		try {
+			const applied = apply(repo, run, env);
+			expect(applied.primeAgent.skill).toEqual({ path: primeSkillPath, target: join(repo, "hosts", "prime-agent"), status: "linked" });
+			expect(applied.primeAgent.agentSkills.map((l) => [l.path, l.status])).toEqual([
+				[join(agentSkillsDir, "ultrathink-kickoff"), "linked"],
+				[join(agentSkillsDir, "ultrathink-sync"), "linked"],
+				[join(agentSkillsDir, "ultrathink-status"), "linked"],
+			]);
+			expect(readlinkSync(join(agentSkillsDir, "ultrathink-status"))).toBe(join(repo, "hosts", "prime-agent", "commands", "ultrathink-status"));
+			expect(readlinkSync(primeSkillPath)).toBe(join(repo, "hosts", "prime-agent"));
+			expect(existsSync(join(primeSkillPath, "SKILL.md"))).toBe(true);
+			const report = applyReport(repo, applied, env).join("\n");
+			expect(report).toContain(`Prime Agent skill: linked (${primeSkillPath} -> ${join(repo, "hosts", "prime-agent")})`);
+			expect(report).toContain(`Prime Agent agent skills: 3/3 linked into ${agentSkillsDir}`);
+			expect(report).toContain("start a new session (or /reload)");
+
+			const again = apply(repo, run, env);
+			expect(again.primeAgent.skill.status).toBe("already");
+			expect(again.primeAgent.agentSkills.every((l) => l.status === "already")).toBe(true);
+
+			// A link the user pointed elsewhere is not ours and stays; so does a real directory.
+			const foreign = join(agentSkillsDir, "ultrathink-sync");
+			rmSync(foreign);
+			mkdirSync(foreign, { recursive: true });
+			const rolledBack = rollback(env, run, repo);
+			expect(rolledBack.primeAgent.skill).toEqual({ path: primeSkillPath, removed: true });
+			expect(rolledBack.primeAgent.agentSkills).toEqual([
+				{ path: join(agentSkillsDir, "ultrathink-kickoff"), removed: true },
+				{ path: foreign, removed: false },
+				{ path: join(agentSkillsDir, "ultrathink-status"), removed: true },
+			]);
+			expect(existsSync(primeSkillPath)).toBe(false);
+			expect(lstatSync(foreign).isDirectory()).toBe(true);
+			const lines = rollbackReport(rolledBack).join("\n");
+			expect(lines).toContain(`Prime Agent skill: unlinked (${primeSkillPath})`);
+			expect(lines).toContain("Prime Agent agent skills: 2/3 unlinked");
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("linkDir retargets a stale symlink, keeps a real directory, and the report names what was kept", () => {
+		const { env, repo, primeSkillPath, cleanup } = tempSetup();
+		try {
+			mkdirSync(dirname(primeSkillPath), { recursive: true });
+			expect(linkDir("/stale/target", primeSkillPath).status).toBe("linked");
+			const retargeted = installPrimeAgent(repo, env);
+			expect(retargeted.skill.status).toBe("linked");
+			expect(readlinkSync(primeSkillPath)).toBe(join(repo, "hosts", "prime-agent"));
+
+			rmSync(primeSkillPath);
+			mkdirSync(primeSkillPath, { recursive: true });
+			const kept = installPrimeAgent(repo, env);
+			expect(kept.skill.status).toBe("kept");
+			expect(primeAgentReport(kept)[0]).toContain("kept — not a symlink");
+			expect(removePrimeAgent(repo, env).skill.removed).toBe(false);
+			expect(lstatSync(primeSkillPath).isDirectory()).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a checkout without skills links only the kernel skill and says none were found", () => {
+		const { env, repo, cleanup } = tempSetup();
+		try {
+			rmSync(join(repo, "skills"), { recursive: true, force: true });
+			rmSync(join(repo, "hosts", "prime-agent", "commands"), { recursive: true, force: true });
+			const result = installPrimeAgent(repo, env);
+			expect(result.agentSkills).toEqual([]);
+			expect(primeAgentReport(result)[1]).toBe("Prime Agent agent skills: none found");
 		} finally {
 			cleanup();
 		}

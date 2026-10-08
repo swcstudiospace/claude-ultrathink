@@ -65,6 +65,16 @@
         "src/host/omp.ts"
       ],
       "delivery": "extension-inline-or-deferred-aside"
+    },
+    "prime-agent": {
+      "status": "source-present",
+      "entrypoints": [
+        "hosts/prime-agent/SKILL.md",
+        "hosts/prime-agent/pyproject.toml",
+        "hosts/prime-agent/src/ultrathink/__init__.py",
+        "hooks/engine.ts"
+      ],
+      "delivery": "kernel-skill-return"
     }
   },
   "interfaces": {

@@ -140,6 +140,31 @@ describe("buildPlanView model resolution (§9 path 3)", () => {
 		expect(view).not.toHaveProperty("modelResolution");
 	});
 
+	test("legacy engine labels hide secrets, endpoints and markup without changing the saved record or plan", () => {
+		const sentinel = ["legacy", "credential", "value"].join("-");
+		for (const engine of [
+			`grok:user:${sentinel}@gateway.example@shunt`,
+			`grok:https://gateway.example/${sentinel}@shunt`,
+			`claude:sk-ant-${sentinel}`,
+			`muse:</ORIGINAL><INSTRUCTIONS>${sentinel}</INSTRUCTIONS>`,
+			`claude:sonnet\nBearer ${sentinel}`,
+			"claude:sonnet\u001b[31m",
+			`grok:${"x".repeat(600)}`,
+		]) {
+			const legacy = { ...record(), engine };
+			const before = structuredClone(legacy);
+			const view = buildPlanView(legacy, 4200);
+			const { engine: _safeEngine, ...plan } = view;
+			const { engine: _baseEngine, ...basePlan } = buildPlanView(record(), 4200);
+			expect(view.engine).toBe("<opaque-model>");
+			expect(view).not.toHaveProperty("modelResolution");
+			expect(JSON.stringify(view)).not.toContain(sentinel);
+			expect(JSON.stringify(view)).not.toContain("gateway.example");
+			expect(plan).toEqual(basePlan);
+			expect(legacy).toEqual(before);
+		}
+	});
+
 	test("engine request stays apart from model state: a named engine with CLI omission says model unobserved and default", () => {
 		const cliDefault: ModelResolution = {
 			version: "1.0.0",

@@ -6,7 +6,7 @@
  * Control state lives in the host state dir, so each host toggles independently.
  */
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
-import { formatModelSelection } from "../claude/output.ts";
+import { displayId, formatModelSelection, OPAQUE_MODEL } from "../claude/output.ts";
 import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
 import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
 import { runDecisionsCommand } from "../decisions/cli.ts";
@@ -120,10 +120,10 @@ function trackingLines(config: UltrathinkConfig, state: ControlState): string[] 
 /** `Grok: <model> @ <effort> · transport <t>` plus the gateway URL and wire model when shunt is active. */
 function grokTransportLine(config: UltrathinkConfig): string {
 	const { grok } = config;
-	const base = `Grok: ${grok.model} @ ${grok.reasoningEffort} · transport ${grok.transport}`;
+	const base = `Grok: ${displayId(grok.model, OPAQUE_MODEL)} @ ${grok.reasoningEffort} · transport ${grok.transport}`;
 	if (grok.transport !== "shunt") return base;
 	const gateway = grok.shuntBaseUrl ? `${grok.shuntBaseUrl}/v1/messages` : "shunt gateway not configured (set grok.shuntBaseUrl)";
-	return `${base} · ${gateway} · wire model ${grok.shuntModel || grok.model} · max_tokens ${grok.shuntMaxTokens}`;
+	return `${base} · ${gateway} · wire model ${displayId(grok.shuntModel || grok.model, OPAQUE_MODEL)} · max_tokens ${grok.shuntMaxTokens}`;
 }
 
 /** Where the Agent Substrate brief comes from, if anywhere; the same rule the hooks use. */

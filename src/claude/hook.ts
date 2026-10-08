@@ -5,8 +5,8 @@
  * with per-node rationale/conclusion fills → HITL clarifications → build a Notion/Linear
  * TrackPlan → persist session state → return the spec plus an instruction to
  * invoke ultrathink-kickoff as hook context. Everything after "decide" is
- * fail-open: the user's prompt always goes through. A caller cancellation (HookDeps.signal) is re-thrown as an
- * AbortError at every stage boundary, and nothing later starts.
+ * fail-open: the user's prompt always goes through. Caller or provider cancellation is re-thrown as an
+ * AbortError, aborting sibling work and preventing later inference or side effects.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -38,7 +38,8 @@ import { isSubagentEnvelope } from "../host/envelope.ts";
 import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
-import { type ClaudeCompleter, isChildInvocation } from "./complete.ts";
+import type { ClaudeCompleter } from "./complete.ts";
+import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
 import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
@@ -154,9 +155,8 @@ async function readKnowledge(session: KnowledgeSession, topic: string): Promise<
 }
 
 /**
- * Cancellation is the caller's lifetime (HookDeps.signal) ending: thrown as an AbortError whatever its reason (a timeout
- * included), never swallowed into a fallback. The hook budget alone is not cancellation; it keeps its documented "plan
- * built so far" behavior.
+ * Caller/provider cancellation is always an AbortError, whatever the signal's reason. The hook budget has a separate
+ * signal: only that deadline keeps the documented "plan built so far" behavior.
  */
 function throwIfCancelled(lifetime: AbortSignal | undefined): void {
 	if (!lifetime?.aborted) return;
@@ -339,12 +339,30 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		...(sessionId === "unknown" ? {} : { sessionId }),
 		...deps.decisionsDeps,
 	});
-	// The planning lifetime every stage gets: the caller's flight signal combined with this hook's budget, whose timer
-	// starts after the gate as before.
+	// Keep cancellation separate from the hook's partial-result budget, whose timer starts after the gate as before.
 	const controller = new AbortController();
-	const lifetime = deps.signal ? AbortSignal.any([deps.signal, controller.signal]) : controller.signal;
+	const cancellation = deps.signal ? AbortSignal.any([deps.signal, controller.signal]) : controller.signal;
+	const budgetController = new AbortController();
+	const lifetime = AbortSignal.any([cancellation, budgetController.signal]);
+	const rethrowCancellation = (error: unknown): void => {
+		// A provider can abort while the caller is still live. Only an expired hook budget may fail open with a partial plan.
+		if (!budgetController.signal.aborted && typeof error === "object" && error !== null && "name" in error && error.name === "AbortError") controller.abort();
+		throwIfCancelled(cancellation);
+	};
+	const complete: ClaudeCompleter = async (system, user, signal) => {
+		// The algorithm's parallel workers may still be unwinding: none may dispatch or consume a late sibling result.
+		throwIfCancelled(lifetime);
+		try {
+			const text = await deps.complete(system, user, signal);
+			throwIfCancelled(cancellation);
+			return text;
+		} catch (error) {
+			rethrowCancellation(error);
+			throw error;
+		}
+	};
 	const gate = await planGate({ prompt: input.prompt ?? "", text: decision.text, skill, history }, decisions, lifetime);
-	throwIfCancelled(deps.signal);
+	throwIfCancelled(cancellation);
 	if (!gate.plan) {
 		return {
 			skipped: JEV_PLAN_SKIP,
@@ -368,7 +386,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 
 	let session: KnowledgeSession | undefined;
 	const budget =
-		deps.config.claude.budgetMs > 0 ? setTimeout(() => controller.abort(), deps.config.claude.budgetMs) : undefined;
+		deps.config.claude.budgetMs > 0 ? setTimeout(() => budgetController.abort(), deps.config.claude.budgetMs) : undefined;
 	try {
 		const original = decision.text;
 		const skillLine = skill
@@ -430,18 +448,18 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		}
 
 		let result: UpliftResult;
-		throwIfCancelled(deps.signal);
+		throwIfCancelled(cancellation);
 		stage("uplift", "start");
 		try {
 			result = await runUplift({
 				original,
 				conversation,
-				complete: deps.complete,
+				complete,
 				signal: lifetime,
 				maxChars: deps.config.uplift.maxChars,
 			});
 		} catch (error) {
-			throwIfCancelled(deps.signal);
+			rethrowCancellation(error);
 			log(`uplift failed: ${error instanceof Error ? error.message : String(error)}`);
 			stage("uplift", "end", false);
 			outcome = "skipped";
@@ -449,17 +467,17 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			return { skipped: "uplift-failed", ...(records.length ? { decisions: records } : {}) };
 		}
 		// A completer that ignored its signal and answered anyway still ends a cancelled flight here.
-		throwIfCancelled(deps.signal);
+		throwIfCancelled(cancellation);
 		stage("uplift", "end", true, `${result.root} · ${result.source}`);
 
 		const brief = await briefPromise;
-		throwIfCancelled(deps.signal);
+		throwIfCancelled(cancellation);
 		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
 		stage("brief", "end", true, brief ? `${brief.split("\n").length} lines` : "none");
 
 		// Settled before anything is formatted so the record says what happened; all are bounded and never reject.
 		const [recalled, grounded, skilled] = await Promise.all([recallPromise, groundPromise, skillsPromise]);
-		throwIfCancelled(deps.signal);
+		throwIfCancelled(cancellation);
 		let lessons: LessonsLookup | undefined;
 		let lessonsText = "";
 		if (recalled) {
@@ -505,7 +523,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			try {
 				const thought = await runThink({
 					uplift: result,
-					complete: deps.complete,
+					complete,
 					signal: lifetime,
 					minNodes: deps.config.think.minNodes,
 					maxNodes: deps.config.think.maxNodes,
@@ -513,7 +531,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					onProgress: log,
 					onEvent: (event) => emit({ ...event, at: now() }),
 				});
-				throwIfCancelled(deps.signal);
+				throwIfCancelled(cancellation);
 				result = thought;
 				graph = thought.graph;
 				thinkDegraded = [
@@ -522,7 +540,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				];
 				stage("think", "end", true, `${graph.nodes.length} nodes`);
 			} catch (error) {
-				throwIfCancelled(deps.signal);
+				rethrowCancellation(error);
 				log(`think failed: ${error instanceof Error ? error.message : String(error)}`);
 				stage("think", "end", false);
 			}
@@ -538,7 +556,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		let knowledgeInput: { digest: string; docs: string[] } | undefined;
 		if (session) {
 			const read = await readKnowledge(session, knowledgeTopic(result, graph));
-			throwIfCancelled(deps.signal);
+			throwIfCancelled(cancellation);
 			const lookup = read.lookup;
 			log(
 				`greptile knowledge base: ${lookup.outcome}${lookup.docs.length > 0 ? ` · ${lookup.docs.join(", ")}` : ""}${lookup.reason ? ` · ${lookup.reason}` : ""} · ${lookup.ms}ms`,
@@ -555,7 +573,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					graph,
 					conversation,
 					answered: clarifications,
-					complete: deps.complete,
+					complete,
 					signal: lifetime,
 					maxQuestions: deps.config.hitl.maxQuestions,
 					onProgress: log,
@@ -564,14 +582,14 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					decisions,
 					onDecision: (decisionRecord) => records.push(decisionRecord),
 				});
-				throwIfCancelled(deps.signal);
+				throwIfCancelled(cancellation);
 				const seen = new Set(clarifications.map((c) => normalizeQuestion(c.question)));
 				const kept = fresh.filter((c) => !seen.has(normalizeQuestion(c.question)));
 				clarifications = [...clarifications, ...kept];
 				if (knowledge) knowledge = { ...knowledge, settled: kept.filter((c) => c.source === "knowledge").length };
 				stage("clarify", "end", true, `${clarifications.length} question${clarifications.length === 1 ? "" : "s"}`);
 			} catch (error) {
-				throwIfCancelled(deps.signal);
+				rethrowCancellation(error);
 				log(`clarify failed: ${error instanceof Error ? error.message : String(error)}`);
 				stage("clarify", "end", false);
 			}
@@ -585,6 +603,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// untracked rather than creating generic FALLBACK_GRAPH boilerplate rows in the shared
 		// Notion/Linear tracker on every engine outage. Only build a plan for real LLM output.
 		if (result.source !== "fallback") {
+			throwIfCancelled(cancellation);
 			stage("plan", "start");
 			try {
 				plan = buildTrackPlan({
@@ -604,13 +623,14 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 
 		let tracking: TrackingRefs | undefined;
 		if (plan && deps.track && !deps.trackingOff) {
+			throwIfCancelled(cancellation);
 			stage("track", "start");
 			tracking = await deps.track({ plan, graph, signal: lifetime, progress: deps.progress }).catch((error: unknown) => {
-				throwIfCancelled(deps.signal);
+				rethrowCancellation(error);
 				log(`tracking failed: ${error instanceof Error ? error.message : String(error)}`);
 				return undefined;
 			});
-			throwIfCancelled(deps.signal);
+			throwIfCancelled(cancellation);
 			if (tracking) {
 				result = { ...result, xml: injectTrackingXml(result.xml, plan, tracking) };
 				log(`tracking ${tracking.status}${tracking.errors.length > 0 ? `: ${tracking.errors.join("; ")}` : ""}`);
@@ -649,7 +669,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		let specPath: string | undefined;
 		let statePath: string | undefined;
 		// No spec or session write for a cancelled flight.
-		throwIfCancelled(deps.signal);
+		throwIfCancelled(cancellation);
 		stage("state", "start");
 		try {
 			specPath = specFile(deps.stateDir, sessionId);
@@ -724,7 +744,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		return { output, record, ...(records.length ? { decisions: records } : {}) };
 	} catch (error) {
 		// A cancelled flight ends skipped, as planPrompt reports it; anything else stays a failure named by its error.
-		if (deps.signal?.aborted) {
+		if (cancellation.aborted) {
 			outcome = "skipped";
 			outcomeDetail = "aborted";
 		} else outcomeDetail = error instanceof Error ? error.name : "error";

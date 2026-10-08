@@ -36,6 +36,10 @@ export function stateDirForHost(host: HostId, env: Record<string, string | undef
 			const home = env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".omp", "agent");
 			return join(home, "ultrathink");
 		}
+		case "prime-agent": {
+			const home = env.PRIME_AGENT_CODING_AGENT_DIR?.trim() || join(homedir(), ".prime", "agent");
+			return join(home, "ultrathink");
+		}
 		case "claude-code": {
 			const home = env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
 			return join(home, "ultrathink");
