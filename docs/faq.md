@@ -4,6 +4,7 @@ Short answers to the questions people ask first. Each links to the page with the
 
 - [What does it cost?](#what-does-it-cost)
 - [Why is my prompt slower?](#why-is-my-prompt-slower)
+- [Which model plans my prompt?](#which-model-plans-my-prompt)
 - [Do I need Notion or Linear?](#do-i-need-notion-or-linear)
 - [Does it run on Windows?](#does-it-run-on-windows)
 - [Can I run it next to another planning plugin?](#can-i-run-it-next-to-another-planning-plugin)
@@ -19,7 +20,7 @@ Short answers to the questions people ask first. Each links to the page with the
 
 ## What does it cost?
 
-ultrathink itself is free (AGPL-3.0-or-later). The planning runs on your own engine login, so it uses your Claude Code plan or API usage (or your Grok account if you switched engines), the same as any other `claude -p` call.
+ultrathink itself is free (AGPL-3.0-or-later). The planning runs on your own engine login, so it uses your Claude Code plan or API usage (or your Grok account if you switched engines), the same as any other `claude -p` call. On Omp it runs on the session's own model and counts against that provider account, like the rest of the session.
 
 Each planned prompt makes several engine calls: one to write the spec, one to draft the Graph of Thought, one per node (5 to 8 by default), and one for clarifying questions. The default Claude model is `sonnet` (`claude.model`).
 
@@ -38,10 +39,20 @@ Planning takes time: several model calls run before your agent starts, and on a 
 What you see depends on the host:
 
 - **Claude Code, Grok Build, Muse Code:** the prompt waits until the plan is ready.
-- **Omp:** ultrathink waits up to 25 s. If the plan isn't ready by then, your agent starts with a note to only read and investigate, and the plan arrives as an aside message when it is done.
+- **Omp:** ultrathink waits up to 25 s. If the plan isn't ready by then, your agent starts with a note to only read and investigate, and the plan arrives as an aside message when it is done. Planning on the session's own model can take several minutes on reasoning-heavy models. A plan is dropped, not delivered, when you send a newer prompt, switch the session's model, switch sessions or end the session first; in print mode (`omp -p`), keep the run going until the aside lands.
 - **Hermes Agent:** the plan must finish inside Hermes' hook cap. With the default 30 s cap nothing is planned; set `plugins.hook_callback_timeout` to 600 as described in [Architecture](architecture.md#hermes-hook-cap).
 
 For prompts that don't need planning, the skip options above cost nothing. More in [Reduce cost and latency](how-to/reduce-cost-and-latency.md) and [Troubleshooting](troubleshooting.md).
+
+## Which model plans my prompt?
+
+Each host's own engine, unless you name one with `think.engine`:
+
+- **Omp:** the session's own model, called inside Omp with Omp's own provider and login. No extra login is needed and ultrathink copies no credential. `models.hosts.omp` can name another model or provider; see [`models`](configuration.md#models-planning-model-selection).
+- **Claude Code, Grok Build, Muse Code:** Claude, Grok or Muse on their CLI routes, with the built-in models `sonnet`, `grok-4.7` and `muse-spark-1.3-contributor` unless you set `claude.model`, `grok.model` or `muse.model`. A blank `claude.model` or `muse.model` lets the CLI pick its own default. See [Route defaults](configuration.md#route-defaults).
+- **Hermes Agent:** the Claude, Grok or Muse route that matches the session model's family, Claude when the family is unknown.
+
+The summary line, the plan and `bin/ultrathink status` (`Last planned resolution:`) say which model planned and why: `detected`, `default`, `override` or `unresolved`. When no model can be used, the prompt goes through unplanned and the reason is shown; nothing is blocked. The six `/ultrathink-*` commands work the same on every host. See [Planning model states](how-to/choose-engine.md#planning-model-states).
 
 ## Do I need Notion or Linear?
 
@@ -101,7 +112,7 @@ Never into your repository's working tree, and never into `.planning/`.
 
 ## What data leaves my machine?
 
-Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login. ultrathink itself contacts Notion, Linear, Greptile, GitHub, Hindsight (`hindsight.enabled`), RAGFlow (`ragflow.enabled`), Agent Substrate and Tailscale only after you configure them. Jev decisions (OpenRouter or Vercel) are always on but send nothing until you store or set a key. A lesson is redacted before it is stored or sent. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
+Only what goes to services you set up. On a fresh install that is your prompt, a short excerpt of recent conversation and, when you invoke a skill, a short summary from its skill file, sent to the planning engine through your own `claude` login (on Omp, to the session's own model through Omp's own login, without the conversation excerpt). ultrathink itself contacts Notion, Linear, Greptile, GitHub, Hindsight (`hindsight.enabled`), RAGFlow (`ragflow.enabled`), Agent Substrate and Tailscale only after you configure them. Jev decisions (OpenRouter or Vercel) are always on but send nothing until you store or set a key. A lesson is redacted before it is stored or sent. `bun scripts/setup.ts apply` does add the hosted Notion and Linear MCP servers to Claude Code, which then connects to them itself. There is no telemetry.
 
 The full table, with what each destination receives and how to turn it off, is in [Privacy and data flow](privacy.md).
 

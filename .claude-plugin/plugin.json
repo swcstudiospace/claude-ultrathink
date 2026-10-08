@@ -1,6 +1,6 @@
 {
 	"name": "ultrathink",
-	"version": "0.4.0",
+	"version": "1.4.0",
 	"description": "Plans every prompt into a spec + Graph of Thought with HITL clarifications on a pluggable engine (Claude default, Grok optional), tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR.",
 	"author": { "name": "SWC Studio", "email": "noreply@swcstudio.space" },
 	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",

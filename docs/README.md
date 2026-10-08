@@ -5,7 +5,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 ## Start here
 
 - [Getting started](getting-started.md): from nothing to a first planned prompt, then to a first tracked plan.
-- [Install](install.md): install, verify, update and remove ultrathink on Claude Code, Grok Build, Hermes Agent, Muse Code and Omp.
+- [Install](install.md): install, verify, update and remove ultrathink on Claude Code, Grok Build, Hermes Agent, Muse Code, Omp and Prime Agent.
 - [What leaves your machine](privacy.md): which services ultrathink contacts, what it sends, and what stays local.
 - [FAQ](faq.md): short answers to common questions.
 
@@ -14,13 +14,13 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Set up Notion](how-to/set-up-notion.md): log in, create or reuse the tracking database, verify.
 - [Set up Linear](how-to/set-up-linear.md): log in with OAuth or an API key, choose the team, verify.
 - [Register the MCP gateway](how-to/register-mcp-gateway.md): give every host's agent the Notion, Linear and Greptile tools.
-- [Choose the engine](how-to/choose-engine.md): plan with your host's own engine (Claude, Grok or Muse).
+- [Choose the engine](how-to/choose-engine.md): plan with your host's own engine (Claude, Grok or Muse, or on Omp the session's own model), name another one, and read the four planning model states.
 - [Ship with Greptile](how-to/ship-with-greptile.md): opt in to the pull request, Greptile review and merge flow.
 - [Use the Greptile knowledge base](how-to/use-greptile-knowledge-base.md): opt in to reading the repository's Greptile knowledge base before the clarifying questions.
 - [Use Jev decisions](how-to/use-jev-decisions.md): store a Jev key for the always-on decision model at the plan, ship, knowledge, blocking, teachable and skillworthy points, check it over OpenRouter or Vercel, tune its thresholds and pin the model.
 - [Connect Hindsight](how-to/connect-hindsight.md): opt in to the Hindsight memory server, store the key, check it and prove a round trip.
 - [Connect RAGFlow](how-to/connect-ragflow.md): opt in to RAGFlow document search, check it without the healthz probe, and turn grounding on.
-- [Use Teachable Moments](how-to/use-teachable-moments.md): capture, confirm, recall and promote lessons. Off until you turn it on.
+- [Use Teachable Moments](how-to/use-teachable-moments.md): capture, confirm, recall and promote lessons. On by default.
 - [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md): the observe hook, the lesson tools and commands, and why Hermes only gets a skill draft.
 - [Reduce cost and latency](how-to/reduce-cost-and-latency.md): fewer engine calls per prompt, or none for small messages.
 - [Headless and CI](how-to/headless-and-ci.md): run hosts in scripts without planning or tracking.
@@ -43,7 +43,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 
 ## Project
 
-- [Project README](../README.md): what ultrathink is, supported hosts and platforms, optional integrations.
+- [Project README](../README.md): what ultrathink is, supported hosts and platforms, optional integrations, and the [cross-agent discovery](../README.md#cross-agent-discovery) descriptor `ultrathink.discovery.json`.
 - [Contributing](../CONTRIBUTING.md): development setup, checks and pull requests.
 - [Security](../SECURITY.md): reporting vulnerabilities and how credentials are stored.
 - [Code of conduct](../CODE_OF_CONDUCT.md): the Contributor Covenant.

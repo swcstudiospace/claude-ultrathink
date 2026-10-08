@@ -1,11 +1,11 @@
 # Configuration
 
-ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with Claude and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, asks no Jev decision, stores no lessons, contacts no Hindsight or RAGFlow server, and never pushes, opens a pull request or merges.
+ultrathink reads JSON config files, a small per-host control file written by the `/ultrathink-*` commands and `bin/ultrathink`, and some environment variables. All of them are optional. With no config at all, ultrathink plans every non-trivial prompt with each host's own engine (see [Host defaults](#host-defaults)) and contacts nothing except the engine: it creates no Linear or Notion rows, requests no Agent Substrate brief, reads no Greptile knowledge base, asks no Jev decision, stores no lessons, contacts no Hindsight or RAGFlow server, and never pushes, opens a pull request or merges.
 
 Terms used on this page:
 
-- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code or Omp.
-- **Engine**: the model that writes the plan: Claude (through the `claude` CLI) by default, or Grok.
+- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent.
+- **Engine**: the model that writes the plan. On Omp with `think.engine: "auto"` it is the session's own live model, called inside Omp. Everywhere else, and on Omp with a named engine, it is Claude, Grok or Muse on its CLI route (Grok also over HTTP or a gateway you run).
 - **Graph of Thought**: the 5 to 8 reasoning nodes the engine builds for each prompt. Each node is filled with numbered rationale steps.
 - **HITL** (human in the loop): the clarifying questions the plan asks before work starts.
 - **Tracker**: Notion and/or Linear, where the plan becomes rows and issues.
@@ -109,7 +109,7 @@ Used when the engine resolves to Grok: on Grok Build by default, or anywhere wit
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | boolean | `true` | When `false`, the Claude engine is used even if `think.engine` is `"grok"`. |
+| `enabled` | boolean | `true` | When `false`, the Claude engine is used even if `think.engine` is `"grok"`. The plan's model line then reads `claude:<model> [configured fallback · grok unavailable]`. |
 | `transport` | `"http"`, `"cli"` or `"shunt"` | `"http"` | `http`: POST `{baseUrl}/responses` with your `grok login` token. `cli`: run the `grok` binary. `shunt`: POST `{shuntBaseUrl}/v1/messages` on an Anthropic-compatible gateway that you run, with no auth. |
 | `baseUrl` | string | `"https://cli-chat-proxy.grok.com/v1"` | Base URL for the `http` transport. Trailing slashes are removed. |
 | `model` | string | `"grok-4.7"` | Model for `http` and `cli`, and for `shunt` when `shuntModel` is empty. |
@@ -117,8 +117,8 @@ Used when the engine resolves to Grok: on Grok Build by default, or anywhere wit
 | `bin` | string | `"grok"` | The `grok` binary. |
 | `home` | string | `""` | Grok home directory, used to find the `grok login` session. `""` means `$GROK_HOME`, else `~/.grok`. |
 | `callTimeoutMs` | number, >= 0 | `0` | Timeout for one call. `0` means no timer; the host's hook timeout is the limit. |
-| `fallbackToClaude` | boolean | `false` | When the Grok login is missing or expired (`http` and `cli` transports), plan with Claude instead. When `false`, the prompt is not planned and the hook reports ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``. |
-| `shuntBaseUrl` | http(s) URL | `""` | Base URL of your gateway for `shunt`; `/v1/messages` is appended. There is no built-in gateway: with `transport: "shunt"` and this key empty, every engine call fails with an error that names `grok.shuntBaseUrl`. The prompt then gets the conservative fallback spec and no rows are created. Claude is not used instead: `fallbackToClaude` only applies to a missing Grok login. |
+| `fallbackToClaude` | boolean | `false` | When the Grok login is missing or expired (`http` and `cli` transports), plan with Claude instead; the plan's model line then reads `claude:<model> [configured fallback · grok unavailable]`. When `false`, the prompt is not planned and the hook reports ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``. This applies on Grok Build under `auto` too. |
+| `shuntBaseUrl` | http(s) URL | `""` | Base URL of your gateway for `shunt`; `/v1/messages` is appended. There is no built-in gateway: with `transport: "shunt"` and this key empty, the prompt is not planned and nothing is sent. The hook reports ``Prompt Uplift skipped · grok:unresolved [transport-incompatible]``, and no rows are created. Claude is not used instead: `fallbackToClaude` only applies to a missing Grok login. |
 | `shuntModel` | string | `""` | Model name sent to the gateway. `""` sends `model`. |
 | `shuntMaxTokens` | integer, > 0 | `8192` | `max_tokens` for `shunt` calls. |
 
@@ -142,12 +142,76 @@ With `think.engine` set to `"auto"` (the default), each host plans with its own 
 | Host | Engine | Model |
 |---|---|---|
 | Claude Code | Claude | `claude.model` (`"sonnet"`) |
-| Hermes Agent | Session model | The engine follows the session's active model (Claude, Grok or Muse); Claude when it cannot be read |
-| Omp | Session model | The engine follows the session's active model (Claude, Grok or Muse); Claude when it cannot be read |
+| Hermes Agent | Chosen by the session model's family | The Claude, Grok or Muse route, picked from the model id Hermes sends; Claude when the family is unknown. The route then uses its own model key. |
+| Omp | Native | The session's own live model, called inside Omp through Omp's own provider and login. See [`models`](#models-planning-model-selection). |
 | Grok Build | Grok | `grok.model` (`"grok-4.7"`) |
 | Muse Code | Muse | `muse.model` (`"muse-spark-1.3-contributor"`) |
 
-Hermes forwards its hook payload's model and Omp reads its session file's last `model_change` entry, so a Grok session plans with Grok and a Claude session with Claude. An unrecognized model (Kimi included, until it gets an engine) plans with Claude. On Grok Build without a usable Grok login, planning falls back to Claude and the engine label ends in `(grok unavailable)`; `grok.fallbackToClaude` is not needed for this. Set `think.engine` to a named engine to plan with one engine on every host. Teachable Moments are stored per host (see [`teach`](#teach-teachable-moments)), so every host keeps its own lessons whichever engine it plans with.
+On Omp, `auto` plans natively. ultrathink copies the session's live model once per prompt and runs the uplift, the graph, every node fill and the clarifying questions on that copy, through Omp's own provider and login. Nothing is read from Omp's saved session history, and the model is not mapped to a Claude, Grok or Muse family. When no model can be used, the prompt goes through unplanned and the reason is shown (see [the four states](how-to/choose-engine.md#planning-model-states)). A named engine (`think.engine`, or `bin/ultrathink grok engine …` for Omp) opts Omp out of native planning and uses that engine's CLI route. Omp's auxiliary helpers, the ship done check and the Teachable Moments distiller, are never native: they use the Claude CLI route under `auto`, or the named engine.
+
+Native Omp planning also snapshots the session's thinking level once per flight and uses it for every planning stage. `off` uses Omp's reasoning-disable option; `inherit`, an unset level, or an older host without the capability leaves provider options unset. There is no hidden low-effort default, and the CLI-route effort settings do not control native planning. Changing the session level invalidates a reused flight at the next planning observation.
+
+Hermes sends its session's model id, and ultrathink picks the Claude, Grok or Muse route from its family. An unknown model (Kimi included, until it gets an engine) plans with Claude. The id itself is never sent as the wire model.
+
+Claude replaces a selected Grok route only through the two explicit, labeled user switches: `grok.fallbackToClaude: true` (HTTP/CLI login missing or expired) and `grok.enabled: false` (documented ‘forces Claude even when Grok is selected’). Without them, a missing or expired Grok login skips planning with the unchanged `GROK_LOGIN_REQUIRED` notice. Naming `think.engine: "claude"` is a deliberate engine choice, not a replacement.
+
+The notice reads ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``. Set `think.engine` to a named engine to plan with one engine on every host. Teachable Moments are stored per host (see [`teach`](#teach-teachable-moments)), so every host keeps its own lessons whichever engine it plans with.
+
+### Route defaults
+
+The CLI routes take their built-in model from one version-controlled map, `ROUTE_DEFAULT_MODELS` in `src/route-defaults.ts`. It has one entry per route, and each entry can be changed on its own without touching the resolution logic:
+
+| Route | Built-in model | Key that replaces it |
+|---|---|---|
+| `claude` | `sonnet` | `claude.model` |
+| `grok` | `grok-4.7` | `grok.model` (on `shunt`, a non-empty `grok.shuntModel` is sent instead) |
+| `muse` | `muse-spark-1.3-contributor` | `muse.model` |
+
+- Unset in every config file, a route uses its map entry. The record says `default`, source `route-default`, and the label reads, for example, `claude:sonnet [route default]`.
+- Set in any config file, the value is an override (`override`, source `engine-model`), even when it equals the built-in model.
+- `""` for `claude.model` or `muse.model` omits `--model`, so the CLI's own default model answers: `claude:CLI default (model unobserved)`. A blank `grok.model` or `grok.shuntModel` is ignored, as before.
+- Nonblank legacy model and shunt-alias values retain leading or trailing control characters for `selector-invalid` rejection before auth or execution; trimming cannot turn an invalid selector into a valid target. Whitespace-only values keep the clearing and lower-pin rules above.
+  Omp's private flight identity uses that same normalization: changing a shunt alias from valid to control-invalid cancels the old plan, and correcting an invalid alias starts a fresh flight. Plain surrounding spaces and whitespace-only absence remain equivalent.
+
+The map is keyed by route, not by provider. Native Omp planning never reads it: its defaults come from Omp (see below).
+
+### `models`: planning model selection
+
+Per-host model choices and per-provider defaults. Every layer may set them, the project file included.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `models.hosts.<host>.model` | string | unset | The model to plan with on that host. `<host>` is `claude-code`, `grok-build`, `hermes`, `muse` or `omp`; other keys are ignored. On Omp under `auto` it is a selector that Omp resolves, such as a model id, `provider/id` or a role; a selector that does not resolve leaves the prompt unplanned and is never replaced by another model. On the CLI routes it is the wire model sent instead of the engine's own model key. |
+| `models.hosts.<host>.provider` | string | unset | On Omp under `auto`: the exact provider id the model must come from. Without a `model`, a usable live model from that provider is kept; otherwise that provider's default is used. On the CLI routes no provider can be bound, so a provider here leaves the prompt unplanned (`transport-incompatible`). |
+| `models.providerDefaults.<provider>` | string | none | Omp only: the model to plan with for that exact provider id when the session's own model cannot be used. Without an entry, the default of Omp's installed catalog for that provider is used. |
+
+How these keys merge:
+
+- A blank value (`""` or only whitespace) in a later file clears the earlier one. A cleared host model or provider restores the default resolution; a cleared `providerDefaults` entry restores the catalog default.
+- An absent, `null` or wrong-type value keeps the earlier value. Surrounding whitespace is trimmed.
+- A value that contains a control character is kept as written and reported as `selector-invalid` when the prompt is planned; it is never sent anywhere.
+- Only own keys and own host `provider`/`model` fields merge: `__proto__`, `constructor` and `prototype` are skipped, inherited selectors and getters are ignored, and an absent or inherited field keeps its lower-layer pin.
+- The keys select models Omp already has. They cannot define an endpoint, a header or a credential.
+
+On Omp under `auto`, the planning model is chosen in this order, and the first match wins:
+
+1. A non-empty `models.hosts.omp.model`, resolved by Omp (and required to come from `models.hosts.omp.provider` when that is set): `override`.
+2. The session's live model, when Omp can use it for a plain text completion: `detected`.
+3. The default for the live model's provider (or for `models.hosts.omp.provider`): `models.providerDefaults[<provider>]`, else Omp's installed catalog default for that provider. The model must come from exactly that provider, and a catalog default must be exactly that id. This is `default`, or `override` when a provider constraint made ultrathink pick it.
+4. Otherwise `unresolved`, with the reason.
+
+A failed `models.hosts.omp.model` or `providerDefaults` entry never falls through to the next tier. The catalog default is the per-provider default of the `@oh-my-pi/pi-catalog` package bundled with your Omp, so it changes when you update Omp. It is not a lookup of the provider's newest model. The states, sources and reasons are in [Choose the planning engine](how-to/choose-engine.md#planning-model-states).
+
+Example: on Omp, always plan with a model from one provider. The session's own model is used when it comes from that provider and Omp can use it; otherwise the provider's configured default is used.
+
+```json
+{
+  "models": {
+    "hosts": { "omp": { "provider": "<provider id>", "model": "" } },
+    "providerDefaults": { "<provider id>": "<model id or role>" }
+  }
+}
+```
 
 ### `notion`: Notion tracking
 
@@ -373,6 +437,7 @@ All keys are optional; write only the ones you change. This file shows every key
     "reasoningEffort": "high",
     "callTimeoutMs": 0
   },
+  "models": { "hosts": {}, "providerDefaults": {} },
   "notion": { "dataSourceUrl": "collection://<data source id>" },
   "linear": { "team": "<your Linear team>" },
   "track": { "enabled": true, "budgetMs": 60000, "concurrency": 6 },
@@ -557,7 +622,7 @@ ultrathink sets these itself. Do not set them.
 | Variable | Purpose |
 |---|---|
 | `ULTRATHINK_CHILD` | Set to `1` on the headless `claude` calls the engine makes, so the hooks do not plan or track them. A process that has it set to `1` is never planned. |
-| `ULTRATHINK_PROGRESS_FD` | File descriptor (3 or higher) the Omp extension reads planning progress from. |
+| `ULTRATHINK_PROGRESS_FD` | File descriptor (3 or higher) that `hooks/engine.ts` writes planning progress to, one JSON line per event, when its caller sets it. Omp no longer uses it: the Omp extension plans in-process and reads progress directly. |
 | `ULTRATHINK_BUN_REQUIRED` | Set to `1` by `bin/ultrathink`, `bin/ultrathink-mcp` and `bin/ultrathink-ship` so `bin/run-bun` exits 127 when Bun is missing. `bin/run-bun` removes it before starting Bun. |
 | `MAX_THINKING_TOKENS` | Set to `0` on the headless `claude` calls when `claude.thinking` is `false`. |
 | `GROK_SUBAGENTS`, `GROK_MEMORY`, `GROK_WEB_FETCH` | Set to `0` on the `grok` process the `cli` transport starts. `GROK_HOME` is set there too when `grok.home` is not empty. |
