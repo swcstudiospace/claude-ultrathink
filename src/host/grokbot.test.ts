@@ -26,6 +26,7 @@ import {
 	validateUplift,
 } from "./grokbot.ts";
 import { buildTrackPayloads, recordRefs } from "./grokbot-track.ts";
+import { buildCloudPrompt, DEFAULT_DESK_RULES, validateCloudPrompt, wellFormed } from "./grokbot-prompts.ts";
 import { dirFetcher, promoteGuard, reviewRead } from "./grokbot-cli.ts";
 import { writeFileSync } from "node:fs";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
@@ -311,5 +312,38 @@ describe("grok-bot review read", () => {
 		expect(read.greptileThreadsTotal).toBe(2);
 		expect(read.greptileThreadsOnHead).toBe(1);
 		expect(read.greptileCheckRuns).toEqual([{ name: "Greptile Review", status: "completed", conclusion: "success" }]);
+	});
+});
+
+describe("grok-bot prompts build", () => {
+	test("builds a validated follow-up prompt from a planned node", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(6));
+		const record = JSON.parse(readFileSync(result.response?.statePath as string, "utf8")) as SessionRecord;
+		const dispatch = { unit: "n2", mode: "followup" as const, agentId: "bc-test", repo: "o/r", pr: 14, branch: "grokbot/fix-a & b", notes: ["keep <fixture> rule"] };
+		const xml = buildCloudPrompt(record, dispatch);
+		const check = validateCloudPrompt(xml, dispatch, PROMPT);
+		expect(check.errors).toEqual([]);
+		expect((xml.match(/<SUBISSUE /g) ?? []).length).toBe(6);
+		expect(xml).toContain("<FOLLOW_UP>");
+		expect(xml).toContain("grokbot/fix-a &amp; b");
+		expect(xml).toContain(`graph="${record.plan?.graphId}"`);
+		expect((xml.match(/<RULE>/g) ?? []).length).toBe(DEFAULT_DESK_RULES.length);
+	});
+	test("rejects malformed XML, too many rules, missing agent ids and secret-like text", async () => {
+		expect(wellFormed("<A><B></A></B>").length).toBeGreaterThan(0);
+		expect(wellFormed("<A>x & y</A>").join()).toMatch(/bare/);
+		expect(wellFormed("<A/><B/>").join()).toMatch(/one root/);
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(5));
+		const record = JSON.parse(readFileSync(result.response?.statePath as string, "utf8")) as SessionRecord;
+		const many = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b", rules: Array.from({ length: 11 }, (_, i) => `rule ${i}`) };
+		expect(validateCloudPrompt(buildCloudPrompt(record, many), many, PROMPT).ok).toBe(true);
+		const injected = buildCloudPrompt(record, many).replace("<RULE>rule 0</RULE>", "<RULE>rule 0</RULE><RULE>x</RULE>".repeat(6));
+		expect(validateCloudPrompt(injected, many, PROMPT).errors.join()).toMatch(/DESK_RULES/);
+		const follow = { unit: "n3", mode: "followup" as const, repo: "o/r", branch: "b" };
+		expect(validateCloudPrompt(buildCloudPrompt(record, follow), follow, PROMPT).errors.join()).toMatch(/agent id/);
+		const leaky = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b", notes: ["key sk-or-abcdefghijklmnop"] };
+		expect(validateCloudPrompt(buildCloudPrompt(record, leaky), leaky, PROMPT).errors.join()).toMatch(/secret-like/);
 	});
 });

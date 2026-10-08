@@ -33,6 +33,7 @@ import {
 	storeAnswer,
 } from "./grokbot.ts";
 import { buildTrackPayloads, recordRefs } from "./grokbot-track.ts";
+import { buildCloudPrompt, type UnitDispatch, validateCloudPrompt } from "./grokbot-prompts.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
 
 const USAGE = `usage: ultrathink-grokbot <command>
@@ -47,6 +48,7 @@ const USAGE = `usage: ultrathink-grokbot <command>
   track record --session S --refs F           write real refs (from Desk Lead's connector results) into state + spec
   review read --repo owner/name --pr N [--from-dir D]   read-only Greptile score + open threads (public GitHub API)
   prompts [uplift|graph|cot|clarify|distill]  print the plugin's system prompts
+  prompts build --session S --units units.json [--out-dir D]   cloud-agent prompts per graph node (validated; never launched)
   ctl <status|on|off|skip|last|track ..|think ..|hitl ..|grok ..>   planner controls (grok-bot state dir)
   decisions check | probe <point> <cases.json>
   teach <subcommand…>                         Teachable Moments (promote: --target drafts only, never --install)
@@ -271,6 +273,24 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			return { code: 0, text: json(await reviewRead(repo, pr, fromDir ? dirFetcher(resolve(fromDir)) : fetch)) };
 		}
 		case "prompts": {
+			if (rest[0] === "build") {
+				const units = flag(rest, "--units");
+				if (!units) return { code: 2, text: "prompts build needs --session S --units units.json [--out-dir D] (units: [{unit, mode, repo, branch, agentId?, pr?, seat?, base?, verify?, notes?, file?}])" };
+				const { record } = readRecord(stateDir, session(rest));
+				const outDir = resolve(flag(rest, "--out-dir") ?? ".");
+				const list = JSON.parse(readFileSync(units, "utf8")) as Array<UnitDispatch & { file?: string }>;
+				const report: Array<Record<string, unknown>> = [];
+				let failed = 0;
+				for (const dispatch of list) {
+					const xml = buildCloudPrompt(record, dispatch);
+					const check = validateCloudPrompt(xml, dispatch, record.result.original);
+					const path = join(outDir, dispatch.file ?? `${dispatch.unit}.prompt.xml`);
+					if (check.ok) writeFileSync(path, xml);
+					else failed++;
+					report.push({ unit: dispatch.unit, mode: dispatch.mode, agent: dispatch.agentId, path: check.ok ? path : undefined, ...check });
+				}
+				return { code: failed ? 1 : 0, text: json(report) };
+			}
 			const all: Record<string, string> = { uplift: UPLIFT_SYSTEM_PROMPT, graph: GRAPH_SYSTEM_PROMPT, cot: COT_SYSTEM_PROMPT, clarify: CLARIFY_SYSTEM_PROMPT, distill: DISTILL_SYSTEM };
 			const which = rest[0];
 			if (which) return all[which] ? { code: 0, text: all[which] } : { code: 2, text: `unknown prompt ${which}` };
