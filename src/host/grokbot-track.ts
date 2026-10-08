@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
+/**
+ * Grok Bot tracker bridge. Desk Lead writes Linear/Notion rows through its own connectors, which a Bun process cannot
+ * call. So the plugin's real `createTracking` runs against *recording* tool callers: every `save_issue`,
+ * `notion-fetch` and `notion-create-pages` call it would make is captured in order, with placeholder refs
+ * (`PEND-<n>` identifiers, `https://www.notion.so/pending-<n>` pages) standing in for created rows. Desk Lead executes
+ * the calls in order, substituting each placeholder with the real ref an earlier call returned, then `recordRefs`
+ * writes the real refs back into the SessionRecord and re-renders `<ISSUES>` in the spec, exactly as
+ * `ultrathink-mcp track complete` does.
+ *
+ * Desk addition: every Linear create carries `project` (default "Kanban"); the plugin has no project setting.
+ */
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import type { SessionRecord } from "../claude/state.ts";
+import { createTracking, type ToolCaller } from "../track/create.ts";
+import { formatTrackingTodos, injectTrackingXml } from "../track/render.ts";
+import type { IssueRef, TrackingRefs } from "../track/types.ts";
+
+/** Notion Agent Task Graph columns (docs/tracking.md); the dry run reports every one so no property is dropped. */
+export const NOTION_COLUMNS = [
+	"Item", "Level", "Status", "Linear State", "Graph ID", "Description", "Uplifted Prompt", "Agent", "Thought", "Step",
+	"Linear URL", "Issue ID", "Repo", "Branch", "PR URL", "PR #", "PR State", "Checks", "Reviewers", "Completed", "Parent Item", "Sub-Items",
+] as const;
+
+export interface RecordedCall {
+	seq: number;
+	provider: "linear" | "notion";
+	tool: string;
+	args: Record<string, unknown>;
+	/** Placeholders this call's result defines (Linear: one PEND-n; Notion: one per page, in order). */
+	defines: string[];
+	/** Graph keys the defined placeholders stand for: `n3` (issue), `n3.2` (sub-issue), `task`. */
+	keys: string[];
+}
+
+export interface TrackPayloads {
+	graphId: string;
+	linearTeam?: string;
+	project?: string;
+	notionDataSource?: string;
+	calls: RecordedCall[];
+	counts: { linearIssues: number; linearSubIssues: number; notionTask: number; notionIssues: number; notionSubIssues: number };
+}
+
+const FOOTER_RE = /ultrathink graph \S+ · node (\S+?)(?: · step (\d+))?$/m;
+
+export async function buildTrackPayloads(
+	record: SessionRecord,
+	options: { linearTeam?: string; notionDataSource?: string; project?: string; agent?: string },
+): Promise<TrackPayloads> {
+	const recorded = record.plan;
+	if (!recorded) throw new Error("session record has no plan");
+	// The adapter plans under the prime-agent engine family; the Notion Agent column names the real caller.
+	const plan = options.agent ? { ...recorded, task: { ...recorded.task, agent: options.agent } } : recorded;
+	const calls: RecordedCall[] = [];
+	let linearSeq = 0;
+	let notionSeq = 0;
+	const linear: ToolCaller = {
+		async call(name, args) {
+			const seq = calls.length + 1;
+			if (name !== "save_issue") {
+				calls.push({ seq, provider: "linear", tool: name, args, defines: [], keys: [] });
+				return { issues: [] };
+			}
+			const id = `PEND-${++linearSeq}`;
+			const description = typeof args.description === "string" ? args.description : "";
+			const match = description.match(FOOTER_RE);
+			const key = match ? (match[2] ? `${match[1]}.${match[2]}` : (match[1] as string)) : `?${linearSeq}`;
+			const withProject = options.project ? { ...args, project: options.project } : args;
+			calls.push({ seq, provider: "linear", tool: name, args: withProject, defines: [id], keys: [key] });
+			return { id, identifier: id, url: `https://linear.app/pending/issue/${id}/pending` };
+		},
+	};
+	const notion: ToolCaller = {
+		async call(name, args) {
+			const seq = calls.length + 1;
+			if (name === "notion-fetch") {
+				calls.push({ seq, provider: "notion", tool: name, args, defines: [], keys: [] });
+				return { properties: Object.fromEntries(NOTION_COLUMNS.map((column) => [column, { type: "rich_text" }])) };
+			}
+			if (name === "notion-create-pages") {
+				const pages = Array.isArray(args.pages) ? (args.pages as Array<{ properties?: Record<string, unknown> }>) : [];
+				const urls: string[] = [];
+				const keys: string[] = [];
+				for (const page of pages) {
+					urls.push(`https://www.notion.so/pending-${++notionSeq}`);
+					const props = page.properties ?? {};
+					const level = String(props.Level ?? "");
+					const step = props.Step;
+					keys.push(level === "Task" ? "task" : `${String(props.Item ?? "").match(/^\[(n\d+)\]/)?.[1] ?? "?"}${level === "Sub-Issue" && step !== undefined ? `.${String(step)}` : ""}`);
+				}
+				calls.push({ seq, provider: "notion", tool: name, args, defines: urls, keys });
+				return { pages: urls.map((url) => ({ url })) };
+			}
+			calls.push({ seq, provider: "notion", tool: name, args, defines: [], keys: [] });
+			return {};
+		},
+	};
+	await createTracking(plan, record.graph, undefined, {
+		linear,
+		notion,
+		...(options.linearTeam ? { linearTeam: options.linearTeam } : {}),
+		...(options.notionDataSource ? { notionDataSource: options.notionDataSource.replace(/^collection:\/\//, "") } : {}),
+		concurrency: 1,
+		budgetMs: 600_000,
+	});
+	const created = (provider: "linear" | "notion", tool: string) => calls.filter((c) => c.provider === provider && c.tool === tool);
+	const linearCreates = created("linear", "save_issue");
+	const notionKeys = created("notion", "notion-create-pages").flatMap((c) => c.keys);
+	return {
+		graphId: plan.graphId,
+		...(options.linearTeam ? { linearTeam: options.linearTeam } : {}),
+		...(options.project ? { project: options.project } : {}),
+		...(options.notionDataSource ? { notionDataSource: options.notionDataSource } : {}),
+		calls,
+		counts: {
+			linearIssues: linearCreates.filter((c) => !c.keys[0]?.includes(".")).length,
+			linearSubIssues: linearCreates.filter((c) => c.keys[0]?.includes(".")).length,
+			notionTask: notionKeys.filter((k) => k === "task").length,
+			notionIssues: notionKeys.filter((k) => k !== "task" && !k.includes(".")).length,
+			notionSubIssues: notionKeys.filter((k) => k.includes(".")).length,
+		},
+	};
+}
+
+export interface RealRefs {
+	/** Graph key (`n1`, `n1.3`) → the Linear issue Desk Lead created. */
+	linear?: Record<string, IssueRef>;
+	/** Graph key (`task`, `n1`, `n1.3`) → Notion page URL. */
+	notion?: Record<string, string>;
+	errors?: string[];
+}
+
+/** Writes real refs into the record's tracking and re-renders the spec, like `ultrathink-mcp track complete`. */
+export function recordRefs(statePath: string, refs: RealRefs, now = Date.now()): { tracking: TrackingRefs; todos: string } {
+	const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+	const plan = record.plan;
+	if (!plan) throw new Error("session record has no plan");
+	const previous = record.tracking;
+	const tracking: TrackingRefs = {
+		graphId: plan.graphId,
+		status: "failed",
+		...(previous?.linearTeam ? { linearTeam: previous.linearTeam } : {}),
+		linear: { nodes: { ...previous?.linear.nodes }, steps: { ...previous?.linear.steps } },
+		notion: { ...(previous?.notion.taskUrl ? { taskUrl: previous.notion.taskUrl } : {}), nodes: { ...previous?.notion.nodes }, steps: { ...previous?.notion.steps } },
+		errors: [...(refs.errors ?? [])],
+		updatedAt: now,
+	};
+	for (const [key, ref] of Object.entries(refs.linear ?? {})) {
+		if (key.includes(".")) tracking.linear.steps[key] = ref;
+		else tracking.linear.nodes[key] = ref;
+	}
+	for (const [key, url] of Object.entries(refs.notion ?? {})) {
+		if (key === "task") tracking.notion.taskUrl = url;
+		else if (key.includes(".")) tracking.notion.steps[key] = url;
+		else tracking.notion.nodes[key] = url;
+	}
+	const linearDone = plan.linearIssues.every((i) => tracking.linear.nodes[i.nodeId]) && plan.linearSubIssues.every((s) => tracking.linear.steps[`${s.nodeId}.${s.step}`]);
+	const notionDone = !!tracking.notion.taskUrl && plan.issues.every((r) => tracking.notion.nodes[r.nodeId]) && plan.subIssues.every((r) => tracking.notion.steps[`${r.nodeId}.${r.step}`]);
+	const any = Object.keys(tracking.linear.nodes).length + Object.keys(tracking.notion.nodes).length + (tracking.notion.taskUrl ? 1 : 0);
+	tracking.status = linearDone && notionDone ? "complete" : any > 0 ? "partial" : "failed";
+	record.tracking = tracking;
+	const xml = injectTrackingXml(record.result.xml, plan, tracking);
+	record.result = { ...record.result, xml };
+	const write = (path: string, text: string) => {
+		writeFileSync(`${path}.tmp`, text);
+		renameSync(`${path}.tmp`, path);
+	};
+	write(statePath, `${JSON.stringify(record, null, 2)}\n`);
+	write(statePath.replace(/\.json$/, ".xml"), xml);
+	return { tracking, todos: formatTrackingTodos(plan, tracking) };
+}
