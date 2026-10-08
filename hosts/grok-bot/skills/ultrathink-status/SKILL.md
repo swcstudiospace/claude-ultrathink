@@ -1,7 +1,7 @@
 ---
 name: ultrathink-status
 description: >-
-  Use when Ming types /ultrathink-status or /desk needs the planner line: show
+  Use when Ming types /ultrathink-status or /ultrathink needs the planner line: show
   planning on/off, engine (Desk Lead host model), tracking, ship (off), Jev,
   teach and the last plan.
 ---

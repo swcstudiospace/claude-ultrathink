@@ -9,7 +9,7 @@ description: >-
 # Ultrathink teach admin
 
 - `G teach status|list|show <id>|capture ...|recall "<q>"|confirm <id>|forget <id>|sync|export --a2a`
-- Observe a finished session: pipe a digest into `G teach observe --stdin`. If the output lists `needsModel` (stage `distill`), answer it like a plan request: `G show --session teach <key>`, write the JSON lessons the SYSTEM text asks for, `G answer --session teach <key> --file F`, then re-run the same observe command.
+- Observe a finished session: build the digest with `G teach digest --session S --transcript <turns.jsonl> [--outcome completed]` and pipe it into `G teach observe --stdin`. If the output lists `needsModel` (stage `distill`), answer it like a plan request: `G show --session teach <key>`, write the JSON lessons the SYSTEM text asks for, `G answer --session teach <key> --file F`, then re-run the same observe command.
 - Promote: `G teach promote <id> --target drafts` only; `--install` is blocked.
 
 ## Shared rules (every ultrathink skill on Grok Bot)
