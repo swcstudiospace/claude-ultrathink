@@ -72,6 +72,15 @@ muse plugins remove ultrathink
 omp plugin uninstall ultrathink
 ```
 
+### Prime Agent
+
+`scripts/setup.ts rollback` (step 2) removes the symlinks `hosts/prime-agent` in `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` and the agent skills in `~/.agents/skills`. If you linked them manually, remove those symlinks:
+
+```sh
+rm ${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink
+rm ~/.agents/skills/ultrathink-*
+```
+
 ## 2. Undo `scripts/setup.ts apply`
 
 Skip this step if you never ran `bun scripts/setup.ts apply`.
@@ -157,6 +166,7 @@ Each host keeps its own state directory: control state, planned sessions, specs 
 | Hermes Agent | `${HERMES_HOME:-~/.hermes}/ultrathink`, and `ultrathink` in each Hermes profile directory you used it in (`${HERMES_HOME:-~/.hermes}/profiles/<name>`) |
 | Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/ultrathink` |
 | Omp | `${PI_CODING_AGENT_DIR:-~/.omp/agent}/ultrathink` |
+| Prime Agent | `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/ultrathink` |
 
 If you set `ULTRATHINK_STATE_DIR`, the state is in that directory instead. Unset the variable too.
 

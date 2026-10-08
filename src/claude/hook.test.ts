@@ -9,6 +9,7 @@ import type { DecisionAction, DecisionRecord, DecisionsConfig, DecisionsErrorKin
 import type { Clarification } from "../hitl/types.ts";
 import type { KnowledgeReader, KnowledgeResult } from "../greptile/knowledge.ts";
 import type { RunClarifyOptions } from "../hitl/pipeline.ts";
+import type { ModelResolution } from "../host/engine.ts";
 import type { ProgressEvent } from "../host/progress.ts";
 import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
 import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
@@ -421,8 +422,8 @@ describe("substrate brief", () => {
 		}
 	});
 
-	test("passes the resolved repo and branch to the brief", async () => {
-		let seen: { repo?: string; branch?: string; surface?: string } | undefined;
+	test("passes the resolved repo and branch to the brief, with the planning lifetime", async () => {
+		let seen: { repo?: string; branch?: string; surface?: string; signal?: AbortSignal } | undefined;
 		const { deps, cleanup } = baseDeps({
 			complete: smartComplete(),
 			clarify: async () => [],
@@ -433,7 +434,9 @@ describe("substrate brief", () => {
 		});
 		try {
 			await runPromptSubmit(input, deps);
-			expect(seen).toEqual({ repo: "acme/widgets", branch: "feat/widget", surface: "claude-code" });
+			expect(seen).toMatchObject({ repo: "acme/widgets", branch: "feat/widget", surface: "claude-code" });
+			expect(Object.keys(seen ?? {}).sort()).toEqual(["branch", "repo", "signal", "surface"]);
+			expect(seen?.signal).toBeInstanceOf(AbortSignal);
 		} finally {
 			cleanup();
 		}
@@ -991,6 +994,8 @@ describe("skill invocations", () => {
 		const config = trackedConfig();
 		config.ship.enabled = true;
 		const { deps, cleanup } = baseDeps({ config, complete: smartComplete() });
+		const shipFlag = process.env.ULTRATHINK_SHIP;
+		delete process.env.ULTRATHINK_SHIP;
 		try {
 			const gsd = await runPromptSubmit(skillInput, deps);
 			expect(gsd.output?.hookSpecificOutput.additionalContext).toMatch(
@@ -1002,6 +1007,8 @@ describe("skill invocations", () => {
 			const plain = await runPromptSubmit(input, deps);
 			expect(plain.output?.hookSpecificOutput.additionalContext).not.toContain("## Ship");
 		} finally {
+			if (shipFlag === undefined) delete process.env.ULTRATHINK_SHIP;
+			else process.env.ULTRATHINK_SHIP = shipFlag;
 			cleanup();
 		}
 	});
@@ -2214,6 +2221,510 @@ describe("lessons and RAGFlow documents in the plan", () => {
 			expect(R.calls).toHaveLength(0);
 		} finally {
 			cleanup();
+		}
+	});
+});
+
+describe("caller cancellation and the resolution record (D-12)", () => {
+	/** An honest fixture record: CLI default delegation, no model claimed. */
+	const RESOLUTION: ModelResolution = {
+		version: "1.0.0",
+		state: "default",
+		host: "claude-code",
+		transport: "claude-cli",
+		source: "cli-default",
+		reason: "cli-delegation",
+		engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		modelKnown: false,
+		label: "claude:CLI default (model unobserved)",
+	};
+	/** Hook stage of each completer call, in run order: the graph and its node fills are one stage. */
+	const STAGE = { uplift: 0, graph: 1, fill: 1, clarify: 2 } as const;
+	type Phase = keyof typeof STAGE;
+	const phaseOf = (user: string): Phase =>
+		user.includes("<user_request>") ? "uplift" : user.startsWith("<spec>") ? "clarify" : user.includes("current_node") ? "fill" : "graph";
+	const noneKnowledge: KnowledgeResult = { lookup: { outcome: "none", docs: [], chars: 0, ms: 1 }, digest: "" };
+
+	/** Runs a plan whose seams record every completer phase and every write, so a test sees what started after cancellation. */
+	async function cancelledRun(overrides: (controller: AbortController) => Partial<HookDeps>, onPhase?: (phase: Phase, controller: AbortController) => boolean) {
+		const controller = new AbortController();
+		const phases: Phase[] = [];
+		const events: ProgressEvent[] = [];
+		let tracked = 0;
+		const complete = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			signal: controller.signal,
+			modelResolution: RESOLUTION,
+			progress: (event) => events.push(event),
+			complete: async (system, user) => {
+				const phase = phaseOf(user);
+				phases.push(phase);
+				// true: the provider honours the abort; false: it ignores it and answers anyway.
+				if (onPhase?.(phase, controller) === true) throw new DOMException("aborted", "AbortError");
+				return complete(system, user);
+			},
+			track: async () => {
+				tracked++;
+				return undefined;
+			},
+			...overrides(controller),
+		});
+		try {
+			const caught = await runPromptSubmit(input, deps).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			const specFile = sessionPath(deps.stateDir, "s1").replace(/\.json$/, ".xml");
+			return {
+				name: caught instanceof Error ? caught.name : undefined,
+				phases,
+				tracked,
+				events,
+				aborted: controller.signal.aborted,
+				written: existsSync(sessionPath(deps.stateDir, "s1")) || existsSync(specFile) || existsSync(join(deps.stateDir, "last.json")),
+			};
+		} finally {
+			cleanup();
+		}
+	}
+
+	const ENDED: ProgressEvent = { type: "end", at: 1_000, outcome: "skipped", detail: "aborted", modelResolution: RESOLUTION };
+
+	test("a flight cancelled before it starts sends no gate request and starts no lookup, stage, tracker call or write", async () => {
+		const R = recordingFetch([JEV(0.97)]);
+		const lookups = { recall: 0, ground: 0 };
+		const controller = new AbortController();
+		controller.abort();
+		const h = jevHarness(onConfig(), R.fetch, {
+			signal: controller.signal,
+			modelResolution: RESOLUTION,
+			recall: async () => {
+				lookups.recall++;
+				return { status: "none", lessons: [], source: "none", chars: 0, ms: 0 };
+			},
+			ground: async () => {
+				lookups.ground++;
+				return { status: "none", chunks: [], chars: 0, ms: 0, datasets: 0 };
+			},
+		});
+		try {
+			const caught = await runPromptSubmit({ ...input, prompt: NEW_WORK }, h.deps).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+			expect(R.calls).toHaveLength(0);
+			expect(h.calls).toEqual({ engine: 0, track: 0, brief: 0, knowledge: 0 });
+			expect(lookups).toEqual({ recall: 0, ground: 0 });
+			expect(h.events).toEqual([]);
+			expect(existsSync(sessionPath(h.deps.stateDir, "s1"))).toBe(false);
+		} finally {
+			h.cleanup();
+		}
+	});
+
+	test("a cancellation during any stage is re-thrown: no later stage, tracker call, write or delivery, even when the provider ignores it", async () => {
+		for (const at of ["uplift", "graph", "fill", "clarify"] as const) {
+			for (const honours of [true, false]) {
+				const run = await cancelledRun(
+					() => ({}),
+					(phase, controller) => {
+						if (phase !== at || controller.signal.aborted) return false;
+						controller.abort();
+						return honours;
+					},
+				);
+				const label = { at, honours };
+				expect({ ...label, name: run.name }).toEqual({ ...label, name: "AbortError" });
+				expect({ ...label, later: run.phases.filter((phase) => STAGE[phase] > STAGE[at]) }).toEqual({ ...label, later: [] });
+				expect({ ...label, tracked: run.tracked, written: run.written }).toEqual({ ...label, tracked: 0, written: false });
+				expect(run.events.some((event) => event.type === "stage" && event.stage === "state")).toBe(false);
+				expect(run.events.at(-1)).toEqual(ENDED);
+			}
+		}
+	});
+
+	for (const at of ["uplift", "graph", "fill", "clarify"] as const) {
+		test(`a provider AbortError during ${at} cancels planning while the caller signal stays live`, async () => {
+			const run = await cancelledRun(() => ({}), (phase) => phase === at);
+			const phases: Phase[] = ["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"];
+			expect(run.phases).toEqual(phases.slice(0, phases.indexOf(at) + 1));
+			expect(run).toMatchObject({ name: "AbortError", aborted: false, tracked: 0, written: false });
+			expect(run.events.some((event) => event.type === "stage" && ["plan", "track", "state"].includes(event.stage))).toBe(false);
+			expect(run.events.at(-1)).toEqual(ENDED);
+		});
+	}
+
+	test("an injected clarifier AbortError cancels planning without relying on the completer or caller signal", async () => {
+		const run = await cancelledRun(() => ({
+			clarify: async () => {
+				throw new DOMException("provider cancelled", "AbortError");
+			},
+		}));
+		expect(run).toMatchObject({ name: "AbortError", aborted: false, tracked: 0, written: false });
+		expect(run.events.at(-1)).toEqual(ENDED);
+	});
+
+	test("a provider cancellation aborts pending brief, evidence and knowledge work without waiting for their deadlines", async () => {
+		const config = trackedConfig();
+		config.claude.budgetMs = 0;
+		config.teach.timeoutMs = 60_000;
+		config.ragflow.timeoutMs = 60_000;
+		const controller = new AbortController();
+		const signals: Record<string, AbortSignal | undefined> = {};
+		let reads = 0;
+		let closed = 0;
+		const pending = (name: string, signal: AbortSignal | undefined): Promise<never> => {
+			signals[name] = signal;
+			// Deliberately ignores abort: the hook must release its bounded waiters itself.
+			return Promise.withResolvers<never>().promise;
+		};
+		const { deps, cleanup } = baseDeps({
+			config,
+			signal: controller.signal,
+			complete: async () => {
+				throw new DOMException("provider cancelled", "AbortError");
+			},
+			brief: ({ signal }) => pending("brief", signal),
+			recall: ({ signal }) => pending("recall", signal),
+			ground: ({ signal }) => pending("ground", signal),
+			skills: ({ signal }) => pending("skills", signal),
+			knowledge: {
+				start: ({ signal }) => {
+					signals.knowledge = signal;
+					return {
+						read: async () => {
+							reads++;
+							return noneKnowledge;
+						},
+						close: () => { closed++; },
+					};
+				},
+			},
+		});
+		try {
+			const caught = await runPromptSubmit(input, deps).then(() => undefined, (error: unknown) => error);
+			expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+			expect(controller.signal.aborted).toBe(false);
+			expect(Object.keys(signals).sort()).toEqual(["brief", "ground", "knowledge", "recall", "skills"]);
+			for (const [name, signal] of Object.entries(signals)) expect({ name, aborted: signal?.aborted }).toEqual({ name, aborted: true });
+			expect({ reads, closed }).toEqual({ reads: 0, closed: 1 });
+			expect(existsSync(deps.stateDir)).toBe(false);
+		} finally {
+			controller.abort();
+			cleanup();
+		}
+	});
+
+	for (const honours of [true, false]) {
+		test(`a provider-aborted fill cancels its ${honours ? "signal-honouring" : "signal-ignoring"} sibling and prevents queued fills`, async () => {
+			const config = trackedConfig();
+			config.claude.concurrency = 2;
+			config.claude.budgetMs = 0;
+			const controller = new AbortController();
+			const first = Promise.withResolvers<string>();
+			const sibling = Promise.withResolvers<string>();
+			const siblingStarted = Promise.withResolvers<void>();
+			const calls: string[] = [];
+			const events: ProgressEvent[] = [];
+			let siblingSignal: AbortSignal | undefined;
+			let tracked = 0;
+			const complete = smartComplete();
+			const { deps, cleanup } = baseDeps({
+				config,
+				signal: controller.signal,
+				modelResolution: RESOLUTION,
+				progress: (event) => events.push(event),
+				complete: async (system, user, signal) => {
+					const phase = phaseOf(user);
+					const id = user.match(/current_node id="([^"]+)"/)?.[1];
+					calls.push(id ?? phase);
+					if (phase === "graph") {
+						return JSON.stringify({
+							goal: "Ship it",
+							nodes: Array.from({ length: 5 }, (_, i) => ({
+								id: `n${i + 1}`,
+								title: `T${i + 1}`,
+								kind: i === 0 ? "understand" : i === 4 ? "synthesize" : "generate",
+								question: `Q${i + 1}`,
+								depends_on: i < 3 ? [] : i === 3 ? ["n1", "n2", "n3"] : ["n4"],
+							})),
+						});
+					}
+					if (id === "n1") return first.promise;
+					if (id === "n2") {
+						siblingSignal = signal;
+						if (honours) signal?.addEventListener("abort", () => sibling.reject(new DOMException("aborted", "AbortError")), { once: true });
+						siblingStarted.resolve();
+						return sibling.promise;
+					}
+					return complete(system, user);
+				},
+				track: async () => {
+					tracked++;
+					return undefined;
+				},
+			});
+			try {
+				const running = runPromptSubmit(input, deps).then(() => undefined, (error: unknown) => error);
+				await siblingStarted.promise;
+				expect(siblingSignal?.aborted).toBe(false);
+				first.reject(new DOMException("provider cancelled", "AbortError"));
+				const caught = await running;
+				// A late success from an ignoring provider must not release its worker to start n3.
+				sibling.resolve("<node><rationale>step</rationale><conclusion>late</conclusion></node>");
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+				expect(controller.signal.aborted).toBe(false);
+				expect(siblingSignal?.aborted).toBe(true);
+				expect(calls).toEqual(["uplift", "graph", "n1", "n2"]);
+				expect(events.some((event) => event.type === "node" && event.phase === "done")).toBe(false);
+				expect(events.at(-1)).toEqual(ENDED);
+				expect(tracked).toBe(0);
+				expect(existsSync(deps.stateDir)).toBe(false);
+			} finally {
+				controller.abort();
+				first.resolve("");
+				sibling.resolve("");
+				cleanup();
+			}
+		});
+	}
+
+	test("a cancellation seen by the brief, a lookup, the knowledge base or the tracker ends the flight at the next boundary", async () => {
+		const cases: Array<{ name: string; seams: (controller: AbortController) => Partial<HookDeps>; later: Phase[] }> = [
+			{
+				name: "brief",
+				seams: (controller) => ({
+					brief: async () => {
+						controller.abort();
+						return "## Substrate brief";
+					},
+				}),
+				later: ["uplift", "graph", "fill", "clarify"],
+			},
+			{
+				name: "recall",
+				seams: (controller) => ({
+					recall: async () => {
+						controller.abort();
+						return { status: "none", lessons: [], source: "none", chars: 0, ms: 0 };
+					},
+				}),
+				later: ["uplift", "graph", "fill", "clarify"],
+			},
+			{
+				name: "knowledge",
+				seams: (controller) => ({
+					knowledge: {
+						start: () => ({
+							read: async () => {
+								controller.abort();
+								return noneKnowledge;
+							},
+							close: () => {},
+						}),
+					},
+				}),
+				later: ["clarify"],
+			},
+			{
+				name: "track",
+				seams: (controller) => ({
+					track: async () => {
+						controller.abort();
+						return undefined;
+					},
+				}),
+				later: [],
+			},
+		];
+		for (const { name, seams, later } of cases) {
+			const run = await cancelledRun(seams);
+			expect({ name, aborted: run.aborted, error: run.name }).toEqual({ name, aborted: true, error: "AbortError" });
+			expect({ name, later: run.phases.filter((phase) => later.includes(phase)) }).toEqual({ name, later: [] });
+			expect({ name, written: run.written }).toEqual({ name, written: false });
+			expect(run.events.at(-1)).toEqual(ENDED);
+		}
+	});
+
+	test("a cancelled flight releases a lookup that ignores its signal at once", async () => {
+		const config = trackedConfig();
+		config.teach.timeoutMs = 60_000;
+		const controller = new AbortController();
+		const lookupSignals: AbortSignal[] = [];
+		const { deps, cleanup } = baseDeps({
+			config,
+			signal: controller.signal,
+			complete: smartComplete(),
+			clarify: async () => [],
+			recall: ({ signal }) => {
+				lookupSignals.push(signal);
+				return Promise.withResolvers<never>().promise;
+			},
+			// The caller aborts just as the plan starts waiting for the lookups (the brief has settled).
+			progress: (event) => {
+				if (event.type === "stage" && event.stage === "brief" && event.phase === "end") controller.abort();
+			},
+		});
+		try {
+			// Without the release this waits out the 60 s lookup deadline and the test times out.
+			const caught = await runPromptSubmit(input, deps).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(caught instanceof Error ? caught.name : caught).toBe("AbortError");
+			expect(lookupSignals).toHaveLength(1);
+			expect(lookupSignals[0]?.aborted).toBe(true);
+			expect(existsSync(sessionPath(deps.stateDir, "s1"))).toBe(false);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("every stage gets the one planning lifetime, which the caller's signal aborts", async () => {
+		const controller = new AbortController();
+		const seen: Record<string, AbortSignal | undefined> = {};
+		const complete = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			signal: controller.signal,
+			complete: async (system, user, signal) => {
+				seen[phaseOf(user)] = signal;
+				return complete(system, user);
+			},
+			brief: async ({ signal }) => {
+				seen.brief = signal;
+				return "";
+			},
+			knowledge: {
+				start: ({ signal }) => {
+					seen.knowledge = signal;
+					return { read: async () => noneKnowledge, close: () => {} };
+				},
+			},
+			track: async ({ signal }) => {
+				seen.track = signal;
+				return undefined;
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record).toBeDefined();
+			const names = ["brief", "clarify", "fill", "graph", "knowledge", "track", "uplift"];
+			expect(Object.keys(seen).sort()).toEqual(names);
+			for (const name of names) expect({ name, aborted: seen[name]?.aborted }).toEqual({ name, aborted: false });
+			controller.abort();
+			for (const name of names) expect({ name, aborted: seen[name]?.aborted }).toEqual({ name, aborted: true });
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("the hook budget alone is not cancellation: it still delivers the plan built so far", async () => {
+		const config = trackedConfig();
+		// Real timer: the budget is a platform setTimeout inside runPromptSubmit with no clock seam; 30 ms keeps it short.
+		config.claude = { ...config.claude, budgetMs: 30 };
+		const complete = smartComplete();
+		const { deps, cleanup } = baseDeps({
+			config,
+			signal: new AbortController().signal,
+			modelResolution: RESOLUTION,
+			clarify: async () => [],
+			complete: async (system, user, signal) => {
+				if (phaseOf(user) !== "graph") return complete(system, user);
+				// The graph call outlives the budget and honours its signal.
+				return new Promise<string>((_resolve, reject) => signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.skipped).toBeUndefined();
+			expect(result.output).toBeDefined();
+			expect(result.record?.graph).toBeUndefined();
+			expect(result.record?.modelResolution).toEqual(RESOLUTION);
+		} finally {
+			cleanup();
+		}
+	});
+
+	for (const at of ["uplift", "fill", "clarify"] as const) {
+		test(`the hook budget expiring during ${at} retains its budget-only result instead of cancelling the flight`, async () => {
+			const config = trackedConfig();
+			config.claude.budgetMs = 30;
+			const controller = new AbortController();
+			const complete = smartComplete();
+			const phases: Phase[] = [];
+			const { deps, cleanup } = baseDeps({
+				config,
+				signal: controller.signal,
+				complete: async (system, user, signal) => {
+					const phase = phaseOf(user);
+					phases.push(phase);
+					if (phase !== at) return complete(system, user);
+					return new Promise<string>((_resolve, reject) => {
+						const abort = (): void => reject(new DOMException("budget expired", "AbortError"));
+						if (signal?.aborted) abort();
+						else signal?.addEventListener("abort", abort, { once: true });
+					});
+				},
+			});
+			try {
+				const result = await runPromptSubmit(input, deps);
+				expect(controller.signal.aborted).toBe(false);
+				expect(phases.at(-1)).toBe(at);
+				if (at === "uplift") {
+					expect(result.skipped).toBe("uplift-failed");
+					expect(result.output).toBeUndefined();
+					expect(existsSync(deps.stateDir)).toBe(false);
+				} else {
+					expect(result.skipped).toBeUndefined();
+					expect(result.output).toBeDefined();
+					expect(result.record?.result.source).toBe("llm");
+					expect(Boolean(result.record?.graph)).toBe(at === "clarify");
+					expect(readSession(deps.stateDir, "s1")).toBeDefined();
+				}
+			} finally {
+				cleanup();
+			}
+		});
+	}
+
+	test("the safe record reaches begin, end and the persisted plan; skips and Jev skips persist nothing", async () => {
+		const events: ProgressEvent[] = [];
+		const { deps, cleanup } = baseDeps({
+			complete: smartComplete(),
+			clarify: async () => [],
+			modelResolution: RESOLUTION,
+			progress: (event) => events.push(event),
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record?.modelResolution).toEqual(RESOLUTION);
+			expect(readSession(deps.stateDir, "s1")?.modelResolution).toEqual(RESOLUTION);
+			expect(events[0]).toMatchObject({ type: "begin", engine: "claude:sonnet", modelResolution: RESOLUTION });
+			expect(events.at(-1)).toEqual({ type: "end", at: 1_000, outcome: "planned", modelResolution: RESOLUTION });
+		} finally {
+			cleanup();
+		}
+
+		const trivial = baseDeps({ modelResolution: RESOLUTION });
+		try {
+			expect(await runPromptSubmit({ ...input, prompt: "ok" }, trivial.deps)).toEqual({ skipped: "skip" });
+			expect(existsSync(sessionPath(trivial.deps.stateDir, "s1"))).toBe(false);
+		} finally {
+			trivial.cleanup();
+		}
+
+		const R = recordingFetch([JEV(0.04)]);
+		const h = jevHarness(onConfig(), R.fetch, { modelResolution: RESOLUTION });
+		try {
+			const skipped = await runPromptSubmit({ ...input, prompt: ACK }, h.deps);
+			expect(skipped.skipped).toBe("jev-skip");
+			expect(skipped.record).toBeUndefined();
+			expect(h.events).toEqual([]);
+			expect(existsSync(sessionPath(h.deps.stateDir, "s1"))).toBe(false);
+		} finally {
+			h.cleanup();
 		}
 	});
 });

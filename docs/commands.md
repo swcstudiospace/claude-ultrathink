@@ -75,6 +75,13 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - `/ultrathink-quick <message>` sends the message to the agent as a normal user message and skips planning, tracking and the status bar for exactly that message. Without a message it shows a usage notification.
 - In a task-subagent session the commands do nothing special: the typed text goes to the agent unchanged.
 
+### Prime Agent
+
+- Prime Agent has no command hook, so the `/ultrathink-*` names are instructions the agent carries out through the `ultrathink` kernel skill: `ultrathink.ctl("status")`, `ctl("off")`, `ctl("on")`, `ctl("skip")`, `ctl("track", "off"|"on")`, and `ctl("think", ...)`, `ctl("hitl", ...)`, `ctl("grok", "engine", ...)` for the verbs the other hosts leave to `bin/ultrathink`. Each call runs `bin/ultrathink` against the Prime Agent state directory and returns its text.
+- `/ultrathink-quick <message>`: the agent answers the message without calling the planner. `raw:` and `uplift:` prefixes work as everywhere; `await ultrathink(text, raw=True)` and `force=True` add them.
+- `ultrathink.status()` returns the clone, state directory, session id and the status text; `ultrathink.last()` the carrier of the last plan; `ultrathink.spec()` its XML.
+- The shell form `ultrathink "<request>" --force` is the same call from a `bash()` cell.
+
 ### Hermes Agent
 
 - The plugin (`hosts/hermes/__init__.py`) registers `ultrathink-quick`, `ultrathink-skip`, `ultrathink-off`, `ultrathink-on`, `ultrathink-track` and `ultrathink-status`. Control commands run `bin/ultrathink` against the Hermes state directory, and the command dispatcher replies inline. A command that gets no answer within 20 seconds reports that instead.
@@ -196,7 +203,7 @@ Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --st
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
 Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
-Model: sonnet · concurrency 3
+Engine request: auto (config) · concurrency 3
 State: ~/.claude/ultrathink
 ```
 
@@ -205,7 +212,7 @@ What the lines can say:
 | Line | Values |
 |---|---|
 | `Prompt Uplift` | `on` or `off`, plus `(skipping next prompt)` while a `/ultrathink-skip` is armed. |
-| `Engine` | The resolved engine label: `claude:<model>` (`claude:session default` when `claude.model` is `""`), the Grok label (`<model>@<effort>`, or `<model>@shunt`), or `muse:<model>`. |
+| `Engine` | The current engine label: `claude:<model>` (`claude:session default` when `claude.model` is `""`), the Grok label (`<model>@<effort>`, or `<model>@shunt`), or `muse:<model>`. On a CLI route, a provider set in `models.hosts.<host>.provider` shows `<engine>:unresolved [transport-incompatible]`. On Omp with `auto` it is the planning model the session last used, for example `omp-native:<provider>/<model> [detected]`, or `omp-native:auto (live model not observed)` before the first plan and from a shell. |
 | `Grok` | Model, effort and transport. With `transport: "shunt"` it adds `<shuntBaseUrl>/v1/messages`, or `shunt gateway not configured (set grok.shuntBaseUrl)`, then the wire model and `max_tokens`. |
 | `SuperGrok OAuth` | The `grok login` state: the account and expiry, `not logged in (run grok login)`, `expired (run grok login)`, or `not used (shunt gateway owns upstream auth)`. |
 | `Tracking` | `on (Linear/Notion rows)`, `off (Linear/Notion rows)` after `/ultrathink-track off`, `on (not configured: …)` when neither tracker is set, or `kickoff (…)` when only the planner's own row creation is off. |
@@ -214,12 +221,13 @@ What the lines can say:
 | `Ship` | `off (opt-in: set ship.enabled)`, `off (ULTRATHINK_SHIP=0)`, or `on · auto-merge on\|off · delete branch on\|off`. |
 | `Knowledge base` | The Greptile knowledge-base read before the clarifying questions (see [`hitl.knowledgeBase`](configuration.md#hitl-clarifying-questions)): `off (opt-in: set hitl.knowledgeBase)`; `on · not read while HITL is off`; `on · no Greptile credential (run bin/ultrathink-mcp auth login greptile)`; or `on · Greptile` (`on · Greptile · organization <org>` when `ship.greptileOrganization` is set). |
 | `Decisions` | Jev decisions over OpenRouter or Vercel (see [`decisions`](configuration.md#decisions-jev-decisions-openrouter-decisions-api)): `off (ULTRATHINK_DECISIONS=0)` when that variable is set, whatever the config says; `on · no Jev key (…)` when there is no key for the resolved rail; or `on · <model> · <points> · provider <vercel\|openrouter> · key from <source> · zdr on\|off`, where `<points>` is the `decisions.points` list joined by `, ` (or `no points`), `<source>` is `store`, `AI_GATEWAY_API_KEY` or `OPENROUTER_API_KEY` (never the key), and, on the OpenRouter rail only, ` · url <url>` (origin and path only) is added while `ULTRATHINK_DECISIONS_URL` is in effect, or ` · ULTRATHINK_DECISIONS_URL ignored (must be https://openrouter.ai/… or a loopback URL)` when it is set but not accepted. |
-| `Model` | `claude.model` and `claude.concurrency`. |
+| `Engine request` | The engine asked for, where the request comes from (`config`, or `control` after `bin/ultrathink grok engine …`), `native opt-out` when a named engine replaces Omp's native planning, and `claude.concurrency`. For example `Engine request: auto (config) · concurrency 3`. |
 | `State` | The state directory in use. |
 | `Hindsight` | Starts with `Hindsight: `. `off (ULTRATHINK_HINDSIGHT=0)`; `off (opt-in: set hindsight.enabled)`; `on · no URL (set hindsight.url or HINDSIGHT_API_URL)`; `on · bad URL (<reason>)`; `on · no key (run bin/ultrathink-mcp auth set-key hindsight --stdin, or set HINDSIGHT_API_KEY)`; or `on · <origin> · bank <bank> · key from <store|HINDSIGHT_API_KEY|HINDSIGHT_API_TOKEN>`. Never the key, never a URL path. |
 | `RAGFlow` | Starts with `RAGFlow: `. `off (ULTRATHINK_RAGFLOW=0)`; `off (opt-in: set ragflow.enabled)`; `on · no URL (set ragflow.url or RAGFLOW_URL)`; `on · bad URL (<reason>)`; `on · no key (run bin/ultrathink-mcp auth set-key ragflow --stdin, or set RAGFLOW_API_KEY)`; or `on · <origin> · key from <store|RAGFLOW_API_KEY> · grounding on|off · <n> dataset(s) pinned` (or `all datasets`). |
 | `Teach` | Starts with `Teach: `. `off (opt-in: set teach.enabled)` while `teach.enabled` is false, even if `ULTRATHINK_TEACH=0` is set; `off (ULTRATHINK_TEACH=0)` when enabled and that variable is `0`; or `on · capture <mode> · recall on|off · <n> confirmed, <m> candidate · Hindsight <ready|off|no URL|bad URL|no key> · outbox <k>`. |
 | `Last` | Only after a plan: root element, source (`llm` or `fallback`) and node count of the last plan. |
+| `Last planned resolution` | Only after a plan that recorded its model: the model line of the last plan, for example `claude:sonnet [route default] · reason route-default-model · engine auto (config)`. It is what planned last time, not a live check. See [Planning model states](how-to/choose-engine.md#planning-model-states). |
 
 The `Decisions:` line in full, in its three forms:
 

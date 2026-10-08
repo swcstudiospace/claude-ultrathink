@@ -30,6 +30,23 @@
 						"type": "command",
 						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-sync.ts\"",
 						"timeout": 30
+					},
+					{
+						"type": "command",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/flow-eval.ts\"",
+						"timeout": 30,
+						"statusMessage": "Ultrathink · Jev flow score"
+					}
+				]
+			},
+			{
+				"matcher": "^(Skill|skill)$",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/run-bun\" \"${CLAUDE_PLUGIN_ROOT}/hooks/flow-eval.ts\"",
+						"timeout": 30,
+						"statusMessage": "Ultrathink · Jev flow score"
 					}
 				]
 			},

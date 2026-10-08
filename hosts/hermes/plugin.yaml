@@ -1,7 +1,7 @@
 # Requires Python 3.10 or later. Hermes' plugin.yaml schema has no minimum-Python key
 # (python_runtime only opts a plugin out of Hermes' venv), so the requirement is stated here.
 name: ultrathink
-version: 0.4.0
+version: 1.4.0
 description: "Plans each prompt with the shared ultrathink engine. /ultrathink-quick <message> sends one message without planning."
 author: "SWC Studio"
 license: AGPL-3.0-or-later

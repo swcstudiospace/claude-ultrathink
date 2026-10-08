@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 /**
- * Grok discards an allowing UserPromptSubmit hook's stdout, and Muse/Omp/Hermes
+ * Grok discards an allowing UserPromptSubmit hook's stdout, and Muse/Omp/Hermes/Prime Agent
  * do not read Claude's `additionalContext`. The spec file plus `last-plan.json`
  * is the carrier those hosts can actually read. The text is plugin-authored
  * data, not a grant of tools or a command to ignore the user.

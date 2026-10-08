@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CHILD_ENV } from "../claude/complete.ts";
 import { CHILD_PROMPT_SENTINEL, planningTarget } from "../uplift/skill.ts";
+import { ROUTE_DEFAULT_MODELS } from "../route-defaults.ts";
 import { buildMuseArgs, buildMusePrompt, museComplete, parseMuseJsonl } from "./complete.ts";
+import { DEFAULT_MUSE_CONFIG, MUSE_MODEL_DEFAULT } from "./types.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -38,6 +40,13 @@ describe("buildMuseArgs", () => {
 			"--prompt-file",
 			"/tmp/p.txt",
 		]);
+	});
+
+	test("the unpinned default sends the Muse route default from the central map (muse-spark-1.3-contributor)", () => {
+		expect(MUSE_MODEL_DEFAULT).toBe(ROUTE_DEFAULT_MODELS.muse);
+		const args = buildMuseArgs("/tmp/p.txt", { model: DEFAULT_MUSE_CONFIG.model, reasoningEffort: DEFAULT_MUSE_CONFIG.reasoningEffort });
+		expect(args[args.indexOf("--model") + 1]).toBe(ROUTE_DEFAULT_MODELS.muse);
+		expect(args[args.indexOf("--model") + 1]).toBe("muse-spark-1.3-contributor");
 	});
 
 	test("blank model omits --model (CLI session default answers)", () => {

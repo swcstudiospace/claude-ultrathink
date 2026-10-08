@@ -195,12 +195,14 @@ describe("uplift hook with a Jev plan skip", () => {
 			const path = carrierPath(stateDir);
 			try {
 				writeStalePlan();
-				await runJevHook("grok-build", { sessionId: "s1", promptId: "p1", userPrompt: "thanks" }, jev.url, { decisions: { enabled: true } });
+				// shunt has no Grok login check, so selection reaches the Jev gate without a login (AD-2a removed the auto Claude switch).
+				const grokShunt = { transport: "shunt", shuntBaseUrl: "http://127.0.0.1:9" };
+				await runJevHook("grok-build", { sessionId: "s1", promptId: "p1", userPrompt: "thanks" }, jev.url, { decisions: { enabled: true }, grok: grokShunt });
 				const afterTrivial = existsSync(path) ? readFileSync(path, "utf8") : null;
 				expect(jev.requests).toHaveLength(0);
 
 				writeStalePlan();
-				await runJevHook("grok-build", { sessionId: "s1", promptId: "p2", userPrompt: ACK }, jev.url, { decisions: { enabled: true } });
+				await runJevHook("grok-build", { sessionId: "s1", promptId: "p2", userPrompt: ACK }, jev.url, { decisions: { enabled: true }, grok: grokShunt });
 				expect(jev.requests).toHaveLength(1);
 				expect(existsSync(path) ? readFileSync(path, "utf8") : null).toEqual(afterTrivial);
 				expect(afterTrivial).toBeNull();

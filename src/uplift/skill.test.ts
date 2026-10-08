@@ -144,6 +144,11 @@ describe("resolveSkillFile", () => {
 	test("folded description block", () => {
 		put(join(home, ".agents/skills/y/SKILL.md"), "---\ndescription: >\n  Folded\n  text\nname: y\n---\nbody");
 		expect(resolveSkillFile("/y", { cwd, home })).toEqual({ path: join(home, ".agents/skills/y/SKILL.md"), summary: "Folded text" });
+		// Prime Agent: `/skill:<name>` strips to the bare name; project skills shadow the personal directory.
+		put(join(home, ".prime/agent/skills/pa/SKILL.md"), "---\nname: pa\ndescription: Personal\n---\nbody");
+		expect(resolveSkillFile("/skill:pa", { cwd, home })?.summary).toBe("Personal");
+		put(join(cwd, ".prime/agent/skills/pa/SKILL.md"), "---\nname: pa\ndescription: Project\n---\nbody");
+		expect(resolveSkillFile("/skill:pa", { cwd, home })?.summary).toBe("Project");
 	});
 
 	test("plugin cache glob", () => {

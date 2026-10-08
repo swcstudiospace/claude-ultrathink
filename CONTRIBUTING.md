@@ -13,6 +13,7 @@ bun install
 bun run check                          # type check (TypeScript 5.9.3, pinned in package.json)
 bun test
 python3 hosts/hermes/bridge_test.py    # Hermes bridge tests; prints "ok"
+python3 hosts/prime-agent/bridge_test.py   # Prime Agent bridge tests (unittest, stdlib only)
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10. The Bun 1.2.x jobs run the tests and the Hermes bridge tests without `bun install` and the type check, because they cannot read `bun.lock` and ultrathink has no runtime dependencies.
@@ -40,12 +41,14 @@ bin/               sh launchers: run-bun (finds Bun, exits 0 without it), ultrat
                    ultrathink-mcp, ultrathink-ship
 commands/          slash-command files for the ultrathink-<verb> commands (Claude Code, Grok Build, Muse)
 hooks/             host hook entries: uplift.ts (plans the prompt), engine.ts (JSON in, JSON out, for
-                   Hermes and Omp), answers.ts (HITL answers), pr-sync.ts and stop.ts (sync and ship
+                   Hermes), answers.ts (HITL answers), pr-sync.ts and stop.ts (sync and ship
                    nudges), muse-* launchers, and hooks.json (Claude Code hooks; scripts/setup.ts
                    derives Grok's global hook file from it)
 hosts/grok/        rule that tells Grok to read the plan carrier (installed by scripts/setup.ts)
 hosts/hermes/      Hermes plugin: plugin.yaml, __init__.py, bridge.py (calls hooks/engine.ts),
                    bridge_test.py (plain script: python3 hosts/hermes/bridge_test.py), lesson tools
+hosts/prime-agent/ Prime Agent kernel skill: SKILL.md, pyproject.toml, src/ultrathink (calls hooks/engine.ts),
+                   bridge_test.py (python3 hosts/prime-agent/bridge_test.py)
                    ultrathink_lesson_save / ultrathink_lesson_recall and /ultrathink-learn / /ultrathink-lessons
 scripts/           setup.ts (apply, status, rollback) and mcp-register.ts (registers the MCP gateway
                    in every host)
@@ -92,7 +95,7 @@ The engine is shared. A host gets a thin entry that calls it and fails open.
 1. **Register the id.** Add it to `HOSTS` in `src/host/types.ts`, and give it a state directory in `stateDirForHost` (`src/host/paths.ts`). State lives under the host's own home, never in the working directory or a `.planning/` tree.
 2. **Call the engine.** Choose the entry that matches the host's hook protocol:
    - If the host speaks Claude Code's hook protocol (hook JSON on stdin; `hookSpecificOutput.additionalContext` or `{"decision": "block"}` on stdout), add an sh launcher like `hooks/muse-prompt` that exports `ULTRATHINK_HOST=<id>` and runs `bin/run-bun hooks/uplift.ts`.
-   - Otherwise, send `{"host": "<id>", "session_id": …, "prompt": …, "cwd": …}` on stdin to `bin/run-bun hooks/engine.ts` and read one JSON object back: `context`, `specPath`, `statePath` and `carrierPath`, or `skipped`. `hosts/hermes/bridge.py` does this from Python; `spawnEnginePlanner` in `src/host/omp.ts` does it from TypeScript.
+   - Otherwise, send `{"host": "<id>", "session_id": …, "prompt": …, "cwd": …}` on stdin to `bin/run-bun hooks/engine.ts` and read one JSON object back: `context`, `specPath`, `statePath` and `carrierPath`, or `skipped`. `hosts/hermes/bridge.py` and `hosts/prime-agent/src/ultrathink/__init__.py` do this from Python. A TypeScript host can call `planPrompt` from `src/host/plan.ts` in-process instead, as the Omp extension in `src/host/omp.ts` does.
 3. **Deliver the plan.** Inject `context` into the model's turn. If the host throws hook output away, as Grok Build does, point the model at the carrier file the engine writes, `last-plan.json` in the state directory (`src/host/carrier.ts`), with a rule like `hosts/grok/ultrathink.md`.
 4. **Never plan subagents.** A plan creates Linear and Notion rows when tracking is on, so subagent and child sessions must not be planned. Pass `parent_session_id`, set `ULTRATHINK_CHILD=1`, or detect them in the entry, as `src/host/omp-session.ts` does for Omp.
 5. **Fail open.** Launch through `bin/run-bun`, which exits 0 when Bun is missing. Stop waiting before the host's hook timeout (Hermes reads its own `plugins.hook_callback_timeout` and kills the engine's process group at min(540 s, cap − 15 s); Omp waits 25 s and delivers a later plan as an aside), and treat an error, a timeout or unreadable output as "no context".

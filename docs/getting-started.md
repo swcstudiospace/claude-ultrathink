@@ -4,8 +4,8 @@ This tutorial takes you from nothing to a first planned prompt, and then, if you
 
 A few terms used throughout:
 
-- **Host**: the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code or Omp). ultrathink plugs into its prompt hook.
-- **Engine**: the model that writes the plan. It runs as a separate headless call, independent of the host. The default engine is Claude, through the `claude` CLI.
+- **Host**: the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent). ultrathink plugs into its prompt hook (or kernel skill on Prime Agent).
+- **Engine**: the model that writes the plan. On Claude Code, which this tutorial uses, it runs as separate headless calls through the `claude` CLI, independent of the host, and the default engine is Claude. On Omp it is the session's own model, called through Omp's own login (see [Choose the engine](how-to/choose-engine.md#omp-the-sessions-own-model)).
 - **Spec**: your message rewritten as structured XML. Your own words stay verbatim inside it.
 - **Graph of Thought**: the plan itself, 5 to 8 nodes by default with dependencies between them. It ends in a WORKFLOW: waves of work whose units can run in parallel.
 - **HITL questions** (human in the loop): up to 4 clarifying questions whose answers would change the work. Blocking ones are asked once, before any code is written.
@@ -65,7 +65,7 @@ Start a new Claude Code session so it loads the plugin.
 | Grok Build | [install.md#grok-build](install.md#grok-build) | Tested with 1.0.41. Plugins stay off until enabled: after the symlink, run `grok plugin enable ultrathink` and check it with `grok plugin list`. Grok ignores plugin hooks, so `bun scripts/setup.ts apply` installs a global hook file and a rule file |
 | Hermes Agent | [install.md#hermes-agent](install.md#hermes-agent) | Tested with v0.21.4. Python plugin (Python 3.10 or later). You must raise Hermes' plugin hook cap to at least 105 s (600 recommended) |
 | Muse Code | [install.md#muse-code](install.md#muse-code) | `muse plugins install`, then `muse plugins approve ultrathink` before planning starts |
-| Omp | [install.md#omp](install.md#omp) | `omp plugin link <clone>`; a slow plan arrives as an aside message |
+| Omp | [install.md#omp](install.md#omp) | `omp plugin link <clone>`; it plans on the session's own model with Omp's own login, and a slow plan arrives as an aside message |
 
 ## 4. Check the install
 
@@ -100,11 +100,11 @@ Decisions: on · no Jev key (Vercel: bin/ultrathink-mcp auth set-key vercel --st
 Hindsight: off (opt-in: set hindsight.enabled)
 RAGFlow: off (opt-in: set ragflow.enabled)
 Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0
-Model: sonnet · concurrency 3
+Engine request: auto (config) · concurrency 3
 State: /home/<you>/.claude/ultrathink
 ```
 
-The Grok lines only matter if you switch the engine to Grok. Nothing is configured to leave your machine except the engine calls: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight and no RAGFlow. The engine calls include Teachable Moments, which is on by default: each qualifying finished turn sends the engine one extra call with a redacted excerpt of the session, tool results included, to distill lessons (see [Privacy](privacy.md#planning-engine-lesson-distillation); `"teach": { "capture": "explicit" }` stops it). The lessons, recall and skill installs stay on the local machine while Hindsight is off.
+The Grok lines only matter if you switch the engine to Grok. `Engine request:` shows the engine you asked for and where that setting comes from; after your first plan, a `Last planned resolution:` line names the model that planned it. Nothing is configured to leave your machine except the engine calls: no tracker, no Agent Substrate, no ship, no Greptile knowledge base, no Jev decisions, no Hindsight and no RAGFlow. The engine calls include Teachable Moments, which is on by default: each qualifying finished turn sends the host's planning engine one extra call with a redacted excerpt of the session, tool results included, to distill lessons (see [Privacy](privacy.md#planning-engine-lesson-distillation); `"teach": { "capture": "explicit" }` stops it). The lessons, recall and skill installs stay on the local machine while Hindsight is off.
 
 ## 5. Send your first prompt
 
@@ -120,10 +120,10 @@ What happens:
 2. A summary line appears in the transcript, for example:
 
    ```text
-   Prompt Uplift · BUILD_PROMPT · llm · claude:sonnet · Graph of Thought · 6 nodes · HITL · 2 question(s) · Tracking · off · 48.3s
+   Prompt Uplift · BUILD_PROMPT · llm · claude:sonnet [route default] · reason route-default-model · engine auto (config) · Graph of Thought · 6 nodes · HITL · 2 question(s) · Tracking · off · 48.3s
    ```
 
-   `BUILD_PROMPT` is the kind of spec, `llm` means the engine wrote it (`fallback` means the engine failed and a minimal spec was used), then the engine, the node count, the open questions, the tracking state and the time taken.
+   `BUILD_PROMPT` is the kind of spec, `llm` means the engine wrote it (`fallback` means the engine failed and a minimal spec was used), then the planning model with why it was chosen and the engine you asked for, the node count, the open questions, the tracking state and the time taken.
 3. The agent receives the plan in its context. It tries to answer the HITL questions from the repository, asks you the blocking ones that remain, then works through the waves, running the units of a wave in parallel.
 
 If planning fails for any reason, your prompt still goes through: the agent gets the minimal spec and the summary line reports `Engine error · …`.

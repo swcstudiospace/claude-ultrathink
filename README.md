@@ -1,6 +1,6 @@
 # ultrathink
 
-ultrathink is a planner plugin for coding agents. Before the agent sees a non-trivial prompt, ultrathink rewrites it into an XML spec, builds a Graph of Thought that ends in a WORKFLOW of parallel waves, drafts the clarifying questions whose answers would change the work, and, if you configure it, creates matching Linear issues and Notion rows. The agent then starts from that plan. It runs on Claude Code, Grok Build, Hermes Agent, Muse Code and Omp, plans with Claude by default or with Grok if you choose, and fails open: a problem inside ultrathink never blocks your prompt.
+ultrathink is a planner plugin for coding agents. Before the agent sees a non-trivial prompt, ultrathink rewrites it into an XML spec, builds a Graph of Thought that ends in a WORKFLOW of parallel waves, drafts the clarifying questions whose answers would change the work, and, if you configure it, creates matching Linear issues and Notion rows. The agent then starts from that plan. It runs on Claude Code, Grok Build, Hermes Agent, Muse Code, Omp and Prime Agent, plans with each host's own engine by default (on Omp, the session's own model) or with the engine you choose, and fails open: a problem inside ultrathink never blocks your prompt.
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 [![CI](https://github.com/swcstudiospace/claude-ultrathink/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/swcstudiospace/claude-ultrathink/actions/workflows/ci.yml)
@@ -9,7 +9,7 @@ ultrathink is a planner plugin for coding agents. Before the agent sees a non-tr
 
 ## Why
 
-A coding agent starts on the prompt exactly as typed. For anything larger than a one-line fix, the scope, the order of the work and the questions worth settling first are left for the agent to work out as it goes, and whatever plan it forms stays inside that one session. ultrathink adds one planning pass in front of the agent: a written spec, a dependency graph whose independent parts can run in parallel, the blocking questions asked once up front, and, if you want them, tracker rows for every part of the plan. One engine and one config serve all five hosts.
+A coding agent starts on the prompt exactly as typed. For anything larger than a one-line fix, the scope, the order of the work and the questions worth settling first are left for the agent to work out as it goes, and whatever plan it forms stays inside that one session. ultrathink adds one planning pass in front of the agent: a written spec, a dependency graph whose independent parts can run in parallel, the blocking questions asked once up front, and, if you want them, tracker rows for every part of the plan. One engine and one config serve all six hosts.
 
 ## What happens on a prompt
 
@@ -47,7 +47,7 @@ The agent-side half is four skills, shared by every host:
 
 ## Supported hosts
 
-Each host was tested live with the version shown, including planning and the `/ultrathink-*` commands described under [Skip ultrathink for quick messages](#skip-ultrathink-for-quick-messages).
+Each host was tested live with the version shown, including planning and the `/ultrathink-*` commands described under [Skip ultrathink for quick messages](#skip-ultrathink-for-quick-messages). On Omp, planning on the session's own model was verified live on 18.8.0 in print mode.
 
 | Host | Tested | How ultrathink loads | How the plan reaches the agent |
 |---|---|---|---|
@@ -55,9 +55,18 @@ Each host was tested live with the version shown, including planning and the `/u
 | Grok Build | 1.0.41 | The plugin directory supplies the skills and commands. Grok does not dispatch plugin hooks, so `bun scripts/setup.ts apply` installs the global hook file `${GROK_HOME:-~/.grok}/hooks/ultrathink.json` | Grok discards hook output, so the plan is written to `last-plan.json` and a rule file (`${GROK_HOME:-~/.grok}/rules/ultrathink.md`) tells the model to read it |
 | Hermes Agent | v0.21.4 | Python plugin `hosts/hermes` (Python 3.10 or later), symlinked into `${HERMES_HOME:-~/.hermes}/plugins/ultrathink` | `pre_llm_call` gets the plan from `hooks/engine.ts` and hands the agent a short handoff: the spec path, the state file and the Graph ID |
 | Muse Code | 1.4.0 | `.muse-plugin/plugin.json` | `UserPromptSubmit` hook context, same entry as Claude Code |
-| Omp | 18.3.1 | `package.json` `omp.extensions` → `src/host/omp.ts` | `before_agent_start`; the TUI shows a live status bar and plan cards. Omp caps a handler at 30 s, so the extension waits up to 25 s and a slower plan arrives later as an aside |
+| Prime Agent | 0.9.8 | Python-backed kernel skill `hosts/prime-agent`, linked into `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` by `bun scripts/setup.ts apply`; the `ultrathink-*` agent skills are linked into `~/.agents/skills` | Prime Agent has no prompt hook: the agent calls `await ultrathink("<request>")` in its persistent Python kernel, the skill runs `hooks/engine.ts` and returns the plan (`context`, the spec and its path) to the kernel. The agent then runs the waves, with `ultrathink-kickoff` first when tracking is on |
+| Omp | 18.3.1 (native planning: 18.8.0) | `package.json` `omp.extensions` → `src/host/omp.ts` | `before_agent_start` plans inside Omp on the session's own model, with Omp's own provider and login (see [Choose the planning engine](docs/how-to/choose-engine.md#omp-the-sessions-own-model)); the TUI shows a live status bar and plan cards. Omp caps a handler at 30 s, so the extension waits up to 25 s and a slower plan arrives later as an aside |
 
 With Teachable Moments on, the Hermes plugin registers the tools `ultrathink_lesson_save` and `ultrathink_lesson_recall` and the commands `/ultrathink-learn` and `/ultrathink-lessons`. The plan handoff stays short: the spec path, the state file and the Graph ID.
+
+Every plan records which model planned it and why, in one of four states: `detected` (Omp's live session model), `default` (a built-in or provider default), `override` (a model you set) or `unresolved` (none could be used; the prompt goes through unplanned with the reason). See [Planning model states](docs/how-to/choose-engine.md#planning-model-states).
+
+### Cross-agent discovery
+
+claude-ultrathink is a cross-agent reasoning plugin for prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications, with optional Linear/Notion tracking and Greptile-gated shipping. Existing adapters serve Claude Code, Grok Build, Hermes Agent, Muse, Omp and Prime Agent. Loader name: ultrathink. Grok Bot/GPT Dot protocols are pending; compatibility is unverified.
+
+[`ultrathink.discovery.json`](ultrathink.discovery.json), with its schema [`ultrathink.discovery.schema.json`](ultrathink.discovery.schema.json), says the same in machine-readable form: the repository identity, the five adapters with their entry files (status `source-present`: present in the source, not a promise that a given install works), the JSON planner, control and tracker-relay interfaces (only the first one plans), and the pending Grok Bot and GPT Dot records, whose `adapterPresent` and `compatibilityVerified` are both `false`. It is a static file read from a checkout, and no host is known to pick it up on its own. It is not a bot adapter or a planning server: it registers nothing and holds no planning-service URL, credential or model default.
 
 ### Platforms
 
@@ -66,7 +75,7 @@ ultrathink runs on **Linux** and **macOS**. On Windows, use it inside **WSL**; n
 Requirements:
 
 - **Bun 1.2 or newer** (tested with 1.4.0). `bin/run-bun` finds Bun even when a host's PATH does not include it. Without Bun the hooks exit quietly and prompts go through unplanned; the `bin/` CLIs print `ultrathink: bun not found` and exit with status 127.
-- **An engine:** each host plans with its own engine by default — Claude on Claude Code, Hermes and Omp (the `claude` CLI, Claude Code 2.1.278 or later, installed and logged in), Grok on Grok Build (`grok login`), Muse on Muse Code (the `muse` CLI, logged in). The Claude engine passes `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`; an older CLI rejects these and every plan falls back to the minimal spec.
+- **An engine:** each host plans with its own engine by default. Claude Code, Hermes and Prime Agent use Claude (the `claude` CLI, Claude Code 2.1.278 or later, installed and logged in; Hermes picks Grok or Muse instead for a Grok or Muse session model), Grok Build uses Grok (`grok login`) and Muse Code uses Muse (the `muse` CLI, logged in). Omp plans on the session's own model through Omp's own provider and login, so planning needs no engine CLI there; under `auto`, Omp's ship done check and Teachable Moments distiller still use the `claude` CLI. The Claude engine passes `--tools ""`, `--strict-mcp-config` and `--exclude-dynamic-system-prompt-sections`; an older CLI rejects these and every plan falls back to the minimal spec.
 - **Hermes Agent only:** Python 3.10 or newer.
 - **For ship (optional):** `gh`, authenticated, and Greptile: a Greptile key in the gateway, or the Greptile CLI (tested with 3.4.1) after `greptile login`.
 
@@ -74,13 +83,13 @@ State is kept per host: `~/.claude/ultrathink`, `$GROK_PLUGIN_DATA/ultrathink` i
 
 ## Cost and latency
 
-Planning is not free. For each prompt it plans, the engine makes one model call to write the spec, one to build the Graph of Thought, one per node to fill it in (5 to 8 nodes by default) and one for the clarifying questions: **8 to 11 headless model calls** on the configured engine. With the Claude engine they run through your `claude` login, with model `sonnet` unless you set `claude.model`. Node fills run up to `claude.concurrency` (default 3) at a time within a dependency level; the other calls run one after another, and creating tracker rows can add up to `track.budgetMs` (60 s by default). The agent starts only when the plan is ready (on Omp, after 25 s at most; a slower plan arrives as an aside).
+Planning is not free. For each prompt it plans, the engine makes one model call to write the spec, one to build the Graph of Thought, one per node to fill it in (5 to 8 nodes by default) and one for the clarifying questions: **8 to 11 model calls** on the configured engine. With the Claude engine they run through your `claude` login, with model `sonnet` unless you set `claude.model`. On Omp under `auto` they run on the session's own model and count against that provider account; on reasoning-heavy models a plan can take several minutes. Node fills run up to `claude.concurrency` (default 3) at a time within a dependency level; the other calls run one after another, and creating tracker rows can add up to `track.budgetMs` (60 s by default). The agent starts only when the plan is ready (on Omp, after 25 s at most; a slower plan arrives as an aside).
 
 To spend less: send small messages with `/ultrathink-quick` or a `raw:` prefix, lower `think.maxNodes`, turn clarifying questions off with `hitl.enabled: false`, or turn the graph off with `think.enabled: false`. Short replies such as `ok` are not planned. See [Reduce cost and latency](docs/how-to/reduce-cost-and-latency.md).
 
 ## What leaves your machine
 
-- **Always, for a planned prompt:** your message and the recent conversation go to the planning engine: Anthropic through the `claude` CLI by default, or xAI when you choose the Grok engine (or a gateway you run, with the Grok `shunt` transport).
+- **Always, for a planned prompt:** your message and the recent conversation go to the planning engine: Anthropic through the `claude` CLI by default; on Omp under `auto`, the provider of your Omp session's model, through Omp's own login; or xAI when you choose the Grok engine (or a gateway you run, with the Grok `shunt` transport).
 - **By default, for a qualifying finished turn (Teachable Moments):** one extra call to the same planning engine with a redacted excerpt of the session (your messages, the assistant's text, tool calls and tool results; at most 60 turns, 24,000 characters) to distill lessons. It runs when the turn had at least `teach.observeMinToolCalls` tool calls (default 4) and a recovery, a user correction or a failed run. `"teach": { "capture": "explicit" }` stops it; `teach.enabled: false` or `ULTRATHINK_TEACH=0` turns Teachable Moments off. Lessons, recall and skill installs stay on this machine unless Hindsight is on.
 - **Only when you configure them:** plan contents (the uplifted prompt, node titles and reasoning, repository name and branch) go to Notion and Linear through their hosted MCP servers; ship pushes to GitHub with `gh` and sends the pull request to Greptile; the Greptile knowledge-base read sends only list and read calls to Greptile (never your prompt or code) and passes the documents it reads to the engine; the Agent Substrate brief request sends the repository, branch and host name to the URL you set, and each planned prompt then sends it one event with the Graph ID, session id, host, repository, branch and node count (never the prompt or the plan).
 - **Only with a Jev key:** Jev decisions go to OpenRouter at `openrouter.ai` (`/api/alpha/decisions`) or the Vercel AI Gateway (`ai-gateway.vercel.sh`), picked by `decisions.provider` (`auto` prefers Vercel when its key exists). `ULTRATHINK_DECISIONS=0` turns them off for a process. Each request carries a small, capped state for one yes/no question: the message and the last assistant turn (plan gate), the request, acceptance criteria and patch (ship), a knowledge-base question, answer and cited document (knowledge), or the task, question and default answer (blocking). The `teachable` and `skillworthy` points send a clipped lesson (name, description, body cut to 800 characters, kind, and occurrences for `skillworthy`) whenever that point is listed and a key exists. OpenRouter requests ask for zero data retention and `data_collection: "deny"` by default.
@@ -92,7 +101,7 @@ Details for every service: [What leaves your machine](docs/privacy.md).
 
 ## Optional integrations (off by default)
 
-A fresh install plans prompts and contacts nothing but the engine. Each of these stays off until you turn it on:
+A fresh install plans prompts and contacts nothing but the engine. External integrations stay off until you turn them on:
 
 | Integration | Turn it on with | What it does |
 |---|---|---|
@@ -105,7 +114,8 @@ A fresh install plans prompts and contacts nothing but the engine. Each of these
 | Jev decisions (OpenRouter Decisions API) | `decisions.enabled: true` in your user config and an OpenRouter key (`bin/ultrathink-mcp auth set-key openrouter --stdin`, or `OPENROUTER_API_KEY`) | Asks the `~typesafe/jev-latest` decision model one yes/no question at each listed point (six by default, including `teachable` and `skillworthy`), after the deterministic rules: skip planning for a message that is not new work, veto an incomplete ship "done" (or, without auto-merge, judge it when there is no LLM verdict), reject a knowledge-base answer the document does not support, promote a risky default to a blocking question (see [Use Jev decisions](docs/how-to/use-jev-decisions.md)) |
 | Hindsight | `hindsight.enabled: true` in your user config (default off), a URL (`hindsight.url` or `HINDSIGHT_API_URL`) and a key (`bin/ultrathink-mcp auth set-key hindsight --stdin`, or `HINDSIGHT_API_KEY`) | Stores lesson text and answers the recall query (see [Connect Hindsight](docs/how-to/connect-hindsight.md)) |
 | RAGFlow grounding | `ragflow.ground: true` in your user config (default off; also needs `ragflow.enabled`, a URL and a key: `bin/ultrathink-mcp auth set-key ragflow --stdin`, or `RAGFLOW_API_KEY`) | Sends the grounding query and adds excerpts to the plan (see [Connect RAGFlow](docs/how-to/connect-ragflow.md)) |
-| Teachable Moments | On by default (`teach.enabled`, `capture: "auto"`, `autoPromote: true`) | Distills finished turns into lessons, recalls matching lessons and skills into later plans, and installs recurring lessons as skills (see [Use Teachable Moments](docs/how-to/use-teachable-moments.md)) |
+
+Teachable Moments operates locally and is **on by default** (`teach.enabled: true`, `capture: "auto"`, `autoPromote: true`): it distills finished turns into lessons, recalls matching lessons and skills into later plans, and installs recurring lessons as skills without human intervention (see [Use Teachable Moments](docs/how-to/use-teachable-moments.md)).
 
 `bin/ultrathink status` shows tracking, Substrate, Ship, the knowledge base, Decisions (the `Decisions:` line), and also `Hindsight:`, `RAGFlow:` and `Teach:`, plus the Grok transport. Every key: [docs/configuration.md](docs/configuration.md).
 
@@ -142,6 +152,9 @@ muse plugins approve ultrathink
 
 # Omp
 omp plugin link <clone>
+
+# Prime Agent: setup.ts links hosts/prime-agent into ~/.prime/agent/skills/ultrathink and skills/* into ~/.agents/skills
+bun <clone>/scripts/setup.ts apply
 ```
 
 - **Hermes hook cap.** Hermes stops waiting for a plugin hook after `plugins.hook_callback_timeout` seconds, 30 by default, and a plan takes longer than that. ultrathink plans only when the cap is at least 105 s; 600 (Hermes' maximum) is recommended. It is a global Hermes setting that applies to every plugin, and ultrathink never changes it for you. Below 105 s, every prompt goes through unplanned and the Hermes log gets one warning naming the command above.
@@ -166,7 +179,7 @@ Then set `linear.team` to `<your Linear team name>` in `~/.config/ultrathink/con
 
 ## Skip ultrathink for quick messages
 
-The same commands work on every host. Nothing changes unless you use one.
+The same commands work on every host (on Prime Agent the agent runs them through `ultrathink.ctl(...)`, see [docs/commands.md](docs/commands.md#prime-agent)). Nothing changes unless you use one.
 
 | Command | Effect |
 |---|---|

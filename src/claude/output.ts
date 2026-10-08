@@ -9,7 +9,11 @@
  * framed as the user's own request, elaborated by a plugin the user installed.
  */
 import { join } from "node:path";
-import { MAX_ENGINE_ERROR_CHARS } from "../host/engine.ts";
+import { hasControlCharacter } from "../config.ts";
+import { redactSecrets } from "../grok/auth.ts";
+import type { ModelResolution } from "../host/engine.ts";
+import { MAX_ENGINE_ERROR_CHARS } from "../host/display-limits.ts";
+import { redactLine } from "../teach/redact.ts";
 import { SHIP_CLI } from "../ship/nudge.ts";
 import { type DecisionRecord, formatP } from "../decisions/types.ts";
 import { formatHitlAddendum } from "../hitl/format.ts";
@@ -101,6 +105,76 @@ const BOTH_PROVIDERS: TrackerProviders = { linear: true, notion: true };
 export const TRACKING_OFF_NOTE =
 	"Issue tracking is off for this prompt (/ultrathink-track on or configure notion/linear to enable).";
 
+/** Display markers of an unsafe provider or model id (the record's own convention, §9); an unsafe label shows the model one. */
+export const OPAQUE_PROVIDER = "<opaque-provider>";
+export const OPAQUE_MODEL = "<opaque-model>";
+const OPAQUE_MARKERS = /<opaque-(?:provider|model)>/g;
+/** Characters of a generated label: display id characters, route and tag words, brackets, parentheses and `·`. */
+const LABEL_CHARS = /^[\w .:@+/~()[\]·-]+$/;
+/** Display id characters and bound, as the record applies them: markup, quotes, spaces and controls make an id opaque. */
+const ID_CHARS = /^[\w.:@+/~-]+$/;
+const MAX_ID_CHARS = 128;
+/** URI, endpoint or user-info shapes in an id: `//`, a leading `/`, or `name:secret@`. */
+const ENDPOINT_LIKE = /\/\/|^\/|:[^/]*@/;
+/** Route punctuation and Grok's shunt suffix are generated syntax, not part of the displayed identifier. */
+const LABEL_ROUTE_PREFIX = /^(?:omp-native|claude|muse|grok):/;
+const SHUNT_LABEL_SUFFIX = /@shunt(?= \[|$)/;
+/** Fixed-vocabulary record values: states, sources, reasons, transports, hosts and engine requests. */
+const DISPLAY_TOKEN = /^[a-z][a-z.-]{0,63}$/;
+
+/**
+ * A resolution label for display (§9 safe projection): one line, unchanged when it is plainly a generated label, else the
+ * opaque marker. Control, ANSI or markup characters, a URI, endpoint or user-info shape, anything `redactLine` or
+ * `redactSecrets` would mask, and more than MAX_ENGINE_ERROR_CHARS characters never reach a summary, context, view or
+ * status line. Only the display changes; the target used for inference is untouched.
+ */
+export function displayLabel(value: unknown): string {
+	if (typeof value !== "string" || hasControlCharacter(value)) return OPAQUE_MODEL;
+	const line = value.replace(/\s+/g, " ").trim();
+	const plain = line.replace(OPAQUE_MARKERS, "");
+	const target = line.replace(LABEL_ROUTE_PREFIX, "");
+	const endpointText = line.startsWith("grok:") ? target.replace(SHUNT_LABEL_SUFFIX, "") : target;
+	const safe =
+		line !== "" &&
+		line.length <= MAX_ENGINE_ERROR_CHARS &&
+		(plain === "" || LABEL_CHARS.test(plain)) &&
+		!ENDPOINT_LIKE.test(endpointText) &&
+		redactSecrets(redactLine(line, MAX_ENGINE_ERROR_CHARS)) === line;
+	return safe ? line : OPAQUE_MODEL;
+}
+
+/**
+ * A provider or model id for display, by the rule the record itself applies: unchanged when plainly safe, else `opaque`.
+ * URI, endpoint, user-info and credential-looking ids are suppressed; the id used for inference is untouched.
+ */
+export function displayId(value: unknown, opaque: typeof OPAQUE_PROVIDER | typeof OPAQUE_MODEL): string {
+	if (typeof value !== "string") return opaque;
+	if (value === OPAQUE_PROVIDER || value === OPAQUE_MODEL) return value;
+	const safe =
+		value.length <= MAX_ID_CHARS &&
+		ID_CHARS.test(value) &&
+		!ENDPOINT_LIKE.test(value) &&
+		redactSecrets(redactLine(value, MAX_ENGINE_ERROR_CHARS)) === value;
+	return safe ? value : opaque;
+}
+
+/** A fixed-vocabulary record value as displayed; anything else (wrong type, markup, free text) is undefined. */
+export function displayToken(value: unknown): string | undefined {
+	return typeof value === "string" && DISPLAY_TOKEN.test(value) ? value : undefined;
+}
+
+/**
+ * One display line for a model resolution (§9 path 3): the record's generated label, the concise model reason unless the
+ * label already shows it, then the engine request with its source and native opt-out, kept apart from the model state.
+ */
+export function formatModelSelection(resolution: ModelResolution): string {
+	const label = displayLabel(resolution.label);
+	const reason = displayToken(resolution.reason);
+	const { engine, source, nativeOptOut } = resolution.engineSelection;
+	const request = `engine ${displayToken(engine) ?? "unknown"} (${displayToken(source) ?? "unknown"}${nativeOptOut === true ? ", native opt-out" : ""})`;
+	return [label, ...(reason && !label.includes(`[${reason}]`) ? [`reason ${reason}`] : []), request].join(" · ");
+}
+
 /** Context section for a knowledge-base lookup that was used; undefined for any other outcome. */
 function formatKnowledgeSection(lookup: KnowledgeLookup | undefined): string | undefined {
 	if (lookup?.outcome !== "used" || lookup.docs.length === 0) return undefined;
@@ -157,8 +231,13 @@ export function formatPlanSkipNotice(p: number): string {
 
 export interface PromptContextInput {
 	result: UpliftResult;
-	/** Thinking engine label; named in the degradation notice when the plan fell back. */
+	/** Thinking engine label; named in the degradation notice when the plan fell back and no `modelResolution` is given. */
 	engine?: string;
+	/**
+	 * The selection's safe record (§9 path 3). When given, a `Planning model:` line shows its label, reason and engine
+	 * request, and the degradation notice names its label. Execution failure stays the notice's job, never a state.
+	 */
+	modelResolution?: ModelResolution;
 	/** First engine error message; with a fallback result it adds the degradation notice. */
 	engineError?: string;
 	/** Plan stages that fell back to boilerplate ("uplift", "graph", "fill:<nodeId>"); drives the notice wording. */
@@ -278,9 +357,9 @@ function degradedStageName(token: string): string {
  * recorded engine error), or — under a real spec — the think stages that fell back.
  */
 function degradationNotice(
-	input: Pick<PromptContextInput, "result" | "engine" | "engineError" | "degraded" | "tracking" | "trackingOff">,
+	input: Pick<PromptContextInput, "result" | "engine" | "modelResolution" | "engineError" | "degraded" | "tracking" | "trackingOff">,
 ): string | undefined {
-	const engine = input.engine?.trim() || "thinking engine";
+	const engine = input.modelResolution ? displayLabel(input.modelResolution.label) : input.engine?.trim() || "thinking engine";
 	// The capture already bounds this; bound again so a long error can never blow the host context
 	// (the Hermes handoff keeps this notice even past its ceiling).
 	const failure = input.engineError ? ` (${input.engineError.slice(0, MAX_ENGINE_ERROR_CHARS)})` : "";
@@ -327,6 +406,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 			: UPLIFT_CONTEXT_HEADER;
 	const parts: string[] = [header];
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
+	if (input.modelResolution) parts.push(`Planning model: ${formatModelSelection(input.modelResolution)}`);
 	// A failed engine still delivers boilerplate (fail-open), but the agent must know it is
 	// boilerplate and why: otherwise a dead engine looks like a terse real plan with rows to come.
 	const degradedNotice = degradationNotice(input);
@@ -505,6 +585,8 @@ function skillsBit(lookup: SkillsLookup | undefined): string | undefined {
 export function formatSummary(input: {
 	result: UpliftResult;
 	engine?: string;
+	/** The selection's safe record (§9 path 3); replaces the `engine` bit with its label, reason and engine request. */
+	modelResolution?: ModelResolution;
 	graph?: ThoughtGraph;
 	clarifications?: Clarification[];
 	/** True once a TrackPlan has been written but ultrathink-kickoff has not run yet this turn. */
@@ -534,7 +616,8 @@ export function formatSummary(input: {
 	decisions?: readonly DecisionRecord[];
 }): string {
 	const bits = [`Prompt Uplift · ${input.result.root} · ${input.result.source}`];
-	if (input.engine) bits.push(input.engine);
+	if (input.modelResolution) bits.push(formatModelSelection(input.modelResolution));
+	else if (input.engine) bits.push(input.engine);
 	if (input.skill) bits.push(`Skill · ${input.skill}`);
 	if (input.graph) bits.push(`Graph of Thought · ${input.graph.nodes.length} nodes`);
 	const briefLines = input.brief?.trim() ? input.brief.trim().split("\n").length : 0;

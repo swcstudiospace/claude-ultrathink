@@ -139,6 +139,7 @@ describe("targetForHost", () => {
 		expect(targetForHost("claude-code")).toBe("claude");
 		expect(targetForHost("grok-build")).toBe("claude");
 		expect(targetForHost("hermes")).toBe("hermes");
+		expect(targetForHost("prime-agent")).toBe("prime-agent");
 		expect(targetForHost("muse")).toBe("drafts");
 		expect(targetForHost("something-else")).toBe("drafts");
 	});
@@ -370,6 +371,18 @@ describe("installSkill", () => {
 		const claude = installSkill(draft, "claude", f.ctx({ env, host: "claude-code" }));
 		expect(claude.path).toBe(join(f.home, ".claude", "skills", draft.name, "SKILL.md"));
 		expect(claude.action).toBe("created");
+	});
+
+	test("prime-agent: installs under PRIME_AGENT_CODING_AGENT_DIR/skills, else ~/.prime/agent/skills", () => {
+		const f = fixture();
+		const draft = draftOf(f);
+		const scoped = installSkill(draft, "prime-agent", f.ctx({ env: { HOME: f.home, PRIME_AGENT_CODING_AGENT_DIR: join(f.home, "prime") }, host: "prime-agent" }));
+		expect(scoped).toEqual({ target: "prime-agent", path: join(f.home, "prime", "skills", draft.name, "SKILL.md"), action: "created" });
+		expect(readFileSync(scoped.path, "utf8")).toBe(draft.content);
+		const home = installSkill(draft, "prime-agent", f.ctx({ env: { HOME: f.home }, host: "prime-agent" }));
+		expect(home.path).toBe(join(f.home, ".prime", "agent", "skills", draft.name, "SKILL.md"));
+		expect(home.action).toBe("created");
+		expect(installSkill(draft, "prime-agent", f.ctx({ env: { HOME: f.home }, host: "prime-agent" })).action).toBe("updated");
 	});
 
 	test("claude: honors CLAUDE_CONFIG_DIR and updates only its own file", () => {

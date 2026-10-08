@@ -6,13 +6,17 @@
  * Control state lives in the host state dir, so each host toggles independently.
  */
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
+import { displayId, formatModelSelection, OPAQUE_MODEL } from "../claude/output.ts";
 import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
 import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
 import { runDecisionsCommand } from "../decisions/cli.ts";
 import { decisionsKilled, resolveDecisionsKeys } from "../decisions/gate.ts";
 import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
-import { engineLabel } from "../host/engine.ts";
+import { detectHost } from "../host/detect.ts";
+import { engineLabel, type ModelResolution } from "../host/engine.ts";
+import type { HostId } from "../host/types.ts";
+import { projectResolution } from "../host/view.ts";
 import { THINK_ENGINES, type ThinkEngine } from "../think/types.ts";
 import { resolveStateDir } from "../host/paths.ts";
 import { hindsightStatusLine } from "../hindsight/settings.ts";
@@ -116,10 +120,10 @@ function trackingLines(config: UltrathinkConfig, state: ControlState): string[] 
 /** `Grok: <model> @ <effort> · transport <t>` plus the gateway URL and wire model when shunt is active. */
 function grokTransportLine(config: UltrathinkConfig): string {
 	const { grok } = config;
-	const base = `Grok: ${grok.model} @ ${grok.reasoningEffort} · transport ${grok.transport}`;
+	const base = `Grok: ${displayId(grok.model, OPAQUE_MODEL)} @ ${grok.reasoningEffort} · transport ${grok.transport}`;
 	if (grok.transport !== "shunt") return base;
 	const gateway = grok.shuntBaseUrl ? `${grok.shuntBaseUrl}/v1/messages` : "shunt gateway not configured (set grok.shuntBaseUrl)";
-	return `${base} · ${gateway} · wire model ${grok.shuntModel || grok.model} · max_tokens ${grok.shuntMaxTokens}`;
+	return `${base} · ${gateway} · wire model ${displayId(grok.shuntModel || grok.model, OPAQUE_MODEL)} · max_tokens ${grok.shuntMaxTokens}`;
 }
 
 /** Where the Agent Substrate brief comes from, if anywhere; the same rule the hooks use. */
@@ -178,11 +182,26 @@ async function grokOauthLine(config: UltrathinkConfig): Promise<string> {
 	return `SuperGrok OAuth: ${auth.email ?? "logged in"}${auth.expiresAt ? ` · expires ${auth.expiresAt}` : ""}`;
 }
 
-async function statusText(config: UltrathinkConfig, state: ControlState, stateDir: string): Promise<string> {
+/**
+ * The configured engine request, where it comes from and Omp's native opt-out, kept apart from model state: the Engine
+ * line is the current model label and `Last planned resolution` the saved plan's (§9 path 6).
+ */
+function engineRequestLine(config: UltrathinkConfig, state: ControlState, host: HostId): string {
+	const engine = state.engine ?? config.think.engine;
+	const optOut = host === "omp" && engine !== "auto" ? ", native opt-out" : "";
+	return `Engine request: ${engine} (${state.engine === undefined ? "config" : "control"}${optOut}) · concurrency ${config.claude.concurrency}`;
+}
+
+/**
+ * `live` is the host's in-memory projection of its latest observed resolution (Omp), shown as the current Engine label;
+ * nothing here looks a model up or authenticates for it. The saved successful plan's record shows as `Last planned
+ * resolution`, never as current detection (§9 path 6); together they replace the universal `Model: <claude.model>` line.
+ */
+async function statusText(config: UltrathinkConfig, state: ControlState, stateDir: string, host: HostId, live?: ModelResolution): Promise<string> {
 	const last = readLast(stateDir);
 	const lines = [
 		`Prompt Uplift ${flag(state.enabled, config.uplift.enabled)}${state.skipOnce ? " (skipping next prompt)" : ""}`,
-		`Engine: ${engineLabel(config, state)}`,
+		`Engine: ${engineLabel(config, state, host, live)}`,
 		grokTransportLine(config),
 		await grokOauthLine(config),
 		`Graph of Thought ${flag(state.thinkEnabled, config.think.enabled)}`,
@@ -195,27 +214,37 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		hindsightStatusLine(config.hindsight, process.env, storePath(process.env)),
 		ragflowStatusLine(config.ragflow, process.env, storePath(process.env)),
 		teachStatusLine({ teach: config.teach, hindsight: config.hindsight }, process.env, storePath(process.env), stateDir),
-		`Model: ${config.claude.model || "session default"} · concurrency ${config.claude.concurrency}`,
+		engineRequestLine(config, state, host),
 		`State: ${stateDir}`,
 	];
 	if (last) lines.push(`Last: ${last.result.root} · ${last.result.source}${last.graph ? ` · ${last.graph.nodes.length} nodes` : ""}`);
+	const planned = projectResolution(last?.modelResolution);
+	if (planned) lines.push(`Last planned resolution: ${formatModelSelection(planned)}`);
 	return lines.join("\n");
 }
 
 /**
  * Runs skip|off|on|track on|track off|status plus the legacy --ctl scopes
  * (think/hitl/grok/last) against stateDir and returns the user-facing text.
+ * `host` defaults to the detected host. `modelResolution` is the host's live
+ * projection of its latest observed resolution (Omp keeps it in extension
+ * memory); status shows it without any native lookup or auth.
  * Never throws: an error becomes a message.
  */
-export async function runControl(args: string[], input: { stateDir: string; cwd: string }): Promise<string> {
+export async function runControl(
+	args: string[],
+	input: { stateDir: string; cwd: string; host?: HostId; modelResolution?: ModelResolution },
+): Promise<string> {
 	try {
 		const { stateDir, cwd } = input;
+		const host = input.host ?? detectHost();
+		const live = projectResolution(input.modelResolution);
 		const [command = "status", verb = "status", value] = args.map((arg) => arg.trim().toLowerCase()).filter(Boolean);
 		const config = loadConfig(claudeConfigPaths(cwd));
 		const state = readControl(stateDir);
 		switch (command) {
 			case "status":
-				return await statusText(config, state, stateDir);
+				return await statusText(config, state, stateDir, host, live);
 			case "on":
 			case "off":
 				writeControl(stateDir, { enabled: command === "on" });
@@ -270,10 +299,10 @@ export async function runControl(args: string[], input: { stateDir: string; cwd:
 					case "engine": {
 						if (!THINK_ENGINES.includes(value as ThinkEngine)) return "Usage: grok engine auto|claude|grok|muse";
 						writeControl(stateDir, { engine: value as ThinkEngine });
-						return `Thinking engine set to ${engineLabel(config, { ...state, engine: value as ThinkEngine })}`;
+						return `Thinking engine set to ${engineLabel(config, { ...state, engine: value as ThinkEngine }, host, live)}`;
 					}
 					case "status":
-						return [`Engine: ${engineLabel(config, state)}`, grokTransportLine(config), await grokOauthLine(config)].join("\n");
+						return [`Engine: ${engineLabel(config, state, host, live)}`, grokTransportLine(config), await grokOauthLine(config)].join("\n");
 					default:
 						return "Usage: grok [status | engine auto|claude|grok|muse]";
 				}

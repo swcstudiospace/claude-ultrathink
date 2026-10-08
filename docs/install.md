@@ -1,6 +1,6 @@
 # Install
 
-ultrathink runs from one checkout of this repository. Each host (the coding agent you type into: Claude Code, Grok Build, Hermes Agent, Muse Code or Omp) loads it through a small entry point, and every host calls the same TypeScript engine. This page covers installing it on each host and checking that it works. It also covers `scripts/setup.ts`, the shared MCP gateway and choosing the planning engine. To upgrade, move or remove an install, see [Upgrade and move](how-to/upgrade-and-move.md) and [Uninstall](how-to/uninstall.md).
+ultrathink runs from one checkout of this repository. Each host (the coding agent you type into: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent) loads it through a small entry point, and every host calls the same TypeScript engine. This page covers installing it on each host and checking that it works. It also covers `scripts/setup.ts`, the shared MCP gateway and choosing the planning engine. To upgrade, move or remove an install, see [Upgrade and move](how-to/upgrade-and-move.md) and [Uninstall](how-to/uninstall.md).
 
 In the commands below, `<clone>` is the absolute path of your checkout. Paths written as `${NAME:-default}` use the environment variable when you set it, and the default otherwise.
 
@@ -27,7 +27,8 @@ ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL;
 | Grok Build | 1.0.41 |
 | Hermes Agent | v0.21.4 |
 | Muse Code | 1.4.0 |
-| Omp | 18.3.1 |
+| Omp | 18.3.1 (native planning: 18.8.0) |
+| Prime Agent | 0.9.8 |
 | Bun | 1.4.0 (1.2 or later required) |
 | Greptile CLI (optional, for ship) | 3.4.1 |
 
@@ -38,7 +39,7 @@ ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL;
 | [Bun](https://bun.sh) | 1.2 or later | Every host. The hooks, the engine and the CLIs run on Bun. |
 | Python | 3.10 or later | Hermes Agent only, which runs the plugin in its own Python. |
 | `git` | any | Cloning the repository. |
-| `claude` CLI, logged in | 2.1.278 or later (the tested version) | The Claude engine, the default on Claude Code, Hermes and Omp and the fallback everywhere (see [Engine selection](#engine-selection)). The engine passes `claude -p` flags that older CLIs reject, and then every plan falls back. |
+| `claude` CLI, logged in | 2.1.278 or later (the tested version) | The Claude engine: the default on Claude Code and Hermes, Omp's ship done check and Teachable Moments distiller under `auto`, and Claude in Grok's place when you set `grok.fallbackToClaude` or `grok.enabled: false` (see [Engine selection](#engine-selection)). Omp's own planning doesn't need it. The engine passes `claude -p` flags that older CLIs reject, and then every plan falls back. |
 
 1. **Bun.** Hosts often start hooks with a short `PATH`, so they launch Bun through `bin/run-bun`. It looks for Bun in this order and uses the first it finds:
 
@@ -63,10 +64,11 @@ ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL;
 
    ultrathink has no runtime dependencies, so `bun install` is not needed to run it. It only installs type definitions for development. (If you plan to use Muse, see the note on symlinks in [Muse Code](#muse-code).) A Claude Code install from the GitHub marketplace does not need a clone. The other hosts and the MCP gateway do. Keep the clone where it is: several hosts store its path. If you move it later, follow [Upgrade and move](how-to/upgrade-and-move.md#move-the-clone-to-another-directory).
 
-3. **An engine login.** Planning runs on a separate model call, independent of the host you type into.
-   - Claude (the default on Claude Code, Hermes and Omp): the `claude` CLI must be on `PATH` and logged in. The engine runs `claude -p` headless.
+3. **An engine login.** Planning runs its own model calls, apart from the host's work.
+   - Claude (the default on Claude Code and Hermes): the `claude` CLI must be on `PATH` and logged in. The engine runs `claude -p` headless.
    - Grok (the default on Grok Build): run `grok login`, unless you use the `shunt` transport. See [Engine selection](#engine-selection).
    - Muse (the default on Muse Code): the `muse` CLI must be on `PATH` and logged in. The engine runs `muse exec` headless.
+   - Omp: nothing extra. Under `auto`, Omp plans on the session's own model with Omp's own provider and login. See [Omp](#omp).
 
 Optional:
 
@@ -133,7 +135,7 @@ Start a new Claude Code session after installing.
 
 ### Verify
 
-1. Run `/ultrathink-status`. The plugin also lists it as `/ultrathink:ultrathink-status`. The prompt hook answers before any model turn and shows the engine (for example `Engine: claude:sonnet`), the tracking state and the state directory. From a shell, `<clone>/bin/ultrathink status` prints the same thing.
+1. Run `/ultrathink-status`. The plugin also lists it as `/ultrathink:ultrathink-status`. The prompt hook answers before any model turn and shows the engine (for example `Engine: claude:sonnet`), the engine request (`Engine request: auto (config) · concurrency 3`), the tracking state and the state directory. From a shell, `<clone>/bin/ultrathink status` prints the same thing.
 2. Send a non-trivial prompt, such as a one-line feature request. The transcript shows a summary line that starts with `Prompt Uplift ·`, and the agent invokes `ultrathink-kickoff` before it does other work.
 
 Verified live on Claude Code 2.1.278: `/ultrathink-status` and `/ultrathink-quick` in `claude -p`. Headless, the status reply appears as "blocked by hook" text. A quick message was answered and no plan was written.
@@ -258,7 +260,7 @@ Muse runs a copy from its plugin cache, so `git pull` alone does not update it. 
 
 ## Omp
 
-Omp loads the extension listed under `omp.extensions` in `package.json` (`src/host/omp.ts`), plus the skills. The extension plans in `before_agent_start` and waits up to 25 s, because Omp caps a handler at 30 s. A plan that takes longer arrives as an aside message. In the TUI, the extension adds a live `ultrathink` status bar above Omp's status band and renders plans as cards.
+Omp loads the extension listed under `omp.extensions` in `package.json` (`src/host/omp.ts`), plus the skills. With `think.engine: "auto"` the extension plans inside Omp on the session's own model, with Omp's own provider and login, so it needs no `claude`, `grok` or `muse` login (see [Choose the planning engine](how-to/choose-engine.md#omp-the-sessions-own-model)). It plans in `before_agent_start` and waits up to 25 s, because Omp caps a handler at 30 s. A plan that takes longer arrives as an aside message; on reasoning-heavy models that can take several minutes. In the TUI, the extension adds a live `ultrathink` status bar above Omp's status band and renders plans as cards.
 
 ### Install
 
@@ -268,12 +270,14 @@ omp plugin link <clone>
 
 ### Verify
 
-1. `omp plugin list` shows `ultrathink@0.4.0` as enabled.
+1. `omp plugin list` shows `ultrathink@1.4.0` as enabled.
 2. Start the Omp TUI. The `ultrathink` status bar appears above the status band.
-3. Run `/ultrathink-status`. Omp shows the state as a notification.
-4. Send a non-trivial prompt. The status bar shows the planning stages, and the plan appears as a card, either inline or later as an aside.
+3. Run `/ultrathink-status`. Omp shows the state as a notification. Before the first plan the `Engine:` line reads `omp-native:auto (live model not observed)`.
+4. Send a non-trivial prompt. The status bar shows the planning stages and the planning model, for example `omp-native:<provider>/<model> [detected]`, and the plan appears as a card, either inline or later as an aside. Afterwards `/ultrathink-status` shows the same model on its `Engine:` line.
 
 Verified live on Omp 18.3.1 in the interactive UI: `/ultrathink-status` showed the notification, and `/ultrathink-quick` was answered with no plan. Use the interactive UI for these commands. In `omp -p` print mode, notifications are not shown and a quick message is not processed before Omp exits.
+
+Native planning was verified live on Omp 18.8.0 in print mode, with the session model `openai-codex/gpt-6.1-sol`: the record read `omp-native:openai-codex/gpt-6.1-sol [detected]`, the agent got the pending note after 25 s, and the plan (7 graph nodes, 3 clarifying questions) arrived as an aside about 336 s after the prompt. A print-mode run that exits before the plan arrives cancels it, so the agent must keep working, or the session stay open, until the aside lands.
 
 If something looks wrong, `omp plugin doctor` checks the installed plugins.
 
@@ -281,15 +285,40 @@ If something looks wrong, `omp plugin doctor` checks the installed plugins.
 
 See [Upgrade and move](how-to/upgrade-and-move.md#upgrade) and [Uninstall](how-to/uninstall.md#omp).
 
+## Prime Agent
+
+Prime Agent runs the agent in a persistent Python kernel and has no prompt hook, so ultrathink is a Python-backed skill there: `hosts/prime-agent` (a `SKILL.md`, a `pyproject.toml` and the package `src/ultrathink`). The kernel loads it as `ultrathink`, and the agent plans by calling `await ultrathink("<request>")`. The call runs `hooks/engine.ts` through `bin/run-bun` with the host `prime-agent`, the Prime Agent session id and the kernel's working directory, and returns the engine's response to the kernel: `planned`, `context` (the plan text, the same text the other hosts inject), `spec` and `spec_path`, `state_path`, `graph_id`, `summary`, `view` and `model_resolution`. Nothing is planned until the agent calls it; the skill description tells the agent to plan non-trivial requests, `/ultrathink-*` commands and `/skill:gsd-*` runs. The `ultrathink-kickoff`, `ultrathink-plan`, `ultrathink-sync`, `ultrathink-ship` and `ultrathink-teach` skills are linked into `~/.agents/skills`, the shared Agent Skills directory Prime Agent reads, so `/skill:ultrathink-kickoff` works as on the other hosts. State lives in `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/ultrathink/`. Planning runs on the Claude CLI route by default; `think.engine` and `models.hosts.prime-agent` choose another.
+
+### Install
+
+```sh
+bun <clone>/scripts/setup.ts apply
+```
+
+`apply` links `<clone>/hosts/prime-agent` to `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` and each `<clone>/skills/<name>` to `~/.agents/skills/<name>` (`ULTRATHINK_AGENT_SKILLS_DIR` overrides the directory). An existing symlink is retargeted; a real directory at either path is kept and reported, so link it yourself or move it first. Then start a new Prime Agent session (or run `/reload`): the kernel installs the package editable into its venv (`~/.prime/agent/kernel-venv`) and exposes `ultrathink`. Python 3.10 or later; no third-party packages.
+
+### Verify
+
+1. In a Prime Agent session, `await ultrathink.status()` shows `host: prime-agent`, `engine_present: True`, the state directory and the `ultrathink status` text (planning on, the engine route, tracking).
+2. `await ultrathink("ok")` returns `planned: False` with `skipped: precheck-skip` (a trivial prompt is never planned).
+3. `await ultrathink("add a /health endpoint returning uptime and git sha")` returns `planned: True` after one to five minutes, with `context`, `spec_path` under the state directory and, when tracking is configured, the row links. `ultrathink.last()` returns the carrier (`last-plan.json`) afterwards.
+4. `/skill:ultrathink-kickoff` loads the kickoff skill.
+
+Tracking from Prime Agent uses the shared MCP gateway through the kickoff and sync skills: log in with `bin/ultrathink-mcp auth login linear` and `notion` from the clone. Teachable Moments: `ultrathink.teach("status")`, `ultrathink.teach("recall", "<query>")`; promoted skills install into `~/.prime/agent/skills/<name>/SKILL.md` with `--target prime-agent --install`.
+
+### Update and uninstall
+
+The skill is a symlink into the clone, so `git pull` updates it; start a new session afterwards. `bun <clone>/scripts/setup.ts rollback` removes the symlinks it created (only links that point into the clone), and leaves the state directory. A Python environment the kernel created inside `hosts/prime-agent` (`.venv`, `uv.lock`) is ignored by git.
+
 ## `scripts/setup.ts` reference
 
-`bun <clone>/scripts/setup.ts <apply|status|rollback>` works on the clone that contains the script, whatever directory you run it from. With no argument it runs `status`. Grok Build needs `apply`. The other hosts do not, but `apply` also sets up Claude Code when the `claude` CLI is installed.
+`bun <clone>/scripts/setup.ts <apply|status|rollback>` works on the clone that contains the script, whatever directory you run it from. With no argument it runs `status`. Grok Build and Prime Agent need `apply`. The other hosts do not, but `apply` also sets up Claude Code when the `claude` CLI is installed.
 
 | Subcommand | What it does |
 |---|---|
-| `apply` | 1. Writes the Grok hook file `${GROK_HOME:-~/.grok}/hooks/ultrathink.json` and installs the Grok rule `${GROK_HOME:-~/.grok}/rules/ultrathink.md`. The rule is written from `hosts/grok/ultrathink.md` when missing; otherwise only its ultrathink marker block is replaced, or appended when absent, and the rest of the file is kept.<br>2. If the `claude` CLI is installed, adds the hosted Notion (`https://mcp.notion.com/mcp`) and Linear (`https://mcp.linear.app/mcp`) HTTP MCP servers to Claude Code at user scope, unless a server named exactly `notion` or `linear` is already configured. It checks with `claude mcp get <name>`, then falls back to an exact name match in `claude mcp list`, so a server with a similar name or URL does not count.<br>3. Runs `claude plugin marketplace add <clone>` and `claude plugin install ultrathink@ultrathink`.<br>4. Merges a tracking block into `${CLAUDE_CONFIG_DIR:-~/.claude}/CLAUDE.md` between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->`, updating it in place on re-runs. The block says the plugin *can* track work, and that its tracking workflow applies only when `/ultrathink-status` shows a Notion database or a Linear team. Without either, ultrathink creates no rows.<br>5. Records which MCP servers it added in `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink-setup-state.json`. A re-run keeps earlier records, so a server added by any `apply` stays recorded.<br>6. Prints the install commands for Hermes (one `mkdir -p … && ln -sfn … && hermes plugins enable ultrathink` line honoring `HERMES_HOME`, then the hook cap step), Muse and Omp, with the clone path quoted so you can paste them.<br>Without the `claude` CLI, steps 2 to 5 are skipped with the notice `Claude Code: claude CLI not found — skipped …`. |
-| `status` | Reports whether the Grok rule (with its marker block) and the Grok hook file are installed. With the `claude` CLI, it also reports whether Claude Code has servers named exactly `notion` and `linear`, and whether the `CLAUDE.md` block is present. Without it, it prints `Claude Code: claude CLI not found` followed by the Grok lines. |
-| `rollback` | Removes the Grok hook file and the Grok rule (the whole file if it holds only the ultrathink block, otherwise just the block). Removes the `CLAUDE.md` block. Removes the `notion` and `linear` Claude Code MCP servers only if an `apply` run recorded adding them and `claude mcp get` still shows them as user-scope HTTP servers with the hosted URL; a changed entry is left in place, a missing one is reported as `already removed`. Then it deletes the setup state file. If a removal fails, it says so and keeps the state file, so running `rollback` again retries it. It does not uninstall the Claude Code plugin: its last line prints `claude plugin uninstall ultrathink@ultrathink && claude plugin marketplace remove ultrathink` for you to run. |
+| `apply` | 1. Writes the Grok hook file `${GROK_HOME:-~/.grok}/hooks/ultrathink.json` and installs the Grok rule `${GROK_HOME:-~/.grok}/rules/ultrathink.md`. The rule is written from `hosts/grok/ultrathink.md` when missing; otherwise only its ultrathink marker block is replaced, or appended when absent, and the rest of the file is kept.<br>2. If the `claude` CLI is installed, adds the hosted Notion (`https://mcp.notion.com/mcp`) and Linear (`https://mcp.linear.app/mcp`) HTTP MCP servers to Claude Code at user scope, unless a server named exactly `notion` or `linear` is already configured. It checks with `claude mcp get <name>`, then falls back to an exact name match in `claude mcp list`, so a server with a similar name or URL does not count.<br>3. Runs `claude plugin marketplace add <clone>` and `claude plugin install ultrathink@ultrathink`.<br>4. Merges a tracking block into `${CLAUDE_CONFIG_DIR:-~/.claude}/CLAUDE.md` between `<!-- ultrathink:start -->` and `<!-- ultrathink:end -->`, updating it in place on re-runs. The block says the plugin *can* track work, and that its tracking workflow applies only when `/ultrathink-status` shows a Notion database or a Linear team. Without either, ultrathink creates no rows.<br>5. Records which MCP servers it added in `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink-setup-state.json`. A re-run keeps earlier records, so a server added by any `apply` stays recorded.<br>6. Links the Prime Agent host: `<clone>/hosts/prime-agent` to `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` and `<clone>/skills/<name>` to `${ULTRATHINK_AGENT_SKILLS_DIR:-~/.agents/skills}/<name>`; an existing symlink is retargeted, anything else is kept and reported.<br>7. Prints the install commands for Hermes (one `mkdir -p … && ln -sfn … && hermes plugins enable ultrathink` line honoring `HERMES_HOME`, then the hook cap step), Muse and Omp, with the clone path quoted so you can paste them.<br>Without the `claude` CLI, steps 2 to 5 are skipped with the notice `Claude Code: claude CLI not found — skipped …`. |
+| `status` | Reports whether the Grok rule (with its marker block), the Grok hook file and the Prime Agent skill link are installed. With the `claude` CLI, it also reports whether Claude Code has servers named exactly `notion` and `linear`, and whether the `CLAUDE.md` block is present. Without it, it prints `Claude Code: claude CLI not found` followed by the Grok lines. |
+| `rollback` | Removes the Grok hook file and the Grok rule (the whole file if it holds only the ultrathink block, otherwise just the block). Removes the Prime Agent symlinks that point into the clone. Removes the `CLAUDE.md` block. Removes the `notion` and `linear` Claude Code MCP servers only if an `apply` run recorded adding them and `claude mcp get` still shows them as user-scope HTTP servers with the hosted URL; a changed entry is left in place, a missing one is reported as `already removed`. Then it deletes the setup state file. If a removal fails, it says so and keeps the state file, so running `rollback` again retries it. It does not uninstall the Claude Code plugin: its last line prints `claude plugin uninstall ultrathink@ultrathink && claude plugin marketplace remove ultrathink` for you to run. |
 
 `apply` is idempotent. The hosted servers from step 2 connect Claude Code directly to Notion and Linear. If you would rather use the [shared MCP gateway](#shared-mcp-gateway) in Claude Code too, note that `scripts/mcp-register.ts` keeps a same-named entry that is not ultrathink's, and reports it as `kept`. Run `bun scripts/mcp-register.ts --replace --hosts claude` to swap the hosted `notion` and `linear` entries for gateway entries; later `apply` runs leave them alone. `rollback` removes the `notion` and `linear` entries only while they are still the user-scope HTTP servers `apply` added, with the hosted URL. An entry you replaced since, such as a gateway entry from `mcp-register --replace`, is left in place and reported as `left in place: <name> was changed since setup added it`; remove gateway entries with `bun scripts/mcp-register.ts --remove`.
 
@@ -352,7 +381,9 @@ The engine is the model that writes the spec, the Graph of Thought and the clari
 
 1. The engine set with `bin/ultrathink grok engine auto|claude|grok|muse` for that host, stored in its state directory. `auto` follows the config.
 2. `think.engine` in config: a named engine, or `"auto"` (the default), which resolves to the host's own engine below.
-3. The host's own engine: Claude on Claude Code, Hermes and Omp, Grok on Grok Build, Muse on Muse Code. Grok is used only when `grok.enabled` is `true` (the default); Grok Build without a usable Grok login plans on Claude instead.
+3. The host's own engine: Claude on Claude Code, Grok on Grok Build, Muse on Muse Code, the route of the session model's family on Hermes (Claude for an unknown family), and on Omp the session's own live model, planned natively. A named engine on Omp opts out of native planning.
+
+Claude replaces a selected Grok route only through the two explicit, labeled user switches: `grok.fallbackToClaude: true` (HTTP/CLI login missing or expired) and `grok.enabled: false` (documented ‘forces Claude even when Grok is selected’). Without them, a missing or expired Grok login skips planning with the unchanged `GROK_LOGIN_REQUIRED` notice. Naming `think.engine: "claude"` is a deliberate engine choice, not a replacement.
 
 ```sh
 <clone>/bin/ultrathink grok                       # engine label, Grok model/effort/transport, Grok login status
@@ -366,8 +397,9 @@ To switch every host, set it in config, for example in `${XDG_CONFIG_HOME:-~/.co
 { "think": { "engine": "grok" } }
 ```
 
-- **Claude** runs the `claude` CLI headless (`claude -p`) with your existing Claude Code login. Its label is `claude:<model>`, for example `claude:sonnet`.
-- **Grok** has three transports. `http` (default) and `cli` use your `grok login` session; if it is missing or expired, the prompt goes through unplanned with ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, unless `grok.fallbackToClaude` is `true`. On Grok Build with the default `auto` engine, a missing login plans on Claude instead without that flag. `shunt` posts to an Anthropic-compatible gateway that you run and name in `grok.shuntBaseUrl`. There is no built-in gateway: with `shunt` selected and `grok.shuntBaseUrl` empty, every planning call fails with an error naming `grok.shuntBaseUrl`.
+- **Claude** runs the `claude` CLI headless (`claude -p`) with your existing Claude Code login. Its status label is `claude:<model>`, for example `claude:sonnet`.
+- **Grok** has three transports. `http` (default) and `cli` use your `grok login` session; if it is missing or expired, the prompt goes through unplanned with ``Prompt Uplift skipped · Grok 4.7 login required (run `grok login`)``, under `auto` on Grok Build too, unless one of the two switches above is set. `shunt` posts to an Anthropic-compatible gateway that you run and name in `grok.shuntBaseUrl`. There is no built-in gateway: with `shunt` selected and `grok.shuntBaseUrl` empty, the prompt goes through unplanned with ``Prompt Uplift skipped · grok:unresolved [transport-incompatible]`` and nothing is sent.
+- **Omp's native planning** uses the session's own model and Omp's login, and shows labels such as `omp-native:<provider>/<model> [detected]`. See [Choose the planning engine](how-to/choose-engine.md#omp-the-sessions-own-model).
 - **Muse** runs the `muse` CLI headless (`muse exec --json`) for one agent turn per call, with the shell, file writes and web tools disabled. Its label is `muse:<model>`, for example `muse:muse-spark-1.3-contributor`.
 
 [Choose an engine](how-to/choose-engine.md) compares them, and [Configuration](configuration.md#key-reference) lists every `claude.*`, `grok.*` and `muse.*` key with its default.

@@ -25,6 +25,8 @@ export interface BriefInput {
 	branch?: string;
 	graphId?: string;
 	surface?: string;
+	/** The caller's planning lifetime, combined with the request timeout: an abort ends the request and the brief is "". */
+	signal?: AbortSignal;
 }
 
 export interface SubstrateTarget {
@@ -59,9 +61,10 @@ function timeoutMs(env: Record<string, string | undefined>): number {
 }
 
 /**
- * The session brief as Markdown, or `""` when no substrate is configured or it
- * cannot answer in time. An empty string is the caller's signal to carry on
- * without it. `url` is the configured `substrate.url`; `SUBSTRATE_URL` wins.
+ * The session brief as Markdown, or `""` when no substrate is configured, it
+ * cannot answer in time, or `input.signal` aborts. An empty string is the
+ * caller's signal to carry on without it. Never rejects. `url` is the
+ * configured `substrate.url`; `SUBSTRATE_URL` wins.
  */
 export async function fetchBrief(
 	input: BriefInput,
@@ -70,6 +73,9 @@ export async function fetchBrief(
 ): Promise<string> {
 	const target = resolveSubstrate(env, url);
 	if (!target) return "";
+	// A cancelled caller sends nothing; the brief is optional, so cancellation reads as "no brief".
+	if (input.signal?.aborted) return "";
+	const timeout = AbortSignal.timeout(timeoutMs(env));
 	try {
 		const response = await fetch(`${target.url}/brief`, {
 			method: "POST",
@@ -80,7 +86,7 @@ export async function fetchBrief(
 				graph_id: input.graphId,
 				surface: input.surface ?? "claude-code",
 			}),
-			signal: AbortSignal.timeout(timeoutMs(env)),
+			signal: input.signal ? AbortSignal.any([input.signal, timeout]) : timeout,
 		});
 		if (!response.ok) return "";
 		return (await response.text()).trim();

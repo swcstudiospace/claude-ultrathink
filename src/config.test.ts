@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeConfigPaths, defaultConfig, loadConfig, mergeConfig, type UltrathinkConfig, userConfigPath } from "./config.ts";
+import {
+	claudeConfigPaths,
+	DEFAULT_CLAUDE_CONFIG,
+	defaultConfig,
+	hasControlCharacter,
+	loadConfig,
+	mergeConfig,
+	type UltrathinkConfig,
+	userConfigPath,
+} from "./config.ts";
 import type { DecisionsConfig } from "./decisions/types.ts";
+import { DEFAULT_GROK_CONFIG } from "./grok/types.ts";
+import { DEFAULT_MUSE_CONFIG } from "./muse/types.ts";
+import { ROUTE_DEFAULT_MODELS } from "./route-defaults.ts";
 
 function tempConfigFile(content: unknown): { path: string; cleanup: () => void } {
 	const dir = mkdtempSync(join(tmpdir(), "ultrathink-config-"));
@@ -83,9 +95,10 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ grok: { reasoningEffort: "extreme" } }, base).grok.reasoningEffort).toBe(base.grok.reasoningEffort);
 	});
 
-	test("muse defaults are muse-spark-1.3-contributor @ high with no timer", () => {
+	test("muse defaults are the Muse route default (muse-spark-1.3-contributor) @ high with no timer", () => {
 		const muse = defaultConfig().muse;
 		expect(muse.bin).toBe("muse");
+		expect(muse.model).toBe(ROUTE_DEFAULT_MODELS.muse);
 		expect(muse.model).toBe("muse-spark-1.3-contributor");
 		expect(muse.reasoningEffort).toBe("high");
 		expect(muse.callTimeoutMs).toBe(0);
@@ -101,8 +114,9 @@ describe("mergeConfig", () => {
 		expect(mergeConfig({ muse: { callTimeoutMs: -5 } }, base).muse.callTimeoutMs).toBe(0);
 	});
 
-	test("grok defaults are grok-4.7 @ xhigh over the http transport, with no shunt gateway configured", () => {
+	test("grok defaults are the Grok route default (grok-4.7) @ xhigh over the http transport, with no shunt gateway configured", () => {
 		const grok = defaultConfig().grok;
+		expect(grok.model).toBe(ROUTE_DEFAULT_MODELS.grok);
 		expect(grok.model).toBe("grok-4.7");
 		expect(grok.reasoningEffort).toBe("xhigh");
 		expect(grok.transport).toBe("http");
@@ -908,5 +922,232 @@ describe("teach config", () => {
 		);
 		expect(config.hindsight).toMatchObject({ enabled: false, url: "http://hs.lan" });
 		expect(config.teach).toMatchObject({ enabled: true, capture: "explicit", recall: false });
+	});
+});
+
+describe("route defaults (AD-1)", () => {
+	test("unconfigured routes retain their legacy targets and route-default provenance", () => {
+		const config = defaultConfig();
+		expect([config.claude.model, config.grok.model, config.muse.model]).toEqual(["sonnet", "grok-4.7", "muse-spark-1.3-contributor"]);
+		expect(config.modelProvenance).toEqual({ claude: "route-default", grok: "route-default", muse: "route-default" });
+	});
+
+	test("the map cannot be changed at runtime", () => {
+		expect(() => {
+			(ROUTE_DEFAULT_MODELS as Record<string, string>).claude = "other";
+		}).toThrow();
+		expect(ROUTE_DEFAULT_MODELS.claude).toBe("sonnet");
+	});
+
+});
+
+describe("models config (D-05 merge truth table)", () => {
+	const base = defaultConfig();
+
+	test("the built-in value is empty hosts and a prototype-free empty providerDefaults", () => {
+		expect(base.models.hosts).toEqual({});
+		expect(Object.keys(base.models.providerDefaults)).toEqual([]);
+		expect(Object.getPrototypeOf(base.models.providerDefaults)).toBeNull();
+	});
+
+	test("nonblank strings trim surrounding whitespace only, keep case, slashes and punctuation, and the later layer wins", () => {
+		const user = mergeConfig(
+			{ models: { hosts: { omp: { provider: " openai-codex ", model: " OpenRouter/Anthropic/Claude-X:beta " } }, providerDefaults: { xai: " Grok-Fast " } } },
+			base,
+		);
+		expect(user.models.hosts.omp).toEqual({ provider: "openai-codex", model: "OpenRouter/Anthropic/Claude-X:beta" });
+		expect(user.models.providerDefaults.xai).toBe("Grok-Fast");
+		const later = mergeConfig({ models: { hosts: { omp: { model: "smol" } }, providerDefaults: { xai: "grok-fast-2" } } }, user);
+		expect(later.models.hosts.omp).toEqual({ provider: "openai-codex", model: "smol" });
+		expect(later.models.providerDefaults.xai).toBe("grok-fast-2");
+		expect(user.models.providerDefaults.xai).toBe("Grok-Fast");
+	});
+
+	test("absent, null, non-object, array and nonstring values preserve the lower value; empty sections merge nothing", () => {
+		const lower = mergeConfig({ models: { hosts: { omp: { provider: "xai", model: "grok-x" } }, providerDefaults: { xai: "fast" } } }, base);
+		const cases: unknown[] = [
+			undefined,
+			null,
+			"x",
+			42,
+			[],
+			{ hosts: null, providerDefaults: [] },
+			{ hosts: { omp: null } },
+			{ hosts: { omp: { provider: 7, model: false } } },
+			{ providerDefaults: { xai: 1 } },
+			{ hosts: {}, providerDefaults: {} },
+		];
+		for (const models of cases) {
+			const merged = mergeConfig({ models }, lower);
+			expect(merged.models.hosts).toEqual(lower.models.hosts);
+			expect({ ...merged.models.providerDefaults }).toEqual({ xai: "fast" });
+		}
+	});
+
+	test("a blank host model or provider clears that lower value without revealing it", () => {
+		const lower = mergeConfig({ models: { hosts: { omp: { provider: "xai", model: "grok-x" }, hermes: { model: "h" } } } }, base);
+		const cleared = mergeConfig({ models: { hosts: { omp: { model: "  " } } } }, lower);
+		expect(cleared.models.hosts.omp).toEqual({ provider: "xai", model: "" });
+		expect(cleared.models.hosts.hermes).toEqual({ provider: "", model: "h" });
+		expect(mergeConfig({ models: { hosts: { omp: { provider: "\t" } } } }, cleared).models.hosts.omp).toEqual({ provider: "", model: "" });
+		expect(JSON.stringify(mergeConfig({ models: { hosts: { omp: { provider: "", model: "" } } } }, lower).models)).not.toContain("grok-x");
+	});
+
+	test("a blank provider default removes the lower selector, exposing the host-catalog tier", () => {
+		const lower = mergeConfig({ models: { providerDefaults: { xai: "fast", openai: "gpt-x" } } }, base);
+		const merged = mergeConfig({ models: { providerDefaults: { xai: " " } } }, lower);
+		expect(Object.hasOwn(merged.models.providerDefaults, "xai")).toBe(false);
+		expect(merged.models.providerDefaults.openai).toBe("gpt-x");
+		expect(lower.models.providerDefaults.xai).toBe("fast");
+	});
+
+	test("unknown host keys are ignored and register no host", () => {
+		const merged = mergeConfig({ models: { hosts: { "grok-bot": { model: "x" }, "gpt-dot": { provider: "openai" }, omp: { model: "m" } } } }, base);
+		expect(Object.keys(merged.models.hosts)).toEqual(["omp"]);
+	});
+
+	test("__proto__, constructor and prototype keys are never merged and no mapping is inherited (T-15-01)", () => {
+		const file = JSON.parse(
+			'{"models":{"providerDefaults":{"__proto__":{"polluted":"yes"},"constructor":"evil","prototype":"evil","xai":"fast"},"hosts":{"__proto__":{"model":"evil"}}}}',
+		) as Record<string, unknown>;
+		const merged = mergeConfig(file, base);
+		const defaults = merged.models.providerDefaults;
+		expect(Object.keys(defaults)).toEqual(["xai"]);
+		expect(Object.getPrototypeOf(defaults)).toBeNull();
+		for (const key of ["__proto__", "constructor", "prototype", "toString", "hasOwnProperty"]) expect(Object.hasOwn(defaults, key)).toBe(false);
+		expect(defaults.constructor).toBeUndefined();
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		expect(Object.keys(merged.models.hosts)).toEqual([]);
+		expect(Object.getPrototypeOf(merged.models.hosts)).toBe(Object.prototype);
+		expect(JSON.stringify(merged.models)).not.toContain("evil");
+	});
+
+	test("inherited-only host entries and selector fields never create an override (POL-FUNC-009)", () => {
+		const inherited = Object.create({ provider: "InheritedProvider", model: "InheritedTarget" }) as Record<string, unknown>;
+		const inheritedHosts = Object.create({ omp: { provider: "InheritedProvider", model: "InheritedTarget" } }) as Record<string, unknown>;
+		expect(mergeConfig({ models: { hosts: inheritedHosts } }, base).models.hosts).toEqual({});
+		for (const host of ["omp", "claude-code", "muse", "grok-build", "hermes"] as const) {
+			expect(mergeConfig({ models: { hosts: { [host]: inherited } } }, base).models.hosts).toEqual({});
+			const lower = mergeConfig({ models: { hosts: { [host]: { provider: "LowerProvider", model: "LowerTarget" } } } }, base);
+			expect(mergeConfig({ models: { hosts: { [host]: inherited } } }, lower).models.hosts[host]).toEqual({
+				provider: "LowerProvider",
+				model: "LowerTarget",
+			});
+		}
+	});
+
+	test("mixed own host fields ignore inherited counterparts and preserve lower pins (POL-FUNC-009)", () => {
+		const lower = mergeConfig({ models: { hosts: { omp: { provider: "LowerProvider", model: "LowerTarget" } } } }, base);
+		const inherited = {
+			get provider(): string { throw new Error("an inherited provider must not be read"); },
+			get model(): string { throw new Error("an inherited model must not be read"); },
+		};
+		for (const [own, expected] of [
+			[{ provider: " OwnProvider " }, { provider: "OwnProvider", model: "LowerTarget" }],
+			[{ model: " OwnTarget " }, { provider: "LowerProvider", model: "OwnTarget" }],
+			[{ provider: "\t \n" }, { provider: "", model: "LowerTarget" }],
+			[{ model: "\t \n" }, { provider: "LowerProvider", model: "" }],
+			[{ provider: null, model: false }, { provider: "LowerProvider", model: "LowerTarget" }],
+		] as const) {
+			const fields = Object.create(inherited) as Record<string, unknown>;
+			for (const [key, value] of Object.entries(own)) Object.defineProperty(fields, key, { value, enumerable: true });
+			expect(mergeConfig({ models: { hosts: { omp: fields } } }, lower).models.hosts.omp).toEqual(expected);
+			expect(lower.models.hosts.omp).toEqual({ provider: "LowerProvider", model: "LowerTarget" });
+		}
+	});
+
+	test("a selector carrying a control character is kept as written for resolution to diagnose; all-whitespace is still a blank", () => {
+		const merged = mergeConfig({ models: { hosts: { omp: { model: "\u0000smol", provider: "xai\n" } }, providerDefaults: { xai: " fast\u001b " } } }, base);
+		expect(merged.models.hosts.omp).toEqual({ provider: "xai\n", model: "\u0000smol" });
+		expect(merged.models.providerDefaults.xai).toBe(" fast\u001b ");
+		expect(hasControlCharacter(merged.models.hosts.omp?.model ?? "")).toBe(true);
+		expect(hasControlCharacter("openrouter/anthropic/claude-x:beta")).toBe(false);
+		expect(mergeConfig({ models: { hosts: { omp: { model: "\n\t " } } } }, merged).models.hosts.omp?.model).toBe("");
+	});
+
+	test("every layer, the project file included, may set model selectors", () => {
+		const roots: string[] = [];
+		try {
+			const config = loadLayerFiles(
+				roots,
+				{ models: { hosts: { omp: { provider: "xai" } }, providerDefaults: { xai: "user-fast" } } },
+				{ models: { providerDefaults: { openai: "claude-home" } } },
+				{ models: { hosts: { omp: { model: "project-model" } }, providerDefaults: { xai: "project-fast" } } },
+			);
+			expect(config.models.hosts.omp).toEqual({ provider: "xai", model: "project-model" });
+			expect({ ...config.models.providerDefaults }).toEqual({ xai: "project-fast", openai: "claude-home" });
+		} finally {
+			for (const root of roots) rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("legacy model provenance (AD-1)", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("unset at every layer is the route default; a nonblank file value is a pin, even one equal to the route default", () => {
+		expect(loadLayerFiles(roots, { uplift: { enabled: true } }).modelProvenance).toEqual({
+			claude: "route-default",
+			grok: "route-default",
+			muse: "route-default",
+		});
+		const pinned = loadLayerFiles(roots, { claude: { model: "sonnet" } }, { grok: { model: " grok-4.7 " } }, { muse: { model: "muse-spark-1.3-contributor" } });
+		expect(pinned.modelProvenance).toEqual({ claude: "file-pin", grok: "file-pin", muse: "file-pin" });
+		expect([pinned.claude.model, pinned.grok.model, pinned.muse.model]).toEqual(["sonnet", "grok-4.7", "muse-spark-1.3-contributor"]);
+	});
+
+	test("nonblank legacy model and shunt selectors retain leading/trailing C0/C1 controls (POL-FUNC-011)", () => {
+		for (const control of ["\u0000", "\t", "\n", "\v", "\f", "\r", "\u001b", "\u007f", "\u0085", "\u009f"]) {
+			for (const model of [`${control}Opaque-X`, `Opaque-X${control}`]) {
+				const config = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, defaultConfig());
+				expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual([model, model, model, model]);
+				expect(config.modelProvenance).toEqual({ claude: "file-pin", muse: "file-pin", grok: "file-pin" });
+			}
+		}
+		const model = "MiXeD/opaque:beta;$(literal)`data`";
+		const config = mergeConfig({ claude: { model: ` ${model} ` }, muse: { model: ` ${model} ` }, grok: { model: ` ${model} `, shuntModel: ` ${model} ` } }, defaultConfig());
+		expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual([model, model, model, model]);
+	});
+
+	test("all-whitespace legacy clears and Grok lower-pin retention stay unchanged (POL-FUNC-011, AD-1)", () => {
+		const lower = mergeConfig({ claude: { model: "ClaudePin" }, muse: { model: "MusePin" }, grok: { model: "GrokPin", shuntModel: "ShuntPin" } }, defaultConfig());
+		for (const model of ["", "  ", "\t \r\n\v\f"]) {
+			const config = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, lower);
+			expect([config.claude.model, config.muse.model, config.grok.model, config.grok.shuntModel]).toEqual(["", "", "GrokPin", "ShuntPin"]);
+			expect(config.modelProvenance).toEqual({ claude: "explicit-blank", muse: "explicit-blank", grok: "file-pin" });
+			const builtin = mergeConfig({ claude: { model }, muse: { model }, grok: { model, shuntModel: model } }, defaultConfig());
+			expect(builtin.grok.model).toBe(ROUTE_DEFAULT_MODELS.grok);
+			expect(builtin.grok.shuntModel).toBe(defaultConfig().grok.shuntModel);
+			expect(builtin.modelProvenance.grok).toBe("route-default");
+		}
+	});
+
+	test("an explicit blank claude.model or muse.model clears a lower pin to CLI omission; Grok's non-empty merge ignores blanks", () => {
+		const config = loadLayerFiles(
+			roots,
+			{ claude: { model: "opus" }, grok: { model: "grok-x", shuntModel: "alias" }, muse: { model: "m" } },
+			{ claude: { model: " " }, grok: { model: "", shuntModel: "  " }, muse: { model: "" } },
+		);
+		expect([config.claude.model, config.grok.model, config.grok.shuntModel, config.muse.model]).toEqual(["", "grok-x", "alias", ""]);
+		expect(config.modelProvenance).toEqual({ claude: "explicit-blank", grok: "file-pin", muse: "explicit-blank" });
+		const repinned = loadLayerFiles(roots, { claude: { model: "" } }, undefined, { claude: { model: "haiku" } });
+		expect(repinned.claude.model).toBe("haiku");
+		expect(repinned.modelProvenance.claude).toBe("file-pin");
+	});
+
+	test("wrong types keep the lower value and its provenance", () => {
+		const config = loadLayerFiles(roots, { claude: { model: "opus" } }, { claude: { model: 7 }, muse: "bogus", grok: { model: null } });
+		expect(config.claude.model).toBe("opus");
+		expect(config.grok.model).toBe(ROUTE_DEFAULT_MODELS.grok);
+		expect(config.modelProvenance).toEqual({ claude: "file-pin", grok: "route-default", muse: "route-default" });
+	});
+
+	test("grok.fallbackToClaude keeps its default false and boolean-only merge", () => {
+		expect(defaultConfig().grok.fallbackToClaude).toBe(false);
+		expect(loadLayerFiles(roots, { grok: { fallbackToClaude: true } }).grok.fallbackToClaude).toBe(true);
+		expect(loadLayerFiles(roots, { grok: { fallbackToClaude: true } }, { grok: { fallbackToClaude: "no" } }).grok.fallbackToClaude).toBe(true);
 	});
 });

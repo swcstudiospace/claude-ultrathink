@@ -6,7 +6,7 @@ import { join, resolve, sep } from "node:path";
 import { isTrivial } from "./detect.ts";
 
 export interface SkillInvocation {
-	/** As invoked, without a leading "/" or Omp's "skill:" prefix; Claude plugin skills keep "plugin:skill". */
+	/** As invoked, without a leading "/" or the Omp / Prime Agent "skill:" prefix; Claude plugin skills keep "plugin:skill". */
 	name: string;
 	/** What the user typed alongside the skill; undefined for a bare invocation. */
 	instruction?: string;
@@ -229,6 +229,9 @@ export function resolveSkillFile(name: string, lookup: SkillLookup): { path: str
 		join(home, ".agents", "skills", normalized, "SKILL.md"),
 		join(home, ".grok", "skills", normalized, "SKILL.md"),
 		join(home, ".omp", "agent", "skills", normalized, "SKILL.md"),
+		// Prime Agent: project skills, then the personal skill directory (`/skill:<name>` strips to the bare name above).
+		join(lookup.cwd, ".prime", "agent", "skills", normalized, "SKILL.md"),
+		join(home, ".prime", "agent", "skills", normalized, "SKILL.md"),
 	];
 	for (const path of candidates) {
 		const found = readSkill(path);

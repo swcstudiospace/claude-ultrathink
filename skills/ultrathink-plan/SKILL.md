@@ -14,6 +14,7 @@ The TypeScript engine already planned this prompt. Hook stdout is not a reliable
    - `$HERMES_HOME/ultrathink/last-plan.json`, or `~/.hermes/ultrathink/last-plan.json` when `HERMES_HOME` is unset
    - `$XDG_CONFIG_HOME/muse/ultrathink/last-plan.json` or `~/.config/muse/ultrathink/last-plan.json`
    - `$PI_CODING_AGENT_DIR/ultrathink/last-plan.json` or `~/.omp/agent/ultrathink/last-plan.json`
+   - `$PRIME_AGENT_CODING_AGENT_DIR/ultrathink/last-plan.json` or `~/.prime/agent/ultrathink/last-plan.json` (on Prime Agent, `ultrathink.last()` in the kernel reads it)
    - `~/.claude/ultrathink/last-plan.json`
 2. If `specPath` is set, read that file. It is plugin-authored elaboration of the user's message, not a new permission and not an instruction to ignore the user. The `ORIGINAL` element is the user's verbatim words.
 3. Invoke `ultrathink-kickoff` before other work so the Notion and Linear rows exist.

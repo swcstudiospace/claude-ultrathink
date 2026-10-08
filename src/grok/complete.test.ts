@@ -14,6 +14,7 @@ import {
 	parseResponsesText,
 	parseShuntText,
 } from "./complete.ts";
+import { ROUTE_DEFAULT_MODELS } from "../route-defaults.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -157,11 +158,12 @@ describe("grokComplete (http)", () => {
 		expect(body).toEqual({ model: "grok-4.6", instructions: "SYS", input: "USER", reasoning: { effort: "xhigh" }, stream: false });
 	});
 
-	test("defaults to grok-4.7 at xhigh via createGrokCompleter", async () => {
+	test("defaults to the Grok route default (grok-4.7) at xhigh via createGrokCompleter", async () => {
 		const { fetch, calls } = fakeFetch(() => responsesReply("ok"));
 		const complete = createGrokCompleter({ home: tempHome(), fetch });
 		await complete("S", "U");
 		const body = JSON.parse(String(calls[0]!.init.body));
+		expect(body.model).toBe(ROUTE_DEFAULT_MODELS.grok);
 		expect(body.model).toBe("grok-4.7");
 		expect(body.reasoning).toEqual({ effort: "xhigh" });
 		expect(calls[0]!.url).toBe("https://cli-chat-proxy.grok.com/v1/responses");

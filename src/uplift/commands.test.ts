@@ -5,7 +5,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
-import { readControl } from "../claude/state.ts";
+import { readControl, type SessionRecord, writeSession } from "../claude/state.ts";
+import type { ModelResolution } from "../host/engine.ts";
+import type { HostId } from "../host/types.ts";
 import { writeStore } from "../mcp/store.ts";
 import {
 	parseUltrathinkCommand,
@@ -301,6 +303,187 @@ describe("runControl", () => {
 		expect(await runControl(["think", "last"], io)).toBe("No thought graph recorded yet");
 	});
 
+	describe("model selection status (§9 paths 5-6)", () => {
+		const detected: ModelResolution = {
+			version: "1.0.0",
+			state: "detected",
+			host: "omp",
+			transport: "omp-native",
+			source: "ctx.model",
+			reason: "live-model",
+			engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+			provider: "anthropic",
+			modelId: "claude-x",
+			modelKnown: true,
+			label: "omp-native:anthropic/claude-x [detected]",
+		};
+
+		/** Saves a successful plan whose record carries `modelResolution` (possibly malformed) as the host's last.json. */
+		function savePlan(modelResolution: unknown): void {
+			const record: SessionRecord = {
+				sessionId: "s1",
+				at: 1,
+				engine: "claude:sonnet",
+				result: { xml: "<x/>", original: "x", root: "BUILD_PROMPT", source: "llm" },
+				modelResolution: modelResolution as ModelResolution,
+			};
+			writeSession(io.stateDir, record);
+		}
+
+		async function statusLines(input: { host?: HostId; modelResolution?: ModelResolution } = {}): Promise<string[]> {
+			return (await runControl(["status"], { ...io, ...input })).split("\n");
+		}
+
+		test("the universal Model line is gone: the engine request, its source and concurrency show apart from model state", async () => {
+			const lines = await statusLines({ host: "claude-code" });
+			expect(lines.some((line) => line.startsWith("Model:"))).toBe(false);
+			expect(lines).toContain("Engine: claude:sonnet");
+			expect(lines).toContain("Engine request: auto (config) · concurrency 3");
+			expect(lines.some((line) => line.startsWith("Last planned resolution:"))).toBe(false);
+		});
+
+		test.each([
+			["claude-code", "claude"],
+			["muse", "muse"],
+			["grok-build", "grok"],
+			["hermes", "claude"],
+		] as const)("%s static status projects host overrides and engine pins across the whole response", async (host, route) => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			const selectors = [
+				[`https://model.invalid/path?token=${sentinel}`, false],
+				[`sk-${sentinel}_0123456789abcdef`, false],
+				[`user:${sentinel}@model.invalid`, false],
+				[`<model>${sentinel}</model>`, false],
+				[`${sentinel}${"x".repeat(600)}`, false],
+				[`${sentinel}\u001b[31m\nmodel`, true],
+			] as const;
+			for (const [model, invalid] of selectors) {
+				for (const source of ["host-override", "engine-model", ...(route === "grok" ? ["shunt-model"] : [])]) {
+					const grok = { home: join(dir, "grok"), transport: "shunt", shuntBaseUrl: "http://gateway.example" };
+					const extra: Record<string, unknown> = { grok };
+					if (source === "host-override") extra.models = { hosts: { [host]: { model } } };
+					else if (source === "shunt-model") extra.grok = { ...grok, shuntModel: model };
+					else extra[route] = route === "grok" ? { ...grok, model } : { model };
+					projectConfig(extra);
+					for (const args of [["status"], ["grok", "status"]]) {
+						const text = await runControl(args, { ...io, host });
+						expect(text).not.toContain(sentinel);
+						expect(text).not.toContain("model.invalid");
+						expect(text).not.toContain("\u001b");
+						expect(text).not.toContain("</model>");
+						const engine = text.split("\n").find((line) => line.startsWith("Engine:"));
+						expect(engine).toContain(invalid ? "unresolved [selector-invalid]" : "<opaque-model>");
+						expect(engine!.length).toBeLessThanOrEqual(500);
+						if (host === "hermes") expect(engine).toEndWith("(follows session model)");
+					}
+				}
+			}
+		});
+
+		test("Grok HTTP and CLI status never repeat unsafe configured models in the transport line", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			for (const transport of ["http", "cli"]) {
+				projectConfig({ grok: { home: join(dir, "grok"), transport, model: `https://model.invalid/path?token=${sentinel}` } });
+				for (const args of [["status"], ["grok", "status"]]) {
+					const text = await runControl(args, { ...io, host: "grok-build" });
+					expect(text).not.toContain(sentinel);
+					expect(text).not.toContain("model.invalid");
+					expect(text).toContain("Engine: <opaque-model>@xhigh");
+					expect(text).toContain(`Grok: <opaque-model> @ xhigh · transport ${transport}`);
+				}
+			}
+		});
+
+		test("disabled Grok status projects Claude's fallback model without adopting the host selector", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			projectConfig({
+				grok: { home: join(dir, "grok"), enabled: false },
+				claude: { model: `https://model.invalid/path?token=${sentinel}` },
+				models: { hosts: { "grok-build": { model: `ignored-${sentinel}` } } },
+			});
+			for (const args of [["status"], ["grok", "status"]]) {
+				const text = await runControl(args, { ...io, host: "grok-build" });
+				expect(text).toContain("Engine: claude:<opaque-model>");
+				expect(text).not.toContain(sentinel);
+			}
+		});
+
+		test("standalone Omp status says the live model is not observed, never a guessed follows-session-model Claude line", async () => {
+			const lines = await statusLines({ host: "omp" });
+			expect(lines).toContain("Engine: omp-native:auto (live model not observed)");
+			expect(lines).toContain("Engine request: auto (config) · concurrency 3");
+			expect(lines.join("\n")).not.toContain("follows session model");
+		});
+
+		test("the saved successful record shows as Last planned resolution, never as current detection", async () => {
+			savePlan(detected);
+			const lines = await statusLines({ host: "omp" });
+			expect(lines).toContain("Engine: omp-native:auto (live model not observed)");
+			expect(lines.at(-2)).toStartWith("Last: BUILD_PROMPT · llm");
+			expect(lines.at(-1)).toBe("Last planned resolution: omp-native:anthropic/claude-x [detected] · reason live-model · engine auto (config)");
+		});
+
+		test("a live projection names the current model without any lookup; a named Omp engine shows its opt-out", async () => {
+			expect(await statusLines({ host: "omp", modelResolution: detected })).toContain("Engine: omp-native:anthropic/claude-x [detected]");
+			expect(await runControl(["grok", "engine", "claude"], { ...io, host: "omp", modelResolution: detected })).toBe(
+				"Thinking engine set to claude:sonnet",
+			);
+			// The live record was observed for `auto`; it is not the named engine's selection.
+			const named = await statusLines({ host: "omp", modelResolution: detected });
+			expect(named).toContain("Engine: claude:sonnet");
+			expect(named).toContain("Engine request: claude (control, native opt-out) · concurrency 3");
+			expect(await runControl(["grok", "status"], { ...io, host: "omp" })).toStartWith("Engine: claude:sonnet\nGrok: ");
+		});
+
+		test("a malformed or unsafe record never fails the status and never shows unsafe text", async () => {
+			for (const saved of [null, "omp-native:x", [], { ...detected, engineSelection: null }, { ...detected, version: "2.0.0" }]) {
+				savePlan(saved);
+				const text = (await statusLines({ host: "omp" })).join("\n");
+				expect(text).toStartWith("Prompt Uplift on");
+				expect(text).not.toContain("Last planned resolution:");
+			}
+			// Built in pieces so no scanner reads a credential-like literal out of this fixture.
+			const sentinel = ["sentinel", "credential", "value"].join("-");
+			savePlan({ ...detected, label: `omp-native:x [detected]\nBearer ${sentinel}`, baseUrl: "https://gateway.example/v1", apiKey: sentinel });
+			const live = { ...detected, label: `omp-native:https://user:${sentinel}@gateway.example/v1 [detected]` };
+			const text = (await statusLines({ host: "omp", modelResolution: live })).join("\n");
+			expect(text).toContain("Engine: <opaque-model>");
+			expect(text).toContain("Last planned resolution: <opaque-model> · reason live-model · engine auto (config)");
+			expect(text).not.toContain(sentinel);
+			expect(text).not.toContain("gateway.example");
+		});
+
+		test("unsafe live and saved labels are opaque throughout both status commands", async () => {
+			const sentinel = "EXAMPLE_SENTINEL";
+			for (const label of [
+				`user:${sentinel}@model.invalid`,
+				`omp-native:user:${sentinel}@model.invalid/model [detected]`,
+				`omp-native:/private/${sentinel} [detected]`,
+				`omp-native:https://model.invalid/path?token=${sentinel} [detected]`,
+				`omp-native:Bearer ${sentinel} [detected]`,
+				`omp-native:<model>${sentinel}</model> [detected]`,
+				`omp-native:${sentinel}\nmodel [detected]`,
+				`omp-native:${sentinel}\tmodel [detected]`,
+				`omp-native:${sentinel}\u001b[31m\nmodel [detected]`,
+			]) {
+				const modelResolution = { ...detected, label };
+				savePlan(modelResolution);
+				for (const args of [["status"], ["grok", "status"]]) {
+					const text = await runControl(args, { ...io, host: "omp", modelResolution });
+					expect(text).toContain("Engine: <opaque-model>");
+					expect(text).not.toContain(sentinel);
+					expect(text).not.toContain("model.invalid");
+					expect(text).not.toContain("\u001b");
+					if (args[0] === "status") expect(text).toContain("Last planned resolution: <opaque-model>");
+				}
+			}
+		});
+
+		test("the six commands keep their names (COMPAT-02)", () => {
+			expect(ULTRATHINK_VERBS).toEqual(["quick", "skip", "off", "on", "track", "status"]);
+		});
+	});
+
 	test("bad arguments answer with usage; failures become a message, never a throw", async () => {
 		expect(await runControl(["bogus"], io)).toStartWith("Usage: ultrathink <command>");
 		expect(await runControl(["quick", "fix", "it"], io)).toStartWith("Usage: ultrathink <command>");
@@ -472,7 +655,7 @@ describe("runControl", () => {
 		expect(lines[decisions + 1]).toStartWith("Hindsight: off (opt-in");
 		expect(lines[decisions + 2]).toStartWith("RAGFlow: off (opt-in");
 		expect(lines[decisions + 3]).toStartWith("Teach: on · capture auto · recall on");
-		expect(lines[decisions + 4]).toStartWith("Model:");
+		expect(lines[decisions + 4]).toStartWith("Engine request:");
 	});
 
 	test("status reflects the config sections for Hindsight, RAGFlow and Teach", async () => {

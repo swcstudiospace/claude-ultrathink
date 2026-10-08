@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { DecisionRecord } from "../decisions/types.ts";
 import { shipNudge } from "../ship/nudge.ts";
 import { DEFAULT_SHIP_CONFIG } from "../ship/types.ts";
+import type { ModelResolution } from "../host/engine.ts";
 import {
 	controlPath,
 	defaultStateDir,
@@ -244,5 +245,54 @@ describe("session records and lessons/docs lookups", () => {
 		expect(record).not.toHaveProperty("docs");
 		writeSession(dir, record as SessionRecord);
 		expect(readSession(dir, "old-2")).toEqual(record);
+	});
+});
+
+describe("session records and the model resolution record", () => {
+	const base: SessionRecord = { sessionId: "mr-1", at: 4, engine: "claude:<model>", result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+	const resolution: ModelResolution = {
+		version: "1.0.0",
+		state: "detected",
+		host: "omp",
+		transport: "omp-native",
+		source: "ctx.model",
+		reason: "live-model",
+		engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		api: "acme-chat",
+		providerType: "acme",
+		provider: "acme",
+		modelId: "sol-1",
+		modelKnown: true,
+		label: "omp-native:acme/sol-1 [detected]",
+	};
+
+	test("the safe record round-trips through the session file and last.json, exactly as given", () => {
+		const dir = tempDir();
+		const record: SessionRecord = { ...base, modelResolution: resolution };
+		writeSession(dir, record);
+		expect(readSession(dir, "mr-1")).toEqual(record);
+		expect(readLast(dir)).toEqual(record);
+		expect(Object.keys(readSession(dir, "mr-1")?.modelResolution ?? {}).sort()).toEqual(Object.keys(resolution).sort());
+	});
+
+	test("a record written before it existed reads back without it and stays valid", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		writeFileSync(sessionPath(dir, "old-3"), JSON.stringify({ sessionId: "old-3", at: 1, engine: "claude:<model>", result: base.result }));
+		const record = readSession(dir, "old-3");
+		expect(record?.sessionId).toBe("old-3");
+		expect(record).not.toHaveProperty("modelResolution");
+		writeSession(dir, record as SessionRecord);
+		expect(readSession(dir, "old-3")).toEqual(record);
+	});
+
+	test("control engine values are unchanged: a resolution record is never control state", () => {
+		const dir = tempDir();
+		for (const engine of ["auto", "claude", "grok", "muse"] as const) {
+			writeControl(dir, { engine });
+			expect(readControl(dir).engine).toBe(engine);
+		}
+		writeFileSync(controlPath(dir), JSON.stringify({ engine: "omp-native", modelResolution: resolution }));
+		expect(readControl(dir)).toEqual({});
 	});
 });

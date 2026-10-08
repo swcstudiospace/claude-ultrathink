@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import type { ModelResolution } from "./engine.ts";
 import { paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
 import { type BarState, createBarComponent, createBarStore, LINGER_MS, renderBarLine } from "./omp-ui.ts";
 import type { PlanView } from "./view.ts";
@@ -451,5 +452,98 @@ describe("live graph", () => {
 		const component = createBarComponent(store, fakeTheme(), () => 60_000, () => 40);
 		const first = component.render(80);
 		expect(component.render(80)).toBe(first);
+	});
+});
+
+describe("model resolution on the bar (§9 path 4)", () => {
+	const record = (fields: Partial<ModelResolution>): ModelResolution => ({
+		version: "1.0.0",
+		state: "detected",
+		host: "omp",
+		transport: "omp-native",
+		source: "ctx.model",
+		reason: "live-model",
+		engineSelection: { engine: "auto", source: "config", nativeOptOut: false },
+		modelKnown: true,
+		label: "",
+		...fields,
+	});
+	const DETECTED = record({ provider: "acme", modelId: "sol-1", label: "omp-native:acme/sol-1 [detected]" });
+	const DEFAULTED = record({
+		state: "default",
+		source: "host-catalog",
+		reason: "active-unavailable",
+		provider: "acme",
+		modelId: "def-1",
+		label: "omp-native:acme/def-1 [host-catalog default]",
+	});
+	const OVERRIDE = record({ state: "override", source: "host-override", reason: "explicit-model", provider: "anthropic", modelId: "opus", label: "omp-native:anthropic/opus [override]" });
+	const UNRESOLVED = record({ state: "unresolved", source: "none", reason: "provider-unknown", modelKnown: false, label: "omp-native:unresolved [provider-unknown]" });
+	const line = (state: BarState) => plain(renderBarLine(state, fakeTheme(), 400, 2_000));
+
+	test("begin names the planning model with its reason while planning; delivery keeps it", () => {
+		const store = createBarStore();
+		store.begin(1_000);
+		store.apply({ type: "begin", at: 1_000, sessionId: "s", engine: DETECTED.label, modelResolution: DETECTED });
+		expect(store.get().resolution).toEqual(DETECTED);
+		expect(line(store.get())).toContain("omp-native:acme/sol-1 [detected] · live-model");
+		store.delivered("inline", view, 1_500);
+		expect(line(store.get())).toContain("omp-native:acme/sol-1 [detected] · live-model");
+	});
+
+	test("default and override show their labels and reasons; an unresolved end needs no begin and shows its reason once", () => {
+		for (const [resolution, text] of [
+			[DEFAULTED, "omp-native:acme/def-1 [host-catalog default] · active-unavailable"],
+			[OVERRIDE, "omp-native:anthropic/opus [override] · explicit-model"],
+		] as const) {
+			const store = createBarStore();
+			store.begin(0);
+			store.apply({ type: "begin", at: 0, sessionId: "s", engine: resolution.label, modelResolution: resolution });
+			store.delivered("aside", view, 1);
+			expect(line(store.get())).toContain(text);
+		}
+		const store = createBarStore();
+		store.begin(0);
+		store.apply({ type: "end", at: 1, outcome: "skipped", detail: "provider-unknown", modelResolution: UNRESOLVED });
+		const skipped = line(store.get());
+		expect(skipped).toContain("skipped · provider-unknown");
+		expect(skipped).toContain("omp-native:unresolved [provider-unknown]");
+		expect(skipped).not.toContain("[provider-unknown] · provider-unknown");
+	});
+
+	test("an unsafe record never reaches the bar: its label shows the opaque marker", () => {
+		const store = createBarStore();
+		store.begin(0);
+		store.apply({ type: "begin", at: 0, sessionId: "s", engine: "x", modelResolution: { ...DETECTED, label: "omp-native:https://SECRET.invalid/model [detected]" } });
+		const text = line(store.get());
+		expect(text).toContain("<opaque-model> · live-model");
+		expect(text).not.toContain("SECRET");
+	});
+
+	test("a new planning drops the previous record until its own begin names one", () => {
+		const store = createBarStore();
+		store.apply({ type: "begin", at: 0, sessionId: "s", engine: DETECTED.label, modelResolution: DETECTED });
+		store.delivered("inline", view, 1);
+		store.begin(2);
+		expect(store.get().resolution).toBeUndefined();
+		expect(line(store.get())).not.toContain("[detected]");
+	});
+
+	test("width holds with a resolution in every phase and theme", () => {
+		const planning = createBarStore();
+		planning.begin(0);
+		planning.apply({ type: "begin", at: 0, sessionId: "s", engine: OVERRIDE.label, modelResolution: OVERRIDE });
+		const delivered = createBarStore();
+		delivered.apply({ type: "begin", at: 0, sessionId: "s", engine: DEFAULTED.label, modelResolution: DEFAULTED });
+		delivered.delivered("inline", view, 1);
+		const skipped = createBarStore();
+		skipped.apply({ type: "end", at: 1, outcome: "skipped", detail: "provider-unknown", modelResolution: UNRESOLVED });
+		for (const state of [planning.get(), delivered.get(), skipped.get()]) {
+			for (const width of [20, 40, 80, 200]) {
+				for (const theme of [fakeTheme(), throwingTheme]) {
+					expect(visibleWidth(renderBarLine(state, theme, width, 1_000))).toBeLessThanOrEqual(width);
+				}
+			}
+		}
 	});
 });

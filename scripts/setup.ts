@@ -8,7 +8,9 @@
  * servers (user scope), installs the plugin marketplace, and merges the
  * tracking contract into the global ~/.claude/CLAUDE.md between marker
  * comments. Without `claude` those steps are skipped. It always installs the
- * Grok rule and global hooks under $GROK_HOME (default ~/.grok). Idempotent —
+ * Grok rule and global hooks under $GROK_HOME (default ~/.grok), and links the
+ * Prime Agent host: hosts/prime-agent into the Prime Agent skill directory and
+ * the ultrathink-* agent skills into ~/.agents/skills. Idempotent —
  * re-running updates in place rather than duplicating. rollback undoes what
  * apply recorded and prints (never runs) the Claude Code plugin uninstall.
  *
@@ -16,7 +18,7 @@
  * ~/.claude/settings.json — this plugin has no env vars or local proxy to
  * wire up.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -157,6 +159,128 @@ export interface ApplyResult {
 	/** Undefined when the `claude` CLI is not installed: every Claude Code step was skipped. */
 	claude?: ClaudeApplyResult;
 	grok: { rule: { path: string; changed: boolean }; hooks: { path: string; changed: boolean } };
+	primeAgent: PrimeAgentInstall;
+}
+
+export interface LinkResult {
+	path: string;
+	target: string;
+	/** `kept`: something that is not a symlink already owns the path; it is never replaced. */
+	status: "linked" | "already" | "kept";
+}
+
+export interface PrimeAgentInstall {
+	/** `<prime agent dir>/skills/ultrathink` -> `hosts/prime-agent` (the Python-backed kernel skill). */
+	skill: LinkResult;
+	/** `~/.agents/skills/ultrathink-*` -> `skills/ultrathink-*` and `hosts/prime-agent/commands/ultrathink-*` (the agent-side and command skills Prime Agent reads from the shared Agent Skills directory). */
+	agentSkills: LinkResult[];
+}
+
+export function primeAgentHome(env: Record<string, string | undefined> = process.env): string {
+	return env.PRIME_AGENT_CODING_AGENT_DIR?.trim() || join(homedir(), ".prime", "agent");
+}
+
+/** The shared Agent Skills directory Prime Agent (and other agentskills.io hosts) read; `ULTRATHINK_AGENT_SKILLS_DIR` overrides it. */
+export function agentSkillsDir(env: Record<string, string | undefined> = process.env): string {
+	return env.ULTRATHINK_AGENT_SKILLS_DIR?.trim() || join(homedir(), ".agents", "skills");
+}
+
+/** Points `path` at `target` with a symlink. An existing symlink is retargeted; a real file or directory is kept. */
+export function linkDir(target: string, path: string): LinkResult {
+	let current: ReturnType<typeof lstatSync> | undefined;
+	try {
+		current = lstatSync(path);
+	} catch {
+		current = undefined;
+	}
+	if (current?.isSymbolicLink()) {
+		if (readlinkSync(path) === target) return { path, target, status: "already" };
+		unlinkSync(path);
+	} else if (current) {
+		return { path, target, status: "kept" };
+	}
+	mkdirSync(dirname(path), { recursive: true });
+	symlinkSync(target, path, "dir");
+	return { path, target, status: "linked" };
+}
+
+/** The `skills/<name>` directories of this checkout, sorted; empty when the checkout has none. */
+export function agentSkillNames(repoRoot: string): string[] {
+	try {
+		return readdirSync(join(repoRoot, "skills"), { withFileTypes: true })
+			.filter((entry) => entry.isDirectory() && existsSync(join(repoRoot, "skills", entry.name, "SKILL.md")))
+			.map((entry) => entry.name)
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+/** The `/ultrathink-*` control commands as Prime Agent skills (`hosts/prime-agent/commands/<name>/SKILL.md`), sorted. */
+export function commandSkillNames(repoRoot: string): string[] {
+	try {
+		return readdirSync(join(repoRoot, "hosts", "prime-agent", "commands"), { withFileTypes: true })
+			.filter((entry) => entry.isDirectory() && existsSync(join(repoRoot, "hosts", "prime-agent", "commands", entry.name, "SKILL.md")))
+			.map((entry) => entry.name)
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+/** Every skill directory linked into the shared Agent Skills directory: the agent skills, then the command skills. */
+function linkedSkillSources(repoRoot: string): Array<{ name: string; source: string }> {
+	return [
+		...agentSkillNames(repoRoot).map((name) => ({ name, source: join(repoRoot, "skills", name) })),
+		...commandSkillNames(repoRoot).map((name) => ({ name, source: join(repoRoot, "hosts", "prime-agent", "commands", name) })),
+	];
+}
+
+export function installPrimeAgent(repoRoot: string, env: Record<string, string | undefined> = process.env): PrimeAgentInstall {
+	const skill = linkDir(join(repoRoot, "hosts", "prime-agent"), join(primeAgentHome(env), "skills", "ultrathink"));
+	const skillsDir = agentSkillsDir(env);
+	const agentSkills = linkedSkillSources(repoRoot).map(({ name, source }) => linkDir(source, join(skillsDir, name)));
+	return { skill, agentSkills };
+}
+
+/** Removes a symlink that points into this checkout; anything else stays. */
+function unlinkOwn(repoRoot: string, path: string): boolean {
+	try {
+		if (!lstatSync(path).isSymbolicLink()) return false;
+		const target = readlinkSync(path);
+		if (target !== repoRoot && !target.startsWith(`${repoRoot}/`)) return false;
+		unlinkSync(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function removePrimeAgent(repoRoot: string, env: Record<string, string | undefined> = process.env): { skill: { path: string; removed: boolean }; agentSkills: { path: string; removed: boolean }[] } {
+	const skillPath = join(primeAgentHome(env), "skills", "ultrathink");
+	const skillsDir = agentSkillsDir(env);
+	return {
+		skill: { path: skillPath, removed: unlinkOwn(repoRoot, skillPath) },
+		agentSkills: linkedSkillSources(repoRoot).map(({ name }) => {
+			const path = join(skillsDir, name);
+			return { path, removed: unlinkOwn(repoRoot, path) };
+		}),
+	};
+}
+
+function linkLine(label: string, link: LinkResult): string {
+	const state = { linked: "linked", already: "already linked", kept: "kept — not a symlink, link it yourself" }[link.status];
+	return `${label}: ${state} (${link.path} -> ${link.target})`;
+}
+
+export function primeAgentReport(result: PrimeAgentInstall): string[] {
+	const agent = result.agentSkills;
+	const summary = agent.length === 0 ? "none found" : `${agent.filter((l) => l.status !== "kept").length}/${agent.length} linked into ${dirname(agent[0]?.path ?? "")}`;
+	return [
+		linkLine("Prime Agent skill", result.skill),
+		`Prime Agent agent skills: ${summary}${agent.some((l) => l.status === "kept") ? ` (kept: ${agent.filter((l) => l.status === "kept").map((l) => l.path).join(", ")})` : ""}`,
+		"Prime Agent: start a new session (or /reload) so the kernel installs the `ultrathink` skill; then `await ultrathink.status()`.",
+	];
 }
 
 /** Merges the packaged rule's marker block into the rule file; text a user added around the block stays. */
@@ -232,7 +356,8 @@ export function apply(
 		rule: installGrokRule(repoRoot, join(grokDir, "rules")),
 		hooks: installGrokHooks(repoRoot, join(grokDir, "hooks")),
 	};
-	if (!claudeAvailable(run)) return { grok };
+	const primeAgent = installPrimeAgent(repoRoot, env);
+	if (!claudeAvailable(run)) return { grok, primeAgent };
 
 	const notion = ensureMcpServer("notion", SETUP_MCP_URLS.notion, run);
 	const linear = ensureMcpServer("linear", SETUP_MCP_URLS.linear, run);
@@ -250,7 +375,7 @@ export function apply(
 	const previous = readSetupState(env);
 	writeSetupState({ notionAdded: notion.added || previous.notionAdded, linearAdded: linear.added || previous.linearAdded }, env);
 
-	return { claude: { notion, linear, plugin, claudeMd: { path, changed: after !== before } }, grok };
+	return { claude: { notion, linear, plugin, claudeMd: { path, changed: after !== before } }, grok, primeAgent };
 }
 
 export function status(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): string {
@@ -258,9 +383,11 @@ export function status(env: Record<string, string | undefined> = process.env, ru
 	const rulePath = join(grokDir, "rules", "ultrathink.md");
 	const hooksPath = join(grokDir, "hooks", "ultrathink.json");
 	const ruleOk = existsSync(rulePath) && BLOCK_RE.test(readFileSync(rulePath, "utf8"));
+	const primeSkill = join(primeAgentHome(env), "skills", "ultrathink");
 	const grok = [
 		`Grok rule: ${ruleOk ? "installed" : "missing — run: bun scripts/setup.ts apply"} (${rulePath})`,
 		`Grok hooks: ${existsSync(hooksPath) ? "installed" : "missing — run: bun scripts/setup.ts apply"} (${hooksPath})`,
+		`Prime Agent skill: ${existsSync(join(primeSkill, "SKILL.md")) ? "installed" : "missing — run: bun scripts/setup.ts apply"} (${primeSkill})`,
 	];
 	if (!claudeAvailable(run)) return ["Claude Code: claude CLI not found", ...grok].join("\n");
 	const path = claudeMdPath(env);
@@ -306,6 +433,7 @@ export interface RollbackResult {
 	/** `kept` when a removal failed and the file still records what is left to undo. */
 	state: { path: string; status: "removed" | "kept" | "absent" };
 	grok: { rule: { path: string; removed: boolean }; hooks: { path: string; removed: boolean } };
+	primeAgent: ReturnType<typeof removePrimeAgent>;
 }
 
 /** Plugin removal is left to the user: uninstalling from a running Claude Code session is theirs to decide. */
@@ -368,7 +496,7 @@ function removeMcpServer(name: keyof typeof SETUP_MCP_URLS, added: boolean, run:
 	return result.code === 0 ? { removed: true } : { removed: false, error: commandError(result) };
 }
 
-export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun): RollbackResult {
+export function rollback(env: Record<string, string | undefined> = process.env, run: Run = defaultRun, repoRoot: string = repoRootFromModule(import.meta.url)): RollbackResult {
 	const claudeMdChanged = removeBlock(claudeMdPath(env), false);
 	const state = readSetupState(env);
 	const claudeJson = claudeJsonPath(env);
@@ -395,6 +523,7 @@ export function rollback(env: Record<string, string | undefined> = process.env, 
 		state: { path: statePath, status: stateStatus },
 		// The rule is ours only through its marker block; text a user added around it stays.
 		grok: { rule: { path: rulePath, removed: removeBlock(rulePath, true) }, hooks: { path: hooksPath, removed: hadHooks } },
+		primeAgent: removePrimeAgent(repoRoot, env),
 	};
 }
 
@@ -420,7 +549,7 @@ export function hermesHint(repoRoot: string, env: Record<string, string | undefi
 }
 
 export function applyReport(repoRoot: string, result: ApplyResult, env: Record<string, string | undefined> = process.env): string[] {
-	const { claude, grok } = result;
+	const { claude, grok, primeAgent } = result;
 	const lines = claude
 		? [
 				`Notion MCP: ${claude.notion.message}`,
@@ -435,6 +564,7 @@ export function applyReport(repoRoot: string, result: ApplyResult, env: Record<s
 		...lines,
 		`Grok rule: ${grok.rule.changed ? "installed" : "already up to date"} (${grok.rule.path})`,
 		`Grok hooks: ${grok.hooks.changed ? "installed" : "already up to date"} (${grok.hooks.path})`,
+		...primeAgentReport(primeAgent),
 		hermesHint(repoRoot, env),
 		`Muse: muse plugins install ${shellQuote(repoRoot)} --scope user && muse plugins approve ultrathink`,
 		`Omp: omp plugin link ${shellQuote(repoRoot)}`,
@@ -462,6 +592,8 @@ export function rollbackReport(result: RollbackResult): string[] {
 		`Setup state: ${stateLine} (${result.state.path})`,
 		`Grok rule: ${result.grok.rule.removed ? "removed" : "not installed"} (${result.grok.rule.path})`,
 		`Grok hooks: ${result.grok.hooks.removed ? "removed" : "not installed"} (${result.grok.hooks.path})`,
+		`Prime Agent skill: ${result.primeAgent.skill.removed ? "unlinked" : "not linked"} (${result.primeAgent.skill.path})`,
+		`Prime Agent agent skills: ${result.primeAgent.agentSkills.filter((l) => l.removed).length}/${result.primeAgent.agentSkills.length} unlinked`,
 		`Claude Code plugin: still installed if you added it — to remove it, run: ${PLUGIN_UNINSTALL_COMMANDS.join(" && ")}`,
 	];
 }

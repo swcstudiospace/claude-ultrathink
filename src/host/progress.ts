@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { writeSync } from "node:fs";
+import type { ModelResolution } from "./engine.ts";
 
 export type StageName = "brief" | "uplift" | "think" | "knowledge" | "clarify" | "plan" | "track" | "state";
 
+/**
+ * `modelResolution` on `begin` and `end` is the selection's safe record (§9 path 4), not a new event kind: begin names
+ * the selected model, and an unresolved end carries its safe reason even though no begin or inference happened.
+ */
 export type ProgressEvent =
 	/** `track`: planner-side tracking will run this turn. */
-	| { type: "begin"; at: number; sessionId: string; engine: string; track?: boolean; skill?: string }
+	| { type: "begin"; at: number; sessionId: string; engine: string; track?: boolean; skill?: string; modelResolution?: ModelResolution }
 	| { type: "stage"; at: number; stage: StageName; phase: "start" | "end"; ok?: boolean; detail?: string }
 	| { type: "graph"; at: number; total: number; nodes: Array<{ id: string; title: string; kind: string; dependsOn?: string[] }> }
 	| {
@@ -32,7 +37,7 @@ export type ProgressEvent =
 	  }
 	/** One per created or adopted tracker row; `step` absent for the node's own issue. */
 	| { type: "issue"; at: number; provider: "linear" | "notion"; nodeId: string; step?: number; identifier?: string; url: string }
-	| { type: "end"; at: number; outcome: "planned" | "skipped" | "failed"; detail?: string };
+	| { type: "end"; at: number; outcome: "planned" | "skipped" | "failed"; detail?: string; modelResolution?: ModelResolution };
 
 export type ProgressSink = (event: ProgressEvent) => void;
 

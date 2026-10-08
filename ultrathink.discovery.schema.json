@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ultrathink.discovery.schema.json",
+  "title": "claude-ultrathink static discovery descriptor 1.0.0",
+  "description": "PROPOSED repository-local metadata schema. Not a host loader manifest, registration protocol, completion API, or runtime compatibility attestation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "identity",
+    "description",
+    "capabilities",
+    "hosts",
+    "interfaces",
+    "externalIntegrations"
+  ],
+  "properties": {
+    "$schema": { "type": "string", "const": "./ultrathink.discovery.schema.json" },
+    "schemaVersion": { "type": "string", "const": "1.0.0" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "repositoryUrl", "package", "plugin", "marketplace"],
+      "properties": {
+        "repository": { "type": "string", "const": "claude-ultrathink" },
+        "repositoryUrl": { "type": "string", "const": "https://github.com/swcstudiospace/claude-ultrathink" },
+        "package": { "type": "string", "const": "ultrathink" },
+        "plugin": { "type": "string", "const": "ultrathink" },
+        "marketplace": { "type": "string", "const": "ultrathink" }
+      }
+    },
+    "description": { "type": "string", "minLength": 1, "maxLength": 400 },
+    "capabilities": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "prompt-uplift",
+          "graph-of-thought",
+          "chain-of-thought",
+          "hitl-clarifications",
+          "local-plan-artifact-handoff",
+          "planning-controls",
+          "tracker-mcp-relay"
+        ]
+      }
+    },
+    "hosts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claude-code", "grok-build", "hermes", "muse", "omp", "prime-agent"],
+      "properties": {
+        "claude-code": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "hook-additional-context" } } }
+          ]
+        },
+        "grok-build": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "local-plan-carrier" } } }
+          ]
+        },
+        "hermes": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "pre-llm-plan-handoff" } } }
+          ]
+        },
+        "muse": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "hook-additional-context" } } }
+          ]
+        },
+        "omp": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "extension-inline-or-deferred-aside" } } }
+          ]
+        },
+        "prime-agent": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "kernel-skill-return" } } }
+          ]
+        }
+      }
+    },
+    "interfaces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonPlanner", "controls", "trackerMcp"],
+      "properties": {
+        "jsonPlanner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["transport", "launcher", "entrypoint", "responseType"],
+          "properties": {
+            "transport": { "type": "string", "const": "json-stdin-stdout" },
+            "launcher": { "type": "string", "const": "bin/run-bun" },
+            "entrypoint": { "type": "string", "const": "hooks/engine.ts" },
+            "responseType": { "type": "string", "const": "PlanResponse" }
+          }
+        },
+        "controls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entrypoint", "canPlan"],
+          "properties": {
+            "entrypoint": { "type": "string", "const": "bin/ultrathink" },
+            "canPlan": { "type": "boolean", "const": false }
+          }
+        },
+        "trackerMcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["transport", "entrypoint", "providers", "canPlan"],
+          "properties": {
+            "transport": { "type": "string", "const": "mcp-stdio-relay" },
+            "entrypoint": { "type": "string", "const": "bin/ultrathink-mcp" },
+            "providers": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["notion", "linear", "greptile"] }
+            },
+            "canPlan": { "type": "boolean", "const": false }
+          }
+        }
+      }
+    },
+    "externalIntegrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grok-bot", "gpt-dot"],
+      "properties": {
+        "grok-bot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "status", "adapterPresent", "compatibilityVerified"],
+          "properties": {
+            "identity": { "type": "string", "const": "documented-product" },
+            "status": { "type": "string", "const": "pending-contract" },
+            "adapterPresent": { "type": "boolean", "const": false },
+            "compatibilityVerified": { "type": "boolean", "const": false }
+          }
+        },
+        "gpt-dot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "status", "adapterPresent", "compatibilityVerified"],
+          "properties": {
+            "identity": { "type": "string", "const": "unverified" },
+            "status": { "type": "string", "const": "pending-identity-and-contract" },
+            "adapterPresent": { "type": "boolean", "const": false },
+            "compatibilityVerified": { "type": "boolean", "const": false }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relativeFile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^(?!.*(?:^|/)(?:\\.{1,2}|\\.planning)(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "hostAdapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "entrypoints", "delivery"],
+      "properties": {
+        "status": { "type": "string", "const": "source-present" },
+        "entrypoints": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativeFile" }
+        },
+        "delivery": {
+          "type": "string",
+          "enum": [
+            "hook-additional-context",
+            "local-plan-carrier",
+            "pre-llm-plan-handoff",
+            "extension-inline-or-deferred-aside",
+            "kernel-skill-return"
+          ]
+        }
+      }
+    }
+  }
+}

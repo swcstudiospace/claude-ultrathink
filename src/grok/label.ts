@@ -4,7 +4,7 @@ import type { GrokConfig } from "./types.ts";
 
 /**
  * Engine label recorded in session state and echoed to the user, e.g.
- * `grok-4.7@xhigh` (proxy/cli transports) or `<shuntModel>@shunt` (shunt
+ * `<model>@xhigh` (proxy/cli transports) or `<shuntModel>@shunt` (shunt
  * transport, where the wire model alias carries the effort; an unset
  * `shuntModel` falls back to `model`, matching what is sent on the wire).
  */

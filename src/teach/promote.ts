@@ -53,6 +53,7 @@ const HOST_TARGETS: Record<string, SkillTarget> = {
 	"claude-code": "claude",
 	"grok-build": "claude",
 	hermes: "hermes",
+	"prime-agent": "prime-agent",
 };
 
 const SECTION: Record<MomentKind, string> = {
@@ -390,6 +391,11 @@ export function installSkill(draft: SkillDraft, target: SkillTarget, ctx: TeachC
 	if (target === "omp") {
 		const piDir = ctx.env.PI_CODING_AGENT_DIR?.trim() || join(home, ".omp", "agent");
 		return installIntoHost(draft, target, join(piDir, "managed-skills"));
+	}
+	if (target === "prime-agent") {
+		// Prime Agent reads personal skills from `~/.prime/agent/skills/<name>/SKILL.md` (PRIME_AGENT_CODING_AGENT_DIR moves the root).
+		const agentDir = ctx.env.PRIME_AGENT_CODING_AGENT_DIR?.trim() || join(home, ".prime", "agent");
+		return installIntoHost(draft, target, join(agentDir, "skills"));
 	}
 	const claudeDir = ctx.env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
 	return installIntoHost(draft, target, join(claudeDir, "skills"));

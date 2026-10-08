@@ -27,6 +27,7 @@ Then do the step for each host you use. A Claude Code install from the GitHub ma
 | Hermes Agent | Restart Hermes, and any running Hermes gateway. | The plugin is a symlink into the clone. Hermes loads Python plugins at start. |
 | Muse Code | `muse plugins update ultrathink`<br>`muse plugins inspect ultrathink` | Muse runs a copy from its plugin cache. If `inspect` lists a hook that is not `status=trusted_enabled`, run `muse plugins approve ultrathink` again. |
 | Omp | Restart Omp. | `omp plugin link` links the clone itself. |
+| Prime Agent | `bun scripts/setup.ts apply`<br>Then start a new session (or run `/reload`). | The skill is a symlink into the clone. `apply` keeps skills and commands linked. |
 
 `bun scripts/setup.ts apply` also re-runs its Claude Code steps when the `claude` CLI is installed. Those steps are idempotent too. See the [`scripts/setup.ts` reference](../install.md#scriptssetupts-reference).
 
@@ -58,6 +59,7 @@ Then update every place that holds the old path. Skip the hosts you don't use.
 | Claude Code local-path marketplace (added with `claude plugin marketplace add <clone>`, or by `setup.ts apply`) | `claude plugin marketplace remove ultrathink`<br>`claude plugin marketplace add <new clone>`<br>`claude plugin install ultrathink@ultrathink`<br>A GitHub marketplace install has no local path and needs nothing. |
 | Muse Code | `muse plugins remove ultrathink`<br>`muse plugins install <new clone> --scope user`<br>`muse plugins approve ultrathink`<br>`muse plugins update` refreshes from the source it was installed from, which is the old path. |
 | Omp | `omp plugin uninstall ultrathink`<br>`omp plugin link <new clone>` |
+| Prime Agent skill symlinks | `bun scripts/setup.ts apply`<br>Re-links `hosts/prime-agent` and `~/.agents/skills` to the new clone path. |
 
 Check the result:
 
