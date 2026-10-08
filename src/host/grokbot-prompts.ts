@@ -11,6 +11,7 @@ import type { SessionRecord } from "../claude/state.ts";
 import { nodeStepTitles, splitRationaleSteps } from "../track/plan.ts";
 import type { TrackingRefs } from "../track/types.ts";
 import { escapeXml } from "../uplift/xml.ts";
+import { stripTrackingXml } from "../track/render.ts";
 import { MAX_STEPS, MIN_STEPS } from "../think/types.ts";
 
 export const MAX_DESK_RULES = 10;
@@ -53,6 +54,17 @@ function workflowOf(record: SessionRecord): { lines: string[]; verify?: string }
 	return { lines, ...(verify ? { verify: verify.replace(/^Verify:\s*/, "") } : {}) };
 }
 
+/** The spec as planned: `injectTrackingXml` undone (no `<ISSUES>` block, no issue/issueUrl/notionUrl on NODE tags). */
+export function untrackedSpec(xml: string): string {
+	return stripTrackingXml(xml);
+}
+
+/** SUBISSUE steps of the unit itself (inside `<UNIT>…<SUBISSUES>`), never the ones in the embedded SPEC. */
+export function unitSubissueCount(xml: string): number {
+	const block = xml.match(/<UNIT\b[^>]*>[\s\S]*?<SUBISSUES>([\s\S]*?)<\/SUBISSUES>/);
+	return block ? (block[1]!.match(/<SUBISSUE\b/g) ?? []).length : 0;
+}
+
 export function buildCloudPrompt(record: SessionRecord, dispatch: UnitDispatch): string {
 	const graph = record.graph;
 	const plan = record.plan;
@@ -64,6 +76,7 @@ export function buildCloudPrompt(record: SessionRecord, dispatch: UnitDispatch):
 	const rawSteps = splitRationaleSteps(node.thinking ?? "");
 	const rules = (dispatch.rules ?? DEFAULT_DESK_RULES).slice(0, MAX_DESK_RULES);
 	const issue = tracking?.linear.nodes[node.id];
+	const notion = tracking?.notion.nodes[node.id];
 	const workflow = workflowOf(record);
 	const verify = dispatch.verify ?? workflow.verify ?? "";
 	const out: string[] = [];
@@ -81,14 +94,14 @@ export function buildCloudPrompt(record: SessionRecord, dispatch: UnitDispatch):
 	out.push(`    <GRAPH_ID>${esc(plan.graphId)}</GRAPH_ID>`);
 	out.push(`    <MODE>${dispatch.mode === "followup" ? "follow-up on an existing cloud agent" : "new cloud agent, new draft PR"}</MODE>`);
 	out.push("  </DISPATCH>");
-	out.push(`  <UNIT${attr("id", node.id)}${attr("kind", node.kind)}${attr("title", node.title)}${attr("issue", issue?.identifier ?? "pending kickoff")}>`);
+	out.push(`  <UNIT${attr("id", node.id)}${attr("kind", node.kind)}${attr("title", node.title)}${attr("issue", issue?.identifier ?? "pending kickoff")}${attr("url", issue?.url)}${attr("notion", notion)}>`);
 	out.push(`    <QUESTION>${esc(node.question)}</QUESTION>`);
 	out.push(`    <NODE_CONCLUSION>${esc(node.conclusion ?? "")}</NODE_CONCLUSION>`);
 	out.push("    <SUBISSUES>");
 	steps.forEach((title, index) => {
 		const key = `${node.id}.${index + 1}`;
 		const ref = tracking?.linear.steps[key];
-		out.push(`      <SUBISSUE${attr("step", index + 1)}${attr("issue", ref?.identifier ?? "pending kickoff")}${attr("title", title)}>${esc(rawSteps[index] ?? title)}</SUBISSUE>`);
+		out.push(`      <SUBISSUE${attr("step", index + 1)}${attr("issue", ref?.identifier ?? "pending kickoff")}${attr("url", ref?.url)}${attr("notion", tracking?.notion.steps[key])}${attr("title", title)}>${esc(rawSteps[index] ?? title)}</SUBISSUE>`);
 	});
 	out.push("    </SUBISSUES>");
 	const preds = node.dependsOn.map((id) => graph.nodes.find((n) => n.id === id)).filter((n) => n !== undefined);
@@ -109,7 +122,7 @@ export function buildCloudPrompt(record: SessionRecord, dispatch: UnitDispatch):
 		out.push("  </WORKFLOW>");
 	}
 	out.push("  <ISSUES>");
-	out.push(`    <ISSUE${attr("node", node.id)}${attr("ref", issue?.identifier ?? "pending kickoff")}${attr("url", issue?.url)}>${esc(`[${node.id}] ${node.title}`)}</ISSUE>`);
+	out.push(`    <ISSUE${attr("node", node.id)}${attr("ref", issue?.identifier ?? "pending kickoff")}${attr("url", issue?.url)}${attr("notion", notion)}>${esc(`[${node.id}] ${node.title}`)}</ISSUE>`);
 	out.push("  </ISSUES>");
 	const questions = record.clarifications ?? [];
 	out.push("  <CLARIFICATIONS>");
@@ -123,7 +136,9 @@ export function buildCloudPrompt(record: SessionRecord, dispatch: UnitDispatch):
 	for (const rule of rules) out.push(`    <RULE>${esc(rule)}</RULE>`);
 	out.push("  </DESK_RULES>");
 	out.push("  <SPEC>");
-	out.push(record.result.xml);
+	// Kickoff re-renders the spec with tracker links (NODE attributes plus an <ISSUES> block of one SUBISSUE per step of
+	// every node). The unit's own refs are already on UNIT/SUBISSUE/ISSUE above, so the embedded spec stays the planned one.
+	out.push(untrackedSpec(record.result.xml));
 	out.push("  </SPEC>");
 	out.push("</CLOUD_AGENT_PROMPT>");
 	return `${out.join("\n")}\n`;
@@ -171,7 +186,7 @@ export function validateCloudPrompt(xml: string, dispatch: UnitDispatch, origina
 	for (const section of need) if (!xml.includes(section)) errors.push(`missing ${section.replace(/[<> ]/g, "")}`);
 	const rules = (xml.match(/<RULE>/g) ?? []).length;
 	if (rules === 0 || rules > MAX_DESK_RULES) errors.push(`DESK_RULES must have 1-${MAX_DESK_RULES} rules (got ${rules})`);
-	const subs = (xml.match(/<SUBISSUE /g) ?? []).length;
+	const subs = unitSubissueCount(xml);
 	if (subs < MIN_STEPS || subs > MAX_STEPS) errors.push(`unit must carry ${MIN_STEPS}-${MAX_STEPS} SUBISSUE steps (got ${subs})`);
 	if (!xml.includes(`<ORIGINAL>${escapeXml(original)}</ORIGINAL>`)) errors.push("SPEC must carry ORIGINAL verbatim");
 	if (!xml.includes(`<BRANCH`) || !xml.includes(`>${escapeXml(dispatch.branch)}</BRANCH>`)) errors.push("DISPATCH branch missing");
