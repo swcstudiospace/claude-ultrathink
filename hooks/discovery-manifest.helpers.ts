@@ -11,7 +11,14 @@ import type { HostId } from "../src/host/types.ts";
 type JsonObject = { [key: string]: unknown };
 type Literal = string | boolean;
 type HostRecord = { status: string; entrypoints: string[]; delivery: string };
-type BotRecord = { identity: string; status: string; adapterPresent: boolean; compatibilityVerified: boolean };
+type BotRecord = {
+	identity: string;
+	status: string;
+	adapterPresent: boolean;
+	compatibilityVerified: boolean;
+	delivery?: string;
+	entrypoints?: string[];
+};
 type Descriptor = {
 	$schema: string;
 	schemaVersion: string;
@@ -34,13 +41,13 @@ const DISCOVERY_STEM = "ultrathink.discovery";
 const DESCRIPTOR_LIMIT = 16_384;
 /** Also bounds the loader manifests, which are a few KiB. */
 const SCHEMA_LIMIT = 32_768;
-/** Five hosts of at most eight entrypoints, plus the four interface paths. */
+/** Host entrypoints, the four interface paths, and the Grok Bot skill entrypoints. */
 const MAX_PATH_REFERENCES = 44;
 const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const SCHEMA_POINTER = `./${SCHEMA_FILE}`;
 const SCHEMA_VERSION = "1.0.0";
 const DESCRIPTION =
-	"claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Existing adapters are listed from repository sources; Grok Bot and GPT Dot integration contracts remain pending and compatibility is not verified.";
+	"claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Adapters are listed from repository sources. Grok Bot is a native host: bin/ultrathink-grokbot runs the engine, the bot answers its prompts and skills replace the prompt hook; compatibility is not verified. GPT Dot remains pending and unverified.";
 const ROOT_KEYS = ["$schema", "schemaVersion", "identity", "description", "capabilities", "hosts", "interfaces", "externalIntegrations"];
 const IDENTITY = {
 	repository: "claude-ultrathink",
@@ -83,14 +90,32 @@ const JSON_PLANNER = { transport: "json-stdin-stdout", launcher: "bin/run-bun", 
 const CONTROLS = { entrypoint: "bin/ultrathink", canPlan: false };
 /** The trackerMcp literals; its providers are a fixed set checked separately. */
 const TRACKER_MCP = { transport: "mcp-stdio-relay", entrypoint: "bin/ultrathink-mcp", canPlan: false };
-const EXTERNAL: Record<string, BotRecord> = {
-	"grok-bot": { identity: "documented-product", status: "pending-contract", adapterPresent: false, compatibilityVerified: false },
+/** Scalar fields only. Grok Bot's entrypoints are a path list, checked like a host inventory, not as a const. */
+const EXTERNAL: Record<string, Record<string, Literal>> = {
+	"grok-bot": {
+		identity: "documented-product",
+		status: "native-adapter",
+		adapterPresent: true,
+		compatibilityVerified: false,
+		delivery: "skill-protocol-cli",
+	},
 	"gpt-dot": { identity: "unverified", status: "pending-identity-and-contract", adapterPresent: false, compatibilityVerified: false },
 };
+const GROK_BOT_ENTRYPOINTS = [
+	"bin/ultrathink-grokbot",
+	"src/host/grokbot-cli.ts",
+	"hosts/grok-bot/README.md",
+	"hosts/grok-bot/skills/ultrathink-protocol/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-plan/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-kickoff/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-sync/SKILL.md",
+	"docs/how-to/use-with-grok-bot.md",
+];
 /** Every distinct path the approved descriptor declares: host entrypoints, then the interface paths. */
 const NORMATIVE_PATHS = [
 	...new Set([
 		...HOST_IDS.flatMap((id) => HOST_MAPPING[id].entrypoints),
+		...GROK_BOT_ENTRYPOINTS,
 		JSON_PLANNER.launcher,
 		JSON_PLANNER.entrypoint,
 		CONTROLS.entrypoint,
@@ -164,7 +189,19 @@ function approved(): Descriptor {
 			]),
 		),
 		interfaces: { jsonPlanner: { ...JSON_PLANNER }, controls: { ...CONTROLS }, trackerMcp: { ...TRACKER_MCP, providers: [...RELAY_SERVICES] } },
-		externalIntegrations: Object.fromEntries(Object.entries(EXTERNAL).map(([id, record]): [string, BotRecord] => [id, { ...record }])),
+		externalIntegrations: Object.fromEntries(
+			Object.entries(EXTERNAL).map(([id, record]): [string, BotRecord] => [
+				id,
+				{
+					identity: String(record.identity),
+					status: String(record.status),
+					adapterPresent: record.adapterPresent === true,
+					compatibilityVerified: record.compatibilityVerified === true,
+					...(typeof record.delivery === "string" ? { delivery: record.delivery } : {}),
+					...(id === "grok-bot" ? { entrypoints: [...GROK_BOT_ENTRYPOINTS] } : {}),
+				},
+			]),
+		),
 	};
 }
 
@@ -264,11 +301,29 @@ function interfacesFindings(value: unknown): string[] {
 	return findings;
 }
 
+function grokBotFindings(value: unknown, literals: Record<string, Literal>): string[] {
+	const pointer = "/externalIntegrations/grok-bot";
+	const findings = literalFindings(pointer, value, literals, ["entrypoints"]);
+	if (!isPlainObject(value) || !Object.hasOwn(value, "entrypoints")) return findings;
+	const declared = value.entrypoints;
+	if (!Array.isArray(declared) || declared.length < 1 || declared.length > 8) {
+		return [...findings, `shape: ${pointer}/entrypoints must be an array of 1 to 8 paths`];
+	}
+	for (const [index, path] of declared.entries()) findings.push(...pathFindings(`${pointer}/entrypoints/${index}`, path));
+	if (new Set(declared).size !== declared.length) findings.push(`shape: ${pointer}/entrypoints repeats a path`);
+	if (JSON.stringify(declared) !== JSON.stringify(GROK_BOT_ENTRYPOINTS)) {
+		findings.push(`semantic: ${pointer}/entrypoints must be ${JSON.stringify(GROK_BOT_ENTRYPOINTS)}`);
+	}
+	return findings;
+}
+
 function externalFindings(value: unknown): string[] {
 	if (!isPlainObject(value)) return ["shape: /externalIntegrations must be an object"];
 	const findings = keyFindings("/externalIntegrations", value, Object.keys(EXTERNAL));
 	for (const [id, record] of Object.entries(EXTERNAL)) {
-		if (Object.hasOwn(value, id)) findings.push(...literalFindings(`/externalIntegrations/${id}`, value[id], record));
+		if (!Object.hasOwn(value, id)) continue;
+		if (id === "grok-bot") findings.push(...grokBotFindings(value[id], record));
+		else findings.push(...literalFindings(`/externalIntegrations/${id}`, value[id], record));
 	}
 	return findings;
 }
@@ -299,8 +354,10 @@ function descriptorFindings(value: unknown): string[] {
 /** Every path a valid descriptor declares, duplicates included: host entrypoints plus the four interface paths. */
 function declaredPaths(descriptor: Descriptor): string[] {
 	const { jsonPlanner, controls, trackerMcp } = descriptor.interfaces;
+	const grokEntrypoints = descriptor.externalIntegrations["grok-bot"]?.entrypoints;
 	return [
 		...Object.values(descriptor.hosts).flatMap((host) => host.entrypoints),
+		...(Array.isArray(grokEntrypoints) ? grokEntrypoints : []),
 		jsonPlanner.launcher,
 		jsonPlanner.entrypoint,
 		controls.entrypoint,
@@ -455,6 +512,9 @@ function schemaFindings(schema: unknown): string[] {
 	for (const [id, record] of Object.entries(EXTERNAL)) {
 		for (const [key, value] of Object.entries(record)) same(["properties", "externalIntegrations", "properties", id, "properties", key, "const"], value);
 	}
+	const grokEntrypoints = ["properties", "externalIntegrations", "properties", "grok-bot", "properties", "entrypoints"];
+	same([...grokEntrypoints, "items", "$ref"], "#/$defs/relativeFile");
+	for (const [key, value] of Object.entries({ minItems: 1, maxItems: 8, uniqueItems: true })) same([...grokEntrypoints, key], value);
 	same(["$defs", "hostAdapter", "properties", "status", "const"], "source-present");
 	same(["$defs", "hostAdapter", "properties", "delivery", "enum"], [...DELIVERIES].sort(), sorted);
 	const entrypoints = ["$defs", "hostAdapter", "properties", "entrypoints"];

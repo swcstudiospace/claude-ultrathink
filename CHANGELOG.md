@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Grok Bot native host. `bin/ultrathink-grokbot` runs `planPrompt` with a journal completer: every completion the engine needs is written to `<stateDir>/journal/<session>/pending/`, the bot answers it by following the plugin's own system prompt, `answer` validates it the way the engine parses it, and the next `plan` replays it. Jev decisions are journalled for resumed runs. Shipping is forced off. `track payloads` / `track record` bridge `createTracking` to the bot's Linear and Notion connectors; `answers` folds chat replies into clarifications (the AskUserQuestion hook's job); `teach digest` builds a `TeachDigest` from the bot's turns for `teach observe` (the Stop hook's job); `prompts build` derives validated cloud-agent prompts per node; `review read` reads the Greptile score and threads; `skills status` reports drift between the 21 staged skills in `hosts/grok-bot/skills` and the installed copies. `ultrathink.discovery.json` lists `grok-bot` with status `native-adapter`, delivery `skill-protocol-cli`, `adapterPresent` true and `compatibilityVerified` false. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
+
 ## [1.4.0] - 2026-10-08
 
 ### Added
