@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-/** Real-process RMW fixture; delayed pauses at the stale snapshot, safe guard release or obsolete unsafe rename. */
+/** Real-process RMW fixture; delayed pauses at a stale snapshot, empty-guard handoff, late removal or obsolete unsafe rename. */
 import { mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ const [stateDir, sessionId, events, actor] = process.argv.slice(2);
 if (!stateDir || !sessionId || !events || !actor) process.exit(2);
 const eventDir = events;
 const lock = join(stateDir, "sessions", `${sessionId}.json.lock`);
+const guard = `${lock}.guard`;
 const nodeFs = { ...fs };
 const sleepWord = new Int32Array(new SharedArrayBuffer(4));
 function signal(name: string): void {
@@ -24,6 +25,8 @@ function wait(name: string): void {
 }
 
 let paused = false;
+let releasedOwner = false;
+let claimed = false;
 mock.module("node:fs", () => ({
 	...nodeFs,
 	statSync(path: string): fs.Stats {
@@ -39,21 +42,38 @@ mock.module("node:fs", () => ({
 		try {
 			nodeFs.renameSync(from, to);
 		} catch (error) {
-			if (to === `${lock}.guard` && ["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+			if (to === guard && ["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) {
 				signal(`${actor}.guarded`);
 			}
 			throw error;
+		}
+		if (actor !== "delayed" && !claimed && to === guard && nodeFs.existsSync(join(events, "released-owner"))) {
+			claimed = true;
+			signal(`${actor}.claimed`);
+			wait("claimed-go");
 		}
 		if (actor === "delayed" && from === lock) {
 			signal("moved");
 			wait("rename-go");
 		}
 	},
+	unlinkSync(path: string): void {
+		nodeFs.unlinkSync(path);
+		if (actor === "delayed" && paused && !releasedOwner && path.startsWith(`${guard}/`)) {
+			releasedOwner = true;
+			signal("released-owner");
+			wait("released-owner-go");
+		}
+	},
 	rmdirSync(path: string): void {
-		nodeFs.rmdirSync(path);
-		if (actor === "delayed" && paused && path === `${lock}.guard`) {
-			signal("recovered");
-			wait("recovered-go");
+		try {
+			nodeFs.rmdirSync(path);
+		} finally {
+			// A successor can replace the empty guard before rmdir, which then correctly fails.
+			if (actor === "delayed" && paused && path === guard) {
+				signal("recovered");
+				wait("recovered-go");
+			}
 		}
 	},
 }));
@@ -79,5 +99,5 @@ const result = updateSession(stateDir, sessionId, (record: SessionRecord & { cou
 			nodeFs.unlinkSync(join(events, "active"));
 		}
 	}
-}, { timeoutMs: 20_000, staleMs: 60_000, pollMs: 5 });
+}, { timeoutMs: 20_000, staleMs: 60_000, pollMs: 5, log: (message) => console.error(`${actor}: ${message}`) });
 if (!result) throw new Error("session vanished");

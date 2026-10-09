@@ -325,12 +325,16 @@ describe("concurrent updates through updateSession", () => {
 			workers.push(spawn("first"), spawn("second"));
 			await Promise.all([waitFor(["first.attempting"]), waitFor(["second.attempting"])]);
 			// Observe the obsolete snapshot being applied, not a particular acquisition winner.
-			// The safe path pauses delayed after releasing its guard so a competing writer wins first.
+			// Force a successor to claim the now-empty guard before delayed attempts its late rmdir.
 			await waitFor(["first.entered", "second.entered", "first.guarded", "second.guarded"]);
 			signal("snapshot-go");
-			if (await waitFor(["moved", "recovered"]) === "moved") {
+			if (await waitFor(["moved", "released-owner"]) === "moved") {
 				await waitFor(["first.overlap", "second.overlap"]);
 			} else {
+				await waitFor(["first.claimed", "second.claimed"]);
+				signal("released-owner-go");
+				await waitFor(["recovered"]);
+				signal("claimed-go");
 				await waitFor(["first.entered", "second.entered"]);
 			}
 			signal("rename-go");
@@ -348,6 +352,8 @@ describe("concurrent updates through updateSession", () => {
 			signal("rename-go");
 			signal("body-go");
 			signal("recovered-go");
+			signal("released-owner-go");
+			signal("claimed-go");
 			for (const worker of workers) if (worker.exitCode === null) worker.kill();
 			await Promise.allSettled(workers.map((worker) => worker.exited));
 		}
