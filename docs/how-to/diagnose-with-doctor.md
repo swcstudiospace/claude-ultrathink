@@ -63,7 +63,7 @@ Only features that are switched on are checked:
 | `linear.team` set | Linear |
 | `hindsight.enabled` (unless `ULTRATHINK_HINDSIGHT=0`) | Hindsight in direct mode; Desk gateway when its selected backend is gateway |
 | `ragflow.enabled` (unless `ULTRATHINK_RAGFLOW=0`) | RAGFlow in direct mode; Desk gateway when its selected backend is gateway |
-| `substrate.enabled` with its gateway backend (unless `SUBSTRATE_DISABLED=1`) | Desk gateway |
+| `substrate.backend: "gateway"` (unless `SUBSTRATE_DISABLED=1`) | Desk gateway |
 | Jev, unless `ULTRATHINK_DECISIONS=0` | an OpenRouter or Vercel AI Gateway key |
 
 A missing credential for a feature you turned on is a warning, with the command that stores it, for example `bin/ultrathink-mcp auth set-key greptile --stdin`. Jev without a key is only info, because it fails open and skips its decision points. A present credential is reported as `credential present` with its source, either the credential store or the name of the environment variable.
