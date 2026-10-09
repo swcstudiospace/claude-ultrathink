@@ -466,7 +466,15 @@ describe("errors", () => {
 		const controller = new AbortController();
 		controller.abort();
 		const c = client(fake({}).fetch, { signal: controller.signal });
-		await expect(c.recall({ query: "q" })).rejects.toMatchObject({ name: "AbortError" });
+		// `.rejects` is typed as returning void, so awaiting the matcher is a no-op to the checker.
+		// Await the recall itself: an already-aborted signal must reject, not come back as an error result.
+		try {
+			await c.recall({ query: "q" });
+		} catch (error) {
+			expect(error).toMatchObject({ name: "AbortError" });
+			return;
+		}
+		throw new Error("expected AbortError");
 	});
 });
 
