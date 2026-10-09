@@ -136,13 +136,20 @@ const LAST_LOCK_WAIT_MS = 5;
 const LAST_LOCK_ATTEMPTS = 40;
 const LAST_LOCK_STALE_MS = 5_000;
 
-/** True when the lock file names a process that is still running. A missing or dead pid is not a holder. */
+/** True when the lock file names a running process, or is a fresh empty file another writer has not filled yet. */
 function holderAlive(lockPath: string): boolean {
 	let text: string;
 	try {
 		text = readFileSync(lockPath, "utf8").trim();
 	} catch {
 		return false;
+	}
+	if (!text) {
+		try {
+			return Date.now() - statSync(lockPath).mtimeMs <= LAST_LOCK_STALE_MS;
+		} catch {
+			return false;
+		}
 	}
 	const pid = Number(text);
 	if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -207,10 +214,12 @@ export function lastRefreshMessage(lastPath: string): string {
 	return `could not refresh ${lastPath}; the session was saved, but ctl last may still show the previous plan`;
 }
 
-export function writeSession(dir: string, record: SessionRecord): void {
+/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
+export function writeSession(dir: string, record: SessionRecord): string | undefined {
 	writeJson(sessionPath(dir, record.sessionId), record);
 	const last = join(dir, "last.json");
-	if (!withLastLock(last, () => writeJson(last, record))) throw new Error(lastRefreshMessage(last));
+	if (!withLastLock(last, () => writeJson(last, record))) return lastRefreshMessage(last);
+	return undefined;
 }
 
 export function readLast(dir: string): SessionRecord | undefined {

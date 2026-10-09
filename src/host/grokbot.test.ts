@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionRecord, writeControl, writeSession } from "../claude/state.ts";
@@ -612,7 +612,8 @@ describe("grok-bot answers", () => {
 		try {
 			expect(() => mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 })).toThrow(/could not refresh/);
 			expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
-			expect(() => writeSession(stateDir, { ...record, at: 3 })).toThrow(/could not refresh/);
+			expect(writeSession(stateDir, { ...record, at: 3 })).toMatch(/could not refresh/);
+			expect(JSON.parse(readFileSync(join(stateDir, "sessions", "s1.json"), "utf8")).at).toBe(3);
 			expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
 		} finally {
 			closeSync(fd);
@@ -620,6 +621,23 @@ describe("grok-bot answers", () => {
 		}
 		mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
 		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(2);
+		expect(existsSync(`${lastPath}.lock`)).toBe(false);
+	});
+
+	test("a fresh empty last.json lock stays held", () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const record = { sessionId: "s1", at: 1, result: { xml: "<x/>", original: "o", root: "BUILD_PROMPT", source: "llm" } } as SessionRecord;
+		writeSession(stateDir, record);
+		const lastPath = join(stateDir, "last.json");
+		writeFileSync(`${lastPath}.lock`, "");
+		expect(writeSession(stateDir, { ...record, at: 2 })).toMatch(/could not refresh/);
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
+		expect(readFileSync(`${lastPath}.lock`, "utf8")).toBe("");
+		const stale = new Date(Date.now() - 6_000);
+		utimesSync(`${lastPath}.lock`, stale, stale);
+		expect(writeSession(stateDir, { ...record, at: 4 })).toBeUndefined();
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(4);
 		expect(existsSync(`${lastPath}.lock`)).toBe(false);
 	});
 

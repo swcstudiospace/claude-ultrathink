@@ -738,6 +738,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
+		let lastNote: string | undefined;
 		// No spec or session write for a cancelled flight.
 		throwIfCancelled(cancellation);
 		stage("state", "start");
@@ -745,8 +746,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			specPath = specFile(deps.stateDir, sessionId);
 			mkdirSync(dirname(specPath), { recursive: true });
 			writeFileSync(specPath, `${result.xml}\n`);
-			writeSession(deps.stateDir, record);
+			lastNote = writeSession(deps.stateDir, record);
 			statePath = sessionPath(deps.stateDir, sessionId);
+			if (lastNote) log(lastNote);
 			stage("state", "end", true);
 		} catch (error) {
 			log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -770,6 +772,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					brief,
 					statePath,
 					specPath,
+					...(lastNote ? { lastNote } : {}),
 					plan,
 					tracking,
 					trackCommand: deps.trackCommand,

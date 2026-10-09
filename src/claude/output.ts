@@ -249,6 +249,8 @@ export interface PromptContextInput {
 	/** Path to the session state file `ultrathink-kickoff` should read; adds the tracking tail when set. */
 	statePath?: string;
 	specPath?: string;
+	/** Set when the session was saved but `last.json` could not be refreshed. */
+	lastNote?: string;
 	maxChars?: number;
 	/** Tracker plan and the rows created for it; together they add the Linked issues section. */
 	plan?: TrackPlan;
@@ -406,6 +408,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 			: UPLIFT_CONTEXT_HEADER;
 	const parts: string[] = [header];
 	if (input.specPath) parts.push(`Specification file: ${input.specPath}`);
+	if (input.lastNote) parts.push(input.lastNote);
 	if (input.modelResolution) parts.push(`Planning model: ${formatModelSelection(input.modelResolution)}`);
 	// A failed engine still delivers boilerplate (fail-open), but the agent must know it is
 	// boilerplate and why: otherwise a dead engine looks like a terse real plan with rows to come.
