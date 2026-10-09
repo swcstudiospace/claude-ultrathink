@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
@@ -162,6 +162,7 @@ describe("legacy diagnostic label safety", () => {
 		const marker = join(cli.cwd, "shell-canary-ran");
 		const model = `${sentinel};touch ${marker};$(touch ${marker});\`touch ${marker}\`;#`;
 		const before = readdirSync(cli.cwd).sort();
+		const realTmp = realpathSync(tmpdir());
 		const host = route === "claude" ? "claude-code" : route === "muse" ? "muse" : "grok-build";
 		const argvLengths: Record<LegacyRoute, number> = { claude: 14, muse: 13, grok: 28 };
 		const lower = defaultConfig();
@@ -190,14 +191,14 @@ describe("legacy diagnostic label safety", () => {
 			expect(existsSync(join(childCwd, model))).toBe(false);
 			if (route === "grok") {
 				expect(childCwd).not.toBe(cli.cwd);
-				expect(dirname(childCwd)).toBe(tmpdir());
+				expect(realpathSync(dirname(childCwd))).toBe(realTmp);
 				expect(basename(childCwd)).toStartWith("ultrathink-grok-");
 			} else expect(childCwd).toBe(cli.cwd);
 			if (route !== "claude") {
 				const promptFile = args[args.indexOf("--prompt-file") + 1];
 				if (!promptFile) throw new Error("expected a CLI prompt file");
 				expect(basename(promptFile)).toBe(route === "muse" ? "prompt.txt" : "prompt.md");
-				expect(dirname(dirname(promptFile))).toBe(tmpdir());
+				expect(realpathSync(dirname(dirname(promptFile)))).toBe(realTmp);
 				expect(basename(dirname(promptFile))).toStartWith(`ultrathink-${route}-`);
 				expect(promptFile).not.toContain(sentinel);
 				expect(existsSync(promptFile)).toBe(false);
