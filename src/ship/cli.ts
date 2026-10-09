@@ -277,6 +277,19 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 		}
 		result = { ...result, comments: openThreadComments(threads.threads) };
 	}
+	if (result.status === "unverified") {
+		// The completed review remains reusable. Only its thread scan failed, so no round or retry is consumed.
+		writeShip(statePath, { phase: "pr-open", pending: undefined }, deps.now());
+		return {
+			ok: false,
+			ready: false,
+			status: "unverified",
+			reviewId: result.reviewId,
+			reason: `could not read review threads: ${result.error ?? "verification unavailable"}`,
+			round: ship.rounds.length,
+			next: "run review again",
+		};
+	}
 	if (result.status === "blocked") {
 		// Greptile is unusable as configured: no round is recorded and the flow stops until the user fixes the setup.
 		const reason = result.error ?? "Greptile review blocked";

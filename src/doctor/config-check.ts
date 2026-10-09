@@ -8,9 +8,10 @@
  * Findings carry key names, types and effective values, never the written value or the file content.
  */
 import { readFileSync } from "node:fs";
-import { claudeConfigPaths, defaultConfig, mergeConfig, type UltrathinkConfig } from "../config.ts";
+import { claudeConfigPaths, defaultConfig, hasControlCharacter, mergeConfig, type UltrathinkConfig } from "../config.ts";
 import { isPlainObject } from "../decisions/client.ts";
 import { HOSTS, isHostId } from "../host/types.ts";
+import { redactText } from "../teach/redact.ts";
 import type { DoctorDeps, DoctorLevel, Finding } from "./types.ts";
 
 type Json = Record<string, unknown>;
@@ -71,7 +72,21 @@ export function suggestName(name: string, candidates: readonly string[]): string
 }
 
 function describeValue(value: unknown): string {
-	const text = JSON.stringify(value) ?? String(value);
+	let display = value;
+	if (typeof value === "string") {
+		try {
+			const url = new URL(value);
+			if (url.username || url.password) {
+				url.username = "";
+				url.password = "";
+				display = url.toString();
+			}
+		} catch {
+			// Non-URL effective values still use the shared secret redactor below.
+		}
+	}
+	// Redact before truncation so a long credential cannot leave a visible prefix.
+	const text = redactText(JSON.stringify(display) ?? String(display));
 	return text.length > MAX_VALUE_CHARS ? `${text.slice(0, MAX_VALUE_CHARS)}…` : text;
 }
 
@@ -172,6 +187,14 @@ function checkModels(out: Collector, value: unknown, effective: Json): void {
 						unknownName(out, "key", fieldPath, HOST_OVERRIDE_KEYS, keyPath);
 					} else if (typeof selector !== "string") {
 						out.add("warn", "wrong-type", fieldPath, `${fieldPath} ignored: expected string, got ${kindOf(selector)}`, `File: ${out.layer.path}`);
+					} else if (selector.trim() !== "" && hasControlCharacter(selector)) {
+						out.add(
+							"warn",
+							"selector-invalid",
+							fieldPath,
+							`${fieldPath} invalid: contains a control character`,
+							`Model selection rejects this value before resolution. File: ${out.layer.path}`,
+						);
 					}
 				}
 			}
@@ -190,6 +213,14 @@ function checkModels(out: Collector, value: unknown, effective: Json): void {
 				const keyPath = `models.providerDefaults.${provider}`;
 				if (typeof selector !== "string") {
 					out.add("warn", "wrong-type", keyPath, `${keyPath} ignored: expected string, got ${kindOf(selector)}`, `File: ${out.layer.path}`);
+				} else if (selector.trim() !== "" && hasControlCharacter(selector)) {
+					out.add(
+						"warn",
+						"selector-invalid",
+						keyPath,
+						`${keyPath} invalid: contains a control character`,
+						`Model selection rejects this value before resolution. File: ${out.layer.path}`,
+					);
 				} else if (selector.trim() !== "" && effectiveDefaults[provider] !== selector.trim()) {
 					out.add("warn", "ignored", keyPath, `${keyPath} ignored by the merge`, `A reserved provider name is never merged. File: ${out.layer.path}`);
 				}

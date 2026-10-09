@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { claudeConfigPaths, defaultConfig, loadConfig } from "../config.ts";
 import { checkConfig, suggestName } from "./config-check.ts";
+import { buildReport, formatReport, reportJson } from "./report.ts";
 import type { DoctorDeps, Finding } from "./types.ts";
 
 const FAKE_KEY = "sk-test-not-a-real-key";
@@ -205,6 +206,35 @@ describe("checkConfig", () => {
 		expect(byId(findings, "config.user.ignored.think.engine").title).toContain('"auto"');
 	});
 
+	test.each([
+		["plain", "doctor-dummy-user", "doctor-dummy-password"],
+		["encoded", "%64%6f%63%74%6f%72%2d%64%75%6d%6d%79%2d%75%73%65%72", "%64%6f%63%74%6f%72%2d%64%75%6d%6d%79%2d%70%61%73%73%77%6f%72%64"],
+		["username-only", "doctor-dummy-user", ""],
+		["password-only", "", "doctor-dummy-password"],
+		["long", "doctor-dummy-user", `doctor-dummy-password${"x".repeat(100)}`],
+	])("%s URL credentials never reach either doctor report format", (_name, username, password) => {
+		const lowerUrl = `https://${username}${password ? `:${password}` : ""}@gateway.test/api`;
+		write("user", { substrate: { url: lowerUrl } });
+		write("claude", { substrate: { url: "not-a-url" } });
+		const findings = checkConfig(deps);
+		const finding = byId(findings, "config.claude-user.ignored.substrate.url");
+		expect(finding.level).toBe("warn");
+		expect(finding.title).toContain("effective value");
+		expect(finding.title).toContain("gateway.test");
+		const report = buildReport(findings);
+		for (const output of [formatReport(report), reportJson(report)]) {
+			expect(output).toContain("substrate.url");
+			expect(output).toContain("ignored");
+			expect(output).toContain("gateway.test");
+			for (const secret of ["doctor-dummy-user", "doctor-dummy-password", username, password].filter(Boolean)) {
+				expect(output).not.toContain(secret);
+				expect(decodeURIComponent(output)).not.toContain(decodeURIComponent(secret));
+			}
+		}
+		// Only diagnostics change: the lower credential-bearing URL remains the runtime selection.
+		expect(loadConfig(claudeConfigPaths(deps.cwd, deps.env)).substrate.url).toBe(lowerUrl);
+	});
+
 	test("a wrong type is reported with the expected and the actual type", () => {
 		write("user", { ship: { autoMerge: "yes", skills: "gsd-" }, hitl: "on" });
 		const findings = checkConfig(deps);
@@ -297,13 +327,67 @@ describe("checkConfig", () => {
 			expect(byId(findings, "config.user.wrong-type.models.hosts.muse").title).toContain("expected object, got string");
 		});
 
+		test.each(["\u0000", "\n", "\t", "\u001b", "\u007f", "\u0085"])("nonblank selectors carrying control %j name the actual rejection cause", (control) => {
+			const provider = `${control}doctor-invalid-provider`;
+			const model = `doctor-invalid${control}model`;
+			const providerDefault = `doctor-invalid-default${control}`;
+			write("user", { models: { hosts: { omp: { provider, model } }, providerDefaults: { "my-gateway": providerDefault } } });
+			const findings = checkConfig(deps);
+			for (const key of ["hosts.omp.provider", "hosts.omp.model", "providerDefaults.my-gateway"]) {
+				const finding = byId(findings, `config.user.selector-invalid.models.${key}`);
+				expect(finding.level).toBe("warn");
+				expect(finding.title).toContain("control character");
+				expect(finding.detail).toContain("selection");
+				expect(findings.some((candidate) => candidate.id === `config.user.ignored.models.${key}`)).toBe(false);
+			}
+			const report = buildReport(findings);
+			for (const output of [formatReport(report), reportJson(report)]) {
+				expect(output).toContain("control character");
+				expect(output).not.toContain("reserved provider");
+				expect(output).not.toContain("doctor-invalid");
+			}
+			const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+			expect(effective.models.hosts.omp).toEqual({ provider, model });
+			expect(effective.models.providerDefaults["my-gateway"]).toBe(providerDefault);
+		});
+
+		test("valid selectors and entirely blank resets retain normalization and layer precedence without warnings", () => {
+			write("user", {
+				models: {
+					hosts: { omp: { provider: "  openrouter  ", model: " openrouter/anthropic/claude-x:beta " } },
+					providerDefaults: { openrouter: " anthropic/claude-x:beta ", "my-gateway": " model-a " },
+				},
+			});
+			expect(aboveInfo(checkConfig(deps))).toEqual([]);
+			const lower = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+			expect(lower.models.hosts.omp).toEqual({ provider: "openrouter", model: "openrouter/anthropic/claude-x:beta" });
+			expect(lower.models.providerDefaults.openrouter).toBe("anthropic/claude-x:beta");
+			write("claude", {
+				models: { hosts: { omp: { model: "\n\t " } }, providerDefaults: { openrouter: "\n\t " } },
+			});
+			write("project", {
+				models: { hosts: { omp: { provider: "" } }, providerDefaults: { "my-gateway": " model-b " } },
+			});
+			expect(aboveInfo(checkConfig(deps))).toEqual([]);
+			const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+			expect(effective.models.hosts.omp).toEqual({ provider: "", model: "" });
+			expect(Object.hasOwn(effective.models.providerDefaults, "openrouter")).toBe(false);
+			expect(effective.models.providerDefaults["my-gateway"]).toBe("model-b");
+		});
+
 		test("providerDefaults keys are free, values must be strings, reserved names are ignored", () => {
-			write("user", `{"models":{"providerDefaults":{"my-gateway":"model-a","blank":"  ","numeric":4,"__proto__":"x"}}}`);
+			write("user", `{"models":{"providerDefaults":{"my-gateway":"model-a","blank":"  ","numeric":4,"__proto__":"x","constructor":"x","prototype":"x"}}}`);
 			const findings = checkConfig(deps);
 			expect(findings.some((finding) => finding.id.includes("my-gateway"))).toBe(false);
 			expect(findings.some((finding) => finding.id.endsWith("providerDefaults.blank"))).toBe(false);
 			expect(byId(findings, "config.user.wrong-type.models.providerDefaults.numeric").level).toBe("warn");
-			expect(byId(findings, "config.user.ignored.models.providerDefaults.__proto__").level).toBe("warn");
+			for (const provider of ["__proto__", "constructor", "prototype"]) {
+				const finding = byId(findings, `config.user.ignored.models.providerDefaults.${provider}`);
+				expect(finding.level).toBe("warn");
+				expect(finding.detail).toContain("reserved provider");
+			}
+			const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+			expect(Object.keys(effective.models.providerDefaults)).toEqual(["my-gateway"]);
 		});
 
 		test("an unknown key under models suggests the real one, and a wrong-typed models is reported", () => {

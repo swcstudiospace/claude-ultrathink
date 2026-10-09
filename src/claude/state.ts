@@ -147,7 +147,7 @@ const LAST_LOCK_ATTEMPTS = 40;
 const LAST_LOCK_STALE_MS = 5_000;
 
 /** True when the lock file names a running process, or is a fresh empty file another writer has not filled yet. */
-function holderAlive(lockPath: string): boolean {
+export function lastLockHeld(lockPath: string): boolean {
 	let text: string;
 	try {
 		text = readFileSync(lockPath, "utf8").trim();
@@ -187,7 +187,7 @@ export function withLastLock(lastPath: string, body: () => void): boolean {
 			held = true;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-			const reclaim = !holderAlive(lockPath);
+			const reclaim = !lastLockHeld(lockPath);
 			if (reclaim) {
 				try {
 					unlinkSync(lockPath);

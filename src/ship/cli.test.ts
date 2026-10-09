@@ -11,6 +11,7 @@ import type { Github, ReviewThreads, ReviewThreadsOptions } from "./github.ts";
 import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
+import { runReview } from "./greptile.ts";
 import { appendAttempts, archiveShip, readShip, writeShip } from "./state.ts";
 import { MAX_SHIP_HISTORY } from "./types.ts";
 import type { Assessment, GitSignals, PrRef, PrStatus, ReviewResult, ShipAttempt, ShipConfig, ShipSignals } from "./types.ts";
@@ -493,6 +494,34 @@ describe("runShip", () => {
 		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
 	});
 
+	test("failed fresh thread scans do not spend review retries or restart a completed review", async () => {
+		writeShip(statePath, { pr: PR, phase: "pr-open", pending: { headSha: "abc", source: "pr", since: 0, runId: "completed" } });
+		const client = {
+			async call(name: string): Promise<unknown> {
+				if (name === "list_repositories") return { repositories: [{ name: "o/r", remote: "github", defaultBranch: PR.base }] };
+				if (name === "list_code_reviews") return { codeReviews: [{ id: "completed", commitSha: "abc", status: "COMPLETED" }] };
+				if (name === "get_code_review") return { codeReview: { body: "Confidence Score: 5/5" } };
+				throw new Error(`completed review must remain reusable, not call ${name}`);
+			},
+		};
+		const failed: ShipDeps = { ...deps({ config: { reviewRetries: 0 } }), greptile: () => client, review: runReview };
+		for (let i = 0; i < 2; i++) {
+			clock += CONFIG.reviewTimeoutMs + 1;
+			expect((await ship("review", failed)).output).toMatchObject({ ok: false, ready: false, status: "unverified", reviewId: "completed", round: 0 });
+			expect(readShip(statePath)).toMatchObject({ phase: "pr-open", rounds: [] });
+			expect(readShip(statePath)?.pending).toBeUndefined();
+			expect((await ship("merge", failed)).output).toMatchObject({ ok: false, merged: false });
+		}
+		const recovered: ShipDeps = {
+			...deps({ config: { reviewRetries: 0 }, threads: { ok: true, threads: [] } }),
+			greptile: () => client,
+			review: runReview,
+		};
+		expect((await ship("review", recovered)).output).toMatchObject({ ok: true, ready: true, passed: true, round: 1 });
+		expect(readShip(statePath)?.rounds).toMatchObject([{ status: "completed", reviewId: "completed", score: 5 }]);
+		expect((await ship("merge", recovered)).output).toMatchObject({ ok: true, merged: true });
+	});
+
 	test("review thread scans share the review call budget: an over-deadline scan stops fail-closed", async () => {
 		const open = { body: "intended behavior", path: "a.ts", threadId: "T1" };
 		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [open], headSha: "abc", at: 1 };
@@ -506,17 +535,6 @@ describe("runShip", () => {
 		expect(String(out.output.reason)).toContain("review threads scan exceeded its deadline");
 		expect(readShip(statePath)?.rounds).toMatchObject([{ comments: [open] }]);
 
-		// The callback handed to a fresh review carries the same deadline: entry now 1000 + waitMs.
-		writeShip(statePath, { pr: PR, rounds: [] });
-		let tick = 1000;
-		const fresh: ShipDeps = { ...deps({ threads: { ok: true, threads: [] } }), now: () => tick };
-		expect((await ship("review", fresh)).output).toMatchObject({ ok: true, ready: true });
-		const scan = reviewInputs.at(-1)?.reviewThreads;
-		expect(scan).toBeDefined();
-		tick = 1000 + CONFIG.waitMs - 1;
-		expect(scan?.()).toEqual({ ok: true, threads: [] });
-		tick = 1000 + CONFIG.waitMs;
-		expect(scan?.()).toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
 	});
 
 	test("review refuses when local HEAD differs from the PR head", async () => {

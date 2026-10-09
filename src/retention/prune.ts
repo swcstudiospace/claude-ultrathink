@@ -10,7 +10,7 @@
 import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join } from "node:path";
 import { withFileLock } from "../claude/atomic.ts";
-import { sessionPath } from "../claude/state.ts";
+import { lastLockHeld, sessionPath } from "../claude/state.ts";
 import { carrierPath } from "../host/carrier.ts";
 
 const DAY_MS = 86_400_000;
@@ -212,13 +212,14 @@ function removeFile(sweep: Sweep, path: string, name: string): boolean {
 	}
 }
 
-/** Removes `*.tmp` and `*.lock` regular files older than an hour: leftovers of a crashed atomic write. */
-function sweepOrphans(sweep: Sweep, dir: string, names: string[]): void {
+/** Removes hour-old atomic-write leftovers; a held strict-last lock is never an orphan. */
+function sweepOrphans(sweep: Sweep, dir: string, names: string[], lastLockPath?: string): void {
 	for (const name of names) {
 		if (!name.endsWith(".tmp") && !name.endsWith(".lock")) continue;
 		const path = join(dir, name);
 		const stat = statEntry(sweep, path, name);
 		if (!stat?.isFile() || sweep.now - stat.mtimeMs <= ORPHAN_AGE_MS) continue;
+		if (path === lastLockPath && lastLockHeld(path)) continue;
 		if (!removeFile(sweep, path, name)) continue;
 		sweep.result.orphans.push({ name, bytes: stat.size });
 		sweep.result.bytes += stat.size;
@@ -386,7 +387,7 @@ export function pruneSessions(options: PruneOptions): PruneResult {
 			return result;
 		}
 		const sessionsDir = join(options.stateDir, "sessions");
-		sweepOrphans(sweep, options.stateDir, listEntries(sweep, options.stateDir, "state directory"));
+		sweepOrphans(sweep, options.stateDir, listEntries(sweep, options.stateDir, "state directory"), join(options.stateDir, "last.json.lock"));
 		const bounded = options.limit !== undefined;
 		const names = bounded
 			? listSessionEntries(sweep, sessionsDir, "sessions", readCursor(options.stateDir))

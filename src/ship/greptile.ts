@@ -215,7 +215,7 @@ export async function reviewPr(input: {
 				// Greptile reviews incrementally and never flips `addressed` on a fix, so GitHub thread state decides.
 				// A failed thread scan is not evidence that all findings are addressed.
 				const threads = input.reviewThreads?.();
-				if (threads && !threads.ok) return done({ status: "failed", reviewId, error: threads.error });
+				if (threads && !threads.ok) return done({ status: "unverified", reviewId, error: threads.error });
 				const comments = threads?.ok
 					? openThreadComments(threads.threads)
 					: mapComments(

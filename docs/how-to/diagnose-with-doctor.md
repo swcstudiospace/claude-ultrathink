@@ -35,7 +35,7 @@ The report has four sections, always in this order.
 
 ### Config files
 
-Each file is judged on its own against the built-in defaults, using the same merge ultrathink uses. Doctor never changes that merge. For every file:
+Each file is checked over the accumulated lower-precedence layers using the same merge ultrathink uses. Doctor never changes that merge. For every file:
 
 | Finding | Level | Meaning |
 |---|---|---|
@@ -43,11 +43,12 @@ Each file is judged on its own against the built-in defaults, using the same mer
 | not valid JSON, not readable, or top level is not an object | error | Every key in the file is ignored. The finding shows the path and the parser's message, never the file's content. |
 | unknown section, unknown key | warn | The merge ignores it. When a known name is close (an edit distance of 2 or less, or the same first four letters) the finding says `Did you mean …?`. |
 | `<key> ignored: expected <type>, got <type>` | warn | The value has the wrong type, so the lower layer's value or the default stays. |
+| `<key> invalid: contains a control character` | warn | A nonblank host provider/model selector or provider-default model contains a control character and will be rejected by model resolution. Whitespace-only resets keep their normal meaning. |
 | `<key> ignored or adjusted: effective value is <value>` | warn | The type is right but the value is outside what the merge accepts (a range, an allowed word, a shape), so the effective value is the one shown. |
 | `decisions.enabled ignored: Jev is always on; …` | warn | `decisions.enabled` has no effect in any file. Set `ULTRATHINK_DECISIONS=0` to turn Jev off. |
 | `<key> ignored in a project file by design` | info | The key is one a file inside a cloned repository may not set, or may only tighten, such as `hindsight.url`, `teach.recallLimit` or `decisions.zdr: false`. Put it in your own config if you want it. See [Share config with a team or a project](team-and-project-config.md). |
 
-Doctor knows the sections and keys from the built-in defaults, so a key added to ultrathink later is known without a doctor update. `models.hosts` entries must use a host id (`claude-code`, `grok-build`, `hermes`, `muse`, `omp` or `prime-agent`) and hold only `provider` and `model` strings. `models.providerDefaults` takes any provider name with a string value.
+Doctor knows built-in sections and keys plus supported optional backend fields. `models.hosts` entries must use a supported host id and hold only `provider` and `model` strings. `models.providerDefaults` takes provider names with string values, except reserved keys such as `__proto__`, `constructor` and `prototype`. Nonblank selectors containing control characters are diagnosed rather than silently trimmed.
 
 A key you wrote with the value it already defaults to is not a finding.
 
@@ -60,8 +61,9 @@ Only features that are switched on are checked:
 | `ship.enabled` (unless `ULTRATHINK_SHIP=0`) and `hitl.knowledgeBase` | Greptile |
 | `notion.dataSourceUrl` set | Notion |
 | `linear.team` set | Linear |
-| `hindsight.enabled` (unless `ULTRATHINK_HINDSIGHT=0`) | Hindsight |
-| `ragflow.enabled` (unless `ULTRATHINK_RAGFLOW=0`) | RAGFlow |
+| `hindsight.enabled` (unless `ULTRATHINK_HINDSIGHT=0`) | Hindsight in direct mode; Desk gateway when its selected backend is gateway |
+| `ragflow.enabled` (unless `ULTRATHINK_RAGFLOW=0`) | RAGFlow in direct mode; Desk gateway when its selected backend is gateway |
+| `substrate.enabled` with its gateway backend (unless `SUBSTRATE_DISABLED=1`) | Desk gateway |
 | Jev, unless `ULTRATHINK_DECISIONS=0` | an OpenRouter or Vercel AI Gateway key |
 
 A missing credential for a feature you turned on is a warning, with the command that stores it, for example `bin/ultrathink-mcp auth set-key greptile --stdin`. Jev without a key is only info, because it fails open and skips its decision points. A present credential is reported as `credential present` with its source, either the credential store or the name of the environment variable.
@@ -74,13 +76,13 @@ A missing credential for a feature you turned on is a warning, with the command 
 | The directory exists but is not writable, or the path is not a directory | error |
 | Number, total size and oldest age of the session records in `sessions/` | info |
 | More than 500 session records, or more than 100 MB | warn, with the hint `ultrathink prune --older-than 30 --dry-run` |
-| Session or carrier files that group or others can read | warn, with the fix `chmod -R go-rwx <dir>`. ultrathink writes new files with mode `0600`. |
-| `*.tmp` or `*.lock` files in `sessions/` older than one hour | warn: leftovers of a write that crashed before it finished |
+| Session, carrier, control or last files that group or others can read | warn, with the fix `chmod -R go-rwx <dir>`. ultrathink writes new files with mode `0600`. |
+| `*.tmp` or `*.lock` regular files in the state root or `sessions/` older than one hour | warn: possible write leftovers. Pruning still preserves a strict `last.json` lock whose PID is alive. |
 
 ## What it never does
 
 - It makes no network request and starts neither `gh` nor `curl`. It does not run `gh auth status`, which contacts GitHub. Whether a token works is something only a live probe can tell you (see [What to run next](#what-to-run-next)).
-- It never prints a credential: not the value, not a prefix of it, not its length. Every line of output also passes through the same redaction the other commands use, which masks bearer tokens and JWT-like strings.
+- It never prints a credential: not the value, not a prefix of it, not its length. Effective URL values omit username/password before formatting; every line also passes through shared secret redaction.
 - It never opens a session record. It only looks at their names, sizes, ages and permissions, and it prints none of the names.
 - It never writes or deletes anything and never changes your config.
 

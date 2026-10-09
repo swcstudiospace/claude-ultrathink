@@ -45,6 +45,7 @@ Always `git push` before `review`: it refuses when the local HEAD differs from t
 `review` returns within about 100 seconds (config `waitMs`), well inside a shell tool's default timeout, even though a Greptile review can take several minutes.
 
 - `status: "pending"`: the Greptile review is still running. Run the same command again (optionally wait ~30s first); it resumes the same Greptile run and never starts a duplicate. Pending never counts as a round. Only if a review of one head stays pending past config `reviewTimeoutMs` (20 min) is it recorded as a timed-out round.
+- `status: "unverified"`: Greptile completed, but GitHub review threads could not be verified. Run `review` again to retry that scan. The completed review stays reusable; no review retry or round is consumed, and merging remains refused until verification succeeds.
 - A failed review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or a timed-out one is not a verdict on your code: `next` says `run review again to re-trigger it (retry k of N)`. Run `review` again; it starts a fresh Greptile review of the same head. Config `ship.reviewRetries` (default 3) bounds these re-triggers per head commit; they never count toward `maxRounds`.
 - `ready`: go to step 4.
 - `pr-open` (the review passed: 5/5, no open findings, but the PR is still waiting): go to step 4; `merge` itself waits out pending CI and mergeability not computed yet. For failing CI or merge conflicts, fix them, commit, `git push`, then run `review` again. A waiting round never counts toward `maxRounds`.

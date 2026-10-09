@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { readLast, readSession, withLastLock, writeSession } from "../claude/state.ts";
 import { pruneSessions, pruneSessionsBestEffort } from "./prune.ts";
 
 const DAY = 86_400_000;
@@ -199,6 +200,103 @@ describe("pruneSessions", () => {
 		expect(result.bytes).toBe(8);
 		expect(sessionFiles(state)).toEqual(["young.json.tmp"]);
 		expect(readdirSync(state).sort()).toEqual(["control.json", "sessions", "young.lock"]);
+	});
+
+	for (const dryRun of [true, false]) {
+		test(`preserves an aged live strict-last lock and its counters (${dryRun ? "dry" : "actual"} prune)`, () => {
+			const state = makeState();
+			seed(state, "held", 300);
+			const lastPath = join(state, "last.json");
+			const lockPath = `${lastPath}.lock`;
+			const last = JSON.stringify({ sessionId: "held", at: 1, result: { original: "previous plan" } });
+			const holder = String(process.pid);
+			put(lastPath, last, 300 * DAY);
+			put(lockPath, holder, 3 * HOUR);
+			const lockMtime = statSync(lockPath).mtimeMs;
+
+			const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, dryRun, now });
+
+			expect(result).toEqual({ dryRun, scanned: 5, kept: 1, keptActive: 0, pruned: [], orphans: [], bytes: 0, errors: [] });
+			expect(readFileSync(lastPath, "utf8")).toBe(last);
+			expect(readFileSync(lockPath, "utf8")).toBe(holder);
+			expect(statSync(lockPath).mtimeMs).toBe(lockMtime);
+			expect(sessionFiles(state)).toEqual(["held.json", "held.xml"]);
+		});
+
+		for (const [kind, holder] of [["dead", "2147483647"], ["empty", ""]] as const) {
+			test(`cleans an aged ${kind} strict-last lock (${dryRun ? "dry" : "actual"} prune)`, () => {
+				const state = makeState();
+				const lastPath = join(state, "last.json");
+				const lockPath = `${lastPath}.lock`;
+				const last = '{"sessionId":"previous","result":{}}';
+				put(lastPath, last, 300 * DAY);
+				// Epoch mtime is stale for both the prune clock and the strict-lock clock.
+				put(lockPath, holder, NOW);
+
+				const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, dryRun, now });
+
+				expect(result).toEqual({
+					dryRun, scanned: 2, kept: 0, keptActive: 0, pruned: [],
+					orphans: [{ name: "last.json.lock", bytes: holder.length }], bytes: holder.length, errors: [],
+				});
+				expect(existsSync(lockPath)).toBe(dryRun);
+				if (dryRun) expect(readFileSync(lockPath, "utf8")).toBe(holder);
+				expect(readFileSync(lastPath, "utf8")).toBe(last);
+			});
+		}
+
+		test(`a session writer cannot replace last while an aged holder survives ${dryRun ? "dry" : "actual"} prune`, () => {
+			const state = makeState();
+			const previous = {
+				sessionId: "previous", at: 1,
+				result: { xml: "<X/>", original: "previous plan", root: "X", source: "llm" as const },
+			};
+			const next = { ...previous, sessionId: "next", at: 2 };
+			expect(writeSession(state, previous)).toBeUndefined();
+			const lastPath = join(state, "last.json");
+			const before = readFileSync(lastPath, "utf8");
+
+			expect(withLastLock(lastPath, () => {
+				const seconds = (NOW - 3 * HOUR) / 1000;
+				utimesSync(`${lastPath}.lock`, seconds, seconds);
+				const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, dryRun, now });
+				expect(result.orphans).toEqual([]);
+				expect(result.bytes).toBe(0);
+				expect(writeSession(state, next)).toBeDefined();
+				expect(readSession(state, "next")).toEqual(next);
+				expect(readLast(state)).toEqual(previous);
+				expect(readFileSync(lastPath, "utf8")).toBe(before);
+				expect(readFileSync(`${lastPath}.lock`, "utf8")).toBe(String(process.pid));
+			})).toBe(true);
+			expect(existsSync(`${lastPath}.lock`)).toBe(false);
+			expect(readFileSync(lastPath, "utf8")).toBe(before);
+		});
+	}
+
+	test("generic aged locks keep their existing orphan rules even when their PID is live", () => {
+		const state = makeState();
+		const holder = String(process.pid);
+		put(join(state, "control.json.lock"), holder, 3 * HOUR);
+		put(join(state, "sessions", "last.json.lock"), holder, 3 * HOUR);
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.orphans.map((orphan) => orphan.name)).toEqual(["control.json.lock", "last.json.lock"]);
+		expect(result.bytes).toBe(2 * holder.length);
+		expect(existsSync(join(state, "control.json.lock"))).toBe(false);
+		expect(sessionFiles(state)).toEqual([]);
+	});
+
+	test("never follows or removes a strict-last lock symlink", () => {
+		const state = makeState();
+		const outside = makeState();
+		const target = join(outside, "dead.lock");
+		put(target, "2147483647", 3 * HOUR);
+		symlinkSync(target, join(state, "last.json.lock"));
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.orphans).toEqual([]);
+		expect(result.bytes).toBe(0);
+		expect(result.errors).toEqual([]);
+		expect(existsSync(join(state, "last.json.lock"))).toBe(true);
+		expect(readFileSync(target, "utf8")).toBe("2147483647");
 	});
 
 	test("a missing state directory gives an empty result without an error", () => {

@@ -186,7 +186,7 @@ describe("reviewPr", () => {
 			list_merge_request_comments: () => ({ comments: [] }),
 		});
 		const result = await reviewPr({ client, ...base, ...clock(), reviewThreads: () => ({ ok: false, error }) });
-		expect(result).toMatchObject({ status: "failed", score: null, error, comments: [] });
+		expect(result).toMatchObject({ status: "unverified", score: null, reviewId: "2", error, comments: [] });
 	});
 
 	test("re-triggers when the only review for headSha failed, ignoring it afterwards", async () => {
