@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-/** Real-process RMW fixture; only the delayed worker pauses at the stale-read and rename boundaries. */
+/** Real-process RMW fixture; delayed pauses at the stale snapshot, safe guard release or obsolete unsafe rename. */
 import { mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -47,6 +47,13 @@ mock.module("node:fs", () => ({
 		if (actor === "delayed" && from === lock) {
 			signal("moved");
 			wait("rename-go");
+		}
+	},
+	rmdirSync(path: string): void {
+		nodeFs.rmdirSync(path);
+		if (actor === "delayed" && paused && path === `${lock}.guard`) {
+			signal("recovered");
+			wait("recovered-go");
 		}
 	},
 }));

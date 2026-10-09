@@ -19,6 +19,7 @@ import {
 	updateSession,
 	writeControl,
 	writeSession,
+    withLastLock,
 } from "./state.ts";
 
 const ANSWERS_HOOK = join(import.meta.dir, "..", "..", "hooks", "answers.ts");
@@ -385,6 +386,46 @@ describe("updateSession", () => {
 		).toThrow("bad mutate");
 		expect(existsSync(`${sessionPath(dir, "u1")}.lock`)).toBe(false);
 		expect(readSession(dir, "u1")).toEqual(record);
+	});
+});
+
+describe("strict last-lock completion", () => {
+	test("a completed live writer can be replaced after a competing mutation guard is freed", () => {
+		const dir = tempDir();
+		mkdirSync(dir, { recursive: true });
+		const last = join(dir, "last.json");
+		const guard = `${last}.lock.guard`;
+		const owner = `${process.pid}.${"a".repeat(32)}`;
+		const before: SessionRecord = { sessionId: "before", at: 1, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+		const after: SessionRecord = { ...before, sessionId: "after" };
+		expect(withLastLock(last, () => {
+			writeFileSync(last, JSON.stringify(before));
+			mkdirSync(guard, { mode: 0o700 });
+			writeFileSync(join(guard, owner), "", { mode: 0o600 });
+		})).toBe(true);
+		expect(writeSession(dir, after)).toBeDefined();
+		expect(readSession(dir, "after")).toEqual(after);
+		expect(readLast(dir)).toEqual(before);
+		rmSync(guard, { recursive: true });
+		expect(writeSession(dir, after)).toBeUndefined();
+		expect(readLast(dir)).toEqual(after);
+		expect(existsSync(`${last}.lock`)).toBe(false);
+	});
+
+	test("finishing an old inode cannot release a successor with the same live PID", () => {
+		const dir = tempDir();
+		mkdirSync(dir, { recursive: true });
+		const last = join(dir, "last.json");
+		const lock = `${last}.lock`;
+		const before: SessionRecord = { sessionId: "before", at: 1, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+		expect(withLastLock(last, () => {
+			writeFileSync(last, JSON.stringify(before));
+			rmSync(lock);
+			writeFileSync(lock, String(process.pid), { mode: 0o600 });
+		})).toBe(true);
+		expect(withLastLock(last, () => writeFileSync(last, '{"sessionId":"incorrect"}'))).toBe(false);
+		expect(readLast(dir)).toEqual(before);
+		expect(readFileSync(lock, "utf8")).toBe(String(process.pid));
 	});
 });
 

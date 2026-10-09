@@ -4,7 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
@@ -180,40 +180,54 @@ export function lastLockHeld(lockPath: string): boolean {
  */
 export function withLastLock(lastPath: string, body: () => void): boolean {
 	const lockPath = `${lastPath}.lock`;
-	const pid = String(process.pid);
-	let held = false;
-	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && !held; attempt++) {
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && fd === undefined; attempt++) {
 		try {
-			held = withLockMutation(lockPath, () => {
-				if (lastLockHeld(lockPath)) return false;
+			fd = withLockMutation(lockPath, () => {
+				if (lastLockHeld(lockPath)) return undefined;
 				try {
 					unlinkSync(lockPath);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
-				writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
-				return true;
-			}) === true;
+				const opened = openSync(lockPath, "wx", 0o600);
+				try {
+					writeFileSync(opened, String(process.pid));
+					return opened;
+				} catch (error) {
+					closeSync(opened);
+					unlinkSync(lockPath);
+					throw error;
+				}
+			});
 		} catch {
 			return false;
 		}
-		if (!held) Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
+		if (fd === undefined) Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
 	}
-	if (!held) return false;
+	if (fd === undefined) return false;
+	const ownedFd = fd;
 	try {
 		body();
 		return true;
 	} finally {
-		for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS; attempt++) {
-			try {
-				if (withLockMutation(lockPath, () => {
-					if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
-					return true;
-				})) break;
-			} catch {
-				break;
-			}
-			Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
+		try {
+			// Mark the opened inode complete even if another mutator temporarily owns the pathname.
+			// A live host PID must not keep a finished writer held, and a successor inode is untouched.
+			writeSync(ownedFd, "!", 0, "utf8");
+		} catch {
+			// Still attempt guarded removal when the completion marker could not be written.
+		}
+		try {
+			withLockMutation(lockPath, () => {
+				const owned = fstatSync(ownedFd);
+				const current = statSync(lockPath);
+				if (current.dev === owned.dev && current.ino === owned.ino) unlinkSync(lockPath);
+			});
+		} catch {
+			// The next acquisition or orphan sweep can remove the completed marker under the guard.
+		} finally {
+			try { closeSync(ownedFd); } catch { /* do not replace a body error with a cleanup error */ }
 		}
 	}
 }

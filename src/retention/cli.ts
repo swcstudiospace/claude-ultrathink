@@ -81,7 +81,7 @@ function render(result: PruneResult, days: number, stateDir: string): string {
 		if (result.pruned.length > LISTED_SESSIONS) lines.push(`  and ${result.pruned.length - LISTED_SESSIONS} more`);
 	}
 	lines.push(`Kept ${result.kept} (${plural(result.keptActive, "active ship")})`);
-	lines.push(`${result.dryRun ? "Would remove" : "Removed"} ${plural(result.orphans.length, "leftover temporary or lock file")}`);
+	lines.push(`${result.dryRun ? "Would remove" : "Removed"} ${plural(result.orphans.length, "leftover temporary or lock item")}`);
 	for (const error of result.errors.slice(0, LISTED_ERRORS)) lines.push(`error: ${error}`);
 	if (result.errors.length > LISTED_ERRORS) lines.push(`and ${result.errors.length - LISTED_ERRORS} more errors`);
 	return lines.join("\n");

@@ -376,7 +376,7 @@ Read-modify-write of a session record, `control.json`, ship state, `session mark
 
 Creation, reclamation and release of a lock name share a private `<file>.lock.guard` directory. A prepared nonempty directory claims the guard atomically; each owner has one immutable PID/random entry. Recovery removes only a dead owner's entry; a successor's nonempty directory defeats a delayed removal, and the primary lock is never moved aside or restored over another holder. The guard contains no prompt data and is removed after bookkeeping.
 
-`last.json` uses the same mutation guard but a separate strict PID-lock policy: a live PID stays protected regardless of age, and a busy or unreadable lock refuses the mirror update instead of running unlocked. The session still saves and reports that the last mirror was not refreshed. Pruning rechecks age and ownership under the mutation guard before removing an old lock; do not delete a live lock by hand.
+`last.json` uses the same mutation guard but a separate strict PID-lock policy: an active live PID stays protected regardless of age, and a busy or unreadable lock refuses the mirror update instead of running unlocked. A completed writer marks only its opened lock inode inactive before guarded removal, so temporary guard contention cannot leave a live host PID blocking later plans; inode identity prevents it from touching a successor. The session still saves and reports when the last mirror was not refreshed. Pruning rechecks age and ownership before removing old locks or narrowly recognized dead prepared guard candidates; do not delete a live lock by hand.
 
 Credentials are not in the state directory. They live in the [MCP gateway](#mcp-gateway) store.
 

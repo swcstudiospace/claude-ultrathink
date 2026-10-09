@@ -9,7 +9,7 @@
  */
 import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join } from "node:path";
-import { withFileLock, withLockMutation } from "../claude/atomic.ts";
+import { removeDeadLockCandidate, withFileLock, withLockMutation } from "../claude/atomic.ts";
 import { lastLockHeld, sessionPath } from "../claude/state.ts";
 import { carrierPath } from "../host/carrier.ts";
 
@@ -212,13 +212,24 @@ function removeFile(sweep: Sweep, path: string, name: string): boolean {
 	}
 }
 
-/** Removes hour-old atomic-write leftovers; a held strict-last lock is never an orphan. */
+/** Removes hour-old atomic-write leftovers and dead prepared guard candidates, never a held strict-last lock. */
 function sweepOrphans(sweep: Sweep, dir: string, names: string[], lastLockPath?: string): void {
 	for (const name of names) {
 		if (!name.endsWith(".tmp") && !name.endsWith(".lock")) continue;
 		const path = join(dir, name);
 		const stat = statEntry(sweep, path, name);
-		if (!stat?.isFile() || sweep.now - stat.mtimeMs <= ORPHAN_AGE_MS) continue;
+		if (!stat || sweep.now - stat.mtimeMs <= ORPHAN_AGE_MS) continue;
+		if (stat.isDirectory()) {
+			try {
+				if (!removeDeadLockCandidate(path, sweep.dryRun)) continue;
+				sweep.result.orphans.push({ name, bytes: stat.size });
+				sweep.result.bytes += stat.size;
+			} catch (error) {
+				fail(sweep, name, error);
+			}
+			continue;
+		}
+		if (!stat.isFile()) continue;
 		const remove = (): void => {
 			const current = statEntry(sweep, path, name);
 			if (!current?.isFile() || sweep.now - current.mtimeMs <= ORPHAN_AGE_MS) return;

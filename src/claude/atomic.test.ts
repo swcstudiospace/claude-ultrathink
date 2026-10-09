@@ -324,15 +324,18 @@ describe("concurrent updates through updateSession", () => {
 			await waitFor(["snapshot"]);
 			workers.push(spawn("first"), spawn("second"));
 			await Promise.all([waitFor(["first.attempting"]), waitFor(["second.attempting"])]);
-			// Advance only on real child-process events: force the obsolete snapshot, then observe either
-			// a protected writer or the stolen-name window before releasing the real session mutations.
+			// Observe the obsolete snapshot being applied, not a particular acquisition winner.
+			// The safe path pauses delayed after releasing its guard so a competing writer wins first.
 			await waitFor(["first.entered", "second.entered", "first.guarded", "second.guarded"]);
 			signal("snapshot-go");
-			if (await waitFor(["moved", "delayed.entered"]) === "moved") {
+			if (await waitFor(["moved", "recovered"]) === "moved") {
 				await waitFor(["first.overlap", "second.overlap"]);
+			} else {
+				await waitFor(["first.entered", "second.entered"]);
 			}
 			signal("rename-go");
 			signal("body-go");
+			signal("recovered-go");
 			const exits = await Promise.all(workers.map((worker) => worker.exited));
 			const errors = await Promise.all(workers.map((worker) => new Response(worker.stderr).text()));
 			expect(errors.join("")).toBe("");
@@ -344,6 +347,7 @@ describe("concurrent updates through updateSession", () => {
 			signal("snapshot-go");
 			signal("rename-go");
 			signal("body-go");
+			signal("recovered-go");
 			for (const worker of workers) if (worker.exitCode === null) worker.kill();
 			await Promise.allSettled(workers.map((worker) => worker.exited));
 		}

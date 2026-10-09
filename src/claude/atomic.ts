@@ -8,7 +8,7 @@
  * never block a prompt; a lock that cannot be taken in time degrades to running the callback unlocked.
  */
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /** The synchronous file calls `writeFileAtomic` needs, so a test can make one of them fail. */
@@ -110,20 +110,48 @@ function discardGuard(path: string, owner: string): void {
 	}
 }
 
+const GUARD_OWNER = /^[1-9]\d*\.[a-f0-9]{32}$/;
+
+function deadGuardOwner(owner: string): boolean {
+	if (!GUARD_OWNER.test(owner)) return false;
+	try {
+		process.kill(Number.parseInt(owner, 10), 0);
+		return false;
+	} catch (error) {
+		return errorCode(error) === "ESRCH";
+	}
+}
+
 function reclaimDeadGuard(path: string): void {
 	try {
 		const owners = readdirSync(path);
 		const owner = owners[0];
-		if (owners.length !== 1 || !owner || !/^[1-9]\d*\.[a-f0-9]{32}$/.test(owner)) return;
-		try {
-			process.kill(Number(owner.split(".")[0]), 0);
-			return;
-		} catch (error) {
-			if (errorCode(error) !== "ESRCH") return;
-		}
+		if (owners.length !== 1 || !owner || !deadGuardOwner(owner)) return;
 		discardGuard(path, owner);
 	} catch {
 		// An unverifiable owner remains held.
+	}
+}
+
+/** Removes only a prepared guard candidate whose immutable named owner is dead; a dry run changes nothing. */
+export function removeDeadLockCandidate(path: string, dryRun = false): boolean {
+	const owner = basename(path).match(/\.lock\.guard\.([1-9]\d*\.[a-f0-9]{32})\.tmp$/)?.[1];
+	if (!owner || !deadGuardOwner(owner)) return false;
+	try {
+		if (!lstatSync(path).isDirectory()) return false;
+		const entries = readdirSync(path);
+		if (entries.length > 1 || (entries.length === 1 && entries[0] !== owner)) return false;
+		if (entries.length === 1) {
+			const marker = lstatSync(join(path, owner));
+			if (!marker.isFile() || marker.size !== 0) return false;
+		}
+		if (dryRun) return true;
+		if (entries.length === 1) unlinkSync(join(path, owner));
+		rmdirSync(path);
+		return true;
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return false;
+		throw error;
 	}
 }
 
@@ -167,7 +195,7 @@ export function withLockMutation<T>(lockPath: string, fn: () => T): T | undefine
 		if (claimed) discardGuard(guard, owner);
 		else if (prepared) {
 			try { unlinkSync(join(candidate, owner)); } catch { /* preparation may not have reached the file */ }
-			try { rmdirSync(candidate); } catch { /* an unremovable private candidate is harmless */ }
+			try { rmdirSync(candidate); } catch { /* orphan pruning can reclaim the dead owner's prepared candidate */ }
 		}
 	}
 }

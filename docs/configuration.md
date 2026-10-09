@@ -429,9 +429,9 @@ What a prune never removes:
 
 - A session whose ship has a pull request that is neither merged nor blocked.
 - The session `last.json` names and the session the plan carrier (`last-plan.json`) points to.
-- Symlinks, and anything that is not a `sessions/<id>.json` or `sessions/<id>.xml` file, so Teachable Moments lessons under `teach/` are never touched.
+- Symlinks or Teachable Moments lessons under `teach/`. Session deletion only selects `sessions/<id>.json` and `sessions/<id>.xml`; narrowly recognized write/lock leftovers have the separate orphan rules below.
 
-A prune also removes regular `*.tmp` and `*.lock` files older than one hour in `sessions/` or directly in the state directory. Lock deletion shares the writer's mutation guard and rechecks age before removal; a busy guard is skipped, and a strict `last.json` lock whose PID is alive is never an orphan. Dry runs take no mutation guard and change nothing.
+A prune also removes regular `*.tmp` and `*.lock` files older than one hour in `sessions/` or directly in the state directory. Lock deletion shares the writer's mutation guard and rechecks age before removal; a busy guard is skipped, and an active strict `last.json` lock whose PID is alive is never an orphan. Prepared `*.lock.guard.<pid>.<32-hex-nonce>.tmp` directories are removed only when their named PID is dead and they are empty or contain exactly their own empty owner marker; live owners and unrelated contents are preserved. Dry runs take no mutation guard and change nothing.
 
 `prune` works on the current host's state directory. To prune another host's, set `ULTRATHINK_HOST=<host>`, for example `ULTRATHINK_HOST=omp bin/ultrathink prune --older-than 30 --dry-run`. The output lists session ids, sizes and ages, never prompt text.
 

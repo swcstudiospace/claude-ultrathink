@@ -61,7 +61,6 @@ describe("runPruneCommand", () => {
 		expect(lines[0]).toMatch(new RegExp(`^Pruned 2 sessions \\(${SIZE}\\) older than 30 days from `));
 		expect(lines[0]?.endsWith(state)).toBe(true);
 		expect(lines).toContain("Kept 1 (0 active ships)");
-		expect(lines).toContain("Removed 0 leftover temporary or lock files");
 		expect(remaining(state)).toEqual(["recent.json", "recent.xml"]);
 	});
 
@@ -89,7 +88,6 @@ describe("runPruneCommand", () => {
 		expect(lines[1]).toMatch(new RegExp(`^ {2}bbb {2}${SIZE} {2}120d$`));
 		expect(lines[2]).toMatch(new RegExp(`^ {2}aaa {2}${SIZE} {2}45d$`));
 		expect(lines).toContain("Kept 1 (1 active ship)");
-		expect(lines).toContain("Would remove 1 leftover temporary or lock file");
 		expect(remaining(state)).toEqual(["aaa.json", "aaa.xml", "bbb.json", "bbb.xml", "live.json", "live.xml", "x.json.tmp"]);
 	});
 

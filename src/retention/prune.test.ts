@@ -203,6 +203,46 @@ describe("pruneSessions", () => {
 	});
 
 	for (const dryRun of [true, false]) {
+		test(`reclaims only dead prepared mutation guards (${dryRun ? "dry" : "actual"} prune)`, () => {
+			const state = makeState();
+			const create = (name: string, owner: string | undefined, age: number, extra?: string): string => {
+				const path = join(state, name);
+				mkdirSync(path, { mode: 0o700 });
+				if (owner) writeFileSync(join(path, owner), "", { mode: 0o600 });
+				if (extra) writeFileSync(join(path, extra), "keep");
+				const seconds = (NOW - age) / 1000;
+				utimesSync(path, seconds, seconds);
+				return path;
+			};
+			const dead = `2147483647.${"a".repeat(32)}`;
+			const live = `${process.pid}.${"b".repeat(32)}`;
+			const old = create(`state.json.lock.guard.${dead}.tmp`, dead, 2 * HOUR);
+			const empty = create(`last.json.lock.guard.${dead}.tmp`, undefined, 2 * HOUR);
+			const held = create(`control.json.lock.guard.${live}.tmp`, live, 2 * HOUR);
+			const young = create(`young.json.lock.guard.${dead}.tmp`, dead, HOUR / 2);
+			const foreign = create(`foreign.json.lock.guard.${dead}.tmp`, live, 2 * HOUR);
+			const extra = create(`extra.json.lock.guard.${dead}.tmp`, dead, 2 * HOUR, "unrelated");
+			const unrelated = create("unrelated.tmp", undefined, 2 * HOUR);
+			const outside = makeState();
+			const linkedName = `linked.json.lock.guard.${dead}.tmp`;
+			symlinkSync(outside, join(state, linkedName));
+			const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, dryRun, now });
+			expect(result.orphans.map((orphan) => orphan.name).sort()).toEqual([`last.json.lock.guard.${dead}.tmp`, `state.json.lock.guard.${dead}.tmp`]);
+			expect(result.errors).toEqual([]);
+			expect(existsSync(old)).toBe(dryRun);
+			expect(existsSync(empty)).toBe(dryRun);
+			if (dryRun) expect(readFileSync(join(old, dead), "utf8")).toBe("");
+			expect(readFileSync(join(held, live), "utf8")).toBe("");
+			expect(readFileSync(join(young, dead), "utf8")).toBe("");
+			expect(readFileSync(join(foreign, live), "utf8")).toBe("");
+			expect(readFileSync(join(extra, "unrelated"), "utf8")).toBe("keep");
+			expect(readdirSync(unrelated)).toEqual([]);
+			expect(statSync(join(state, linkedName)).isDirectory()).toBe(true);
+			expect(readdirSync(outside)).toEqual([]);
+		});
+	}
+
+	for (const dryRun of [true, false]) {
 		test(`preserves an aged live strict-last lock and its counters (${dryRun ? "dry" : "actual"} prune)`, () => {
 			const state = makeState();
 			seed(state, "held", 300);
