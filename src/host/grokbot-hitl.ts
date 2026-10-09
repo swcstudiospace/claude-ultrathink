@@ -6,7 +6,7 @@
  * folded into the session's clarifications and the saved spec XML with the plugin's own `applyAnswers` and
  * `injectClarificationsXml`, so `ctl hitl last`, `summary` and `prompts build` all see "answered: …" instead of the default.
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { applyAnswers } from "../hitl/answers.ts";
@@ -65,11 +65,18 @@ export function recordAnswers(statePath: string, input: AnswersInput, now = Date
 export function mirrorLast(statePath: string, record: SessionRecord): void {
 	const lastPath = join(dirname(dirname(statePath)), "last.json");
 	if (!existsSync(lastPath)) return;
+	const tmp = `${lastPath}.tmp`;
 	try {
 		const last = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
 		if (last.sessionId !== record.sessionId) return;
-		writeFileSync(`${lastPath}.tmp`, `${JSON.stringify(record, null, "\t")}\n`);
-		renameSync(`${lastPath}.tmp`, lastPath);
+		writeFileSync(tmp, `${JSON.stringify(record, null, "\t")}\n`);
+		// Another session may have replaced last.json while this one was writing. Check again immediately before the rename.
+		const again = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
+		if (again.sessionId !== record.sessionId) {
+			unlinkSync(tmp);
+			return;
+		}
+		renameSync(tmp, lastPath);
 	} catch {
 		// an unreadable last.json stays as it is
 	}

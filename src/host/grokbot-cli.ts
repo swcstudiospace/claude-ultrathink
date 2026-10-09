@@ -320,7 +320,10 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			if (sub === "payloads") {
 				const config = loadConfig(claudeConfigPaths(cwd));
 				if (trackingOff(config, readControl(stateDir))) {
-					return { code: 0, text: json({ graphId: record.plan?.graphId, calls: [], counts: { linearIssues: 0, linearSubIssues: 0, notionTask: 0, notionIssues: 0, notionSubIssues: 0 }, tracking: "off" }) };
+					const empty = { graphId: record.plan?.graphId, calls: [] as unknown[], counts: { linearIssues: 0, linearSubIssues: 0, notionTask: 0, notionIssues: 0, notionSubIssues: 0 }, tracking: "off" as const };
+					const out = flag(rest, "--out");
+					if (out) writeFileSync(out, `${json(empty)}\n`);
+					return { code: 0, text: out ? json({ out, counts: empty.counts, calls: 0, graphId: empty.graphId, tracking: "off" }) : json(empty) };
 				}
 				const payloads = await buildTrackPayloads(record, {
 					linearTeam: config.linear.team,

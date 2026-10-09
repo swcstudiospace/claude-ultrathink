@@ -330,6 +330,11 @@ describe("grok-bot track bridge", () => {
 		expect(off.code).toBe(0);
 		expect(off.text).toContain('"tracking": "off"');
 		expect(off.text).toContain('"calls": []');
+		const stale = join(root, "payloads.json");
+		writeFileSync(stale, '{"calls":[{"tool":"save_issue"}]}\n');
+		const replaced = await main(["track", "payloads", "--session", "s1", "--cwd", root, "--out", stale], env);
+		expect(replaced.code).toBe(0);
+		expect(JSON.parse(readFileSync(stale, "utf8")).calls).toEqual([]);
 		mkdirSync(join(root, "xdg", "ultrathink"), { recursive: true });
 		writeFileSync(join(root, "xdg", "ultrathink", "config.json"), JSON.stringify({ linear: { team: "Team" }, notion: { dataSourceUrl: "collection://abc" } }));
 		writeControl(stateDir, { trackEnabled: false });
@@ -623,6 +628,18 @@ describe("grok-bot teach digest and host", () => {
 		const mixed = grokbotDigest(src, { sessionId: "s3", cwd: root });
 		expect(mixed?.toolCalls).toBeGreaterThanOrEqual(1);
 		expect(mixed?.turns.some((turn) => turn.role === "user" && turn.text === "Keep the user line.")).toBe(true);
+		writeFileSync(src, [
+			JSON.stringify({ type: "user", message: { role: "user", content: "Fix the fetch." } }),
+			JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "Shell", input: { command: "bun test" } }] } }),
+			JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "1 fail", is_error: true }] } }),
+			JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "do not do that, do this instead" } }),
+			JSON.stringify({ type: "user", message: { role: "user", content: "[Request interrupted by user]" } }),
+		].join("\n"));
+		const claude = grokbotDigest(src, { sessionId: "s4", cwd: root, now: () => 0 });
+		expect(claude?.outcome).toBe("interrupted");
+		expect(claude?.turns.some((turn) => turn.role === "tool" && turn.tool === "Shell" && turn.isError === true)).toBe(true);
+		expect(claude?.turns.some((turn) => turn.text.includes("do not") || turn.text.includes("interrupted"))).toBe(false);
+		expect(grokbotDigest(src, { sessionId: "s4", cwd: root, outcome: "completed", now: () => 0 })?.outcome).toBe("completed");
 	});
 
 	test("teach captures are host grok-bot", async () => {
