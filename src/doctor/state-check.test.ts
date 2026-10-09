@@ -113,6 +113,23 @@ describe("checkState", () => {
 		expect(findings.filter((finding) => finding.id === "state.sessions")).toHaveLength(1);
 	});
 
+	test("a dangling symlinked sessions directory is an error with no healthy summary", () => {
+		mkdirSync(stateDir);
+		const target = join(dir, "real-sessions");
+		mkdirSync(target);
+		const sessionsDir = join(stateDir, "sessions");
+		symlinkSync(target, sessionsDir);
+		rmSync(target, { recursive: true, force: true });
+		const findings = checkState(deps);
+		expect(byId(findings, "state.dir")).toMatchObject({ level: "ok" });
+		const finding = byId(findings, "state.sessions");
+		expect(finding).toMatchObject({ level: "error", section: "state" });
+		expect(finding.title).toContain(sessionsDir);
+		expect(finding.title.toLowerCase()).toContain("symlink");
+		expect(finding.fix).toContain(sessionsDir);
+		expect(findings.filter((found) => found.id === "state.sessions")).toHaveLength(1);
+	});
+
 	test.skipIf(RUNNING_AS_ROOT)("a sessions directory the user cannot write to is an error", () => {
 		const sessionsDir = join(stateDir, "sessions");
 		mkdirSync(sessionsDir, { recursive: true });

@@ -94,8 +94,18 @@ export function checkState(deps: DoctorDeps): Finding[] {
 	const sessionsDir = join(dir, "sessions");
 	let names: string[] = [];
 	let sessionsUsable = true;
-	const sessionsStat = statFollowOrUndefined(sessionsDir);
-	if (sessionsStat !== undefined) {
+	const sessionsEntry = statOrUndefined(sessionsDir);
+	const sessionsStat = sessionsEntry === undefined ? undefined : statFollowOrUndefined(sessionsDir);
+	if (sessionsStat === undefined && sessionsEntry?.isSymbolicLink()) {
+		add({
+			id: "state.sessions",
+			level: "error",
+			title: `Sessions directory is a broken symlink: ${sessionsDir}`,
+			detail: "No session record can be saved.",
+			fix: `Remove ${sessionsDir} or point it at an existing directory.`,
+		});
+		sessionsUsable = false;
+	} else if (sessionsStat !== undefined) {
 		if (!sessionsStat.isDirectory()) {
 			add({
 				id: "state.sessions",
