@@ -153,9 +153,10 @@ export function savePlanRecord(
 	sessionId: string,
 	record: SessionRecord,
 	log: (message: string) => void = () => {},
-): { record: SessionRecord; specPath: string; statePath: string } {
+): { record: SessionRecord; specPath: string; statePath: string; lastNote?: string } {
 	const statePath = sessionPath(stateDir, sessionId);
 	const specPath = specFile(stateDir, sessionId);
+	let lastNote: string | undefined;
 	const saved = withFileLock(
 		statePath,
 		() => {
@@ -180,12 +181,13 @@ export function savePlanRecord(
 				}
 			}
 			writeFileAtomic(specPath, `${merged.result.xml}\n`);
-			writeSession(stateDir, merged);
+			lastNote = writeSession(stateDir, merged);
+			if (lastNote) log(lastNote);
 			return merged;
 		},
 		{ log },
 	);
-	return { record: saved, specPath, statePath };
+	return { record: saved, specPath, statePath, lastNote };
 }
 
 /**
@@ -286,7 +288,7 @@ function startRecall(
 				env: input.env,
 				sessionId: input.sessionId,
 				stateDir: deps.stateDir,
-				config: { teach, hindsight: deps.config.hindsight },
+				config: { teach, hindsight: deps.config.hindsight, gateway: deps.config.gateway },
 				signal: arg.signal,
 				now: input.now,
 				log: input.log,
@@ -311,7 +313,14 @@ function startGround(deps: HookDeps, input: LookupInput): Promise<GroundOutcome>
 	const run =
 		seam ??
 		(async (arg: { query: string; signal: AbortSignal }): Promise<GroundOutcome> => {
-			return groundDocs({ query: arg.query, config: ragflow, env: input.env, signal: arg.signal, now: input.now });
+			return groundDocs({
+				query: arg.query,
+				config: ragflow,
+				gateway: deps.config.gateway,
+				env: input.env,
+				signal: arg.signal,
+				now: input.now,
+			});
 		});
 	return bounded(
 		(signal) => run({ query: input.query, signal }),
@@ -339,7 +348,7 @@ function startSkills(
 				env: input.env,
 				sessionId: input.sessionId,
 				stateDir: deps.stateDir,
-				config: { teach, hindsight: deps.config.hindsight },
+				config: { teach, hindsight: deps.config.hindsight, gateway: deps.config.gateway },
 				signal: arg.signal,
 				now: input.now,
 				log: input.log,
@@ -382,7 +391,11 @@ async function announcePlan(
 		const env = deps.decisionsDeps?.env ?? process.env;
 		const send =
 			deps.emit ??
-			((event: EmitInput, signal?: AbortSignal) => emitEvent(event, env, deps.config.substrate.url, signal));
+			((event: EmitInput, signal?: AbortSignal) =>
+				emitEvent(event, env, deps.config.substrate.url, signal, {
+					backend: deps.config.substrate.backend,
+					gateway: deps.config.gateway,
+				}));
 		await send(
 			{
 				kind: "note",
@@ -514,7 +527,13 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// planned knowing what other agents already did, and the round trip
 		// overlaps the uplift call instead of adding to it.
 		stage("brief", "start");
-		const fetchSessionBrief = deps.brief ?? ((brief) => fetchBrief(brief, process.env, deps.config.substrate.url));
+		const fetchSessionBrief =
+			deps.brief ??
+			((brief) =>
+				fetchBrief(brief, process.env, deps.config.substrate.url, {
+					backend: deps.config.substrate.backend,
+					gateway: deps.config.gateway,
+				}));
 		const briefPromise = fetchSessionBrief({
 			repo: git.repo,
 			branch: git.branch,
@@ -772,31 +791,33 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
+		let lastNote: string | undefined;
 		// No spec or session write for a cancelled flight.
 		throwIfCancelled(cancellation);
 		stage("state", "start");
 		try {
-		// The JSON and XML saves share the session lock with the answers/ship/mark
-		// updates, so neither side can overwrite the other with stale content.
-		const saved = savePlanRecord(deps.stateDir, sessionId, record, log);
-		record = saved.record;
-		// A late answer merged at save time must reach the agent: `record` alone is
-		// not enough, since `result`/`clarifications` below still hold the stale
-		// pre-save values. Refresh the derived locals, keeping reference equality
-		// when the merge changed nothing.
-	if (saved.record.clarifications !== undefined && saved.record.clarifications !== clarifications) clarifications = saved.record.clarifications;
-		if (saved.record.result.xml !== result.xml) result = { ...result, xml: saved.record.result.xml };
-		specPath = saved.specPath;
-		statePath = saved.statePath;
-		stage("state", "end", true);
-	} catch (error) {
-		log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
-		specPath = undefined;
-		statePath = undefined;
-		stage("state", "end", false);
-	}
-		// Opt-in retention (state.retentionDays above 0): at most one bounded sweep a day. It never throws and never waits.
-		pruneSessionsBestEffort({ stateDir: deps.stateDir, retentionDays: deps.config.state.retentionDays, log });
+			// The JSON and XML saves share the session lock with the answers/ship/mark
+			// updates, so neither side can overwrite the other with stale content.
+			const saved = savePlanRecord(deps.stateDir, sessionId, record, log);
+			record = saved.record;
+			// A late answer merged at save time must reach the agent: `record` alone is
+			// not enough, since `result`/`clarifications` below still hold the stale
+			// pre-save values. Refresh the derived locals, keeping reference equality
+			// when the merge changed nothing.
+			if (saved.record.clarifications !== undefined && saved.record.clarifications !== clarifications) clarifications = saved.record.clarifications;
+			if (saved.record.result.xml !== result.xml) result = { ...result, xml: saved.record.result.xml };
+			specPath = saved.specPath;
+			statePath = saved.statePath;
+			lastNote = saved.lastNote;
+			stage("state", "end", true);
+		} catch (error) {
+			log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
+			specPath = undefined;
+			statePath = undefined;
+			stage("state", "end", false);
+		}
+			// Opt-in retention (state.retentionDays above 0): at most one bounded sweep a day. It never throws and never waits.
+			pruneSessionsBestEffort({ stateDir: deps.stateDir, retentionDays: deps.config.state.retentionDays, log });
 
 		const providers = { linear: deps.config.linear.team.trim() !== "", notion: deps.config.notion.dataSourceUrl.trim() !== "" };
 		const output: HookOutput = {
@@ -813,6 +834,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					brief,
 					statePath,
 					specPath,
+					...(lastNote ? { lastNote } : {}),
 					plan,
 					tracking,
 					trackCommand: deps.trackCommand,

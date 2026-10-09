@@ -18,7 +18,19 @@
  * installed, the user's prompt proceeds exactly as it did before.
  */
 
+import { gatewayBrief, gatewayEmit } from "../gateway/substrate.ts";
+import { resolveGateway, serviceBackend } from "../gateway/settings.ts";
+import { SUBSTRATE_BACKEND_ENV, type GatewayConfig } from "../gateway/types.ts";
+
 const DEFAULT_TIMEOUT_MS = 1500;
+
+/** Passed by callers that have the merged config. Absent keeps the direct substrate client. */
+export interface SubstrateGatewayBinding {
+	backend?: "direct" | "gateway";
+	gateway: GatewayConfig;
+	storePath?: string;
+	fetch?: typeof fetch;
+}
 
 export interface BriefInput {
 	repo?: string;
@@ -70,7 +82,14 @@ export async function fetchBrief(
 	input: BriefInput,
 	env: Record<string, string | undefined> = process.env,
 	url = "",
+	binding?: SubstrateGatewayBinding,
 ): Promise<string> {
+	if (binding && serviceBackend(binding.backend, env, SUBSTRATE_BACKEND_ENV) === "gateway") {
+		if (env.SUBSTRATE_DISABLED === "1") return "";
+		const resolved = resolveGateway(binding.gateway, env, { storePath: binding.storePath });
+		if (!resolved.ok) return "";
+		return gatewayBrief(resolved.gateway, input, binding.fetch);
+	}
 	const target = resolveSubstrate(env, url);
 	if (!target) return "";
 	// A cancelled caller sends nothing; the brief is optional, so cancellation reads as "no brief".
@@ -117,7 +136,14 @@ export async function emitEvent(
 	env: Record<string, string | undefined> = process.env,
 	url = "",
 	signal?: AbortSignal,
+	binding?: SubstrateGatewayBinding,
 ): Promise<boolean> {
+	if (binding && serviceBackend(binding.backend, env, SUBSTRATE_BACKEND_ENV) === "gateway") {
+		if (env.SUBSTRATE_DISABLED === "1") return false;
+		const resolved = resolveGateway(binding.gateway, env, { storePath: binding.storePath });
+		if (!resolved.ok) return false;
+		return gatewayEmit(resolved.gateway, input, binding.fetch, signal);
+	}
 	const target = resolveSubstrate(env, url);
 	if (!target || signal?.aborted) return false;
 	try {

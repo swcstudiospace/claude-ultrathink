@@ -268,7 +268,7 @@ describe("descriptor negative vectors", () => {
 		[
 			"a Grok Bot delivery that is not the skill protocol",
 			(d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { delivery: "hook-additional-context" }),
-			'shape: /externalIntegrations/grok-bot/delivery must be "skill-protocol"',
+			'shape: /externalIntegrations/grok-bot/delivery must be "skill-protocol-cli"',
 		],
 		[
 			"Grok Bot compatibilityVerified true",
@@ -284,7 +284,7 @@ describe("descriptor negative vectors", () => {
 		[
 			"a Grok Bot contract claimed as settled",
 			(d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { status: "compatible" }),
-			'shape: /externalIntegrations/grok-bot/status must be "skill-adapter"',
+			'shape: /externalIntegrations/grok-bot/status must be "native-adapter"',
 		],
 		[
 			"an invented GPT Dot identity",
@@ -491,7 +491,7 @@ describe("schema negative vectors", () => {
 		[
 			"Grok Bot left on the pending contract",
 			(s) => Object.assign(node(s, "properties", "externalIntegrations", "properties", "grok-bot", "properties", "status"), { const: "pending-contract" }),
-			'schema: /properties/externalIntegrations/properties/grok-bot/properties/status/const must be "skill-adapter"',
+			'schema: /properties/externalIntegrations/properties/grok-bot/properties/status/const must be "native-adapter"',
 		],
 		[
 			"GPT Dot allowed verified compatibility",

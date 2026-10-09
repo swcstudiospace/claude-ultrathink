@@ -219,7 +219,8 @@ export async function planPrompt(
 				stateDir,
 				surface: host,
 				conversation: recentConversationFromTranscript,
-				brief: (input) => fetchBrief(input, env, config.substrate.url),
+				brief: (input) =>
+					fetchBrief(input, env, config.substrate.url, { backend: config.substrate.backend, gateway: config.gateway }),
 				// On Hermes the kickoff skill creates rows through `track complete`, so an abandoned or killed hook never leaves orphan rows.
 				track:
 					host !== "hermes" && trackingEnabled(config, control, env)

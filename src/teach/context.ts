@@ -6,6 +6,7 @@
  * ultrathink reads, so a project file can switch the feature off but never on.
  */
 import { claudeConfigPaths, loadConfig } from "../config.ts";
+import { DEFAULT_GATEWAY_CONFIG } from "../gateway/types.ts";
 import { type DecisionOutcome, type Decisions, createDecisions } from "../decisions/gate.ts";
 import type { DecisionStates } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG, type DecisionAction, type DecisionPoint, formatP } from "../decisions/types.ts";
@@ -35,12 +36,13 @@ export interface TeachContextOptions {
 function loadTeachConfig(cwd: string, env: NodeJS.ProcessEnv): TeachContext["config"] {
 	try {
 		const config = loadConfig(claudeConfigPaths(cwd, env));
-		return { teach: config.teach, hindsight: config.hindsight, decisions: config.decisions };
+		return { teach: config.teach, hindsight: config.hindsight, decisions: config.decisions, gateway: config.gateway };
 	} catch {
 		return {
 			teach: { ...DEFAULT_TEACH_CONFIG },
 			hindsight: { ...DEFAULT_HINDSIGHT_CONFIG },
 			decisions: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
+			gateway: { ...DEFAULT_GATEWAY_CONFIG },
 		};
 	}
 }
@@ -96,6 +98,7 @@ export function hindsightFor(ctx: TeachContext, options: { timeoutMs?: number; s
 			storePath: ctx.storePath,
 			fetch: ctx.fetch,
 			signal: options.signal ?? ctx.signal,
+			gateway: ctx.config.gateway,
 		});
 		if (readiness.state === "ready" && client) return { client };
 		if (readiness.state === "off") return { reason: `hindsight is off (${readiness.reason})` };

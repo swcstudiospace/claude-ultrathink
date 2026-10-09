@@ -47,7 +47,7 @@ const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const SCHEMA_POINTER = `./${SCHEMA_FILE}`;
 const SCHEMA_VERSION = "1.0.0";
 const DESCRIPTION =
-	"claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Adapters are listed from repository sources. Grok Bot is a skill-protocol adapter: it does not run the engine and has no prompt hook; compatibility is not verified. GPT Dot remains pending and unverified.";
+	"claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Adapters are listed from repository sources. Grok Bot is a native host: bin/ultrathink-grokbot runs the engine, the bot answers its prompts and skills replace the prompt hook; compatibility is not verified. GPT Dot remains pending and unverified.";
 const ROOT_KEYS = ["$schema", "schemaVersion", "identity", "description", "capabilities", "hosts", "interfaces", "externalIntegrations"];
 const IDENTITY = {
 	repository: "claude-ultrathink",
@@ -94,22 +94,22 @@ const TRACKER_MCP = { transport: "mcp-stdio-relay", entrypoint: "bin/ultrathink-
 const EXTERNAL: Record<string, Record<string, Literal>> = {
 	"grok-bot": {
 		identity: "documented-product",
-		status: "skill-adapter",
+		status: "native-adapter",
 		adapterPresent: true,
 		compatibilityVerified: false,
-		delivery: "skill-protocol",
+		delivery: "skill-protocol-cli",
 	},
 	"gpt-dot": { identity: "unverified", status: "pending-identity-and-contract", adapterPresent: false, compatibilityVerified: false },
 };
 const GROK_BOT_ENTRYPOINTS = [
+	"bin/ultrathink-grokbot",
+	"src/host/grokbot-cli.ts",
 	"hosts/grok-bot/README.md",
-	"hosts/grok-bot/ultrathink-protocol/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-off/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-on/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-quick/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-skip/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-status/SKILL.md",
-	"hosts/grok-bot/commands/ultrathink-track/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-protocol/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-plan/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-kickoff/SKILL.md",
+	"hosts/grok-bot/skills/ultrathink-sync/SKILL.md",
+	"docs/how-to/use-with-grok-bot.md",
 ];
 /** Every distinct path the approved descriptor declares: host entrypoints, then the interface paths. */
 const NORMATIVE_PATHS = [

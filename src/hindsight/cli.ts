@@ -8,6 +8,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
+import type { GatewayConfig } from "../gateway/types.ts";
 import type { CliResult } from "../teach/types.ts";
 import { storePath as defaultStorePath } from "../mcp/store.ts";
 import { createHindsightClient, redactMessage } from "./client.ts";
@@ -22,6 +23,8 @@ export interface CommandDeps {
 	fetch?: typeof fetch;
 	/** The `hindsight` config section; tests pass it, otherwise it is loaded like the other commands do. */
 	config?: HindsightConfig;
+	/** Desk gateway section. Loaded with `config` when omitted. */
+	gateway?: GatewayConfig;
 	stdin?: () => Promise<string>;
 	now?: () => number;
 }
@@ -111,10 +114,10 @@ async function check(config: HindsightConfig, flags: { roundtrip: boolean; json:
 	const env = deps.env ?? process.env;
 	const storePath = deps.storePath ?? defaultStorePath(env);
 	const now = deps.now ?? Date.now;
-	const resolution = resolveHindsight(config, env, { storePath, fetch: deps.fetch });
+	const resolution = resolveHindsight(config, env, { storePath, fetch: deps.fetch, gateway: deps.gateway });
 	const { readiness } = resolution;
 	if (readiness.state !== "ready" || !resolution.client) {
-		const reason = hindsightStatusLine(config, env, storePath).replace(/^Hindsight: /, "");
+		const reason = hindsightStatusLine(config, env, storePath, deps.gateway).replace(/^Hindsight: /, "");
 		return flags.json
 			? { code: 1, text: JSON.stringify({ ok: false, state: readiness.state, reason }) }
 			: { code: 1, text: `Hindsight check: ${reason}` };
@@ -138,7 +141,7 @@ async function check(config: HindsightConfig, flags: { roundtrip: boolean; json:
 	}
 	const { apiVersion, features } = health.value;
 	let smoke: { bank: string; steps: Step[] } | undefined;
-	if (flags.roundtrip) {
+	if (flags.roundtrip && !("backend" in readiness)) {
 		const key = resolveHindsightKey(storePath, env);
 		if (key) smoke = await roundtrip(config, readiness.url, key.key, deps, now);
 	}
@@ -181,8 +184,10 @@ export async function runHindsightCommand(argv: string[], deps: CommandDeps): Pr
 			else return { code: 2, text: USAGE };
 		}
 		const env = deps.env ?? process.env;
-		const config = deps.config ?? loadConfig(claudeConfigPaths(deps.cwd, env)).hindsight;
-		return await check(config, flags, deps);
+		const loaded = deps.config && deps.gateway ? undefined : loadConfig(claudeConfigPaths(deps.cwd, env));
+		const config = deps.config ?? loaded?.hindsight;
+		if (!config) return { code: 1, text: "Hindsight: config unavailable" };
+		return await check(config, flags, { ...deps, gateway: deps.gateway ?? loaded?.gateway });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return { code: 1, text: `Hindsight: ${redactMessage(message)}` };

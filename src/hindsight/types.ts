@@ -21,6 +21,11 @@ export interface HindsightConfig {
 	timeoutMs: number;
 	/** Budget (ms) for one retain. */
 	retainTimeoutMs: number;
+	/**
+	 * Absent or `"direct"` uses the Hindsight API and its key. `"gateway"` calls the desk gateway
+	 * and does not read a Hindsight key. A project file cannot set this.
+	 */
+	backend?: "direct" | "gateway";
 }
 
 export const DEFAULT_HINDSIGHT_CONFIG: HindsightConfig = {
@@ -157,8 +162,9 @@ export type HindsightKeySource = "store" | (typeof HINDSIGHT_KEY_ENVS)[number];
 
 export type HindsightReadiness =
 	| { state: "ready"; url: string; bank: string; keySource: HindsightKeySource }
+	| { state: "ready"; backend: "gateway"; url: string; bank: string; seat: string; tokenSource: "store" | "DESK_GATEWAY_TOKEN" }
 	| { state: "off"; reason: "disabled" | "killed" }
-	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key"; detail?: string };
+	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key" | "no-token"; detail?: string };
 
 export interface HindsightResolution {
 	readiness: HindsightReadiness;

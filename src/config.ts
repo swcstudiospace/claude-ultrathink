@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_GATEWAY_CONFIG, SEAT_PATTERN, type GatewayConfig } from "./gateway/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG, type HindsightConfig } from "./hindsight/types.ts";
 import { DEFAULT_RAGFLOW_CONFIG, type RagflowConfig } from "./ragflow/types.ts";
 import { DECISION_POINTS, DECISIONS_PROVIDERS, DEFAULT_DECISIONS_CONFIG, type DecisionPoint, type DecisionsConfig, type DecisionsProvider } from "./decisions/types.ts";
@@ -88,6 +89,11 @@ export const DEFAULT_TRACK_CONFIG: TrackConfig = {
 export interface SubstrateConfig {
 	/** Agent Substrate service base URL (`POST <url>/brief`); "" = never contacted. `SUBSTRATE_URL` overrides it. */
 	url: string;
+	/**
+	 * Absent or `"direct"` uses `POST /brief` and `POST /events`. `"gateway"` calls the desk gateway
+	 * and does not need `url`. A project file cannot set this.
+	 */
+	backend?: "direct" | "gateway";
 }
 
 export const DEFAULT_SUBSTRATE_CONFIG: SubstrateConfig = {
@@ -142,6 +148,8 @@ export interface UltrathinkConfig {
 	hindsight: HindsightConfig;
 	/** RAGFlow document search (planner grounding). Opt-in; a project file can only turn it off. */
 	ragflow: RagflowConfig;
+	/** Desk gateway used when an integration's backend is `gateway`. A project file cannot set it. */
+	gateway: GatewayConfig;
 	/** Teachable Moments capture, recall and promotion. Opt-in; a project file can only lower it. */
 	teach: TeachConfig;
 	/** On-disk session state. Opt-in retention; a project file can never set it. */
@@ -181,6 +189,7 @@ export function defaultConfig(): UltrathinkConfig {
 		decisions: { ...DEFAULT_DECISIONS_CONFIG, points: [...DEFAULT_DECISIONS_CONFIG.points] },
 		hindsight: { ...DEFAULT_HINDSIGHT_CONFIG },
 		ragflow: { ...DEFAULT_RAGFLOW_CONFIG, datasetIds: [...DEFAULT_RAGFLOW_CONFIG.datasetIds] },
+		gateway: { ...DEFAULT_GATEWAY_CONFIG },
 		teach: { ...DEFAULT_TEACH_CONFIG },
 		state: { ...DEFAULT_STATE_CONFIG },
 		models: { hosts: {}, providerDefaults: providerDictionary({}) },
@@ -460,9 +469,28 @@ function mergeShip(ship: Record<string, unknown> | undefined, defaults: ShipConf
 	};
 }
 
-function mergeSubstrate(substrate: Record<string, unknown> | undefined, defaults: SubstrateConfig): SubstrateConfig {
+/** `"gateway"` is kept. `"direct"` clears it. Anything else keeps the earlier layer. Absent means direct. */
+function backendField(value: unknown, fallback: "direct" | "gateway" | undefined): "gateway" | undefined {
+	if (value === "direct") return undefined;
+	if (value === "gateway") return "gateway";
+	return fallback === "gateway" ? "gateway" : undefined;
+}
+
+function mergeSubstrate(substrate: Record<string, unknown> | undefined, defaults: SubstrateConfig, project: boolean): SubstrateConfig {
 	if (!substrate) return defaults;
-	return { url: httpUrl(substrate.url, defaults.url) };
+	const url = httpUrl(substrate.url, defaults.url);
+	const backend = project ? defaults.backend : backendField(substrate.backend, defaults.backend);
+	return backend === "gateway" ? { url, backend } : { url };
+}
+
+function mergeGateway(gateway: Record<string, unknown> | undefined, defaults: GatewayConfig, project: boolean): GatewayConfig {
+	if (!gateway || project) return defaults;
+	const seat = typeof gateway.seat === "string" && SEAT_PATTERN.test(gateway.seat) ? gateway.seat : defaults.seat;
+	return {
+		url: urlAsWritten(gateway.url, defaults.url),
+		seat,
+		timeoutMs: intInRange(gateway.timeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.timeoutMs),
+	};
 }
 
 /** A finite number in [0, 1]; anything else falls back. */
@@ -540,13 +568,16 @@ function mergeHindsight(hindsight: Record<string, unknown> | undefined, defaults
 	if (!hindsight) return defaults;
 	const enabled = booleanOr(hindsight.enabled, defaults.enabled);
 	if (project) return { ...defaults, enabled: defaults.enabled && enabled };
-	return {
+	const backend = backendField(hindsight.backend, defaults.backend);
+	const merged: HindsightConfig = {
 		enabled,
 		url: urlAsWritten(hindsight.url, defaults.url),
 		bank: typeof hindsight.bank === "string" && HINDSIGHT_BANK.test(hindsight.bank) ? hindsight.bank : defaults.bank,
 		timeoutMs: intInRange(hindsight.timeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.timeoutMs),
 		retainTimeoutMs: intInRange(hindsight.retainTimeoutMs, 1, MAX_SERVICE_TIMEOUT_MS, defaults.retainTimeoutMs),
 	};
+	if (backend === "gateway") merged.backend = "gateway";
+	return merged;
 }
 
 /** Same trust rule as `mergeHindsight`; `ground` (sends the prompt to RAGFlow) can only be turned off by a project file. */
@@ -560,7 +591,8 @@ function mergeRagflow(ragflow: Record<string, unknown> | undefined, defaults: Ra
 		const ids = ragflow.datasetIds.filter((id): id is string => typeof id === "string" && id.trim() !== "").map((id) => id.trim());
 		if (ids.length === ragflow.datasetIds.length && ids.length <= MAX_DATASET_IDS) datasetIds = [...new Set(ids)];
 	}
-	return {
+	const backend = backendField(ragflow.backend, defaults.backend);
+	const merged: RagflowConfig = {
 		enabled,
 		url: urlAsWritten(ragflow.url, defaults.url),
 		datasetIds,
@@ -570,6 +602,8 @@ function mergeRagflow(ragflow: Record<string, unknown> | undefined, defaults: Ra
 		ground,
 		groundChars: intInRange(ragflow.groundChars, 500, 8_000, defaults.groundChars),
 	};
+	if (backend === "gateway") merged.backend = "gateway";
+	return merged;
 }
 
 /**
@@ -636,10 +670,11 @@ export function mergeConfig(
 		linear: mergeLinear(asRecord(file.linear), base.linear),
 		track: mergeTrack(asRecord(file.track), base.track),
 		ship: mergeShip(asRecord(file.ship), base.ship),
-		substrate: mergeSubstrate(asRecord(file.substrate), base.substrate),
+		substrate: mergeSubstrate(asRecord(file.substrate), base.substrate, options.project === true),
 		decisions: mergeDecisions(asRecord(file.decisions), base.decisions, options.project === true),
 		hindsight: mergeHindsight(asRecord(file.hindsight), base.hindsight, options.project === true),
 		ragflow: mergeRagflow(asRecord(file.ragflow), base.ragflow, options.project === true),
+		gateway: mergeGateway(asRecord(file.gateway), base.gateway, options.project === true),
 		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
 		state: mergeState(asRecord(file.state), base.state, options.project === true),
 		models: mergeModels(asRecord(file.models), base.models),

@@ -190,7 +190,8 @@ describe("legacy diagnostic label safety", () => {
 			expect(childCwd).not.toContain(sentinel);
 			expect(existsSync(join(childCwd, model))).toBe(false);
 			if (route === "grok") {
-				expect(childCwd).not.toBe(cli.cwd);
+				expect(realpathSync(childCwd)).not.toBe(realpathSync(cli.cwd));
+				// macOS getcwd resolves /var to /private/var; compare the canonical directory.
 				expect(realpathSync(dirname(childCwd))).toBe(realTmp);
 				expect(basename(childCwd)).toStartWith("ultrathink-grok-");
 			} else expect(realpathSync(childCwd)).toBe(realpathSync(cli.cwd));

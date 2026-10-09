@@ -142,9 +142,26 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 	return rec as SessionRecord;
 }
 
-export function writeSession(dir: string, record: SessionRecord): void {
+/** Exclusive lock for `last.json`, delegated to the shared file lock on `<lastPath>.lock`. Every writer uses it, so a replace cannot land between another writer's check and rename. When the lock cannot be taken in time the body still runs unlocked and `false` is returned. */
+export function withLastLock(lastPath: string, body: () => void): boolean {
+	let locked = false;
+	withFileLock(lastPath, () => {
+		locked = true;
+		body();
+	});
+	return locked;
+}
+
+export function lastRefreshMessage(lastPath: string): string {
+	return `could not refresh ${lastPath}; the session was saved, but ctl last may still show the previous plan`;
+}
+
+/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
+export function writeSession(dir: string, record: SessionRecord): string | undefined {
 	writeJson(sessionPath(dir, record.sessionId), record);
-	writeJson(join(dir, "last.json"), record);
+	const last = join(dir, "last.json");
+	if (!withLastLock(last, () => writeJson(last, record))) return lastRefreshMessage(last);
+	return undefined;
 }
 
 /**
