@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionRecord, writeControl, writeSession } from "../claude/state.ts";
@@ -607,8 +608,11 @@ describe("grok-bot answers", () => {
 		writeSession(stateDir, record);
 		const lastPath = join(stateDir, "last.json");
 		const fd = openSync(`${lastPath}.lock`, "wx");
+		writeSync(fd, String(process.pid));
 		try {
-			mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
+			expect(() => mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 })).toThrow(/could not refresh/);
+			expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
+			expect(() => writeSession(stateDir, { ...record, at: 3 })).toThrow(/could not refresh/);
 			expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
 		} finally {
 			closeSync(fd);
@@ -616,6 +620,23 @@ describe("grok-bot answers", () => {
 		}
 		mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
 		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(2);
+		expect(existsSync(`${lastPath}.lock`)).toBe(false);
+	});
+
+	test("a lock left by a dead planner is reclaimed", () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const record = { sessionId: "s1", at: 1, result: { xml: "<x/>", original: "o", root: "BUILD_PROMPT", source: "llm" } } as SessionRecord;
+		writeSession(stateDir, record);
+		const lastPath = join(stateDir, "last.json");
+		const child = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+		writeFileSync(`${lastPath}.lock`, String(child.pid));
+		writeSession(stateDir, { ...record, at: 2 });
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(2);
+		expect(existsSync(`${lastPath}.lock`)).toBe(false);
+		writeFileSync(`${lastPath}.lock`, String(child.pid));
+		mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 3 });
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(3);
 		expect(existsSync(`${lastPath}.lock`)).toBe(false);
 	});
 });

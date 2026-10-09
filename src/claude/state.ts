@@ -4,7 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -136,41 +136,81 @@ const LAST_LOCK_WAIT_MS = 5;
 const LAST_LOCK_ATTEMPTS = 40;
 const LAST_LOCK_STALE_MS = 5_000;
 
+/** True when the lock file names a process that is still running. A missing or dead pid is not a holder. */
+function holderAlive(lockPath: string): boolean {
+	let text: string;
+	try {
+		text = readFileSync(lockPath, "utf8").trim();
+	} catch {
+		return false;
+	}
+	const pid = Number(text);
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 /** Exclusive lock for `last.json`. Every writer uses it, so a replace cannot land between another writer's check and rename. */
 export function withLastLock(lastPath: string, body: () => void): boolean {
 	const lockPath = `${lastPath}.lock`;
-	let fd: number | undefined;
-	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && fd === undefined; attempt++) {
+	const pid = String(process.pid);
+	let held = false;
+	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && !held; attempt++) {
 		try {
-			fd = openSync(lockPath, "wx");
+			writeFileSync(lockPath, pid, { flag: "wx" });
+			held = true;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-			try {
-				if (Date.now() - statSync(lockPath).mtimeMs > LAST_LOCK_STALE_MS) unlinkSync(lockPath);
-			} catch {
-				// the holder removed it, or another waiter did
+			let reclaim = !holderAlive(lockPath);
+			if (!reclaim) {
+				try {
+					reclaim = Date.now() - statSync(lockPath).mtimeMs > LAST_LOCK_STALE_MS;
+				} catch {
+					reclaim = false;
+				}
 			}
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
+			if (reclaim) {
+				try {
+					unlinkSync(lockPath);
+				} catch {
+					// the holder removed it, or another waiter did
+				}
+				try {
+					writeFileSync(lockPath, pid, { flag: "wx" });
+					held = true;
+				} catch {
+					// another waiter took the reclaimed lock
+				}
+			} else {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
+			}
 		}
 	}
-	if (fd === undefined) return false;
+	if (!held) return false;
 	try {
 		body();
 		return true;
 	} finally {
-		closeSync(fd);
 		try {
-			unlinkSync(lockPath);
+			if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
 		} catch {
-			// the lock file is already gone
+			// the lock file is already gone, or another writer replaced it
 		}
 	}
+}
+
+export function lastRefreshMessage(lastPath: string): string {
+	return `could not refresh ${lastPath}; the session was saved, but ctl last may still show the previous plan`;
 }
 
 export function writeSession(dir: string, record: SessionRecord): void {
 	writeJson(sessionPath(dir, record.sessionId), record);
 	const last = join(dir, "last.json");
-	withLastLock(last, () => writeJson(last, record));
+	if (!withLastLock(last, () => writeJson(last, record))) throw new Error(lastRefreshMessage(last));
 }
 
 export function readLast(dir: string): SessionRecord | undefined {

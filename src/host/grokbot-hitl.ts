@@ -8,7 +8,7 @@
  */
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type SessionRecord, withLastLock } from "../claude/state.ts";
+import { lastRefreshMessage, type SessionRecord, withLastLock } from "../claude/state.ts";
 import { applyAnswers } from "../hitl/answers.ts";
 import { injectClarificationsXml } from "../hitl/format.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -66,8 +66,9 @@ export function mirrorLast(statePath: string, record: SessionRecord): void {
 	const lastPath = join(dirname(dirname(statePath)), "last.json");
 	if (!existsSync(lastPath)) return;
 	const tmp = `${lastPath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+	let refreshed = false;
 	try {
-		withLastLock(lastPath, () => {
+		refreshed = withLastLock(lastPath, () => {
 			const last = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
 			if (last.sessionId !== record.sessionId) return;
 			writeFileSync(tmp, `${JSON.stringify(record, null, "\t")}\n`);
@@ -75,6 +76,7 @@ export function mirrorLast(statePath: string, record: SessionRecord): void {
 		});
 	} catch {
 		// an unreadable last.json stays as it is
+		return;
 	} finally {
 		try {
 			if (existsSync(tmp)) unlinkSync(tmp);
@@ -82,4 +84,5 @@ export function mirrorLast(statePath: string, record: SessionRecord): void {
 			// the temp file is already gone
 		}
 	}
+	if (!refreshed) throw new Error(lastRefreshMessage(lastPath));
 }
