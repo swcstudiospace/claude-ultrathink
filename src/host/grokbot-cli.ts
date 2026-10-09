@@ -195,11 +195,20 @@ export async function reviewRead(repo: string, pr: string, fetcher: typeof fetch
 	const greptileReviews = reviews.filter(isGreptile);
 	const lastReview = greptileReviews[greptileReviews.length - 1];
 	const headReview = [...greptileReviews].reverse().find((review) => review.commit_id === head);
+	/** Issue comments and reviews are separate lists, so the newest score is by timestamp, not by which list was fetched last. */
+	const scoredAt = (item: Item): number => {
+		const raw = item.submitted_at ?? item.created_at;
+		const ms = Date.parse(typeof raw === "string" ? raw : "");
+		return Number.isFinite(ms) ? ms : 0;
+	};
 	const latestCommentScore = [...issueComments, ...reviews]
 		.filter(isGreptile)
-		.map((item) => parseScore(String(item.body ?? "")))
-		.filter((score): score is number => score !== null)
-		.at(-1);
+		.flatMap((item) => {
+			const parsed = parseScore(String(item.body ?? ""));
+			return parsed === null ? [] : [{ score: parsed, at: scoredAt(item) }];
+		})
+		.sort((a, b) => a.at - b.at)
+		.at(-1)?.score;
 	const headScore = headReview ? parseScore(String(headReview.body ?? "")) : null;
 	const descriptionScore = parseScore(String(pull.body ?? ""));
 	const score = headScore ?? latestCommentScore ?? descriptionScore;

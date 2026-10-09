@@ -403,6 +403,25 @@ describe("grok-bot review read", () => {
 		expect(pagedRead.score).toBe(2);
 		expect(pagedRead.scoreSource).toBe("head-review");
 	});
+
+	test("the fallback score is the newest comment or review by time, not by list order", async () => {
+		const root = tmp();
+		const bot = { login: "greptile-apps[bot]" };
+		writeFileSync(join(root, "pull.json"), JSON.stringify({ state: "open", draft: true, head: { sha: "abc" }, body: "" }));
+		writeFileSync(join(root, "issue-comments.json"), JSON.stringify([{ user: bot, body: "Confidence Score: 2/5", created_at: "2026-10-09T00:00:00Z" }]));
+		writeFileSync(join(root, "reviews.json"), JSON.stringify([{ user: bot, commit_id: "old", body: "Confidence Score: 5/5", submitted_at: "2026-10-01T00:00:00Z" }]));
+		writeFileSync(join(root, "review-comments.json"), "[]");
+		writeFileSync(join(root, "check-runs.json"), JSON.stringify({ check_runs: [] }));
+		const read = await reviewRead("o/r", "23", dirFetcher(root));
+		expect(read.score).toBe(2);
+		expect(read.scoreSource).toBe("latest-comment");
+
+		writeFileSync(join(root, "issue-comments.json"), JSON.stringify([{ user: bot, body: "Confidence Score: 1/5", created_at: "2026-10-01T00:00:00Z" }]));
+		writeFileSync(join(root, "reviews.json"), JSON.stringify([{ user: bot, commit_id: "old", body: "Confidence Score: 4/5", submitted_at: "2026-10-09T00:00:00Z" }]));
+		const newerReview = await reviewRead("o/r", "23", dirFetcher(root));
+		expect(newerReview.score).toBe(4);
+		expect(newerReview.scoreSource).toBe("latest-comment");
+	});
 });
 
 describe("grok-bot prompts build", () => {
