@@ -6,7 +6,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type LockOptions, withFileLock, writeFileAtomic } from "./atomic.ts";
+import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
 import { THINK_ENGINES, type ThinkEngine, type ThoughtGraph } from "../think/types.ts";
@@ -145,20 +145,21 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 const LAST_LOCK_WAIT_MS = 5;
 const LAST_LOCK_ATTEMPTS = 40;
 const LAST_LOCK_STALE_MS = 5_000;
+const LAST_LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 
-/** True when the lock file names a running process, or is a fresh empty file another writer has not filled yet. */
+/** True for a live PID, a fresh empty lock, or an existing lock that cannot be safely inspected. */
 export function lastLockHeld(lockPath: string): boolean {
 	let text: string;
 	try {
 		text = readFileSync(lockPath, "utf8").trim();
-	} catch {
-		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
 	}
 	if (!text) {
 		try {
 			return Date.now() - statSync(lockPath).mtimeMs <= LAST_LOCK_STALE_MS;
-		} catch {
-			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code !== "ENOENT";
 		}
 	}
 	const pid = Number(text);
@@ -183,37 +184,36 @@ export function withLastLock(lastPath: string, body: () => void): boolean {
 	let held = false;
 	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && !held; attempt++) {
 		try {
-			writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
-			held = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-			const reclaim = !lastLockHeld(lockPath);
-			if (reclaim) {
+			held = withLockMutation(lockPath, () => {
+				if (lastLockHeld(lockPath)) return false;
 				try {
 					unlinkSync(lockPath);
-				} catch {
-					// the holder removed it, or another waiter did
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
-				try {
-					writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
-					held = true;
-				} catch {
-					// another waiter took the reclaimed lock
-				}
-			} else {
-				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
-			}
+				writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
+				return true;
+			}) === true;
+		} catch {
+			return false;
 		}
+		if (!held) Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
 	}
 	if (!held) return false;
 	try {
 		body();
 		return true;
 	} finally {
-		try {
-			if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
-		} catch {
-			// the lock file is already gone, or another writer replaced it
+		for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS; attempt++) {
+			try {
+				if (withLockMutation(lockPath, () => {
+					if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
+					return true;
+				})) break;
+			} catch {
+				break;
+			}
+			Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
 		}
 	}
 }

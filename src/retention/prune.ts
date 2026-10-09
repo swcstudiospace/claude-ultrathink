@@ -9,7 +9,7 @@
  */
 import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join } from "node:path";
-import { withFileLock } from "../claude/atomic.ts";
+import { withFileLock, withLockMutation } from "../claude/atomic.ts";
 import { lastLockHeld, sessionPath } from "../claude/state.ts";
 import { carrierPath } from "../host/carrier.ts";
 
@@ -219,10 +219,22 @@ function sweepOrphans(sweep: Sweep, dir: string, names: string[], lastLockPath?:
 		const path = join(dir, name);
 		const stat = statEntry(sweep, path, name);
 		if (!stat?.isFile() || sweep.now - stat.mtimeMs <= ORPHAN_AGE_MS) continue;
-		if (path === lastLockPath && lastLockHeld(path)) continue;
-		if (!removeFile(sweep, path, name)) continue;
-		sweep.result.orphans.push({ name, bytes: stat.size });
-		sweep.result.bytes += stat.size;
+		const remove = (): void => {
+			const current = statEntry(sweep, path, name);
+			if (!current?.isFile() || sweep.now - current.mtimeMs <= ORPHAN_AGE_MS) return;
+			if (path === lastLockPath && lastLockHeld(path)) return;
+			if (!removeFile(sweep, path, name)) return;
+			sweep.result.orphans.push({ name, bytes: current.size });
+			sweep.result.bytes += current.size;
+		};
+		if (sweep.dryRun || !name.endsWith(".lock")) remove();
+		else {
+			try {
+				withLockMutation(path, remove);
+			} catch (error) {
+				fail(sweep, name, error);
+			}
+		}
 	}
 }
 

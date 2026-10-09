@@ -422,7 +422,7 @@ The confirmed/candidate counts and the outbox count are included when the status
 
 By default nothing is ever deleted: every session record stays in the state directory until you remove it. Those records hold your prompt and the plan, so you may want to trim them. Two ways:
 
-- **On request.** `bin/ultrathink prune --older-than 30` removes sessions older than 30 days (`30d` also works). Add `--dry-run` to list what would go without deleting anything; the real run then removes exactly that set. Without `--older-than` the command uses `state.retentionDays`; if neither gives a cutoff above 0 it exits 2 and deletes nothing. `--older-than` must be a whole number from 1 to 3650: a smaller cutoff is refused, so a typo cannot empty the directory. Exit codes: 0 done, 1 a file could not be removed (the file name and error code are printed, never content), 2 usage error or refused cutoff.
+- **On request.** `bin/ultrathink prune --older-than 30` removes sessions older than 30 days (`30d` also works). Add `--dry-run` to list candidates without changing them; a real run rechecks freshness and protection and skips records being written, since state can change after the preview. Without `--older-than` the command uses `state.retentionDays`; if neither gives a cutoff above 0 it exits 2 and deletes nothing. `--older-than` must be a whole number from 1 to 3650: a smaller cutoff is refused, so a typo cannot empty the directory. Exit codes: 0 done, 1 a file could not be removed (the file name and error code are printed, never content), 2 usage error or refused cutoff.
 - **On a schedule, if you opt in.** With `state.retentionDays` above 0 in a user file, planning runs the same prune, best effort, at most once a day (it records the time in `<stateDir>/.last-prune`) and looking at no more than 500 directory entries per run. A failure never blocks a prompt. With the key unset nothing prunes by itself.
 
 What a prune never removes:
@@ -431,7 +431,7 @@ What a prune never removes:
 - The session `last.json` names and the session the plan carrier (`last-plan.json`) points to.
 - Symlinks, and anything that is not a `sessions/<id>.json` or `sessions/<id>.xml` file, so Teachable Moments lessons under `teach/` are never touched.
 
-A prune also removes `*.tmp` and `*.lock` files older than one hour in `sessions/` or directly in the state directory: leftovers of an interrupted write.
+A prune also removes regular `*.tmp` and `*.lock` files older than one hour in `sessions/` or directly in the state directory. Lock deletion shares the writer's mutation guard and rechecks age before removal; a busy guard is skipped, and a strict `last.json` lock whose PID is alive is never an orphan. Dry runs take no mutation guard and change nothing.
 
 `prune` works on the current host's state directory. To prune another host's, set `ULTRATHINK_HOST=<host>`, for example `ULTRATHINK_HOST=omp bin/ultrathink prune --older-than 30 --dry-run`. The output lists session ids, sizes and ages, never prompt text.
 

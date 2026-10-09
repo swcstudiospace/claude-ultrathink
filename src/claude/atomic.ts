@@ -8,7 +8,7 @@
  * never block a prompt; a lock that cannot be taken in time degrades to running the callback unlocked.
  */
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /** The synchronous file calls `writeFileAtomic` needs, so a test can make one of them fail. */
@@ -74,7 +74,7 @@ export function writeFileAtomic(path: string, data: string | Uint8Array, options
 }
 
 export interface LockOptions {
-	/** A lock file older than this is a crashed holder's and is reclaimed (default 10 s). */
+	/** A lock file older than this is reclaimed as an expired lease (default 10 s). */
 	staleMs?: number;
 	/** How long to wait for a held lock before running unlocked (default 2 s). */
 	timeoutMs?: number;
@@ -87,94 +87,101 @@ export interface LockOptions {
 	log?: (message: string) => void;
 }
 
+const SLEEP_WORD = new Int32Array(new SharedArrayBuffer(4));
+
 function blockingSleep(ms: number): void {
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+	Atomics.wait(SLEEP_WORD, 0, 0, ms);
 }
 
 function errorCode(error: unknown): string | undefined {
 	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
 }
 
-type Reclaim = "reclaimed" | "fresh" | "gone";
-
-/**
- * Moves a stale lock (older than `staleMs`) aside so a crashed holder stops blocking, then discards it. Of several
- * processes that all see it stale, exactly one rename succeeds; the losers see the name vanish and retry.
- *
- * Compare-and-swap on lock identity: between reading the lock and moving it, another waiter may have reclaimed the
- * stale token and retaken the name, so the file moved aside is checked against the exact stale token seen. A file
- * holding any other token is a successor's live lock and is put back, never discarded.
- */
-function reclaimStale(lockPath: string, staleMs: number, now: () => number): Reclaim {
-	let staleToken: string;
+function discardGuard(path: string, owner: string): void {
 	try {
-		if (now() - statSync(lockPath).mtimeMs <= staleMs) return "fresh";
-		staleToken = readFileSync(lockPath, "utf8");
-	} catch (error) {
-		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
-	}
-	const aside = `${lockPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-	try {
-		renameSync(lockPath, aside);
-	} catch (error) {
-		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
-	}
-	try {
-		// Only the exact stale token seen above may be discarded. Any other token (or a fresh mtime) means the
-		// lock was reclaimed and retaken between our read and our rename: the file aside is a live lock.
-		if (readFileSync(aside, "utf8") === staleToken && now() - statSync(aside).mtimeMs > staleMs) {
-			try {
-				unlinkSync(aside);
-			} catch {
-				// a leftover .tmp file is harmless
-			}
-			return "reclaimed";
-		}
+		unlinkSync(join(path, owner));
 	} catch {
-		// The aside copy cannot be verified; fall through and try to put the name back.
+		return;
 	}
-	restoreStolen(lockPath, aside);
-	return "fresh";
+	try {
+		rmdirSync(path);
+	} catch {
+		// A successor may already have atomically replaced the now-empty directory.
+	}
+}
+
+function reclaimDeadGuard(path: string): void {
+	try {
+		const owners = readdirSync(path);
+		const owner = owners[0];
+		if (owners.length !== 1 || !owner || !/^[1-9]\d*\.[a-f0-9]{32}$/.test(owner)) return;
+		try {
+			process.kill(Number(owner.split(".")[0]), 0);
+			return;
+		} catch (error) {
+			if (errorCode(error) !== "ESRCH") return;
+		}
+		discardGuard(path, owner);
+	} catch {
+		// An unverifiable owner remains held.
+	}
 }
 
 /**
- * Puts a live lock that was mistakenly moved aside back under its name. A third process may have claimed the free
- * name meanwhile, and its token must never be overwritten: `linkSync` atomically refuses when the name exists, so
- * the restore either lands in a free name or is dropped in favor of the current holder.
+ * Serializes lock-name creation, reclamation and release, not the protected RMW itself. A prepared nonempty
+ * directory is renamed into the guard name atomically; it cannot replace another owner's nonempty directory.
+ * Dead-owner recovery unlinks only that owner's unique entry, so a delayed recovery cannot remove a successor.
+ * Returns undefined when busy; other filesystem errors and callback errors propagate to the caller's policy.
  */
-function restoreStolen(lockPath: string, aside: string): void {
+export function withLockMutation<T>(lockPath: string, fn: () => T): T | undefined {
+	const guard = `${lockPath}.guard`;
+	const owner = `${process.pid}.${randomBytes(16).toString("hex")}`;
+	const candidate = `${guard}.${owner}.tmp`;
+	let fd: number | undefined;
+	let prepared = false;
+	let claimed = false;
 	try {
-		linkSync(aside, lockPath);
+		mkdirSync(candidate, { mode: 0o700 });
+		prepared = true;
+		fd = openSync(join(candidate, owner), "wx", 0o600);
+		closeSync(fd);
+		fd = undefined;
 		try {
-			unlinkSync(aside);
-		} catch {
-			// the lock itself is back in place; a leftover .tmp file is harmless
-		}
-		return;
-	} catch (error) {
-		if (errorCode(error) !== "EEXIST") {
-			// Hard links may be unsupported: fall back to a rename, but only into a still-free name.
-			let free = false;
+			renameSync(candidate, guard);
+		} catch (error) {
+			if (errorCode(error) !== "EEXIST" && errorCode(error) !== "ENOTEMPTY") throw error;
+			reclaimDeadGuard(guard);
 			try {
-				readFileSync(lockPath, "utf8");
-			} catch (readError) {
-				free = errorCode(readError) === "ENOENT";
-			}
-			if (free) {
-				try {
-					renameSync(aside, lockPath);
-					return;
-				} catch {
-					// fall through and clean up below
-				}
+				renameSync(candidate, guard);
+			} catch (retryError) {
+				if (errorCode(retryError) === "EEXIST" || errorCode(retryError) === "ENOTEMPTY") return undefined;
+				throw retryError;
 			}
 		}
-		// The name is held by someone else now; drop our copy rather than overwrite their token.
-		try {
-			unlinkSync(aside);
-		} catch {
-			// a leftover .tmp file is harmless
+		claimed = true;
+		return fn();
+	} finally {
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* best effort after a preparation error */ }
 		}
+		if (claimed) discardGuard(guard, owner);
+		else if (prepared) {
+			try { unlinkSync(join(candidate, owner)); } catch { /* preparation may not have reached the file */ }
+			try { rmdirSync(candidate); } catch { /* an unremovable private candidate is harmless */ }
+		}
+	}
+}
+
+type Reclaim = "reclaimed" | "fresh" | "gone";
+
+/** Called only while holding the mutation guard, so the stale name cannot become a successor during deletion. */
+function reclaimStale(lockPath: string, staleMs: number, now: () => number): Reclaim {
+	try {
+		if (now() - statSync(lockPath).mtimeMs <= staleMs) return "fresh";
+		unlinkSync(lockPath);
+		return "reclaimed";
+	} catch (error) {
+		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
 	}
 }
 
@@ -188,29 +195,32 @@ function acquire(lockPath: string, options: LockOptions): string | undefined {
 	const token = randomBytes(16).toString("hex");
 	const started = now();
 	for (let attempt = 0; ; attempt++) {
+		let retry: string | boolean | undefined;
 		try {
-			const fd = openSync(lockPath, "wx", 0o600);
-			try {
-				writeSync(fd, token);
-			} catch (error) {
+			retry = withLockMutation(lockPath, () => {
 				try {
-					unlinkSync(lockPath);
-				} catch {
-					// best effort
+					const fd = openSync(lockPath, "wx", 0o600);
+					try {
+						writeSync(fd, token);
+					} catch (error) {
+						try { unlinkSync(lockPath); } catch { /* best effort */ }
+						throw error;
+					} finally {
+						closeSync(fd);
+					}
+					return token;
+				} catch (error) {
+					if (errorCode(error) !== "EEXIST") throw error;
 				}
-				throw error;
-			} finally {
-				closeSync(fd);
-			}
-			return token;
+				return reclaimStale(lockPath, staleMs, now) !== "fresh";
+			});
 		} catch (error) {
-			if (errorCode(error) !== "EEXIST") {
-				options.log?.(`lock unavailable for ${basename(lockPath)}, writing unlocked: ${error instanceof Error ? error.message : String(error)}`);
-				return undefined;
-			}
+			options.log?.(`lock unavailable for ${basename(lockPath)}, writing unlocked: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
 		}
-		// A reclaimed or vanished lock is worth an immediate retry; the cap keeps a flapping lock from spinning forever.
-		if (reclaimStale(lockPath, staleMs, now) !== "fresh" && attempt < 1_000) continue;
+		if (typeof retry === "string") return retry;
+		// Reclaimed names retry immediately, but every retry takes the same mutation guard.
+		if (retry === true && attempt < 1_000) continue;
 		if (now() - started >= timeoutMs) {
 			options.log?.(`lock ${basename(lockPath)} still held after ${timeoutMs} ms, writing unlocked`);
 			return undefined;
@@ -219,11 +229,25 @@ function acquire(lockPath: string, options: LockOptions): string | undefined {
 	}
 }
 
-function release(lockPath: string, token: string): void {
-	try {
-		if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath);
-	} catch {
-		// the lock is already gone or no longer ours
+function release(lockPath: string, token: string, options: LockOptions): void {
+	const now = options.now ?? Date.now;
+	const sleep = options.sleep ?? blockingSleep;
+	const started = now();
+	for (let attempt = 0; attempt < 1_000; attempt++) {
+		try {
+			if (withLockMutation(lockPath, () => {
+				try {
+					if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath);
+				} catch {
+					// The lock is already gone or no longer ours.
+				}
+				return true;
+			})) return;
+		} catch {
+			return;
+		}
+		if (now() - started >= (options.timeoutMs ?? 2_000)) return;
+		sleep(options.pollMs ?? 15);
 	}
 }
 
@@ -239,6 +263,6 @@ export function withFileLock<T>(target: string, fn: () => T, options: LockOption
 	try {
 		return fn();
 	} finally {
-		release(lockPath, token);
+		release(lockPath, token, options);
 	}
 }

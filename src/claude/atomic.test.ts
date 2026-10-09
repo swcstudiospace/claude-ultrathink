@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withFileLock, writeFileAtomic } from "./atomic.ts";
@@ -143,6 +143,37 @@ describe("withFileLock", () => {
 		expect(leftovers(dir)).toEqual([]);
 	});
 
+	test("a crashed mutation owner is reclaimed before the protected record is updated", () => {
+		const target = join(dir, "state.json");
+		const guard = `${target}.lock.guard`;
+		writeFileAtomic(target, "0");
+		writeFileAtomic(join(guard, `2147483647.${"a".repeat(32)}`), "");
+		const logs: string[] = [];
+		withFileLock(target, () => writeFileAtomic(target, String(Number(readFileSync(target, "utf8")) + 1)), {
+			log: (message) => logs.push(message),
+		});
+		expect(readFileSync(target, "utf8")).toBe("1");
+		expect(logs).toEqual([]);
+		expect(existsSync(guard)).toBe(false);
+		expect(leftovers(dir)).toEqual([]);
+	});
+
+	test("a live mutation owner stays intact when the generic lock times out and writes unlocked", () => {
+		const target = join(dir, "state.json");
+		const guard = `${target}.lock.guard`;
+		const owner = `${process.pid}.${"b".repeat(32)}`;
+		writeFileAtomic(target, "0");
+		writeFileAtomic(join(guard, owner), "");
+		const logs: string[] = [];
+		withFileLock(target, () => writeFileAtomic(target, String(Number(readFileSync(target, "utf8")) + 1)), {
+			timeoutMs: 0,
+			log: (message) => logs.push(message),
+		});
+		expect(readFileSync(target, "utf8")).toBe("1");
+		expect(readdirSync(guard)).toEqual([owner]);
+		expect(logs).toHaveLength(1);
+	});
+
 	test("a fresh held lock is waited on, then the callback runs unlocked and the timeout is logged", () => {
 		const target = join(dir, "state.json");
 		const lock = `${target}.lock`;
@@ -256,7 +287,7 @@ describe("concurrent updates through updateSession", () => {
 		expect(leftovers(stateDir)).toEqual([]);
 	}, 60_000);
 
-	test("simultaneous stale-lock recovery by two waiters loses no update and claims no foreign lock", async () => {
+	test("a delayed stale recovery cannot open a live successor's critical section to another writer", async () => {
 		const stateDir = join(dir, "state");
 		const record: SessionRecord & { counter: number } = {
 			sessionId: "stale-race",
@@ -265,26 +296,56 @@ describe("concurrent updates through updateSession", () => {
 			counter: 0,
 		};
 		writeSession(stateDir, record);
-		// A crashed holder's lock: both waiters see it stale and race to reclaim it. Exactly one rename
-		// succeeds; the loser must retry against the winner's live lock, never move it aside or restore over it.
-		const lock = `${sessionPath(stateDir, "stale-race")}.lock`;
+		const lock = `${sessionPath(stateDir, record.sessionId)}.lock`;
 		writeFileSync(lock, "dead-process-token");
-		const old = new Date(Date.now() - 60_000);
+		const old = new Date(Date.now() - 120_000);
 		utimesSync(lock, old, old);
-		const workers = [0, 1].map(() =>
-			Bun.spawn([process.execPath, WORKER, stateDir, "stale-race", "25"], { stdout: "pipe", stderr: "pipe" }),
+		const events = join(dir, "events");
+		const signal = (name: string): void => writeFileAtomic(join(events, name), "");
+		signal("start");
+		const waitFor = (names: string[]): Promise<string> => new Promise((resolve, reject) => {
+			const check = (): void => {
+				const name = names.find((candidate) => existsSync(join(events, candidate)));
+				if (name) {
+					watcher.close();
+					resolve(name);
+				}
+			};
+			const watcher = watch(events, check);
+			watcher.once("error", reject);
+			check();
+		});
+		const spawn = (actor: string) => Bun.spawn(
+			[process.execPath, join(import.meta.dir, "atomic.recovery.worker.ts"), stateDir, record.sessionId, events, actor],
+			{ stdout: "pipe", stderr: "pipe" },
 		);
-		const exits = await Promise.all(workers.map((worker) => worker.exited));
-		const errors = await Promise.all(workers.map((worker) => new Response(worker.stderr).text()));
-		expect(errors.join("")).toBe("");
-		expect(exits).toEqual([0, 0]);
-		// Exact count proves the two recoveries serialized: any concurrent holding would be a lost update.
-		const parsed: unknown = JSON.parse(readFileSync(sessionPath(stateDir, "stale-race"), "utf8"));
-		expect(parsed).toMatchObject({ sessionId: "stale-race", counter: 50 });
-		expect(readSession(stateDir, "stale-race")).toMatchObject({ counter: 50 });
-		// No waiter left a foreign token behind, deleted a live lock, or leaked an aside copy.
-		expect(existsSync(lock)).toBe(false);
-		expect(leftovers(join(stateDir, "sessions"))).toEqual([]);
-		expect(leftovers(stateDir)).toEqual([]);
+		const workers = [spawn("delayed")];
+		try {
+			await waitFor(["snapshot"]);
+			workers.push(spawn("first"), spawn("second"));
+			await Promise.all([waitFor(["first.attempting"]), waitFor(["second.attempting"])]);
+			// Advance only on real child-process events: force the obsolete snapshot, then observe either
+			// a protected writer or the stolen-name window before releasing the real session mutations.
+			await waitFor(["first.entered", "second.entered", "first.guarded", "second.guarded"]);
+			signal("snapshot-go");
+			if (await waitFor(["moved", "delayed.entered"]) === "moved") {
+				await waitFor(["first.overlap", "second.overlap"]);
+			}
+			signal("rename-go");
+			signal("body-go");
+			const exits = await Promise.all(workers.map((worker) => worker.exited));
+			const errors = await Promise.all(workers.map((worker) => new Response(worker.stderr).text()));
+			expect(errors.join("")).toBe("");
+			expect(exits).toEqual([0, 0, 0]);
+			expect(readSession(stateDir, record.sessionId)).toMatchObject({ counter: 3 });
+			expect(readdirSync(events).filter((name) => name.endsWith(".overlap"))).toEqual([]);
+			expect(leftovers(join(stateDir, "sessions"))).toEqual([]);
+		} finally {
+			signal("snapshot-go");
+			signal("rename-go");
+			signal("body-go");
+			for (const worker of workers) if (worker.exitCode === null) worker.kill();
+			await Promise.allSettled(workers.map((worker) => worker.exited));
+		}
 	}, 60_000);
 });
