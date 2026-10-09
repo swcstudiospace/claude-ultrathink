@@ -339,6 +339,41 @@ describe("createGithub", () => {
 			expect(fake.calls.filter((c) => c.argv[1] === "api")).toHaveLength(20);
 		});
 
+		test("a scan past its deadline stops early with no partial threads", () => {
+			// Each page burns 30s off the caller's 100s wait budget via the injected clock: no sleeps, no timers.
+			let now = 0;
+			const fake = fakeRun((argv) => {
+				if (argv[1] === "repo") return REPO_REPLY;
+				now += 30_000;
+				return page(pageNodes(`p${now}`, 100), `c${now}`);
+			});
+			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7, { deadlineMs: 100_000, now: () => now });
+			expect(result).toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
+			expect("threads" in result).toBe(false);
+			const graphqlCalls = fake.calls.filter((c) => c.argv[1] === "api");
+			expect(graphqlCalls.length).toBeGreaterThan(0);
+			expect(graphqlCalls.length).toBeLessThan(20);
+		});
+
+		test("an already-spent deadline fails closed without paging", () => {
+			const fake = fakeRun((argv) => (argv[1] === "repo" ? REPO_REPLY : page(pageNodes("p", 100), "c1")));
+			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7, { deadlineMs: 100_000, now: () => 100_000 });
+			expect(result).toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
+			expect(fake.calls.filter((c) => c.argv[1] === "api")).toHaveLength(0);
+		});
+
+		test("a scan within its deadline still pages to the end", () => {
+			const replies = Array.from({ length: 3 }, (_unused, i) => page(pageNodes(`p${i}`, 100), i < 2 ? `c${i}` : undefined));
+			let n = 0;
+			const fake = fakeRun((argv) => (argv[1] === "repo" ? REPO_REPLY : (replies[Math.min(n++, replies.length - 1)] ?? {})));
+			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7, { deadlineMs: 100_000, now: () => 0 });
+			expect(result).toEqual({
+				ok: true,
+				threads: [...expectedThreads("p0", 100), ...expectedThreads("p1", 100), ...expectedThreads("p2", 100)],
+			});
+			expect(fake.calls.filter((c) => c.argv[1] === "api")).toHaveLength(3);
+		});
+
 		test("exactly 20 full pages still succeed", () => {
 			const replies = Array.from({ length: 20 }, (_unused, i) => page(pageNodes(`p${i}`, 100), i < 19 ? `c${i}` : undefined));
 			const { result, graphqlCalls } = threadsOf(...replies);

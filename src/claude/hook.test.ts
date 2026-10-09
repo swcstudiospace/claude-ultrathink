@@ -12,8 +12,8 @@ import type { RunClarifyOptions } from "../hitl/pipeline.ts";
 import type { ModelResolution } from "../host/engine.ts";
 import type { ProgressEvent } from "../host/progress.ts";
 import { TRACKING_OFF_NOTE, UPLIFT_CONTEXT_HEADER } from "./output.ts";
-import { runPromptSubmit, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
-import { readSession, type SessionRecord, sessionPath, writeSession } from "./state.ts";
+import { runPromptSubmit, savePlanRecord, type HookDeps, type PromptSubmitInput, type PromptSubmitResult } from "./hook.ts";
+import { readSession, type SessionRecord, sessionPath, updateSession, writeSession } from "./state.ts";
 import type { TrackingRefs } from "../track/types.ts";
 import type { EmitInput } from "../substrate/brief.ts";
 import type { GroundOutcome } from "../ragflow/types.ts";
@@ -234,6 +234,55 @@ describe("runPromptSubmit", () => {
 			});
 			const result = await runPromptSubmit(input, deps);
 			expect(result.record?.clarifications).toEqual([priorAnswer]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("a plan save interleaved with a locked answer update loses neither", async () => {
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [] });
+		try {
+			const open: Clarification = {
+				id: "q1",
+				question: "Which database?",
+				header: "DB",
+				why: "w",
+				options: [{ label: "Postgres" }, { label: "SQLite" }],
+				default: "Postgres",
+				blocking: true,
+			};
+			const answered: Clarification = { ...open, answer: "Postgres", answeredAt: 2, source: "user" };
+			const seed: SessionRecord = {
+				sessionId: "s1",
+				at: 0,
+				result: { xml: "<SPEC/>", original: "x", root: "SPEC", source: "llm" },
+				clarifications: [open],
+			};
+			const planned = (record: SessionRecord): SessionRecord => ({
+				...record,
+				at: 1,
+				result: { xml: "<SPEC><GOAL>add a widget</GOAL></SPEC>", original: "add a widget", root: "SPEC", source: "llm" },
+			});
+			// The planner read the session before the answer landed, then saves: the
+			// late answer is overlaid onto the same question instead of being lost.
+			writeSession(deps.stateDir, seed);
+			const stale = readSession(deps.stateDir, "s1") ?? seed;
+			updateSession(deps.stateDir, "s1", (current) => ({ ...current, clarifications: [answered] }));
+			const saved = savePlanRecord(deps.stateDir, "s1", planned(stale));
+			expect(saved.record.clarifications).toEqual([answered]);
+			expect(saved.record.result.xml).toContain("add a widget");
+			expect(saved.record.result.xml).toContain("<ANSWER");
+			expect(saved.record.result.xml).toContain("Postgres");
+			expect(readSession(deps.stateDir, "s1")).toEqual(saved.record);
+			expect(readFileSync(saved.specPath, "utf8")).toBe(`${saved.record.result.xml}\n`);
+			expect(existsSync(`${saved.statePath}.lock`)).toBe(false);
+			// The plan lands first, then the locked answer update: nothing is lost either.
+			writeSession(deps.stateDir, seed);
+			const planFirst = savePlanRecord(deps.stateDir, "s1", planned({ ...seed, clarifications: [open] }));
+			expect(planFirst.record.clarifications).toEqual([open]);
+			updateSession(deps.stateDir, "s1", (current) => ({ ...current, clarifications: [answered] }));
+			expect(readSession(deps.stateDir, "s1")?.clarifications).toEqual([answered]);
+			expect(readSession(deps.stateDir, "s1")?.result.xml).toContain("add a widget");
 		} finally {
 			cleanup();
 		}

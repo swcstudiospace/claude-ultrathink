@@ -8,7 +8,7 @@
  * never block a prompt; a lock that cannot be taken in time degrades to running the callback unlocked.
  */
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /** The synchronous file calls `writeFileAtomic` needs, so a test can make one of them fail. */
@@ -98,32 +98,83 @@ function errorCode(error: unknown): string | undefined {
 type Reclaim = "reclaimed" | "fresh" | "gone";
 
 /**
- * Moves a lock older than `staleMs` aside, so of several processes that all see it stale exactly one rename succeeds.
- * If the file moved aside turns out to be fresh (the lock was reclaimed and retaken between our check and our rename)
- * it is put back.
+ * Moves a stale lock (older than `staleMs`) aside so a crashed holder stops blocking, then discards it. Of several
+ * processes that all see it stale, exactly one rename succeeds; the losers see the name vanish and retry.
+ *
+ * Compare-and-swap on lock identity: between reading the lock and moving it, another waiter may have reclaimed the
+ * stale token and retaken the name, so the file moved aside is checked against the exact stale token seen. A file
+ * holding any other token is a successor's live lock and is put back, never discarded.
  */
 function reclaimStale(lockPath: string, staleMs: number, now: () => number): Reclaim {
+	let staleToken: string;
 	try {
 		if (now() - statSync(lockPath).mtimeMs <= staleMs) return "fresh";
-		const aside = `${lockPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+		staleToken = readFileSync(lockPath, "utf8");
+	} catch (error) {
+		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
+	}
+	const aside = `${lockPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	try {
 		renameSync(lockPath, aside);
-		let stolenFresh = false;
-		try {
-			stolenFresh = now() - statSync(aside).mtimeMs <= staleMs;
-			if (stolenFresh) renameSync(aside, lockPath);
-		} catch {
-			// nothing more to restore
-		}
-		if (!stolenFresh) {
+	} catch (error) {
+		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
+	}
+	try {
+		// Only the exact stale token seen above may be discarded. Any other token (or a fresh mtime) means the
+		// lock was reclaimed and retaken between our read and our rename: the file aside is a live lock.
+		if (readFileSync(aside, "utf8") === staleToken && now() - statSync(aside).mtimeMs > staleMs) {
 			try {
 				unlinkSync(aside);
 			} catch {
 				// a leftover .tmp file is harmless
 			}
+			return "reclaimed";
 		}
-		return stolenFresh ? "fresh" : "reclaimed";
+	} catch {
+		// The aside copy cannot be verified; fall through and try to put the name back.
+	}
+	restoreStolen(lockPath, aside);
+	return "fresh";
+}
+
+/**
+ * Puts a live lock that was mistakenly moved aside back under its name. A third process may have claimed the free
+ * name meanwhile, and its token must never be overwritten: `linkSync` atomically refuses when the name exists, so
+ * the restore either lands in a free name or is dropped in favor of the current holder.
+ */
+function restoreStolen(lockPath: string, aside: string): void {
+	try {
+		linkSync(aside, lockPath);
+		try {
+			unlinkSync(aside);
+		} catch {
+			// the lock itself is back in place; a leftover .tmp file is harmless
+		}
+		return;
 	} catch (error) {
-		return errorCode(error) === "ENOENT" ? "gone" : "fresh";
+		if (errorCode(error) !== "EEXIST") {
+			// Hard links may be unsupported: fall back to a rename, but only into a still-free name.
+			let free = false;
+			try {
+				readFileSync(lockPath, "utf8");
+			} catch (readError) {
+				free = errorCode(readError) === "ENOENT";
+			}
+			if (free) {
+				try {
+					renameSync(aside, lockPath);
+					return;
+				} catch {
+					// fall through and clean up below
+				}
+			}
+		}
+		// The name is held by someone else now; drop our copy rather than overwrite their token.
+		try {
+			unlinkSync(aside);
+		} catch {
+			// a leftover .tmp file is harmless
+		}
 	}
 }
 

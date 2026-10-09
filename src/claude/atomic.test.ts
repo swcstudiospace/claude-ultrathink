@@ -255,4 +255,36 @@ describe("concurrent updates through updateSession", () => {
 		expect(leftovers(join(stateDir, "sessions"))).toEqual([]);
 		expect(leftovers(stateDir)).toEqual([]);
 	}, 60_000);
+
+	test("simultaneous stale-lock recovery by two waiters loses no update and claims no foreign lock", async () => {
+		const stateDir = join(dir, "state");
+		const record: SessionRecord & { counter: number } = {
+			sessionId: "stale-race",
+			at: 1,
+			result: { xml: "<X/>", original: "x", root: "X", source: "llm" },
+			counter: 0,
+		};
+		writeSession(stateDir, record);
+		// A crashed holder's lock: both waiters see it stale and race to reclaim it. Exactly one rename
+		// succeeds; the loser must retry against the winner's live lock, never move it aside or restore over it.
+		const lock = `${sessionPath(stateDir, "stale-race")}.lock`;
+		writeFileSync(lock, "dead-process-token");
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(lock, old, old);
+		const workers = [0, 1].map(() =>
+			Bun.spawn([process.execPath, WORKER, stateDir, "stale-race", "25"], { stdout: "pipe", stderr: "pipe" }),
+		);
+		const exits = await Promise.all(workers.map((worker) => worker.exited));
+		const errors = await Promise.all(workers.map((worker) => new Response(worker.stderr).text()));
+		expect(errors.join("")).toBe("");
+		expect(exits).toEqual([0, 0]);
+		// Exact count proves the two recoveries serialized: any concurrent holding would be a lost update.
+		const parsed: unknown = JSON.parse(readFileSync(sessionPath(stateDir, "stale-race"), "utf8"));
+		expect(parsed).toMatchObject({ sessionId: "stale-race", counter: 50 });
+		expect(readSession(stateDir, "stale-race")).toMatchObject({ counter: 50 });
+		// No waiter left a foreign token behind, deleted a live lock, or leaked an aside copy.
+		expect(existsSync(lock)).toBe(false);
+		expect(leftovers(join(stateDir, "sessions"))).toEqual([]);
+		expect(leftovers(stateDir)).toEqual([]);
+	}, 60_000);
 });

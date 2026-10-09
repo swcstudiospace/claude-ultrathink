@@ -5,7 +5,7 @@
  * are and how large, which files other users can read, and leftovers of a crashed write. Session records hold the user's
  * prompts, so this module only `stat`s them: it never opens, reads or prints one, and it prints no file name from them.
  */
-import { accessSync, constants, lstatSync, readdirSync, type Stats } from "node:fs";
+import { accessSync, constants, lstatSync, readdirSync, statSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import { defaultStateDir } from "../claude/state.ts";
 import type { DoctorDeps, Finding } from "./types.ts";
@@ -23,6 +23,18 @@ const CARRIER_FILES = ["last.json", "last-plan.json"] as const;
 function statOrUndefined(path: string): Stats | undefined {
 	try {
 		return lstatSync(path);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The root state directory follows links: a symlinked state dir is a working setup, so `statSync` tests the target.
+ * Session entries keep `lstatSync` above so a link inside `sessions/` is never counted as a record.
+ */
+function statFollowOrUndefined(path: string): Stats | undefined {
+	try {
+		return statSync(path);
 	} catch {
 		return undefined;
 	}
@@ -52,7 +64,7 @@ export function checkState(deps: DoctorDeps): Finding[] {
 		findings.push({ section: "state", ...finding });
 	};
 
-	const dirStat = statOrUndefined(dir);
+	const dirStat = statFollowOrUndefined(dir);
 	if (!dirStat) {
 		add({
 			id: "state.dir",
@@ -81,10 +93,54 @@ export function checkState(deps: DoctorDeps): Finding[] {
 
 	const sessionsDir = join(dir, "sessions");
 	let names: string[] = [];
-	try {
-		names = readdirSync(sessionsDir);
-	} catch {
-		// No sessions directory yet, or it cannot be listed: reported below as no sessions.
+	let sessionsUsable = true;
+	const sessionsStat = statOrUndefined(sessionsDir);
+	if (sessionsStat !== undefined) {
+		if (!sessionsStat.isDirectory()) {
+			add({
+				id: "state.sessions",
+				level: "error",
+				title: `Sessions path is not a directory: ${sessionsDir}`,
+				detail: "No session record can be saved.",
+				fix: `Remove ${sessionsDir} so it can be recreated as a directory.`,
+			});
+			sessionsUsable = false;
+		} else {
+			try {
+				accessSync(sessionsDir, constants.W_OK | constants.X_OK);
+			} catch {
+				add({
+					id: "state.sessions",
+					level: "error",
+					title: `Sessions directory is not writable: ${sessionsDir}`,
+					detail: "No session record can be saved.",
+					fix: `chmod u+rwx ${sessionsDir}`,
+				});
+				sessionsUsable = false;
+			}
+			if (sessionsUsable) {
+				try {
+					names = readdirSync(sessionsDir);
+				} catch (error) {
+					// A missing sessions directory is healthy and empty; any other listing failure means planning
+					// cannot save records, so it is an error.
+					const code =
+						typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+							? error.code
+							: undefined;
+					if (code !== "ENOENT") {
+						add({
+							id: "state.sessions",
+							level: "error",
+							title: `Sessions directory cannot be listed: ${sessionsDir}`,
+							detail: error instanceof Error ? error.message : String(error),
+							fix: `chmod u+rwx ${sessionsDir}`,
+						});
+						sessionsUsable = false;
+					}
+				}
+			}
+		}
 	}
 	const now = deps.now();
 	let sessions = 0;
@@ -112,9 +168,10 @@ export function checkState(deps: DoctorDeps): Finding[] {
 		if (stats?.isFile() && stats.mode & LOOSE_MODE) loose++;
 	}
 
-	if (sessions === 0) {
+	// When the sessions directory itself is broken an error above already explains why nothing could be counted.
+	if (sessionsUsable && sessions === 0) {
 		add({ id: "state.sessions", level: "info", title: "No session records yet" });
-	} else {
+	} else if (sessionsUsable) {
 		const age = oldest === undefined ? "" : `, oldest ${formatAge(now - oldest)} old`;
 		const summary = `${plural(sessions, "session record")}, ${formatSize(bytes)}${age}`;
 		if (sessions > MAX_SESSIONS || bytes > MAX_SESSION_BYTES) {
@@ -123,7 +180,7 @@ export function checkState(deps: DoctorDeps): Finding[] {
 				level: "warn",
 				title: `${summary}: above ${MAX_SESSIONS} sessions or 100 MB`,
 				detail: "Session records are kept until you remove them.",
-				fix: "Run `ultrathink prune --dry-run` to see what would be removed.",
+				fix: "Run `ultrathink prune --older-than 30 --dry-run` to see what would be removed.",
 			});
 		} else {
 			add({ id: "state.sessions", level: "info", title: summary });
@@ -145,7 +202,7 @@ export function checkState(deps: DoctorDeps): Finding[] {
 			level: "warn",
 			title: `${plural(orphans, "leftover .tmp or .lock file")} older than one hour in sessions/`,
 			detail: "Leftovers of a write that crashed before it finished.",
-			fix: "Delete them when no ultrathink process is running, or run `ultrathink prune --dry-run`.",
+			fix: "Delete them when no ultrathink process is running, or run `ultrathink prune --older-than 30 --dry-run`.",
 		});
 	}
 	return findings;

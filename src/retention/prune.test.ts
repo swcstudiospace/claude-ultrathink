@@ -255,6 +255,55 @@ describe("pruneSessions", () => {
 		expect(sessionFiles(state).length).toBeGreaterThan(2);
 	});
 
+	test("an entry limit never splits a session pair: a fresh sibling keeps its old record", () => {
+		const state = makeState();
+		seed(state, "a-single", 90, { xml: false });
+		seed(state, "m-pair", 90);
+		put(join(state, "sessions", "m-pair.xml"), "<spec/>", DAY);
+		seed(state, "z-pair", 90);
+		const first = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, limit: 3 });
+		expect(first.pruned.map((session) => session.id)).toEqual(["a-single"]);
+		expect(sessionFiles(state)).toEqual(["m-pair.json", "m-pair.xml", "z-pair.json", "z-pair.xml"]);
+		const second = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, limit: 3 });
+		expect(second.pruned).toEqual([]);
+		expect(sessionFiles(state)).toEqual(["m-pair.json", "m-pair.xml", "z-pair.json", "z-pair.xml"]);
+	});
+
+	test("a session resumed while an earlier session is deleted is kept", () => {
+		const state = makeState();
+		seed(state, "aaa-first", 90);
+		seed(state, "mmm-third", 80);
+		seed(state, "zzz-second", 60);
+		const remove = (path: string): void => {
+			unlinkSync(path);
+			if (path.endsWith("aaa-first.json")) {
+				// another process resumes two sessions between their age checks and their deletions
+				const seconds = NOW / 1000;
+				utimesSync(join(state, "sessions", "zzz-second.json"), seconds, seconds);
+				utimesSync(join(state, "sessions", "zzz-second.xml"), seconds, seconds);
+				writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "mmm-third", result: {} }));
+			}
+		};
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, remove });
+		expect(result.pruned.map((session) => session.id)).toEqual(["aaa-first"]);
+		expect(result.kept).toBe(2);
+		expect(sessionFiles(state)).toEqual(["mmm-third.json", "mmm-third.xml", "zzz-second.json", "zzz-second.xml"]);
+	});
+
+	test("bounded runs resume past the previous cursor so every session is eventually reached", () => {
+		const state = makeState();
+		seed(state, "keep-a", 1);
+		seed(state, "keep-b", 1);
+		seed(state, "old-c", 90);
+		seed(state, "old-d", 80);
+		const first = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, limit: 5 });
+		expect(first.pruned).toEqual([]);
+		expect(first.kept).toBe(2);
+		const second = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, limit: 5 });
+		expect(second.pruned.map((session) => session.id)).toEqual(["old-c"]);
+		expect(sessionFiles(state)).toEqual(["keep-a.json", "keep-a.xml", "keep-b.json", "keep-b.xml", "old-d.json", "old-d.xml"]);
+	});
+
 	test("refuses a cutoff that is not above zero instead of removing everything", () => {
 		const state = makeState();
 		seed(state, "fresh", 0);
@@ -310,6 +359,14 @@ describe("pruneSessionsBestEffort", () => {
 		const later = pruneSessionsBestEffort({ stateDir: state, retentionDays: 30, now: () => NOW + 25 * HOUR });
 		expect(later?.pruned.map((session) => session.id)).toEqual(["old-again"]);
 		expect(sessionFiles(state)).toEqual([]);
+	});
+
+	test("a marker claimed by a sibling process is honored: no second prune", () => {
+		const state = makeState();
+		seed(state, "old", 40);
+		put(join(state, ".last-prune"), "", HOUR);
+		expect(pruneSessionsBestEffort({ stateDir: state, retentionDays: 30, now })).toBeUndefined();
+		expect(sessionFiles(state)).toEqual(["old.json", "old.xml"]);
 	});
 
 	test("an old marker on disk lets it run", () => {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildReport, formatReport, reportJson } from "./report.ts";
@@ -78,6 +78,56 @@ describe("checkState", () => {
 		expect(byId(checkState(deps), "state.dir")).toMatchObject({ level: "error", title: `State path is not a directory: ${stateDir}` });
 	});
 
+	test("a symlinked state directory is followed", () => {
+		const target = join(dir, "real-state");
+		mkdirSync(target);
+		symlinkSync(target, stateDir);
+		put("sessions/a.json", { size: 100 });
+		const findings = checkState(deps);
+		expect(byId(findings, "state.dir")).toMatchObject({ level: "ok", title: `State directory is writable: ${stateDir}` });
+		expect(byId(findings, "state.sessions").title).toBe("1 session record, 100 B, oldest under an hour old");
+	});
+
+	test("a sessions path that is a file is an error with no healthy summary", () => {
+		mkdirSync(stateDir);
+		const sessionsDir = join(stateDir, "sessions");
+		writeFileSync(sessionsDir, "not a directory");
+		const findings = checkState(deps);
+		expect(byId(findings, "state.dir")).toMatchObject({ level: "ok" });
+		expect(byId(findings, "state.sessions")).toMatchObject({
+			level: "error",
+			title: `Sessions path is not a directory: ${sessionsDir}`,
+		});
+		expect(findings.filter((finding) => finding.id === "state.sessions")).toHaveLength(1);
+	});
+
+	test.skipIf(RUNNING_AS_ROOT)("a sessions directory the user cannot write to is an error", () => {
+		const sessionsDir = join(stateDir, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		chmodSync(sessionsDir, 0o500);
+		try {
+			const finding = byId(checkState(deps), "state.sessions");
+			expect(finding.level).toBe("error");
+			expect(finding.title).toBe(`Sessions directory is not writable: ${sessionsDir}`);
+			expect(finding.fix).toBe(`chmod u+rwx ${sessionsDir}`);
+		} finally {
+			chmodSync(sessionsDir, 0o700);
+		}
+	});
+
+	test.skipIf(RUNNING_AS_ROOT)("a sessions directory that cannot be listed is an error", () => {
+		const sessionsDir = join(stateDir, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		chmodSync(sessionsDir, 0o300);
+		try {
+			const finding = byId(checkState(deps), "state.sessions");
+			expect(finding.level).toBe("error");
+			expect(finding.title).toBe(`Sessions directory cannot be listed: ${sessionsDir}`);
+		} finally {
+			chmodSync(sessionsDir, 0o700);
+		}
+	});
+
 	test.skipIf(RUNNING_AS_ROOT)("a directory the user cannot write to is an error", () => {
 		mkdirSync(stateDir);
 		chmodSync(stateDir, 0o500);
@@ -115,7 +165,7 @@ describe("checkState", () => {
 		expect(finding.level).toBe("warn");
 		expect(finding.title).toContain("501 session records");
 		expect(finding.title).toContain("above 500 sessions or 100 MB");
-		expect(finding.fix).toContain("`ultrathink prune --dry-run`");
+		expect(finding.fix).toContain("`ultrathink prune --older-than 30 --dry-run`");
 	});
 
 	test("more than 100 MB of sessions is a warning", () => {
@@ -124,7 +174,19 @@ describe("checkState", () => {
 		const finding = byId(checkState(deps), "state.sessions");
 		expect(finding.level).toBe("warn");
 		expect(finding.title).toContain("101.0 MB");
-		expect(finding.fix).toContain("`ultrathink prune --dry-run`");
+		expect(finding.fix).toContain("`ultrathink prune --older-than 30 --dry-run`");
+	});
+
+	test("both prune hints carry an explicit cutoff that works on the default config", () => {
+		for (let index = 0; index < 501; index++) put(`sessions/hint${index}.json`, { size: 10 });
+		put("sessions/stale.json.tmp", { ageMs: 2 * HOUR });
+		const findings = checkState(deps);
+		expect(byId(findings, "state.sessions").fix).toBe(
+			"Run `ultrathink prune --older-than 30 --dry-run` to see what would be removed.",
+		);
+		expect(byId(findings, "state.orphans").fix).toBe(
+			"Delete them when no ultrathink process is running, or run `ultrathink prune --older-than 30 --dry-run`.",
+		);
 	});
 
 	test("session and carrier files readable by group or others are counted with the chmod fix", () => {

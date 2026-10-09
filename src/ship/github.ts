@@ -28,8 +28,20 @@ export interface Github {
 	comment(number: number, body: string): { ok: boolean; error?: string };
 	mergeMethods(): ShipConfig["mergeMethod"][];
 	syncBase(input: { base: string; branch: string }): { ok: boolean; error?: string };
-	/** The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed. */
-	reviewThreads(prNumber: number): ReviewThreads;
+	/**
+	 * The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed.
+	 * With `opts.deadlineMs` the page scan stops fail-closed once the shared deadline passes instead of
+	 * paging past the caller's wait budget; each page keeps its own request timeout.
+	 */
+	reviewThreads(prNumber: number, opts?: ReviewThreadsOptions): ReviewThreads;
+}
+
+/** Bounds a `reviewThreads` page scan: the loop stops fail-closed once `now()` reaches `deadlineMs`. */
+export interface ReviewThreadsOptions {
+	/** Absolute timestamp on the `now` clock bounding the whole scan; unset scans without a bound. */
+	deadlineMs?: number;
+	/** Clock for the deadline check; defaults to `Date.now`. Injected in tests. */
+	now?: () => number;
 }
 
 const LONG_TIMEOUT_MS = 180_000;
@@ -46,6 +58,7 @@ const DONE_STATUSES: Record<string, true> = { COMPLETED: true, SUCCESS: true };
 // GitHub caps `first` at 100, so a larger pull request is read page by page, up to this many pages.
 const MAX_THREAD_PAGES = 20;
 const PAGINATION_STALLED = "review threads pagination did not advance";
+const THREADS_DEADLINE_EXCEEDED = "review threads scan exceeded its deadline";
 const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
 	repository(owner: $owner, name: $name) {
 		pullRequest(number: $number) {
@@ -232,13 +245,19 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			if (exists && current !== branch) exec(["git", "branch", "-D", branch]);
 			return { ok: true };
 		},
-		reviewThreads(prNumber) {
+		reviewThreads(prNumber, opts = {}) {
 			const [owner, name] = gh.repo()?.name.split("/") ?? [];
 			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
+			const now = opts.now ?? Date.now;
 			const threads: ReviewThread[] = [];
 			const seen = new Set<string>();
 			let after: string | undefined;
 			for (let page = 1; page <= MAX_THREAD_PAGES; page++) {
+				// Fail closed once the caller's wait budget is spent: no partial threads, same as other doubts.
+				// Each page keeps its own request timeout; this only stops starting another page past the deadline.
+				if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) {
+					return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+				}
 				const r = exec([
 					"gh", "api", "graphql",
 					"-f", `query=${THREADS_QUERY}`,

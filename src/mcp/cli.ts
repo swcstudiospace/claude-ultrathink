@@ -319,12 +319,11 @@ async function trackComplete(args: string[]): Promise<number> {
 		}
 		const xml = injectTrackingXml(current.result.xml, plan, tracking);
 		return { ...current, tracking, result: { ...current.result, xml } };
-	});
+	}, (next) => next.result.xml);
 	if (!saved) {
 		if (planReplaced) err(`ultrathink-mcp: the session record has a newer plan than the one tracked; rerun track complete: ${statePath}`);
 		return 1;
 	}
-	writeFileAtomic(statePath.replace(/\.json$/, ".xml"), saved.result.xml);
 	out(
 		`tracking ${tracking.status} · ${Object.keys(tracking.linear.nodes).length} issues · ${Object.keys(tracking.linear.steps).length} sub-issues · graph ${tracking.graphId}`,
 	);
@@ -347,21 +346,24 @@ function readRecord(statePath: string): SessionRecord | undefined {
 	err(`ultrathink-mcp: cannot read session record: ${statePath}`);
 	return undefined;
 }
-
 /**
  * Locked read-modify-write of a session record, atomic and owner-only on disk. Returns the written record, or
  * undefined when the record cannot be read (reported on stderr) or `mutate` returns undefined (nothing written).
+ * An optional `xml` projection is written as the `.xml` sidecar inside the same lock, so the sidecar can never
+ * lag a concurrent JSON update that lands between the record write and the sidecar write.
  */
-function updateRecord(statePath: string, mutate: (record: SessionRecord) => SessionRecord | undefined): SessionRecord | undefined {
+function updateRecord(statePath: string, mutate: (record: SessionRecord) => SessionRecord | undefined, xml?: (next: SessionRecord) => string | undefined): SessionRecord | undefined {
 	return withFileLock(statePath, () => {
 		const record = readRecord(statePath);
 		if (!record) return undefined;
 		const next = mutate(record);
-		if (next) writeFileAtomic(statePath, `${JSON.stringify(next, null, 2)}\n`);
+		if (!next) return undefined;
+		writeFileAtomic(statePath, `${JSON.stringify(next, null, 2)}\n`);
+		const text = xml?.(next);
+		if (text !== undefined) writeFileAtomic(statePath.replace(/\.json$/, ".xml"), text);
 		return next;
 	});
 }
-
 function sessionMark(args: string[]): number {
 	const statePath = flag(args, "--state");
 	if (!statePath) throw new UsageError("session mark needs --state <path>");

@@ -9,6 +9,7 @@
  */
 import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join } from "node:path";
+import { withFileLock } from "../claude/atomic.ts";
 import { sessionPath } from "../claude/state.ts";
 import { carrierPath } from "../host/carrier.ts";
 
@@ -17,7 +18,8 @@ const ORPHAN_AGE_MS = 3_600_000;
 /** Entries one scheduled run may examine, so a huge state directory never slows a prompt. */
 const BEST_EFFORT_LIMIT = 500;
 const MARKER_NAME = ".last-prune";
-
+/** The last sessions-directory entry a bounded run examined; a best-effort hint, never a promise. */
+const CURSOR_NAME = ".prune-cursor";
 export interface PrunedSession {
 	id: string;
 	bytes: number;
@@ -110,6 +112,85 @@ function listEntries(sweep: Sweep, dir: string, label: string): string[] {
 	}
 }
 
+/**
+ * The `.json`/`.xml` stem of a session entry, or undefined for anything else. One shared rule so grouping,
+ * budgeted listing and the locked re-read always agree on what belongs to a session.
+ */
+function sessionStem(name: string): string | undefined {
+	const extension = name.endsWith(".json") ? ".json" : name.endsWith(".xml") ? ".xml" : undefined;
+	if (!extension) return undefined;
+	const stem = name.slice(0, -extension.length);
+	return stem ? stem : undefined;
+}
+
+/**
+ * The sessions-directory listing for a bounded run. `.json`/`.xml` siblings are grouped before the budget slice
+ * so it never splits a pair (an old record judged without its fresh spec would be deleted wrongly), and the slice
+ * starts after the previous run's cursor so bounded sweeps eventually reach every session instead of re-scanning
+ * the same first entries. The first group is always taken while any budget remains, so a pair wider than a tiny
+ * budget still makes progress; the slice may then exceed the budget by one entry.
+ */
+function listSessionEntries(sweep: Sweep, dir: string, label: string, cursor: string | undefined): string[] {
+	let all: string[];
+	try {
+		all = readdirSync(dir).sort();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") fail(sweep, label, error);
+		return [];
+	}
+	const groups: string[][] = [];
+	const byStem = new Map<string, string[]>();
+	for (const name of all) {
+		const stem = sessionStem(name);
+		if (stem === undefined) {
+			groups.push([name]);
+			continue;
+		}
+		const existing = byStem.get(stem);
+		if (existing) existing.push(name);
+		else {
+			const group = [name];
+			byStem.set(stem, group);
+			groups.push(group);
+		}
+	}
+	let start = 0;
+	if (cursor !== undefined && groups.length > 0) {
+		const at = groups.findIndex((group) => group.includes(cursor));
+		start = at < 0 ? 0 : (at + 1) % groups.length;
+	}
+	const budget = Math.max(0, sweep.budget);
+	const names: string[] = [];
+	for (let offset = 0; offset < groups.length && names.length < budget; offset++) {
+		const group = groups[(start + offset) % groups.length];
+		if (!group) continue;
+		if (names.length > 0 && names.length + group.length > budget) break;
+		names.push(...group);
+	}
+	sweep.budget -= names.length;
+	sweep.result.scanned += names.length;
+	return names;
+}
+
+/** The last sessions-directory entry a bounded run examined; missing or unreadable means start over. */
+function readCursor(stateDir: string): string | undefined {
+	try {
+		const value = readFileSync(join(stateDir, CURSOR_NAME), "utf8");
+		return value ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Records the resume position. A lost cursor only repeats work, so failures stay silent. */
+function writeCursor(stateDir: string, last: string): void {
+	try {
+		writeFileSync(join(stateDir, CURSOR_NAME), last, { mode: 0o600 });
+	} catch {
+		// hint only; the next run starts over
+	}
+}
+
 function statEntry(sweep: Sweep, path: string, name: string): Stats | undefined {
 	try {
 		return lstatSync(path);
@@ -185,10 +266,8 @@ function protectedStems(stateDir: string): Set<string> {
 function groupSessions(sweep: Sweep, dir: string, names: string[]): Map<string, SessionGroup> {
 	const groups = new Map<string, SessionGroup>();
 	for (const name of names) {
-		const extension = name.endsWith(".json") ? ".json" : name.endsWith(".xml") ? ".xml" : undefined;
-		if (!extension) continue;
-		const stem = name.slice(0, -extension.length);
-		if (!stem) continue;
+		const stem = sessionStem(name);
+		if (stem === undefined) continue;
 		const path = join(dir, name);
 		const stat = statEntry(sweep, path, name);
 		if (!stat) continue;
@@ -201,6 +280,71 @@ function groupSessions(sweep: Sweep, dir: string, names: string[]): Map<string, 
 		else group.unsafe = true;
 	}
 	return groups;
+}
+
+/** The session's files as they exist right now, re-read under the session lock before deleting. */
+function readSessionGroup(sweep: Sweep, dir: string, stem: string): SessionGroup {
+	const group: SessionGroup = { files: [], unsafe: false };
+	let names: string[];
+	try {
+		names = readdirSync(dir).sort();
+	} catch {
+		return group;
+	}
+	for (const name of names) {
+		if (sessionStem(name) !== stem) continue;
+		const path = join(dir, name);
+		const stat = statEntry(sweep, path, name);
+		if (!stat) continue;
+		if (stat.isFile()) group.files.push({ name, path, size: stat.size, mtimeMs: stat.mtimeMs });
+		else group.unsafe = true;
+	}
+	return group;
+}
+
+/**
+ * Deletes one session candidate. The session's record lock — the same lock session writes take — is held across
+ * a second freshness and carrier check, so a session resumed after the first check is kept, not deleted. A lock
+ * held by a live writer means the session is being written: keep it rather than wait on a prompt path. Dry runs
+ * take no lock: they must touch nothing, not even a lock file.
+ */
+function deleteSession(sweep: Sweep, stateDir: string, dir: string, stem: string, olderThanMs: number): void {
+	const attempt = (): void => {
+		const { result } = sweep;
+		const current = readSessionGroup(sweep, dir, stem);
+		const newest = Math.max(0, ...current.files.map((file) => file.mtimeMs));
+		if (current.unsafe || sweep.now - newest <= olderThanMs || protectedStems(stateDir).has(stem)) {
+			result.kept++;
+			return;
+		}
+		let removed = 0;
+		let bytes = 0;
+		for (const file of current.files) {
+			if (!removeFile(sweep, file.path, file.name)) continue;
+			removed++;
+			bytes += file.size;
+		}
+		if (removed === 0) {
+			result.kept++;
+			return;
+		}
+		const age = sweep.now - newest;
+		result.pruned.push({ id: stem, bytes, ageDays: Math.floor(age / DAY_MS) });
+		result.bytes += bytes;
+	};
+	if (sweep.dryRun) {
+		attempt();
+		return;
+	}
+	let locked = true;
+	withFileLock(
+		join(dir, `${stem}.json`),
+		() => {
+			if (locked) attempt();
+			else sweep.result.kept++;
+		},
+		{ timeoutMs: 0, log: () => { locked = false; } },
+	);
 }
 
 function sweepSessions(sweep: Sweep, stateDir: string, dir: string, names: string[], olderThanMs: number): void {
@@ -222,19 +366,7 @@ function sweepSessions(sweep: Sweep, stateDir: string, dir: string, names: strin
 			result.keptActive++;
 			continue;
 		}
-		let removed = 0;
-		let bytes = 0;
-		for (const file of group.files) {
-			if (!removeFile(sweep, file.path, file.name)) continue;
-			removed++;
-			bytes += file.size;
-		}
-		if (removed === 0) {
-			result.kept++;
-			continue;
-		}
-		result.pruned.push({ id: stem, bytes, ageDays: Math.floor(age / DAY_MS) });
-		result.bytes += bytes;
+		deleteSession(sweep, stateDir, dir, stem, olderThanMs);
 	}
 }
 
@@ -260,9 +392,16 @@ export function pruneSessions(options: PruneOptions): PruneResult {
 		}
 		const sessionsDir = join(options.stateDir, "sessions");
 		sweepOrphans(sweep, options.stateDir, listEntries(sweep, options.stateDir, "state directory"));
-		const names = listEntries(sweep, sessionsDir, "sessions");
+		const bounded = options.limit !== undefined;
+		const names = bounded
+			? listSessionEntries(sweep, sessionsDir, "sessions", readCursor(options.stateDir))
+			: listEntries(sweep, sessionsDir, "sessions");
 		sweepOrphans(sweep, sessionsDir, names);
 		sweepSessions(sweep, options.stateDir, sessionsDir, names, options.olderThanMs);
+		if (bounded && !dryRun && names.length > 0) {
+			const last = names[names.length - 1];
+			if (last !== undefined) writeCursor(options.stateDir, last);
+		}
 	} catch (error) {
 		fail(sweep, "prune", error);
 	}
@@ -278,13 +417,19 @@ export function pruneSessionsBestEffort(options: BestEffortOptions): PruneResult
 		if (!Number.isFinite(options.retentionDays) || options.retentionDays <= 0) return undefined;
 		const now = (options.now ?? Date.now)();
 		const marker = join(options.stateDir, MARKER_NAME);
-		try {
-			if (now - statSync(marker).mtimeMs < DAY_MS) return undefined;
-		} catch {
-			// no marker yet: first run
-		}
-		writeFileSync(marker, "", { mode: 0o600 });
-		utimesSync(marker, now / 1000, now / 1000);
+		// The check-and-claim runs under the marker lock so two processes starting together cannot both pass the
+		// daily check: exactly one touches the marker and prunes while the other sees it fresh and returns early.
+		const claimed = withFileLock(marker, () => {
+			try {
+				if (now - statSync(marker).mtimeMs < DAY_MS) return false;
+			} catch {
+				// no marker yet: first run
+			}
+			writeFileSync(marker, "", { mode: 0o600 });
+			utimesSync(marker, now / 1000, now / 1000);
+			return true;
+		});
+		if (!claimed) return undefined;
 		return pruneSessions({
 			stateDir: options.stateDir,
 			olderThanMs: options.retentionDays * DAY_MS,

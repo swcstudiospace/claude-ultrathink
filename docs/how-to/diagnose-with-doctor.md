@@ -73,7 +73,7 @@ A missing credential for a feature you turned on is a warning, with the command 
 | The directory does not exist yet | info (it is created on the first planned prompt) |
 | The directory exists but is not writable, or the path is not a directory | error |
 | Number, total size and oldest age of the session records in `sessions/` | info |
-| More than 500 session records, or more than 100 MB | warn, with the hint `ultrathink prune --dry-run` |
+| More than 500 session records, or more than 100 MB | warn, with the hint `ultrathink prune --older-than 30 --dry-run` |
 | Session or carrier files that group or others can read | warn, with the fix `chmod -R go-rwx <dir>`. ultrathink writes new files with mode `0600`. |
 | `*.tmp` or `*.lock` files in `sessions/` older than one hour | warn: leftovers of a write that crashed before it finished |
 

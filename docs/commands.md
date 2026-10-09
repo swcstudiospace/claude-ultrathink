@@ -403,7 +403,7 @@ Any other argument prints that line and exits 2. The report has four sections, `
 | `runtime` | Bun 1.2 or later, `git`, `gh` (a warning only when `ship.enabled` is on), whether a GitHub token variable or a gh hosts file exists (not verified), Python 3.10 or later (info only), the detected host. |
 | `config` | Per file: not found (info), invalid JSON or not an object (error), unknown section or key with a `Did you mean …?`, a wrong type, a value the merge ignores or adjusts with the effective value, and a key a project file may not set (info, by design). |
 | `credentials` | Present or missing, by provider name only, for the features that are switched on, with the command that stores a missing one. |
-| `state` | Missing or unwritable directory, session count, size and oldest age (a warning above 500 sessions or 100 MB, with the hint `ultrathink prune --dry-run`), session and carrier files that group or others can read, and `*.tmp` and `*.lock` files in `sessions/` older than one hour. |
+| `state` | Missing or unwritable directory, session count, size and oldest age (a warning above 500 sessions or 100 MB, with the hint `ultrathink prune --older-than 30 --dry-run`), session and carrier files that group or others can read, and `*.tmp` and `*.lock` files in `sessions/` older than one hour. |
 
 Exit 0 means no error finding; warnings still exit 0. Exit 1 means at least one error finding. A credential value, a prefix of one and its length are never printed, and session records are never read.
 
