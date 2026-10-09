@@ -21,6 +21,7 @@
 	"scripts": {
 		"test": "bun test",
 		"check": "bunx --package typescript@5.9.3 tsc --noEmit",
+		"verify": "bun run check && bun test && python3 hosts/hermes/bridge_test.py && python3 hosts/prime-agent/bridge_test.py",
 		"hook:uplift": "bun hooks/uplift.ts",
 		"uplift": "bun hooks/uplift.ts --ctl",
 		"setup": "bun scripts/setup.ts",

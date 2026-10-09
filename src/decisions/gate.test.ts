@@ -561,9 +561,11 @@ describe("provider routing (JEV-02)", () => {
 		const outcome = await decisions.run("plan", PLAN_STATE, PLAN_OPTS);
 		expect(outcome.status).toBe("ok");
 		expect(r.calls).toHaveLength(1);
-		expect(r.calls[0].url).toBe(VERCEL_DECISIONS_URL);
-		expect(r.calls[0].headers["ai-model-id"]).toBe("typesafe-ai/jev");
-		expect(r.calls[0].body).toMatchObject({ questions: { plan_worthy: { type: "boolean" } } });
+		const call = r.calls[0];
+		if (!call) throw new Error("expected a decisions call");
+		expect(call.url).toBe(VERCEL_DECISIONS_URL);
+		expect(call.headers["ai-model-id"]).toBe("typesafe-ai/jev");
+		expect(call.body).toMatchObject({ questions: { plan_worthy: { type: "boolean" } } });
 		if (outcome.status !== "ok") throw new Error("expected ok");
 		expect(outcome.p).toBe(0.97);
 		expect(outcome.record).toMatchObject({ point: "plan", outcome: "ok", model: "typesafe-ai/jev", action: "plan" });
@@ -574,12 +576,12 @@ describe("provider routing (JEV-02)", () => {
 		const r = recordingFetch([VEV(0.5)]);
 		const auto = runtime(r.fetch, { config: { ...ON, provider: "auto" }, env: both }).decisions;
 		await auto.run("plan", PLAN_STATE, PLAN_OPTS);
-		expect(r.calls[0].url).toBe(VERCEL_DECISIONS_URL);
+		expect(r.calls[0]?.url).toBe(VERCEL_DECISIONS_URL);
 		const queued = recordingFetch([JEV(0.5)]);
 		const pinned = runtime(queued.fetch, { config: { ...ON, provider: "openrouter" }, env: both }).decisions;
 		expect(pinned.active("plan")).toBe(true);
 		await pinned.run("plan", PLAN_STATE, PLAN_OPTS);
-		expect(queued.calls[0].url).toBe(ENDPOINT);
+		expect(queued.calls[0]?.url).toBe(ENDPOINT);
 	});
 
 	test("the kill switch offs the vercel rail too, with zero requests", async () => {

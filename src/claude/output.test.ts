@@ -590,8 +590,10 @@ describe("handoff", () => {
 				conclusion: "c".repeat(1_200),
 			})),
 		};
+		const seed = clarifications[0];
+		if (!seed) throw new Error("expected a seed clarification");
 		const blocking: Clarification[] = Array.from({ length: 4 }, (_, i) => ({
-			...clarifications[0],
+			...seed,
 			id: `q${i}`,
 			question: `Which database should the new service layer use, question ${i}?`,
 			why: "Schema, migrations and the deployment topology all depend on it",

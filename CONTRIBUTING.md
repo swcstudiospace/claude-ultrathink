@@ -10,13 +10,16 @@ You need [Bun](https://bun.sh) 1.2 or newer, Python 3.10 or newer and git, on Li
 git clone https://github.com/swcstudiospace/claude-ultrathink.git
 cd claude-ultrathink
 bun install
+bun run verify                         # the local gate: type check, bun test and both bridge tests, in CI's order
 bun run check                          # type check (TypeScript 5.9.3, pinned in package.json)
 bun test
 python3 hosts/hermes/bridge_test.py    # Hermes bridge tests; prints "ok"
 python3 hosts/prime-agent/bridge_test.py   # Prime Agent bridge tests (unittest, stdlib only)
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10. The Bun 1.2.x jobs run the tests and the Hermes bridge tests without `bun install` and the type check, because they cannot read `bun.lock` and ultrathink has no runtime dependencies.
+CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and on every push to `main`, on Linux and macOS, with Bun 1.2.x (the minimum in `package.json`) and the latest Bun, and Python 3.10. The Bun 1.2.x jobs run the tests and the Hermes bridge tests without `bun install` and the type check, because they cannot read `bun.lock` and ultrathink has no runtime dependencies. Each job has a 20-minute timeout, and a newer push to a pull request cancels its superseded runs (runs on `main` always finish).
+
+Every action in `.github/workflows/` is pinned to a full commit SHA with its major tag in a trailing comment (`# v4`). Dependabot (`.github/dependabot.yml`) covers `github-actions` and `bun` and opens one grouped pull request for each every Monday, which updates the SHA and the comment together. To look a SHA up yourself, run `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`. CodeQL (`.github/workflows/codeql.yml`) scans JavaScript/TypeScript and Python on every pull request, including forks, on pushes to `main` and weekly. It uses `pull_request`, not privileged `pull_request_target`: [GitHub permits code-scanning uploads for that event even with a read-only token](https://docs.github.com/en/code-security/reference/code-scanning/troubleshoot-analysis-errors/resource-not-accessible).
 
 The Teachable Moments, Hindsight, RAGFlow and Jev tests are `bun test src/teach src/hindsight src/ragflow src/decisions`. That is a narrower run of `bun test`, not an extra required check. The Hermes plugin tests stay `python3 hosts/hermes/bridge_test.py` (a plain script that prints `ok`; CI runs that, not `python3 -m unittest`).
 

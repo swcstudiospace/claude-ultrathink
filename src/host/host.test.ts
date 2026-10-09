@@ -315,7 +315,9 @@ describe("planPrompt", () => {
 				expect(completers.size).toBe(1);
 				expect(phases).toEqual(["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"]);
 				expect(response.modelResolution).toEqual(resolution);
-				expect(readSession(env.ULTRATHINK_STATE_DIR, "s1")?.modelResolution).toEqual(resolution);
+				const stateDir = env.ULTRATHINK_STATE_DIR;
+				if (!stateDir) throw new Error("expected ULTRATHINK_STATE_DIR");
+				expect(readSession(stateDir, "s1")?.modelResolution).toEqual(resolution);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
@@ -702,7 +704,9 @@ describe("planPrompt with the Jev plan gate", () => {
 					if (acks.includes(prompt)) expect(jev).toEqual({ context: "", skipped: "precheck-skip" });
 				}
 				// Planning turned off by control state.
-				writeControl(h.env.ULTRATHINK_STATE_DIR, { enabled: false });
+				const offDir = h.env.ULTRATHINK_STATE_DIR;
+				if (!offDir) throw new Error("expected ULTRATHINK_STATE_DIR");
+				writeControl(offDir, { enabled: false });
 				h.configure({ enabled: false });
 				const offBase = await run(NEW_WORK);
 				h.configure({ enabled: true });
@@ -1024,7 +1028,9 @@ describe("planPrompt flight context, cancellation and the resolution record", ()
 			const counts: Record<string, number> = { uplift: 0, graph: 0, fill: 0, clarify: 0 };
 			const rec = recorder((call) => {
 				const { stage, text } = stageAnswer(userText(call));
-				counts[stage]++;
+				const seen = counts[stage];
+				if (seen === undefined) throw new Error(`unexpected stage ${stage}`);
+				counts[stage] = seen + 1;
 				return reply([{ type: "text", text }]);
 			});
 			const config = quietConfig();

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { claudeConfigPaths, loadConfig, userConfigPath } from "../config.ts";
+import { withFileLock, writeFileAtomic } from "../claude/atomic.ts";
 import { readControl } from "../claude/state.ts";
 import type { SessionRecord } from "../claude/state.ts";
 import { createGatewayTracker } from "../track/gateway.ts";
@@ -308,12 +309,21 @@ async function trackComplete(args: string[]): Promise<number> {
 		err("ultrathink-mcp: no tracker credentials: run ultrathink-mcp auth status");
 		return 1;
 	}
-	record.tracking = tracking;
-	const xml = injectTrackingXml(record.result.xml, plan, tracking);
-	record.result = { ...record.result, xml };
-	writeAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
-	const specPath = statePath.replace(/\.json$/, ".xml");
-	writeAtomic(specPath, xml);
+	// The tracker call above can take long enough for another process to update the record (a ship step, a mark), so the
+	// record is read again under the lock and only the tracking and its spec XML are applied to it.
+	let planReplaced = false;
+	const saved = updateRecord(statePath, (current) => {
+		if (current.plan?.graphId !== plan.graphId) {
+			planReplaced = true;
+			return undefined;
+		}
+		const xml = injectTrackingXml(current.result.xml, plan, tracking);
+		return { ...current, tracking, result: { ...current.result, xml } };
+	}, (next) => next.result.xml);
+	if (!saved) {
+		if (planReplaced) err(`ultrathink-mcp: the session record has a newer plan than the one tracked; rerun track complete: ${statePath}`);
+		return 1;
+	}
 	out(
 		`tracking ${tracking.status} · ${Object.keys(tracking.linear.nodes).length} issues · ${Object.keys(tracking.linear.steps).length} sub-issues · graph ${tracking.graphId}`,
 	);
@@ -336,14 +346,24 @@ function readRecord(statePath: string): SessionRecord | undefined {
 	err(`ultrathink-mcp: cannot read session record: ${statePath}`);
 	return undefined;
 }
-
-/** Temp file in the same directory, then rename, so readers never see a partial record. */
-function writeAtomic(path: string, text: string): void {
-	const tmp = `${path}.${process.pid}.tmp`;
-	writeFileSync(tmp, text);
-	renameSync(tmp, path);
+/**
+ * Locked read-modify-write of a session record, atomic and owner-only on disk. Returns the written record, or
+ * undefined when the record cannot be read (reported on stderr) or `mutate` returns undefined (nothing written).
+ * An optional `xml` projection is written as the `.xml` sidecar inside the same lock, so the sidecar can never
+ * lag a concurrent JSON update that lands between the record write and the sidecar write.
+ */
+function updateRecord(statePath: string, mutate: (record: SessionRecord) => SessionRecord | undefined, xml?: (next: SessionRecord) => string | undefined): SessionRecord | undefined {
+	return withFileLock(statePath, () => {
+		const record = readRecord(statePath);
+		if (!record) return undefined;
+		const next = mutate(record);
+		if (!next) return undefined;
+		writeFileAtomic(statePath, `${JSON.stringify(next, null, 2)}\n`);
+		const text = xml?.(next);
+		if (text !== undefined) writeFileAtomic(statePath.replace(/\.json$/, ".xml"), text);
+		return next;
+	});
 }
-
 function sessionMark(args: string[]): number {
 	const statePath = flag(args, "--state");
 	if (!statePath) throw new UsageError("session mark needs --state <path>");
@@ -351,13 +371,14 @@ function sessionMark(args: string[]): number {
 	const mark = marks.length === 1 ? marks[0] : undefined;
 	const field = mark === "kicked-off" ? "kickedOff" : mark === "synced" ? "synced" : undefined;
 	if (!field) throw new UsageError(`session mark needs one of kicked-off, synced: ${marks.join(" ") || "(none)"}`);
-	const record = readRecord(statePath);
-	if (!record) return 1;
 	// Plan-scoped: the mark describes the plan now in the record; the session's next planned prompt replaces the record
 	// with a new graph whose kickedOff and synced start false, because that graph has not been kicked off or synced.
-	record[field] = true;
-	writeAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
-	return 0;
+	const marked = updateRecord(statePath, (record) => {
+		const next = { ...record };
+		next[field] = true;
+		return next;
+	});
+	return marked ? 0 : 1;
 }
 
 async function notionInit(args: string[], deps: AuthDeps): Promise<number> {

@@ -213,8 +213,9 @@ export async function reviewPr(input: {
 					return done({ status: "failed", reviewId, error: "score not found in Greptile review body" });
 				}
 				// Greptile reviews incrementally and never flips `addressed` on a fix, so GitHub thread state decides.
-				// If threads are unavailable, fail closed: every unaddressed Greptile comment on the PR stays open.
+				// A failed thread scan is not evidence that all findings are addressed.
 				const threads = input.reviewThreads?.();
+				if (threads && !threads.ok) return done({ status: "unverified", reviewId, error: threads.error });
 				const comments = threads?.ok
 					? openThreadComments(threads.threads)
 					: mapComments(

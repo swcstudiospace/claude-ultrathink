@@ -18,7 +18,7 @@ import type { McpClient } from "../mcp/client.ts";
 import { storePath } from "../mcp/store.ts";
 import { assessDecisionJson, assessDone } from "./assess.ts";
 import { createGithub } from "./github.ts";
-import type { Github } from "./github.ts";
+import type { Github, ReviewThreadsOptions } from "./github.ts";
 import { openThreadComments, runReview } from "./greptile.ts";
 import type { ToolCaller } from "./greptile.ts";
 import { mergeGate, reviewPasses } from "./merge.ts";
@@ -221,6 +221,9 @@ async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
 
 async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	const { deps, statePath, cwd } = ctx;
+	const started = deps.now();
+	// The review call blocks up to waitMs; its thread scans share that single-call budget (same pattern as stepMerge).
+	const threadDeadline = started + deps.config.waitMs;
 	const ship = readShip(statePath);
 	const pr = ship?.pr;
 	if (!pr) return { ok: false, ready: false, reason: "no PR; run pr first" };
@@ -261,18 +264,31 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 				base: pr.base,
 				prNumber: pr.number,
 				headSha: status.headSha,
-				reviewThreads: () => github.reviewThreads(pr.number),
+				reviewThreads: () => github.reviewThreads(pr.number, { deadlineMs: threadDeadline, now: deps.now }),
 				staleReviewIds,
 				...(restart ? { restart: true } : {}),
 			});
 	if (reusedRound && result.source === "pr") {
 		// Threads resolved since the round (non-actionable findings) close without a new commit. A failed refresh must not
 		// fall back to the stored snapshot: a finding posted since then would be missed, so report not ready and persist nothing.
-		const threads = github.reviewThreads(pr.number);
+		const threads = github.reviewThreads(pr.number, { deadlineMs: threadDeadline, now: deps.now });
 		if (!threads.ok) {
 			return { ok: false, ready: false, reason: `could not read review threads: ${threads.error}`, next: "run review again" };
 		}
 		result = { ...result, comments: openThreadComments(threads.threads) };
+	}
+	if (result.status === "unverified") {
+		// The completed review remains reusable. Only its thread scan failed, so no round or retry is consumed.
+		writeShip(statePath, { phase: "pr-open", pending: undefined }, deps.now());
+		return {
+			ok: false,
+			ready: false,
+			status: "unverified",
+			reviewId: result.reviewId,
+			reason: `could not read review threads: ${result.error ?? "verification unavailable"}`,
+			round: ship.rounds.length,
+			next: "run review again",
+		};
 	}
 	if (result.status === "blocked") {
 		// Greptile is unusable as configured: no round is recorded and the flow stops until the user fixes the setup.
@@ -413,7 +429,7 @@ function storedReviewRefusal(config: ShipConfig, latest: ReviewResult | undefine
  * outside the flow, blocks; a stored review that does not pass goes back to the agent and never waits, even when the
  * PR cannot be read.
  */
-function mergeOnce(config: ShipConfig, github: Github, ship: ShipState, pr: PrRef): MergeStep {
+function mergeOnce(config: ShipConfig, github: Github, ship: ShipState, pr: PrRef, threadOpts?: ReviewThreadsOptions): MergeStep {
 	let latest = ship.rounds.at(-1);
 	// After a recorded merge the stored review no longer matters: an unreadable PR is simply retried for the cleanup.
 	const refusal = ship.phase === "merged" ? undefined : storedReviewRefusal(config, latest, pr.url);
@@ -441,7 +457,7 @@ function mergeOnce(config: ShipConfig, github: Github, ship: ShipState, pr: PrRe
 	}
 	if (latest.source === "pr") {
 		// Merge on the PR's current threads, never on the stored snapshot; an unreadable thread list refuses this poll.
-		const threads = github.reviewThreads(pr.number);
+		const threads = github.reviewThreads(pr.number, threadOpts);
 		if (!threads.ok) return { kind: "transient", reason: `could not read review threads: ${threads.error}`, headSha };
 		latest = { ...latest, comments: openThreadComments(threads.threads) };
 	}
@@ -541,7 +557,7 @@ async function stepMerge(ctx: Ctx, budgetMs: number = ctx.deps.config.waitMs): P
 	let waiting = ship.waiting;
 	let delay = config.pollMs;
 	for (let polls = 1; ; polls++) {
-		const step = mergeOnce(config, github, ship, pr);
+		const step = mergeOnce(config, github, ship, pr, { deadlineMs: started + budgetMs, now: deps.now });
 		const now = deps.now();
 		if (step.kind === "merged") return finishMerge(ctx, github, ship, pr, step, now);
 		if (step.kind === "blocked") return blockMerge(ctx, github, ship, pr, step, now);

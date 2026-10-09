@@ -451,7 +451,7 @@ describe("errors", () => {
 
 	test("a redirect is not followed: one request, a classified error, no key leak", async () => {
 		const inits: (RequestInit | undefined)[] = [];
-		const redirecting = (async (input: string | URL | Request, init?: RequestInit) => {
+		const redirecting = (async (_input: string | URL | Request, init?: RequestInit) => {
 			inits.push(init);
 			throw new TypeError("fetch failed: redirect mode is set to error");
 		}) as unknown as typeof fetch;
@@ -466,7 +466,15 @@ describe("errors", () => {
 		const controller = new AbortController();
 		controller.abort();
 		const c = client(fake({}).fetch, { signal: controller.signal });
-		await expect(c.recall({ query: "q" })).rejects.toMatchObject({ name: "AbortError" });
+		// `.rejects` is typed as returning void, so awaiting the matcher is a no-op to the checker.
+		// Await the recall itself: an already-aborted signal must reject, not come back as an error result.
+		try {
+			await c.recall({ query: "q" });
+		} catch (error) {
+			expect(error).toMatchObject({ name: "AbortError" });
+			return;
+		}
+		throw new Error("expected AbortError");
 	});
 });
 

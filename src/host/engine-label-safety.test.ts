@@ -162,6 +162,7 @@ describe("legacy diagnostic label safety", () => {
 		const marker = join(cli.cwd, "shell-canary-ran");
 		const model = `${sentinel};touch ${marker};$(touch ${marker});\`touch ${marker}\`;#`;
 		const before = readdirSync(cli.cwd).sort();
+		const realTmp = realpathSync(tmpdir());
 		const host = route === "claude" ? "claude-code" : route === "muse" ? "muse" : "grok-build";
 		const argvLengths: Record<LegacyRoute, number> = { claude: 14, muse: 13, grok: 28 };
 		const lower = defaultConfig();
@@ -191,14 +192,14 @@ describe("legacy diagnostic label safety", () => {
 			if (route === "grok") {
 				expect(realpathSync(childCwd)).not.toBe(realpathSync(cli.cwd));
 				// macOS getcwd resolves /var to /private/var; compare the canonical directory.
-				expect(realpathSync(dirname(childCwd))).toBe(realpathSync(tmpdir()));
+				expect(realpathSync(dirname(childCwd))).toBe(realTmp);
 				expect(basename(childCwd)).toStartWith("ultrathink-grok-");
 			} else expect(realpathSync(childCwd)).toBe(realpathSync(cli.cwd));
 			if (route !== "claude") {
 				const promptFile = args[args.indexOf("--prompt-file") + 1];
 				if (!promptFile) throw new Error("expected a CLI prompt file");
 				expect(basename(promptFile)).toBe(route === "muse" ? "prompt.txt" : "prompt.md");
-				expect(dirname(dirname(promptFile))).toBe(tmpdir());
+				expect(realpathSync(dirname(dirname(promptFile)))).toBe(realTmp);
 				expect(basename(dirname(promptFile))).toStartWith(`ultrathink-${route}-`);
 				expect(promptFile).not.toContain(sentinel);
 				expect(existsSync(promptFile)).toBe(false);

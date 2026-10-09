@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { resolveOpenRouterKey } from "../decisions/gate.ts";
+import { appendAttempts, writeShip } from "../ship/state.ts";
 import { main, prepareRedirect } from "./cli.ts";
 import type { McpProviderId } from "./providers.ts";
 import type { Run } from "./redirect.ts";
@@ -161,6 +162,39 @@ describe("session mark", () => {
 		expect(code).toBe(0);
 		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ ...record, kickedOff: true, synced: true });
 	});
+
+	test("keeps a ship update written just before it and rewrites the record owner-only with no lock or temporary file left", () => {
+		const path = session(record);
+		chmodSync(path, 0o644);
+		expect(writeShip(path, { phase: "pr-open", nudgedAt: 9 }, 5)?.phase).toBe("pr-open");
+		expect(run("session", "mark", "--state", path, "kicked-off").code).toBe(0);
+		const saved = JSON.parse(readFileSync(path, "utf8")) as SessionRecord;
+		expect(saved.kickedOff).toBe(true);
+		expect(saved.ship).toEqual({ phase: "pr-open", rounds: [], nudgedAt: 9, updatedAt: 5 });
+		if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
+		expect(readdirSync(join(root, "state", "sessions"))).toEqual(["s1.json"]);
+	});
+
+	test("marks racing with ship writes lose neither: every mark and every attempt survives", async () => {
+		const path = session(record);
+		const children = Array.from({ length: 8 }, (_, i) =>
+			Bun.spawn([process.execPath, CLI, "session", "mark", "--state", path, i % 2 === 0 ? "kicked-off" : "synced"], {
+				cwd: root,
+				env: { PATH: process.env.PATH, HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") },
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		for (let i = 0; i < 40; i++) {
+			expect(appendAttempts(path, [{ at: i, step: "review", headSha: "abc", outcome: "waiting" }], i)).toBeDefined();
+		}
+		expect(await Promise.all(children.map((child) => child.exited))).toEqual(Array<number>(8).fill(0));
+		const saved = JSON.parse(readFileSync(path, "utf8")) as SessionRecord;
+		expect(saved.kickedOff).toBe(true);
+		expect(saved.synced).toBe(true);
+		expect(saved.ship?.attempts).toHaveLength(40);
+		expect(readdirSync(join(root, "state", "sessions"))).toEqual(["s1.json"]);
+	}, 60_000);
 
 	test("an unknown, missing or doubled mark is a usage error and leaves the file alone", () => {
 		const path = session(record);

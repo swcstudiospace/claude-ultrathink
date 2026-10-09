@@ -4,8 +4,9 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
 import { THINK_ENGINES, type ThinkEngine, type ThoughtGraph } from "../think/types.ts";
@@ -87,9 +88,9 @@ function readJson(path: string): unknown {
 	}
 }
 
+/** Owner-only and atomic: a crash mid-write leaves the previous file, never a truncated one. */
 function writeJson(path: string, value: unknown): void {
-	mkdirSync(join(path, ".."), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(value, null, "\t")}\n`);
+	writeFileAtomic(path, `${JSON.stringify(value, null, "\t")}\n`);
 }
 
 export function controlPath(dir: string): string {
@@ -110,10 +111,19 @@ export function readControl(dir: string): ControlState {
 	return out;
 }
 
+/** Merges `patch` into control.json; the read-merge-write runs under the file's lock so two toggles never undo each other. */
 export function writeControl(dir: string, patch: ControlState): ControlState {
-	const next = { ...readControl(dir), ...patch };
-	writeJson(controlPath(dir), next);
-	return next;
+	// The lock file lives next to control.json, so the directory must exist before the lock is taken.
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+	} catch {
+		// writeJson reports the same failure below
+	}
+	return withFileLock(controlPath(dir), () => {
+		const next = { ...readControl(dir), ...patch };
+		writeJson(controlPath(dir), next);
+		return next;
+	});
 }
 
 function safeSessionId(id: string): string {
@@ -135,20 +145,21 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 const LAST_LOCK_WAIT_MS = 5;
 const LAST_LOCK_ATTEMPTS = 40;
 const LAST_LOCK_STALE_MS = 5_000;
+const LAST_LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 
-/** True when the lock file names a running process, or is a fresh empty file another writer has not filled yet. */
-function holderAlive(lockPath: string): boolean {
+/** True for a live PID, a fresh empty lock, or an existing lock that cannot be safely inspected. */
+export function lastLockHeld(lockPath: string): boolean {
 	let text: string;
 	try {
 		text = readFileSync(lockPath, "utf8").trim();
-	} catch {
-		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
 	}
 	if (!text) {
 		try {
 			return Date.now() - statSync(lockPath).mtimeMs <= LAST_LOCK_STALE_MS;
-		} catch {
-			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code !== "ENOENT";
 		}
 	}
 	const pid = Number(text);
@@ -161,51 +172,62 @@ function holderAlive(lockPath: string): boolean {
 	}
 }
 
-/** Exclusive lock for `last.json`. Every writer uses it, so a replace cannot land between another writer's check and rename. */
+/**
+ * Exclusive lock for `last.json`. A busy lock does not run `body`: replacing the current plan is worse than
+ * leaving the previous copy, so this does not degrade to an unlocked write the way `withFileLock` does.
+ * Returns false when the lock cannot be taken within 200ms. A dead pid is reclaimed immediately and an empty
+ * lock after 5s; a live pid stays protected regardless of the lock's age.
+ */
 export function withLastLock(lastPath: string, body: () => void): boolean {
 	const lockPath = `${lastPath}.lock`;
-	const pid = String(process.pid);
-	let held = false;
-	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && !held; attempt++) {
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && fd === undefined; attempt++) {
 		try {
-			writeFileSync(lockPath, pid, { flag: "wx" });
-			held = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-			let reclaim = !holderAlive(lockPath);
-			if (!reclaim) {
-				try {
-					reclaim = Date.now() - statSync(lockPath).mtimeMs > LAST_LOCK_STALE_MS;
-				} catch {
-					reclaim = false;
-				}
-			}
-			if (reclaim) {
+			fd = withLockMutation(lockPath, () => {
+				if (lastLockHeld(lockPath)) return undefined;
 				try {
 					unlinkSync(lockPath);
-				} catch {
-					// the holder removed it, or another waiter did
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
+				const opened = openSync(lockPath, "wx", 0o600);
 				try {
-					writeFileSync(lockPath, pid, { flag: "wx" });
-					held = true;
-				} catch {
-					// another waiter took the reclaimed lock
+					writeFileSync(opened, String(process.pid));
+					return opened;
+				} catch (error) {
+					closeSync(opened);
+					unlinkSync(lockPath);
+					throw error;
 				}
-			} else {
-				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
-			}
+			});
+		} catch {
+			return false;
 		}
+		if (fd === undefined) Atomics.wait(LAST_LOCK_SLEEP, 0, 0, LAST_LOCK_WAIT_MS);
 	}
-	if (!held) return false;
+	if (fd === undefined) return false;
+	const ownedFd = fd;
 	try {
 		body();
 		return true;
 	} finally {
 		try {
-			if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
+			// Mark the opened inode complete even if another mutator temporarily owns the pathname.
+			// A live host PID must not keep a finished writer held, and a successor inode is untouched.
+			writeSync(ownedFd, "!", 0, "utf8");
 		} catch {
-			// the lock file is already gone, or another writer replaced it
+			// Still attempt guarded removal when the completion marker could not be written.
+		}
+		try {
+			withLockMutation(lockPath, () => {
+				const owned = fstatSync(ownedFd);
+				const current = statSync(lockPath);
+				if (current.dev === owned.dev && current.ino === owned.ino) unlinkSync(lockPath);
+			});
+		} catch {
+			// The next acquisition or orphan sweep can remove the completed marker under the guard.
+		} finally {
+			try { closeSync(ownedFd); } catch { /* do not replace a body error with a cleanup error */ }
 		}
 	}
 }
@@ -220,6 +242,31 @@ export function writeSession(dir: string, record: SessionRecord): string | undef
 	const last = join(dir, "last.json");
 	if (!withLastLock(last, () => writeJson(last, record))) return lastRefreshMessage(last);
 	return undefined;
+}
+
+/**
+ * Locked read-mutate-write of one session record (the session file and last.json). Returns the written record, or
+ * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` must not write the
+ * same session file itself.
+ */
+export function updateSession(
+	dir: string,
+	sessionId: string,
+	mutate: (record: SessionRecord) => SessionRecord | undefined,
+	lock?: LockOptions,
+): SessionRecord | undefined {
+	return withFileLock(
+		sessionPath(dir, sessionId),
+		() => {
+			const record = readSession(dir, sessionId);
+			if (!record) return undefined;
+			const next = mutate(record);
+			if (!next) return undefined;
+			writeSession(dir, next);
+			return next;
+		},
+		lock,
+	);
 }
 
 export function readLast(dir: string): SessionRecord | undefined {

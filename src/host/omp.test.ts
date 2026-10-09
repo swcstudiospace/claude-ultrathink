@@ -804,7 +804,9 @@ describe("teach capture", () => {
 		const { emit, spawned, contexts, sent } = teach(true, capture);
 		emit("agent_end", { messages: MESSAGES });
 		expect(spawned).toHaveLength(1);
-		const [{ digest, options }] = spawned;
+		const spawnedOnce = spawned[0];
+		if (!spawnedOnce) throw new Error("expected one observe");
+		const { digest, options } = spawnedOnce;
 		expect(digest).toMatchObject({ host: "omp", sessionId: "s1", cwd: "/repo", outcome: "completed" });
 		expect(options).toMatchObject({ stateDir: join(dir, "teach-state"), host: "omp" });
 		expect(options.env.ULTRATHINK_HOST).toBe("omp");
@@ -1131,9 +1133,11 @@ describe("native planner end to end (D-01, D-02)", () => {
 			expect(stages).toEqual(["uplift", "graph", "fill", "fill", "fill", "fill", "fill", "clarify"]);
 			expect(reads).toBe(capability ? 1 : 0);
 			expect(log.resolvers).toHaveLength(1);
+			const resolved = log.resolvers[0];
+			if (!resolved) throw new Error("expected a resolver");
 			for (const call of rec.calls) {
-				expect(call.model).toBe(log.resolvers[0]?.model);
-				expect(call.options?.apiKey).toBe(log.resolvers[0]?.key);
+				expect(call.model).toBe(resolved.model);
+				expect(call.options?.apiKey).toBe(resolved.key);
 				if (level === "off") {
 					expect(call.options?.disableReasoning).toBe(true);
 					expect(call.options).not.toHaveProperty("reasoning");

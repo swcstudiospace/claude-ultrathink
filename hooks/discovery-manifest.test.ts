@@ -39,6 +39,12 @@ import {
 // fetches (the schema's $schema URI is compared, never resolved) or writes outside OS temp dirs it removes.
 // A pass proves parsing, strict shape, source identity and containment; not installation, inference or bot support.
 
+/** Indexed records are optional under noUncheckedIndexedAccess. A missing one fails the vector instead of editing nothing. */
+function defined<T>(value: T | undefined, label: string): T {
+	if (value === undefined) throw new Error(`expected ${label}`);
+	return value;
+}
+
 /** The trusted checkout root is this test's own checkout, never a path taken from metadata. */
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -121,7 +127,7 @@ describe("loader manifests, read-only", () => {
 		],
 		[
 			"a renamed Omp marketplace plugin",
-			(l) => Object.assign((l[".omp-plugin/marketplace.json"].plugins as JsonObject[])[0], { name: "claude-ultrathink" }),
+			(l) => Object.assign(defined((l[".omp-plugin/marketplace.json"].plugins as JsonObject[])[0], "omp plugin"), { name: "claude-ultrathink" }),
 			'loader: .omp-plugin/marketplace.json plugins[0].name must stay "ultrathink"',
 		],
 		[
@@ -136,7 +142,7 @@ describe("loader manifests, read-only", () => {
 		],
 		[
 			"a missing Muse skill file",
-			(l) => Object.assign(((l[".muse-plugin/plugin.json"].capabilities as JsonObject).skills as JsonObject[])[0], { path: "skills/missing/SKILL.md" }),
+			(l) => Object.assign(defined(((l[".muse-plugin/plugin.json"].capabilities as JsonObject).skills as JsonObject[])[0], "muse skill"), { path: "skills/missing/SKILL.md" }),
 			'loader: .muse-plugin/plugin.json capabilities.skills path "skills/missing/SKILL.md" must exist: containment: skills/missing/SKILL.md is missing',
 		],
 		[
@@ -157,7 +163,7 @@ describe("loader manifests, read-only", () => {
 		],
 		[
 			"externalIntegrations grafted onto the Omp marketplace plugin entry",
-			(l) => Object.assign((l[".omp-plugin/marketplace.json"].plugins as JsonObject[])[0], { externalIntegrations: {} }),
+			(l) => Object.assign(defined((l[".omp-plugin/marketplace.json"].plugins as JsonObject[])[0], "omp plugin"), { externalIntegrations: {} }),
 			'loader: .omp-plugin/marketplace.json plugins[0] must not carry the descriptor key "externalIntegrations"',
 		],
 	])("%s fails", (_label, edit, finding) => {
@@ -185,9 +191,9 @@ describe("descriptor negative vectors", () => {
 		["a remote $schema", (d) => Object.assign(d, { $schema: DRAFT_2020_12 }), `shape: /$schema must be "${SCHEMA_POINTER}"`],
 		["an unknown root field", (d) => Object.assign(d, { mcpServers: [] }), 'shape: / has unknown key "mcpServers"'],
 		["an unknown identity field", (d) => Object.assign(d.identity, { alias: "claude-ultrathink" }), 'shape: /identity has unknown key "alias"'],
-		["an unknown host field", (d) => Object.assign(d.hosts.omp, { verified: true }), 'shape: /hosts/omp has unknown key "verified"'],
+		["an unknown host field", (d) => Object.assign(defined(d.hosts.omp, "hosts.omp"), { verified: true }), 'shape: /hosts/omp has unknown key "verified"'],
 		["an unknown interface field", (d) => Object.assign(d.interfaces.controls, { command: "plan" }), 'shape: /interfaces/controls has unknown key "command"'],
-		["an unknown bot field", (d) => Object.assign(d.externalIntegrations["gpt-dot"], { publisher: "unknown" }), 'shape: /externalIntegrations/gpt-dot has unknown key "publisher"'],
+		["an unknown bot field", (d) => Object.assign(defined(d.externalIntegrations["gpt-dot"], "gpt-dot"), { publisher: "unknown" }), 'shape: /externalIntegrations/gpt-dot has unknown key "publisher"'],
 		["a renamed repository", (d) => Object.assign(d.identity, { repository: "ultrathink" }), 'shape: /identity/repository must be "claude-ultrathink"'],
 		[
 			"another repository URL",
@@ -208,31 +214,33 @@ describe("descriptor negative vectors", () => {
 			"shape: /hosts/gpt-dot is not a supported HostId",
 		],
 		["a missing host", (d) => Reflect.deleteProperty(d.hosts, "hermes"), 'shape: /hosts is missing "hermes"'],
-		["a host claiming more than source presence", (d) => Object.assign(d.hosts["grok-build"], { status: "verified" }), 'shape: /hosts/grok-build/status must be "source-present"'],
-		["a wrong delivery", (d) => Object.assign(d.hosts.muse, { delivery: "local-plan-carrier" }), 'shape: /hosts/muse/delivery must be "hook-additional-context"'],
-		["an unknown delivery", (d) => Object.assign(d.hosts.omp, { delivery: "remote-planner" }), 'shape: /hosts/omp/delivery must be "extension-inline-or-deferred-aside"'],
+		["a host claiming more than source presence", (d) => Object.assign(defined(d.hosts["grok-build"], "hosts.grok-build"), { status: "verified" }), 'shape: /hosts/grok-build/status must be "source-present"'],
+		["a wrong delivery", (d) => Object.assign(defined(d.hosts.muse, "hosts.muse"), { delivery: "local-plan-carrier" }), 'shape: /hosts/muse/delivery must be "hook-additional-context"'],
+		["an unknown delivery", (d) => Object.assign(defined(d.hosts.omp, "hosts.omp"), { delivery: "remote-planner" }), 'shape: /hosts/omp/delivery must be "extension-inline-or-deferred-aside"'],
 		[
 			"the Omp marketplace in place of package.json",
-			(d) => Object.assign(d.hosts.omp, { entrypoints: [".omp-plugin/marketplace.json", "src/host/omp.ts"] }),
+			(d) => Object.assign(defined(d.hosts.omp, "hosts.omp"), { entrypoints: [".omp-plugin/marketplace.json", "src/host/omp.ts"] }),
 			`semantic: /hosts/omp/entrypoints must be ${JSON.stringify(HOST_MAPPING.omp.entrypoints)}`,
 		],
 		[
 			"swapped Grok Build and Muse entrypoints",
 			(d) => {
-				[d.hosts["grok-build"].entrypoints, d.hosts.muse.entrypoints] = [d.hosts.muse.entrypoints, d.hosts["grok-build"].entrypoints];
+				const grokBuild = defined(d.hosts["grok-build"], "hosts.grok-build");
+				const muse = defined(d.hosts.muse, "hosts.muse");
+				[grokBuild.entrypoints, muse.entrypoints] = [muse.entrypoints, grokBuild.entrypoints];
 			},
 			`semantic: /hosts/grok-build/entrypoints must be ${JSON.stringify(HOST_MAPPING["grok-build"].entrypoints)}`,
 		],
 		[
 			"an extra existing file",
-			(d) => d.hosts.hermes.entrypoints.push("bin/run-bun"),
+			(d) => defined(d.hosts.hermes, "hosts.hermes").entrypoints.push("bin/run-bun"),
 			`semantic: /hosts/hermes/entrypoints must be ${JSON.stringify(HOST_MAPPING.hermes.entrypoints)}`,
 		],
-		["a repeated entrypoint", (d) => d.hosts["claude-code"].entrypoints.splice(3, 1, "hooks/hooks.json"), "shape: /hosts/claude-code/entrypoints repeats a path"],
-		["no entrypoints", (d) => Object.assign(d.hosts.muse, { entrypoints: [] }), "shape: /hosts/muse/entrypoints must be an array of 1 to 8 paths"],
+		["a repeated entrypoint", (d) => defined(d.hosts["claude-code"], "hosts.claude-code").entrypoints.splice(3, 1, "hooks/hooks.json"), "shape: /hosts/claude-code/entrypoints repeats a path"],
+		["no entrypoints", (d) => Object.assign(defined(d.hosts.muse, "hosts.muse"), { entrypoints: [] }), "shape: /hosts/muse/entrypoints must be an array of 1 to 8 paths"],
 		[
 			"nine entrypoints",
-			(d) => Object.assign(d.hosts.omp, { entrypoints: Array.from({ length: 9 }, (_, index) => `src/host/file-${index}.ts`) }),
+			(d) => Object.assign(defined(d.hosts.omp, "hosts.omp"), { entrypoints: Array.from({ length: 9 }, (_, index) => `src/host/file-${index}.ts`) }),
 			"shape: /hosts/omp/entrypoints must be an array of 1 to 8 paths",
 		],
 		[
@@ -256,31 +264,31 @@ describe("descriptor negative vectors", () => {
 			(d) => Object.assign(d.interfaces.jsonPlanner, { transport: "mcp-streamable-http" }),
 			'shape: /interfaces/jsonPlanner/transport must be "json-stdin-stdout"',
 		],
-		["Grok Bot adapterPresent false", (d) => Object.assign(d.externalIntegrations["grok-bot"], { adapterPresent: false }), "shape: /externalIntegrations/grok-bot/adapterPresent must be true"],
+		["Grok Bot adapterPresent false", (d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { adapterPresent: false }), "shape: /externalIntegrations/grok-bot/adapterPresent must be true"],
 		[
 			"a Grok Bot delivery that is not the skill protocol",
-			(d) => Object.assign(d.externalIntegrations["grok-bot"], { delivery: "hook-additional-context" }),
+			(d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { delivery: "hook-additional-context" }),
 			'shape: /externalIntegrations/grok-bot/delivery must be "skill-protocol-cli"',
 		],
 		[
 			"Grok Bot compatibilityVerified true",
-			(d) => Object.assign(d.externalIntegrations["grok-bot"], { compatibilityVerified: true }),
+			(d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { compatibilityVerified: true }),
 			"shape: /externalIntegrations/grok-bot/compatibilityVerified must be false",
 		],
-		["GPT Dot adapterPresent true", (d) => Object.assign(d.externalIntegrations["gpt-dot"], { adapterPresent: true }), "shape: /externalIntegrations/gpt-dot/adapterPresent must be false"],
+		["GPT Dot adapterPresent true", (d) => Object.assign(defined(d.externalIntegrations["gpt-dot"], "gpt-dot"), { adapterPresent: true }), "shape: /externalIntegrations/gpt-dot/adapterPresent must be false"],
 		[
 			"GPT Dot compatibilityVerified true",
-			(d) => Object.assign(d.externalIntegrations["gpt-dot"], { compatibilityVerified: true }),
+			(d) => Object.assign(defined(d.externalIntegrations["gpt-dot"], "gpt-dot"), { compatibilityVerified: true }),
 			"shape: /externalIntegrations/gpt-dot/compatibilityVerified must be false",
 		],
 		[
 			"a Grok Bot contract claimed as settled",
-			(d) => Object.assign(d.externalIntegrations["grok-bot"], { status: "compatible" }),
+			(d) => Object.assign(defined(d.externalIntegrations["grok-bot"], "grok-bot"), { status: "compatible" }),
 			'shape: /externalIntegrations/grok-bot/status must be "native-adapter"',
 		],
 		[
 			"an invented GPT Dot identity",
-			(d) => Object.assign(d.externalIntegrations["gpt-dot"], { identity: "documented-product" }),
+			(d) => Object.assign(defined(d.externalIntegrations["gpt-dot"], "gpt-dot"), { identity: "documented-product" }),
 			'shape: /externalIntegrations/gpt-dot/identity must be "unverified"',
 		],
 		["a missing bot record", (d) => Reflect.deleteProperty(d.externalIntegrations, "gpt-dot"), 'shape: /externalIntegrations is missing "gpt-dot"'],
@@ -294,7 +302,7 @@ describe("descriptor negative vectors", () => {
 
 	test.each(BAD_PATHS)("%s as a declared entrypoint fails the path rules", (_label, path, problem) => {
 		const descriptor = approved();
-		descriptor.hosts.muse.entrypoints[1] = path;
+		defined(descriptor.hosts.muse, "hosts.muse").entrypoints[1] = path;
 		expect(descriptorFindings(descriptor)).toContain(`path: /hosts/muse/entrypoints/1 ${problem}`);
 	});
 
@@ -374,14 +382,14 @@ describe("declared-path containment in a disposable checkout", () => {
 		const { root } = fixture();
 		expect(containmentFinding(root, "../outside/target.ts")).toBe("containment: ../outside/target.ts resolves outside the checkout root");
 		const descriptor = approved();
-		descriptor.hosts.omp.entrypoints[2] = "../outside/target.ts";
+		defined(descriptor.hosts.omp, "hosts.omp").entrypoints[2] = "../outside/target.ts";
 		expect(pathReferenceFindings(root, descriptor)).toEqual(['containment: "../outside/target.ts" is not inspected: it is not a clean relative file path']);
 	});
 
 	test("more than 44 path references are refused without inspecting any of them", () => {
 		const { root } = fixture();
 		const descriptor = approved();
-		descriptor.hosts.omp.entrypoints = Array.from({ length: 41 }, (_, index) => `src/host/file-${index}.ts`);
+		defined(descriptor.hosts.omp, "hosts.omp").entrypoints = Array.from({ length: 41 }, (_, index) => `src/host/file-${index}.ts`);
 		const references = declaredPaths(descriptor).length;
 		expect(references).toBeGreaterThan(MAX_PATH_REFERENCES);
 		expect(pathReferenceFindings(root, descriptor)).toEqual([`containment: ${references} path references exceed ${MAX_PATH_REFERENCES}`]);

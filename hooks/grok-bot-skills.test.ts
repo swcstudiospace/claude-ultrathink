@@ -79,8 +79,10 @@ describe("Grok Bot native skills", () => {
 			const parsed = readNative(name);
 			expect(parsed.keys).toEqual(["name", "description"]);
 			expect(parsed.values.name).toBe(name);
-			expect(parsed.values.description.length).toBeGreaterThan(0);
-			expect(parsed.values.description).not.toContain("\n");
+			const description = parsed.values.description;
+			if (description === undefined) throw new Error(`${name} description missing`);
+			expect(description.length).toBeGreaterThan(0);
+			expect(description).not.toContain("\n");
 		}
 	});
 
@@ -223,7 +225,7 @@ describe("Grok Bot skill-protocol files", () => {
 			const folder = file.split("/").at(-2);
 			if (folder === undefined) throw new Error(`${file} has no parent folder`);
 			expect(parsed.values.name).toBe(folder);
-			expect(parsed.values.description.length).toBeGreaterThan(0);
+			expect(parsed.values.description?.length).toBeGreaterThan(0);
 			expect(parsed.body).not.toMatch(/https?:\/\//);
 		}
 	});
@@ -231,7 +233,7 @@ describe("Grok Bot skill-protocol files", () => {
 	test("ultrathink-protocol leads with when to use it and keeps the method inside the bot", () => {
 		const parsed = frontmatter(readFileSync(PROTOCOL, "utf8"), PROTOCOL);
 		expect(parsed.values.name).toBe("ultrathink-protocol");
-		expect(parsed.values.description.startsWith("When to use it:")).toBe(true);
+		expect(parsed.values.description?.startsWith("When to use it:")).toBe(true);
 		for (const phrase of [
 			"perform this method yourself",
 			"Keep the XML spec and the graph internal",

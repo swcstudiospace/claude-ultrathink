@@ -6,8 +6,9 @@
  * is the carrier those hosts can actually read. The text is plugin-authored
  * data, not a grant of tools or a command to ignore the user.
  */
-import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileAtomic } from "../claude/atomic.ts";
 import type { HostId } from "./types.ts";
 
 export const CARRIER_INSTRUCTION =
@@ -50,7 +51,6 @@ export function writePlanCarrier(input: CarrierInput): string | undefined {
 		instruction: CARRIER_INSTRUCTION,
 		context: input.context ?? "",
 	};
-	mkdirSync(input.stateDir, { recursive: true });
-	writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
+	writeFileAtomic(path, `${JSON.stringify(body, null, 2)}\n`);
 	return path;
 }

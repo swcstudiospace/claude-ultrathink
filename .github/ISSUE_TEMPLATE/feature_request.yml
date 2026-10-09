@@ -26,8 +26,10 @@ body:
         - Claude Code
         - Grok Build
         - Hermes Agent
-        - Muse
+        - Muse Code
+        - Prime Agent
         - Omp
+        - Grok Bot (skill adapter)
   - type: textarea
     id: alternatives
     attributes:

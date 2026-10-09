@@ -8,8 +8,6 @@
  * fail-open: the user's prompt always goes through. Caller or provider cancellation is re-thrown as an
  * AbortError, aborting sibling work and preventing later inference or side effects.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
 import { createDecisions, type DecisionsDeps } from "../decisions/gate.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
@@ -38,6 +36,8 @@ import { isSubagentEnvelope } from "../host/envelope.ts";
 import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
+import { pruneSessionsBestEffort } from "../retention/prune.ts";
+import { withFileLock, writeFileAtomic } from "./atomic.ts";
 import type { ClaudeCompleter } from "./complete.ts";
 import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
@@ -135,6 +135,59 @@ export interface PromptSubmitResult {
 
 function specFile(stateDir: string, sessionId: string): string {
 	return sessionPath(stateDir, sessionId).replace(/\.json$/, ".xml");
+}
+
+/**
+ * Saves a fresh plan record and its spec XML under the session's file lock, the
+ * same lock `updateSession` (the answers/ship/mark updates) holds, so a locked
+ * update can neither be overwritten by nor overwrite this save with stale
+ * content. Answers that landed after this flight read the session are overlaid
+ * onto the same questions (and re-injected into the spec XML) instead of being
+ * lost with the stale read; plan-scoped marks stay false on the new plan by
+ * design. The hold is one read plus two atomic writes, and a stale or
+ * unobtainable lock never blocks the prompt: the save runs unlocked, as the
+ * lock API already does.
+ */
+export function savePlanRecord(
+	stateDir: string,
+	sessionId: string,
+	record: SessionRecord,
+	log: (message: string) => void = () => {},
+): { record: SessionRecord; specPath: string; statePath: string; lastNote?: string } {
+	const statePath = sessionPath(stateDir, sessionId);
+	const specPath = specFile(stateDir, sessionId);
+	let lastNote: string | undefined;
+	const saved = withFileLock(
+		statePath,
+		() => {
+			const base = record.clarifications ?? [];
+			const late = (readSession(stateDir, sessionId)?.clarifications ?? []).filter(
+				(c) => c.answer && c.source !== "knowledge",
+			);
+			let merged = record;
+			if (late.length > 0) {
+				const byQuestion = new Map<string, Clarification>(late.map((c) => [normalizeQuestion(c.question), c]));
+				const seen = new Set(base.map((c) => normalizeQuestion(c.question)));
+				const clarifications = base.map((c) => byQuestion.get(normalizeQuestion(c.question)) ?? c);
+				for (const c of late) {
+					if (!seen.has(normalizeQuestion(c.question))) clarifications.push(c);
+				}
+				if (clarifications.some((c, index) => c !== base[index])) {
+					merged = {
+						...record,
+						clarifications,
+						result: { ...record.result, xml: injectClarificationsXml(record.result.xml, clarifications) },
+					};
+				}
+			}
+			writeFileAtomic(specPath, `${merged.result.xml}\n`);
+			lastNote = writeSession(stateDir, merged);
+			if (lastNote) log(lastNote);
+			return merged;
+		},
+		{ log },
+	);
+	return { record: saved, specPath, statePath, lastNote };
 }
 
 /**
@@ -714,7 +767,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// Read once: the record, the summary and the context all report the same first error.
 		const engineError = deps.engineError?.();
 		const degraded = [...(result.source === "fallback" ? ["uplift"] : []), ...thinkDegraded];
-		const record: SessionRecord = {
+		let record: SessionRecord = {
 			sessionId,
 			at: now(),
 			engine: deps.engine,
@@ -743,12 +796,19 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		throwIfCancelled(cancellation);
 		stage("state", "start");
 		try {
-			specPath = specFile(deps.stateDir, sessionId);
-			mkdirSync(dirname(specPath), { recursive: true });
-			writeFileSync(specPath, `${result.xml}\n`);
-			lastNote = writeSession(deps.stateDir, record);
-			statePath = sessionPath(deps.stateDir, sessionId);
-			if (lastNote) log(lastNote);
+			// The JSON and XML saves share the session lock with the answers/ship/mark
+			// updates, so neither side can overwrite the other with stale content.
+			const saved = savePlanRecord(deps.stateDir, sessionId, record, log);
+			record = saved.record;
+			// A late answer merged at save time must reach the agent: `record` alone is
+			// not enough, since `result`/`clarifications` below still hold the stale
+			// pre-save values. Refresh the derived locals, keeping reference equality
+			// when the merge changed nothing.
+			if (saved.record.clarifications !== undefined && saved.record.clarifications !== clarifications) clarifications = saved.record.clarifications;
+			if (saved.record.result.xml !== result.xml) result = { ...result, xml: saved.record.result.xml };
+			specPath = saved.specPath;
+			statePath = saved.statePath;
+			lastNote = saved.lastNote;
 			stage("state", "end", true);
 		} catch (error) {
 			log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -756,6 +816,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			statePath = undefined;
 			stage("state", "end", false);
 		}
+			// Opt-in retention (state.retentionDays above 0): at most one bounded sweep a day. It never throws and never waits.
+			pruneSessionsBestEffort({ stateDir: deps.stateDir, retentionDays: deps.config.state.retentionDays, log });
 
 		const providers = { linear: deps.config.linear.team.trim() !== "", notion: deps.config.notion.dataSourceUrl.trim() !== "" };
 		const output: HookOutput = {

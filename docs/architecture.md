@@ -370,6 +370,14 @@ Hermes passes its host id in the engine request, and the Omp extension passes `h
 | `last-plan.json` | Carrier: host, session id, spec and state paths, graph id, reading instruction, context. On Grok it exists only while the latest prompt was planned. |
 | `claims/` | Grok per-turn claims. |
 
+**State files.** Session records hold your prompts verbatim, so every file above is written owner-only: mode `0600` in directories created `0700`. Each write goes to a temporary file in the same directory (`.<name>.<pid>.<hex>.tmp`), is flushed, and is renamed over the target, so a process crash leaves the previous file and never a truncated one. An older `0644` file is tightened to `0600` when rewritten.
+
+Read-modify-write of a session record, `control.json`, ship state, `session mark`, tracking refs or HITL answers holds `<file>.lock`. Its default lease expires after 10 seconds; a lock still held after the 2-second wait causes the update to run unlocked, so a stuck lock does not block the prompt. That deliberate fallback can lose a concurrent update.
+
+Creation, reclamation and release of a lock name share a private `<file>.lock.guard` directory. A prepared nonempty directory claims the guard atomically; each owner has one immutable PID/random entry. Recovery removes only a dead owner's entry; a successor's nonempty directory defeats a delayed removal, and the primary lock is never moved aside or restored over another holder. The guard contains no prompt data and is removed after bookkeeping.
+
+`last.json` uses the same mutation guard but a separate strict PID-lock policy: an active live PID stays protected regardless of age, and a busy or unreadable lock refuses the mirror update instead of running unlocked. A completed writer marks only its opened lock inode inactive before guarded removal, so temporary guard contention cannot leave a live host PID blocking later plans; inode identity prevents it from touching a successor. The session still saves and reports when the last mirror was not refreshed. Pruning rechecks age and ownership before removing old locks or narrowly recognized dead prepared guard candidates; do not delete a live lock by hand.
+
 Credentials are not in the state directory. They live in the [MCP gateway](#mcp-gateway) store.
 
 ## Runtime constraints
@@ -552,7 +560,7 @@ Resolved details: a plan skip's `DecisionRecord` is not written to the session r
 
 | Path | Contents |
 |---|---|
-| `src/claude/` | `runPromptSubmit` orchestration (`hook.ts`), the Jev plan gate (`plan-gate.ts`), Claude engine (`complete.ts`), context and summary formatting (`output.ts`), control and session state (`state.ts`), transcript reader. |
+| `src/claude/` | `runPromptSubmit` orchestration (`hook.ts`), the Jev plan gate (`plan-gate.ts`), Claude engine (`complete.ts`), context and summary formatting (`output.ts`), control and session state (`state.ts`), atomic owner-only writes and the file lock (`atomic.ts`), transcript reader. |
 | `src/host/` | Host ids and detection, state paths, engine and model selection (`engine.ts`), `planPrompt` for Hermes and Omp, the `last-plan.json` carrier, Grok turn claims, progress events, and the Omp extension with its native planner, status bar, graph panel and plan cards (`omp*.ts`). |
 | `src/uplift/` | Prompt decision and prefixes (`detect.ts`), skill resolution (`skill.ts`), `/ultrathink-*` commands and `bin/ultrathink` (`commands.ts`), uplift call and fallback spec, XML helpers. |
 | `src/think/` | Graph of Thought prompts, parsing, node fills, dependency levels and `WORKFLOW` waves. |

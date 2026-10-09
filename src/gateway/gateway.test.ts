@@ -89,7 +89,8 @@ function toolReply(payload: unknown, isError = false): Response {
 	);
 }
 
-function expectTool(sent: Sent, name: string): Record<string, unknown> {
+function expectTool(sent: Sent | undefined, name: string): Record<string, unknown> {
+	if (sent === undefined) throw new Error(`missing ${name} request`);
 	expect(sent.url).toBe("https://gateway.example/desk/mcp/lead");
 	expect(sent.headers.Authorization).toBe(`Bearer ${TOKEN}`);
 	expect(JSON.stringify(sent.headers)).not.toContain(HS_KEY);
@@ -122,7 +123,7 @@ describe("gateway backend", () => {
 		expect(resolution.readiness).toMatchObject({ state: "ready", backend: "gateway", seat: "lead", tokenSource: "DESK_GATEWAY_TOKEN" });
 		const recalled = await resolution.client?.recall({ query: "remembered fact", maxTokens: 800 });
 		expect(recalled).toEqual({ ok: true, value: [{ id: "m1", text: "a remembered fact", tags: ["seat:lead"], metadata: {} }] });
-		const recallArgs = expectTool(recallFetch.sent[0]!, "desk_memory_recall");
+		const recallArgs = expectTool(recallFetch.sent[0], "desk_memory_recall");
 		expect(recallArgs).toEqual({ query: "remembered fact", include_shared: true, limit: 2 });
 
 		const retainFetch = scripted(() => toolReply({ ok: true, bank: "pd-lead" }));
@@ -133,7 +134,7 @@ describe("gateway backend", () => {
 			metadata: { graph_id: GRAPH },
 		});
 		expect(retain?.ok).toBe(true);
-		const retainArgs = expectTool(retainFetch.sent[0]!, "desk_memory_retain");
+		const retainArgs = expectTool(retainFetch.sent[0], "desk_memory_retain");
 		expect(retainArgs.content).toBe("kept this decision");
 		expect(retainArgs.graph_id).toBe(GRAPH);
 		expect(retainArgs.source).toBe("https://example.com/ultrathink/documents/doc-1");
@@ -151,7 +152,7 @@ describe("gateway backend", () => {
 		const resolution = resolveRagflow(ragflowOn, env, { fetch: fetchImpl.fetch, gateway: GATEWAY });
 		const found = await resolution.client?.retrieve({ question: "where is the brief", datasetIds: ["should-not-be-sent"], topK: 5 });
 		expect(found).toMatchObject({ ok: true, value: [{ content: "a chunk", documentName: "docs/readme.md", datasetId: "ds", similarity: 0.4 }] });
-		expect(expectTool(fetchImpl.sent[0]!, "desk_docs_search")).toEqual({ query: "where is the brief", limit: 5 });
+		expect(expectTool(fetchImpl.sent[0], "desk_docs_search")).toEqual({ query: "where is the brief", limit: 5 });
 		expect(seen.has("RAGFLOW_API_KEY")).toBe(false);
 		expect(seen.has("HINDSIGHT_API_KEY")).toBe(false);
 	});
@@ -162,11 +163,11 @@ describe("gateway backend", () => {
 		const briefFetch = scripted(() => toolReply({ substrate: { ok: true, brief: "other agents already landed the cache" } }));
 		const brief = await fetchBrief({ repo: "swcstudiospace/claude-ultrathink", graphId: GRAPH }, env, "", { ...binding, fetch: briefFetch.fetch });
 		expect(brief).toBe("other agents already landed the cache");
-		expect(expectTool(briefFetch.sent[0]!, "desk_brief")).toEqual({ graph_id: GRAPH });
+		expect(expectTool(briefFetch.sent[0], "desk_brief")).toEqual({ graph_id: GRAPH });
 
 		const emitFetch = scripted(() => toolReply({ ok: true }));
 		expect(await emitEvent({ kind: "note", summary: "planned", graphId: "not a graph id" }, env, "", undefined, { ...binding, fetch: emitFetch.fetch })).toBe(true);
-		const args = expectTool(emitFetch.sent[0]!, "desk_event_emit");
+		const args = expectTool(emitFetch.sent[0], "desk_event_emit");
 		expect(args.kind).toBe("note");
 		expect(args).not.toHaveProperty("graph_id");
 		expect(args.payload).toEqual({ summary: "planned" });
@@ -218,7 +219,7 @@ describe("gateway backend", () => {
 		const resolution = resolveHindsight(
 			{ ...hindsightOn, url: "https://hs.example.test" },
 			env,
-			{ fetch: direct.fetch, gateway: GATEWAY },
+			{ fetch: direct.fetch, gateway: GATEWAY, storePath: storeWith("") },
 		);
 		expect(resolution.readiness).toMatchObject({ state: "ready", bank: "ultrathink", keySource: "HINDSIGHT_API_KEY" });
 		expect(resolution.readiness).not.toHaveProperty("backend");
@@ -305,7 +306,7 @@ describe("gateway backend", () => {
 			ok: true,
 			value: [{ id: "m1", text: "lesson for project a", tags: ["project:a", "status:active"], metadata: { tm_id: "tm-1", note: "keep" } }],
 		});
-		expect(expectTool(fetchImpl.sent[0]!, "desk_memory_recall")).not.toHaveProperty("tags");
+		expect(expectTool(fetchImpl.sent[0], "desk_memory_recall")).not.toHaveProperty("tags");
 	});
 
 	test("a per-bank not_configured fails the health check", async () => {

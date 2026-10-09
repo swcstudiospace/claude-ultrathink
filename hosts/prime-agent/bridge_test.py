@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
@@ -34,9 +35,30 @@ print(json.dumps({"context": "PLAN for " + prompt, "host": req["host"], "session
 """
 
 
+# Variables the bridge or host detection reads. The test environment never inherits them from the caller's shell.
+AMBIENT_PREFIXES = ("ULTRATHINK_", "PRIME_AGENT_", "GROK_")
+AMBIENT_NAMES = ("RLM_SESSION_DIR", "HERMES_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME")
+
+
+def base_env(home: str) -> dict[str, str]:
+	"""The minimal environment every test starts from: a PATH for the fake engine's interpreter and a temporary HOME."""
+	return {"PATH": os.environ.get("PATH", os.defpath), "HOME": home}
+
+
+def is_ambient(name: str) -> bool:
+	return name.startswith(AMBIENT_PREFIXES) or name in AMBIENT_NAMES
+
+
 class Bridge(unittest.TestCase):
 	def setUp(self) -> None:
 		self.tmp = tempfile.TemporaryDirectory()
+		home = Path(self.tmp.name) / "home"
+		home.mkdir()
+		# The bridge merges os.environ under the env it is given, so the process environment is replaced for the
+		# test too; otherwise a variable exported in the caller's shell would reach the bridge.
+		patcher = mock.patch.dict(os.environ, base_env(str(home)), clear=True)
+		patcher.start()
+		self.addCleanup(patcher.stop)
 		root = Path(self.tmp.name) / "clone"
 		(root / "hooks").mkdir(parents=True)
 		(root / "bin").mkdir()
@@ -49,6 +71,7 @@ class Bridge(unittest.TestCase):
 		self.spec.write_text("<BUILD_PROMPT><ORIGINAL>hi</ORIGINAL></BUILD_PROMPT>")
 		self.root = root
 		self.env = {
+			**base_env(str(home)),
 			"ULTRATHINK_PLUGIN_ROOT": str(root),
 			"BUN": str(bun),
 			"SPEC": str(self.spec),
@@ -107,13 +130,16 @@ class Bridge(unittest.TestCase):
 		self.assertEqual(env["ULTRATHINK_HOST"], "prime-agent")
 
 	def test_last_and_spec_read_the_carrier(self) -> None:
-		state = bridge.state_dir(self.env)
-		state.mkdir(parents=True)
+		# A fresh directory under the test's own temporary directory, so the carrier is read from where this test wrote it.
+		state = Path(self.tmp.name) / "state"
+		state.mkdir(parents=True, exist_ok=True)
+		env = {**self.env, "ULTRATHINK_STATE_DIR": str(state)}
+		self.assertEqual(bridge.state_dir(env), state)
 		(state / "last-plan.json").write_text(json.dumps({"host": "prime-agent", "specPath": str(self.spec)}))
-		self.assertEqual(bridge.last(self.env)["host"], "prime-agent")
-		self.assertIn("<ORIGINAL>", bridge.spec(self.env))
+		self.assertEqual(bridge.last(env)["host"], "prime-agent")
+		self.assertIn("<ORIGINAL>", bridge.spec(env))
 		(state / "last-plan.json").write_text("{")
-		self.assertIsNone(bridge.last(self.env))
+		self.assertIsNone(bridge.last(env))
 
 	def test_ctl_and_teach_report_a_missing_clone(self) -> None:
 		env = {**self.env, "ULTRATHINK_PLUGIN_ROOT": self.tmp.name}
@@ -122,12 +148,33 @@ class Bridge(unittest.TestCase):
 
 	def test_run_is_awaitable_and_never_plans_through_the_real_engine_here(self) -> None:
 		import asyncio
-		from unittest import mock
 
 		# The process environment is patched so the awaitable path still reaches only the fake engine.
 		with mock.patch.dict(os.environ, self.env):
 			result = asyncio.run(bridge.run("async thing", cwd=self.tmp.name))
 		self.assertEqual(result["context"], "PLAN for async thing")
+
+	def test_variables_exported_in_the_callers_shell_never_reach_the_test_environment(self) -> None:
+		leaks = {
+			"ULTRATHINK_STATE_DIR": "/elsewhere/state",
+			"PRIME_AGENT_CODING_AGENT_DIR": "/elsewhere/agent",
+			"RLM_SESSION_DIR": "/elsewhere/sessions/other",
+			"HERMES_HOME": "/elsewhere/hermes",
+		}
+		home = str(Path(self.tmp.name) / "home")
+		with mock.patch.dict(os.environ, leaks):
+			# setUp's recipe: a minimal explicit base, and a process environment replaced by it.
+			self.assertEqual([name for name in base_env(home) if is_ambient(name)], [])
+			with mock.patch.dict(os.environ, base_env(home), clear=True):
+				merged = bridge._env({"BUN": "/fake"})
+				for name, value in leaks.items():
+					self.assertNotIn(name, merged)
+					self.assertNotIn(value, merged.values())
+				self.assertEqual(bridge.state_dir({}), Path(home) / ".prime" / "agent" / "ultrathink")
+				self.assertEqual(bridge.session_id({}), "unknown")
+		# The environment this test class runs under is the explicit one, whatever the shell exported.
+		self.assertEqual([name for name in os.environ if is_ambient(name)], [])
+		self.assertEqual(bridge.state_dir(self.env), Path(self.tmp.name) / "agent" / "ultrathink")
 
 
 if __name__ == "__main__":

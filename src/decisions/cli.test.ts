@@ -204,7 +204,7 @@ describe("decisions check", () => {
 			text: "Decisions check: ok · typesafe-ai/jev (requested ~typesafe/jev-latest) · 0 ms · attempts 1 · cost n/a · provider vercel · zdr on · key from AI_GATEWAY_API_KEY",
 		});
 		expect(r.calls).toHaveLength(1);
-		expect(r.calls[0].url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
+		expect(r.calls[0]?.url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
 		expect(out.text).not.toContain(V);
 	});
 
@@ -215,7 +215,7 @@ describe("decisions check", () => {
 		const pinned = await runDecisionsCommand(["check"], setup(r, { config: { decisions: { provider: "openrouter" } }, env: both }));
 		expect(pinned.code).toBe(0);
 		expect(pinned.text).toContain("· provider openrouter ·");
-		expect(r.calls[0].url).toBe(ENDPOINT);
+		expect(r.calls[0]?.url).toBe(ENDPOINT);
 	});
 });
 
@@ -272,7 +272,7 @@ describe("decisions probe (A11, §5.7)", () => {
 			"Decisions probe: plan · typesafe-ai/jev · cases 1 · labelled 1 · agree 1/1 · errors 0",
 		]);
 		expect(r.calls).toHaveLength(1);
-		expect(r.calls[0].url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
+		expect(r.calls[0]?.url).toBe("https://ai-gateway.vercel.sh/v4/ai/evaluation-model");
 		expect(out.text).not.toContain(V);
 	});
 

@@ -143,9 +143,10 @@ export interface ReviewResult {
 	source: "pr" | "cli";
 	/**
 	 * "pending": the review is still running server-side; call again to resume it.
+	 * "unverified": the review completed, but GitHub thread verification failed; retry the scan without restarting the review.
 	 * "blocked": Greptile is not usable as configured (no credential or CLI, organization not chosen); `error` says how to fix it.
 	 */
-	status: "completed" | "pending" | "timeout" | "failed" | "blocked";
+	status: "completed" | "pending" | "unverified" | "timeout" | "failed" | "blocked";
 	score: number | null;
 	comments: ReviewComment[];
 	headSha?: string;

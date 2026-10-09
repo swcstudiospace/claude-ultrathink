@@ -796,7 +796,7 @@ describe("runClarify with Jev decisions", () => {
 				expect(call.url).toBe(ENDPOINT);
 				expect(Object.keys(state).sort()).toEqual(["answer", "document", "question"]);
 				expect(state.answer).toBe(SESSIONS_A);
-				expect(state.document.length).toBeLessThanOrEqual(12_000);
+				expect(state.document?.length).toBeLessThanOrEqual(12_000);
 				expect(state.document).toBe(longDoc.slice(0, 12_000));
 				expect(asked).toEqual({ supported: QUESTIONS.knowledge });
 			}
@@ -938,7 +938,7 @@ describe("runClarify with Jev decisions", () => {
 			for (const call of held.calls) {
 				expect(call.url).toBe(ENDPOINT);
 				expect(Object.keys(sent(call).state).sort()).toEqual(["default", "question", "task"]);
-				expect(sent(call).state.task.length).toBeLessThanOrEqual(4000);
+				expect(sent(call).state.task?.length).toBeLessThanOrEqual(4000);
 				expect(sent(call).questions).toEqual({ risky: QUESTIONS.blocking });
 			}
 			expect(run.list.map((item) => item.blocking)).toEqual([false, false, false]);

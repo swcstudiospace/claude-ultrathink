@@ -100,6 +100,15 @@ export const DEFAULT_SUBSTRATE_CONFIG: SubstrateConfig = {
 	url: "",
 };
 
+export interface StateConfig {
+	/** Days a session record is kept before the scheduled prune may remove it; 0 = keep forever. User files only. */
+	retentionDays: number;
+}
+
+export const DEFAULT_STATE_CONFIG: StateConfig = {
+	retentionDays: 0,
+};
+
 /** A per-host planning model override; "" in a field means no override for it. */
 export interface HostModelOverride {
 	/** Exact credential-bearing provider id the planning target must belong to; "" = no provider constraint. */
@@ -143,6 +152,8 @@ export interface UltrathinkConfig {
 	gateway: GatewayConfig;
 	/** Teachable Moments capture, recall and promotion. Opt-in; a project file can only lower it. */
 	teach: TeachConfig;
+	/** On-disk session state. Opt-in retention; a project file can never set it. */
+	state: StateConfig;
 	/** Planning model overrides and exact-provider default selectors; built-in `{ hosts: {}, providerDefaults: {} }`. */
 	models: ModelsConfig;
 	/**
@@ -180,6 +191,7 @@ export function defaultConfig(): UltrathinkConfig {
 		ragflow: { ...DEFAULT_RAGFLOW_CONFIG, datasetIds: [...DEFAULT_RAGFLOW_CONFIG.datasetIds] },
 		gateway: { ...DEFAULT_GATEWAY_CONFIG },
 		teach: { ...DEFAULT_TEACH_CONFIG },
+		state: { ...DEFAULT_STATE_CONFIG },
 		models: { hosts: {}, providerDefaults: providerDictionary({}) },
 		modelProvenance: { claude: "route-default", grok: "route-default", muse: "route-default" },
 	};
@@ -628,6 +640,15 @@ function mergeTeach(teach: Record<string, unknown> | undefined, defaults: TeachC
 	};
 }
 
+/**
+ * A project layer (a file a cloned repository controls) is ignored entirely: a hostile `retentionDays: 1` would delete
+ * the user's history. Only user files can opt in to the scheduled prune.
+ */
+function mergeState(state: Record<string, unknown> | undefined, defaults: StateConfig, project: boolean): StateConfig {
+	if (!state || project) return defaults;
+	return { retentionDays: intInRange(state.retentionDays, 0, 3650, defaults.retentionDays) };
+}
+
 /** Merges one config layer onto `base`; `project` marks a repository-controlled layer (consent may only tighten, K5). */
 export function mergeConfig(
 	file: Record<string, unknown> | undefined,
@@ -655,6 +676,7 @@ export function mergeConfig(
 		ragflow: mergeRagflow(asRecord(file.ragflow), base.ragflow, options.project === true),
 		gateway: mergeGateway(asRecord(file.gateway), base.gateway, options.project === true),
 		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
+		state: mergeState(asRecord(file.state), base.state, options.project === true),
 		models: mergeModels(asRecord(file.models), base.models),
 		modelProvenance: {
 			claude: modelPin(claude, base.modelProvenance.claude, true),

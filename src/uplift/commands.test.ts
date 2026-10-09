@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { readControl, type SessionRecord, writeSession } from "../claude/state.ts";
+import type { DoctorReport } from "../doctor/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
 import type { HostId } from "../host/types.ts";
 import { writeStore } from "../mcp/store.ts";
@@ -858,5 +859,113 @@ describe("runControl", () => {
 		// Not runControl's usage text, and a usage failure (2) rather than a success (0).
 		expect(proc.stdout.toString()).not.toStartWith("Usage: ultrathink <command>");
 		expect(proc.exitCode).not.toBe(0);
+	});
+
+	test("the usage text lists doctor", async () => {
+		expect(await runControl(["bogus"], io)).toContain("  doctor [--json]        check config files, credentials, state and environment");
+	});
+
+	describe("bin/ultrathink doctor", () => {
+		const FAKE_KEY = "sk-test-not-a-real-key-0123456789";
+
+		function runDoctor(args: string[]): { stdout: string; exitCode: number | null } {
+			const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "commands.ts"), "doctor", ...args], {
+				cwd: io.cwd,
+				env: {
+					...process.env,
+					HOME: join(dir, "home"),
+					ULTRATHINK_STATE_DIR: join(dir, "state"),
+					ULTRATHINK_MCP_STORE: join(dir, "mcp-credentials.json"),
+					OPENROUTER_API_KEY: FAKE_KEY,
+				},
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { stdout: proc.stdout.toString(), exitCode: proc.exitCode };
+		}
+
+		test("goes to the doctor command and prints a report without any key", () => {
+			const { stdout, exitCode } = runDoctor([]);
+			expect(stdout).toStartWith("ultrathink doctor\n");
+			expect(stdout).toMatch(/\d+ errors?, \d+ warnings?\n$/);
+			expect(stdout).not.toContain(FAKE_KEY);
+			expect(exitCode).toBe(stdout.includes("✗") ? 1 : 0);
+		});
+
+		test("--json prints one object", () => {
+			const { stdout } = runDoctor(["--json"]);
+			const report: DoctorReport = JSON.parse(stdout);
+			expect(typeof report.ok).toBe("boolean");
+			expect(report.findings.length).toBeGreaterThan(0);
+			expect(stdout).not.toContain(FAKE_KEY);
+		});
+
+		test("an unknown flag is a usage error", () => {
+			const { stdout, exitCode } = runDoctor(["--no-such-flag"]);
+			expect(stdout).toBe("Usage: ultrathink doctor [--json]\n");
+			expect(exitCode).toBe(2);
+		});
+	});
+
+	test("the usage text lists prune", async () => {
+		expect(await runControl(["bogus"], io)).toContain("  prune [--older-than <days>] [--dry-run]");
+	});
+
+	describe("bin/ultrathink prune", () => {
+		const SECRET_PROMPT = "a prompt that must never be printed";
+
+		function runPrune(args: string[]): { stdout: string; exitCode: number | null } {
+			const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "commands.ts"), "prune", ...args], {
+				cwd: io.cwd,
+				env: { ...process.env, HOME: join(dir, "home"), ULTRATHINK_STATE_DIR: join(dir, "state") },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { stdout: proc.stdout.toString(), exitCode: proc.exitCode };
+		}
+
+		function seedSession(id: string, ageDays: number): string {
+			const sessions = join(dir, "state", "sessions");
+			mkdirSync(sessions, { recursive: true });
+			const path = join(sessions, `${id}.json`);
+			writeFileSync(path, JSON.stringify({ sessionId: id, at: 0, result: { xml: "", original: SECRET_PROMPT, root: "", source: "llm" } }));
+			const aged = (Date.now() - ageDays * 86_400_000) / 1000;
+			utimesSync(path, aged, aged);
+			return path;
+		}
+
+		test("--dry-run reports the old session and removes nothing; without it the session goes and the new one stays", () => {
+			const old = seedSession("old-session", 60);
+			const fresh = seedSession("fresh-session", 1);
+			const preview = runPrune(["--older-than", "30", "--dry-run"]);
+			expect(preview.exitCode).toBe(0);
+			expect(preview.stdout).toStartWith("Would prune 1 session");
+			expect(preview.stdout).toContain("old-session");
+			expect(preview.stdout).not.toContain(SECRET_PROMPT);
+			expect(existsSync(old)).toBe(true);
+			const real = runPrune(["--older-than", "30"]);
+			expect(real.exitCode).toBe(0);
+			expect(real.stdout).toStartWith("Pruned 1 session");
+			expect(existsSync(old)).toBe(false);
+			expect(existsSync(fresh)).toBe(true);
+		});
+
+		test("without a cutoff anywhere it refuses and removes nothing", () => {
+			const old = seedSession("old-session", 400);
+			const { stdout, exitCode } = runPrune([]);
+			expect(exitCode).toBe(2);
+			expect(stdout).toContain("no cutoff");
+			expect(existsSync(old)).toBe(true);
+		});
+
+		test("a cutoff below one day is refused", () => {
+			const old = seedSession("old-session", 400);
+			const { stdout, exitCode } = runPrune(["--older-than", "0"]);
+			expect(exitCode).toBe(2);
+			expect(stdout).toContain("refusing to prune everything");
+			expect(existsSync(old)).toBe(true);
+		});
 	});
 });

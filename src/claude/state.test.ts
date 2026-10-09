@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DecisionRecord } from "../decisions/types.ts";
@@ -16,9 +16,13 @@ import {
 	readSession,
 	type SessionRecord,
 	sessionPath,
+	updateSession,
 	writeControl,
 	writeSession,
+    withLastLock,
 } from "./state.ts";
+
+const ANSWERS_HOOK = join(import.meta.dir, "..", "..", "hooks", "answers.ts");
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -294,5 +298,192 @@ describe("session records and the model resolution record", () => {
 		}
 		writeFileSync(controlPath(dir), JSON.stringify({ engine: "omp-native", modelResolution: resolution }));
 		expect(readControl(dir)).toEqual({});
+	});
+});
+
+describe("private, atomic state files", () => {
+	const record: SessionRecord = { sessionId: "p1", at: 5, result: { xml: "<X/>", original: "a verbatim prompt", root: "X", source: "llm" } };
+
+	test.skipIf(process.platform === "win32")("session, last and control files are 0600 in 0700 directories", () => {
+		const dir = tempDir();
+		writeSession(dir, record);
+		writeControl(dir, { enabled: true });
+		for (const path of [sessionPath(dir, "p1"), join(dir, "last.json"), controlPath(dir)]) expect(statSync(path).mode & 0o777).toBe(0o600);
+		for (const path of [dir, join(dir, "sessions")]) expect(statSync(path).mode & 0o777).toBe(0o700);
+	});
+
+	test.skipIf(process.platform === "win32")("a 0644 file written by an older version is 0600 after its next rewrite", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		writeFileSync(sessionPath(dir, "p1"), JSON.stringify(record), { mode: 0o644 });
+		writeSession(dir, record);
+		expect(statSync(sessionPath(dir, "p1")).mode & 0o777).toBe(0o600);
+	});
+
+	test("writes keep the tab-indented JSON format and leave no temporary or lock files", () => {
+		const dir = tempDir();
+		writeSession(dir, record);
+		writeControl(dir, { enabled: false });
+		expect(readFileSync(sessionPath(dir, "p1"), "utf8")).toBe(`${JSON.stringify(record, null, "\t")}\n`);
+		expect(readFileSync(controlPath(dir), "utf8")).toBe('{\n\t"enabled": false\n}\n');
+		for (const where of [dir, join(dir, "sessions")]) {
+			expect(readdirSync(where).filter((name) => name.endsWith(".tmp") || name.endsWith(".lock"))).toEqual([]);
+		}
+	});
+
+	test("a truncated session file reads as missing and the next writeSession replaces it whole", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		writeFileSync(sessionPath(dir, "p1"), '{"sessionId":"p1","at":5,"resu');
+		expect(readSession(dir, "p1")).toBeUndefined();
+		writeSession(dir, record);
+		expect(readSession(dir, "p1")).toEqual(record);
+	});
+});
+
+describe("updateSession", () => {
+	const record: SessionRecord = { sessionId: "u1", at: 1, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+
+	test("returns the mutated record, writing the session file and last.json", () => {
+		const dir = tempDir();
+		writeSession(dir, record);
+		const next = updateSession(dir, "u1", (current) => ({ ...current, kickedOff: true }));
+		expect(next).toEqual({ ...record, kickedOff: true });
+		expect(readSession(dir, "u1")).toEqual({ ...record, kickedOff: true });
+		expect(readLast(dir)).toEqual({ ...record, kickedOff: true });
+		expect(existsSync(`${sessionPath(dir, "u1")}.lock`)).toBe(false);
+	});
+
+	test("a missing record is undefined, mutate is not called and nothing is written", () => {
+		const dir = tempDir();
+		let called = false;
+		expect(
+			updateSession(dir, "nope", (current) => {
+				called = true;
+				return current;
+			}),
+		).toBeUndefined();
+		expect(called).toBe(false);
+		expect(existsSync(sessionPath(dir, "nope"))).toBe(false);
+		expect(existsSync(join(dir, "last.json"))).toBe(false);
+	});
+
+	test("a mutate that returns undefined leaves the record as it was", () => {
+		const dir = tempDir();
+		writeSession(dir, record);
+		const before = readFileSync(sessionPath(dir, "u1"), "utf8");
+		expect(updateSession(dir, "u1", () => undefined)).toBeUndefined();
+		expect(readFileSync(sessionPath(dir, "u1"), "utf8")).toBe(before);
+	});
+
+	test("a throwing mutate propagates and releases the lock", () => {
+		const dir = tempDir();
+		writeSession(dir, record);
+		expect(() =>
+			updateSession(dir, "u1", () => {
+				throw new Error("bad mutate");
+			}),
+		).toThrow("bad mutate");
+		expect(existsSync(`${sessionPath(dir, "u1")}.lock`)).toBe(false);
+		expect(readSession(dir, "u1")).toEqual(record);
+	});
+});
+
+describe("strict last-lock completion", () => {
+	test("a completed live writer can be replaced after a competing mutation guard is freed", () => {
+		const dir = tempDir();
+		mkdirSync(dir, { recursive: true });
+		const last = join(dir, "last.json");
+		const guard = `${last}.lock.guard`;
+		const owner = `${process.pid}.${"a".repeat(32)}`;
+		const before: SessionRecord = { sessionId: "before", at: 1, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+		const after: SessionRecord = { ...before, sessionId: "after" };
+		expect(withLastLock(last, () => {
+			writeFileSync(last, JSON.stringify(before));
+			mkdirSync(guard, { mode: 0o700 });
+			writeFileSync(join(guard, owner), "", { mode: 0o600 });
+		})).toBe(true);
+		expect(writeSession(dir, after)).toBeDefined();
+		expect(readSession(dir, "after")).toEqual(after);
+		expect(readLast(dir)).toEqual(before);
+		rmSync(guard, { recursive: true });
+		expect(writeSession(dir, after)).toBeUndefined();
+		expect(readLast(dir)).toEqual(after);
+		expect(existsSync(`${last}.lock`)).toBe(false);
+	});
+
+	test("finishing an old inode cannot release a successor with the same live PID", () => {
+		const dir = tempDir();
+		mkdirSync(dir, { recursive: true });
+		const last = join(dir, "last.json");
+		const lock = `${last}.lock`;
+		const before: SessionRecord = { sessionId: "before", at: 1, result: { xml: "<X/>", original: "x", root: "X", source: "llm" } };
+		expect(withLastLock(last, () => {
+			writeFileSync(last, JSON.stringify(before));
+			rmSync(lock);
+			writeFileSync(lock, String(process.pid), { mode: 0o600 });
+		})).toBe(true);
+		expect(withLastLock(last, () => writeFileSync(last, '{"sessionId":"incorrect"}'))).toBe(false);
+		expect(readLast(dir)).toEqual(before);
+		expect(readFileSync(lock, "utf8")).toBe(String(process.pid));
+	});
+});
+
+describe("the HITL answers hook", () => {
+	test("folds the user's answers into the session record and spec file, keeping other fields, owner-only", async () => {
+		const dir = tempDir();
+		const record: SessionRecord = {
+			sessionId: "h1",
+			at: 1,
+			kickedOff: true,
+			result: { xml: "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>", original: "x", root: "BUILD_PROMPT", source: "llm" },
+		};
+		writeSession(dir, record);
+		const envelope = {
+			session_id: "h1",
+			tool_name: "AskUserQuestion",
+			tool_input: { questions: [{ question: "Which database?", header: "Database", options: [{ label: "Postgres" }, { label: "SQLite" }] }] },
+			tool_response: { answers: { "Which database?": "Postgres" } },
+		};
+		const proc = Bun.spawn([process.execPath, ANSWERS_HOOK], {
+			cwd: join(dir, ".."),
+			env: { PATH: process.env.PATH, HOME: dir, ULTRATHINK_STATE_DIR: dir },
+			stdin: new TextEncoder().encode(JSON.stringify(envelope)),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		expect(exit).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({ systemMessage: "HITL · 1 answer(s) recorded" });
+
+		const saved = readSession(dir, "h1");
+		expect(saved?.kickedOff).toBe(true);
+		expect(saved?.clarifications).toHaveLength(1);
+		expect(saved?.clarifications?.[0]).toMatchObject({ question: "Which database?", answer: "Postgres", source: "user" });
+		expect(saved?.result.xml).toContain("Postgres");
+		const specPath = sessionPath(dir, "h1").replace(/\.json$/, ".xml");
+		expect(readFileSync(specPath, "utf8")).toBe(`${saved?.result.xml}\n`);
+		expect(readLast(dir)?.clarifications).toHaveLength(1);
+		if (process.platform !== "win32") {
+			expect(statSync(specPath).mode & 0o777).toBe(0o600);
+			expect(statSync(sessionPath(dir, "h1")).mode & 0o777).toBe(0o600);
+		}
+	});
+
+	test("a session with no record is left alone and the hook stays silent", async () => {
+		const dir = tempDir();
+		const proc = Bun.spawn([process.execPath, ANSWERS_HOOK], {
+			cwd: join(dir, ".."),
+			env: { PATH: process.env.PATH, HOME: dir, ULTRATHINK_STATE_DIR: dir },
+			stdin: new TextEncoder().encode(
+				JSON.stringify({ session_id: "ghost", tool_name: "AskUserQuestion", tool_input: {}, tool_response: { answers: { Q: "a" } } }),
+			),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		expect(exit).toBe(0);
+		expect(stdout).toBe("");
+		expect(existsSync(sessionPath(dir, "ghost"))).toBe(false);
 	});
 });

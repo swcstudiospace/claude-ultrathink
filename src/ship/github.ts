@@ -28,8 +28,20 @@ export interface Github {
 	comment(number: number, body: string): { ok: boolean; error?: string };
 	mergeMethods(): ShipConfig["mergeMethod"][];
 	syncBase(input: { base: string; branch: string }): { ok: boolean; error?: string };
-	/** The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed. */
-	reviewThreads(prNumber: number): ReviewThreads;
+	/**
+	 * The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed.
+	 * With `opts.deadlineMs`, repository lookup and every page share the remaining wait budget; a response
+	 * arriving after that deadline also fails closed.
+	 */
+	reviewThreads(prNumber: number, opts?: ReviewThreadsOptions): ReviewThreads;
+}
+
+/** Bounds a `reviewThreads` page scan: the loop stops fail-closed once `now()` reaches `deadlineMs`. */
+export interface ReviewThreadsOptions {
+	/** Absolute timestamp on the `now` clock bounding the whole scan; unset scans without a bound. */
+	deadlineMs?: number;
+	/** Clock for the deadline check; defaults to `Date.now`. Injected in tests. */
+	now?: () => number;
 }
 
 const LONG_TIMEOUT_MS = 180_000;
@@ -43,11 +55,15 @@ const FAILED_CONCLUSIONS: Record<string, true> = {
 };
 const FAILED_STATES: Record<string, true> = { FAILURE: true, ERROR: true };
 const DONE_STATUSES: Record<string, true> = { COMPLETED: true, SUCCESS: true };
-const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+// GitHub caps `first` at 100, so a larger pull request is read page by page, up to this many pages.
+const MAX_THREAD_PAGES = 20;
+const PAGINATION_STALLED = "review threads pagination did not advance";
+const THREADS_DEADLINE_EXCEEDED = "review threads scan exceeded its deadline";
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
 	repository(owner: $owner, name: $name) {
 		pullRequest(number: $number) {
-			reviewThreads(first: 100) {
-				pageInfo { hasNextPage }
+			reviewThreads(first: 100, after: $after) {
+				pageInfo { hasNextPage endCursor }
 				nodes { id isResolved isOutdated comments(first: 1) { nodes { author { login } path line originalLine body } } }
 			}
 		}
@@ -101,7 +117,10 @@ export function classifyChecks(rollup: unknown): PrStatus["checks"] {
 	return pending ? "pending" : "passing";
 }
 
-function parseReviewThreads(stdout: string): ReviewThreads {
+type ThreadsPage = { ok: true; threads: ReviewThread[]; next?: string } | { ok: false; error: string };
+
+/** Parses one page of the reviewThreads response; `next` is the cursor of the following page when there is one. */
+function parseThreadsPage(stdout: string): ThreadsPage {
 	const root = obj(parseJson(stdout));
 	if (!root) return { ok: false, error: "unparseable review threads response" };
 	const errors = root.errors;
@@ -110,7 +129,10 @@ function parseReviewThreads(stdout: string): ReviewThreads {
 	}
 	const threads = obj(obj(obj(obj(root.data)?.repository)?.pullRequest)?.reviewThreads);
 	if (!threads || !Array.isArray(threads.nodes)) return { ok: false, error: "pull request review threads missing" };
-	if (obj(threads.pageInfo)?.hasNextPage === true) return { ok: false, error: "more than 100 review threads" };
+	const pageInfo = obj(threads.pageInfo);
+	if (!pageInfo || typeof pageInfo.hasNextPage !== "boolean") return { ok: false, error: "malformed review threads pageInfo" };
+	const next = pageInfo?.hasNextPage === true ? str(pageInfo.endCursor) : undefined;
+	if (pageInfo?.hasNextPage === true && !next) return { ok: false, error: PAGINATION_STALLED };
 	const out: ReviewThread[] = [];
 	for (const node of threads.nodes) {
 		const thread = obj(node);
@@ -120,8 +142,11 @@ function parseReviewThreads(stdout: string): ReviewThreads {
 		const author = str(obj(first?.author)?.login);
 		const body = str(first?.body);
 		if (!thread || !id || !first) return { ok: false, error: "malformed review thread" };
+		// A null author is GitHub's valid representation of a deleted account.
+		if (first.author === null) continue;
+		if (!author) return { ok: false, error: "malformed review thread" };
 		// The Greptile app posts as `greptile-apps[bot]`; GraphQL reports the login without the suffix.
-		if (!author?.toLowerCase().startsWith("greptile")) continue;
+		if (!author.toLowerCase().startsWith("greptile")) continue;
 		if (!body || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean") {
 			return { ok: false, error: "malformed review thread" };
 		}
@@ -132,23 +157,24 @@ function parseReviewThreads(stdout: string): ReviewThreads {
 		if (typeof line === "number") entry.line = line;
 		out.push(entry);
 	}
-	return { ok: true, threads: out };
+	return next ? { ok: true, threads: out, next } : { ok: true, threads: out };
 }
 
 export function createGithub(input: { cwd: string; run?: Run }): Github {
 	const run = input.run ?? defaultRun;
 	const cwd = input.cwd;
 	const exec = (argv: string[], opts: { timeoutMs?: number; stdin?: string } = {}) => run(argv, { cwd, ...opts });
+	const repo = (timeoutMs?: number) => {
+		const r = exec(["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"], { timeoutMs });
+		if (r.exitCode !== 0) return undefined;
+		const o = obj(parseJson(r.stdout));
+		const name = str(o?.nameWithOwner);
+		const defaultBranch = str(obj(o?.defaultBranchRef)?.name);
+		return name && defaultBranch ? { name, defaultBranch } : undefined;
+	};
 
 	const gh: Github = {
-		repo() {
-			const r = exec(["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"]);
-			if (r.exitCode !== 0) return undefined;
-			const o = obj(parseJson(r.stdout));
-			const name = str(o?.nameWithOwner);
-			const defaultBranch = str(obj(o?.defaultBranchRef)?.name);
-			return name && defaultBranch ? { name, defaultBranch } : undefined;
-		},
+		repo,
 		push(branch) {
 			const r = exec(["git", "push", "-u", "origin", branch], { timeoutMs: LONG_TIMEOUT_MS });
 			return r.exitCode === 0 ? { ok: true } : { ok: false, error: errorOf(r) };
@@ -224,17 +250,38 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			if (exists && current !== branch) exec(["git", "branch", "-D", branch]);
 			return { ok: true };
 		},
-		reviewThreads(prNumber) {
-			const [owner, name] = gh.repo()?.name.split("/") ?? [];
+		reviewThreads(prNumber, opts = {}) {
+			const now = opts.now ?? Date.now;
+			let remaining = opts.deadlineMs === undefined ? undefined : opts.deadlineMs - now();
+			if (remaining !== undefined && remaining <= 0) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+			const [owner, name] = repo(remaining)?.name.split("/") ?? [];
+			if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
 			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
-			const r = exec([
-				"gh", "api", "graphql",
-				"-f", `query=${THREADS_QUERY}`,
-				"-f", `owner=${owner}`,
-				"-f", `name=${name}`,
-				"-F", `number=${prNumber}`,
-			]);
-			return r.exitCode === 0 ? parseReviewThreads(r.stdout) : { ok: false, error: errorOf(r) };
+			const threads: ReviewThread[] = [];
+			const seen = new Set<string>();
+			let after: string | undefined;
+			for (let page = 1; page <= MAX_THREAD_PAGES; page++) {
+				remaining = opts.deadlineMs === undefined ? undefined : opts.deadlineMs - now();
+				if (remaining !== undefined && remaining <= 0) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+				const r = exec([
+					"gh", "api", "graphql",
+					"-f", `query=${THREADS_QUERY}`,
+					"-f", `owner=${owner}`,
+					"-f", `name=${name}`,
+					"-F", `number=${prNumber}`,
+					...(after === undefined ? [] : ["-f", `after=${after}`]),
+				], { timeoutMs: remaining });
+				if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+				if (r.exitCode !== 0) return { ok: false, error: errorOf(r) };
+				const parsed = parseThreadsPage(r.stdout);
+				if (!parsed.ok) return parsed;
+				threads.push(...parsed.threads);
+				if (!parsed.next) return { ok: true, threads };
+				if (seen.has(parsed.next)) return { ok: false, error: PAGINATION_STALLED };
+				seen.add(parsed.next);
+				after = parsed.next;
+			}
+			return { ok: false, error: `more than ${MAX_THREAD_PAGES * 100} review threads` };
 		},
 	};
 	return gh;

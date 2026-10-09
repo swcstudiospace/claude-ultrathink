@@ -18,8 +18,10 @@ body:
         - Claude Code
         - Grok Build
         - Hermes Agent
-        - Muse
+        - Muse Code
+        - Prime Agent
         - Omp
+        - Grok Bot (skill adapter)
     validations:
       required: true
   - type: input
@@ -34,7 +36,7 @@ body:
     id: host-version
     attributes:
       label: Host version
-      description: The output of `claude --version`, `grok --version`, `hermes --version`, `muse --version` or `omp --version`.
+      description: The output of `claude --version`, `grok --version`, `hermes --version`, `muse --version` or `omp --version`. For Prime Agent or Grok Bot, the version of that tool.
     validations:
       required: true
   - type: textarea
