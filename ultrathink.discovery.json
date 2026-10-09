@@ -8,7 +8,7 @@
     "plugin": "ultrathink",
     "marketplace": "ultrathink"
   },
-  "description": "claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Existing adapters are listed from repository sources; Grok Bot and GPT Dot integration contracts remain pending and compatibility is not verified.",
+  "description": "claude-ultrathink is a cross-agent reasoning plugin providing prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications. Adapters are listed from repository sources. Grok Bot is a skill-protocol adapter: it does not run the engine and has no prompt hook; compatibility is not verified. GPT Dot remains pending and unverified.",
   "capabilities": [
     "prompt-uplift",
     "graph-of-thought",
@@ -98,9 +98,20 @@
   "externalIntegrations": {
     "grok-bot": {
       "identity": "documented-product",
-      "status": "pending-contract",
-      "adapterPresent": false,
-      "compatibilityVerified": false
+      "status": "skill-adapter",
+      "adapterPresent": true,
+      "compatibilityVerified": false,
+      "delivery": "skill-protocol",
+      "entrypoints": [
+        "hosts/grok-bot/README.md",
+        "hosts/grok-bot/ultrathink-protocol/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-off/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-on/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-quick/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-skip/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-status/SKILL.md",
+        "hosts/grok-bot/commands/ultrathink-track/SKILL.md"
+      ]
     },
     "gpt-dot": {
       "identity": "unverified",

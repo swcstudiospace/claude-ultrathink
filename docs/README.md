@@ -27,6 +27,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Team and project config](how-to/team-and-project-config.md): share settings per repository and layer them with your own.
 - [Upgrade and move](how-to/upgrade-and-move.md): update each host and move the clone.
 - [Uninstall](how-to/uninstall.md): remove ultrathink from each host, plus its shared config, credentials and state.
+- [Use with Grok Bot](how-to/use-with-grok-bot.md): load the skill-protocol adapter. Grok Bot does not run the engine and has no prompt hook.
 
 ## Reference
 
