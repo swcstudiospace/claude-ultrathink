@@ -8,7 +8,7 @@
  */
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { SessionRecord } from "../claude/state.ts";
+import { type SessionRecord, withLastLock } from "../claude/state.ts";
 import { applyAnswers } from "../hitl/answers.ts";
 import { injectClarificationsXml } from "../hitl/format.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -65,19 +65,21 @@ export function recordAnswers(statePath: string, input: AnswersInput, now = Date
 export function mirrorLast(statePath: string, record: SessionRecord): void {
 	const lastPath = join(dirname(dirname(statePath)), "last.json");
 	if (!existsSync(lastPath)) return;
-	const tmp = `${lastPath}.tmp`;
+	const tmp = `${lastPath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
 	try {
-		const last = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
-		if (last.sessionId !== record.sessionId) return;
-		writeFileSync(tmp, `${JSON.stringify(record, null, "\t")}\n`);
-		// Another session may have replaced last.json while this one was writing. Check again immediately before the rename.
-		const again = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
-		if (again.sessionId !== record.sessionId) {
-			unlinkSync(tmp);
-			return;
-		}
-		renameSync(tmp, lastPath);
+		withLastLock(lastPath, () => {
+			const last = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
+			if (last.sessionId !== record.sessionId) return;
+			writeFileSync(tmp, `${JSON.stringify(record, null, "\t")}\n`);
+			renameSync(tmp, lastPath);
+		});
 	} catch {
 		// an unreadable last.json stays as it is
+	} finally {
+		try {
+			if (existsSync(tmp)) unlinkSync(tmp);
+		} catch {
+			// the temp file is already gone
+		}
 	}
 }

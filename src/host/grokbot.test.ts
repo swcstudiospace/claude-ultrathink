@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type SessionRecord, writeControl } from "../claude/state.ts";
+import { type SessionRecord, writeControl, writeSession } from "../claude/state.ts";
 import { escapeXml } from "../uplift/xml.ts";
 import { planPrompt } from "./plan.ts";
 import {
@@ -30,7 +30,7 @@ import { buildTrackPayloads, graphRegisterPayload, recordRefs } from "./grokbot-
 import { buildCloudPrompt, DEFAULT_DESK_RULES, unitSubissueCount, untrackedSpec, validateCloudPrompt, wellFormed } from "./grokbot-prompts.ts";
 import { dirFetcher, grokbotStatusLines, main, promoteGuard, reviewRead } from "./grokbot-cli.ts";
 import { normalizeTranscript } from "./grokbot.ts";
-import { parseAnswersInput, recordAnswers } from "./grokbot-hitl.ts";
+import { mirrorLast, parseAnswersInput, recordAnswers } from "./grokbot-hitl.ts";
 import { skillsStatus } from "./grokbot-skills.ts";
 import { grokbotDigest } from "./grokbot-teach.ts";
 import { conversationFromJsonl } from "../claude/transcript.ts";
@@ -598,6 +598,25 @@ describe("grok-bot answers", () => {
 		writeFileSync(lastPath, `${JSON.stringify({ sessionId: "other", result: { xml: "stale" } }, null, "\t")}\n`);
 		recordAnswers(statePath, parseAnswersInput({ q1: "JSON lines" }));
 		expect(JSON.parse(readFileSync(lastPath, "utf8")).sessionId).toBe("other");
+	});
+
+	test("a held last.json lock keeps the current plan in place", () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const record = { sessionId: "s1", at: 1, result: { xml: "<x/>", original: "o", root: "BUILD_PROMPT", source: "llm" } } as SessionRecord;
+		writeSession(stateDir, record);
+		const lastPath = join(stateDir, "last.json");
+		const fd = openSync(`${lastPath}.lock`, "wx");
+		try {
+			mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
+			expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(1);
+		} finally {
+			closeSync(fd);
+			unlinkSync(`${lastPath}.lock`);
+		}
+		mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(2);
+		expect(existsSync(`${lastPath}.lock`)).toBe(false);
 	});
 });
 

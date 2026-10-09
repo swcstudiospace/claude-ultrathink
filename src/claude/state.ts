@@ -4,7 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
@@ -132,9 +132,45 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 	return rec as SessionRecord;
 }
 
+const LAST_LOCK_WAIT_MS = 5;
+const LAST_LOCK_ATTEMPTS = 40;
+const LAST_LOCK_STALE_MS = 5_000;
+
+/** Exclusive lock for `last.json`. Every writer uses it, so a replace cannot land between another writer's check and rename. */
+export function withLastLock(lastPath: string, body: () => void): boolean {
+	const lockPath = `${lastPath}.lock`;
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && fd === undefined; attempt++) {
+		try {
+			fd = openSync(lockPath, "wx");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+			try {
+				if (Date.now() - statSync(lockPath).mtimeMs > LAST_LOCK_STALE_MS) unlinkSync(lockPath);
+			} catch {
+				// the holder removed it, or another waiter did
+			}
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
+		}
+	}
+	if (fd === undefined) return false;
+	try {
+		body();
+		return true;
+	} finally {
+		closeSync(fd);
+		try {
+			unlinkSync(lockPath);
+		} catch {
+			// the lock file is already gone
+		}
+	}
+}
+
 export function writeSession(dir: string, record: SessionRecord): void {
 	writeJson(sessionPath(dir, record.sessionId), record);
-	writeJson(join(dir, "last.json"), record);
+	const last = join(dir, "last.json");
+	withLastLock(last, () => writeJson(last, record));
 }
 
 export function readLast(dir: string): SessionRecord | undefined {
