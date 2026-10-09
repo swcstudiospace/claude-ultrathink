@@ -4,7 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type LockOptions, withFileLock, writeFileAtomic } from "./atomic.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
@@ -142,14 +142,80 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 	return rec as SessionRecord;
 }
 
-/** Exclusive lock for `last.json`, delegated to the shared file lock on `<lastPath>.lock`. Every writer uses it, so a replace cannot land between another writer's check and rename. When the lock cannot be taken in time the body still runs unlocked and `false` is returned. */
+const LAST_LOCK_WAIT_MS = 5;
+const LAST_LOCK_ATTEMPTS = 40;
+const LAST_LOCK_STALE_MS = 5_000;
+
+/** True when the lock file names a running process, or is a fresh empty file another writer has not filled yet. */
+function holderAlive(lockPath: string): boolean {
+	let text: string;
+	try {
+		text = readFileSync(lockPath, "utf8").trim();
+	} catch {
+		return false;
+	}
+	if (!text) {
+		try {
+			return Date.now() - statSync(lockPath).mtimeMs <= LAST_LOCK_STALE_MS;
+		} catch {
+			return false;
+		}
+	}
+	const pid = Number(text);
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
+ * Exclusive lock for `last.json`. A busy lock does not run `body`: replacing the current plan is worse than
+ * leaving the previous copy, so this does not degrade to an unlocked write the way `withFileLock` does.
+ * Returns false when the lock cannot be taken within 200ms. A dead pid is reclaimed immediately and an empty
+ * lock after 5s; a live pid stays protected regardless of the lock's age.
+ */
 export function withLastLock(lastPath: string, body: () => void): boolean {
-	let locked = false;
-	withFileLock(lastPath, () => {
-		locked = true;
+	const lockPath = `${lastPath}.lock`;
+	const pid = String(process.pid);
+	let held = false;
+	for (let attempt = 0; attempt < LAST_LOCK_ATTEMPTS && !held; attempt++) {
+		try {
+			writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
+			held = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+			const reclaim = !holderAlive(lockPath);
+			if (reclaim) {
+				try {
+					unlinkSync(lockPath);
+				} catch {
+					// the holder removed it, or another waiter did
+				}
+				try {
+					writeFileSync(lockPath, pid, { flag: "wx", mode: 0o600 });
+					held = true;
+				} catch {
+					// another waiter took the reclaimed lock
+				}
+			} else {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LAST_LOCK_WAIT_MS);
+			}
+		}
+	}
+	if (!held) return false;
+	try {
 		body();
-	});
-	return locked;
+		return true;
+	} finally {
+		try {
+			if (readFileSync(lockPath, "utf8").trim() === pid) unlinkSync(lockPath);
+		} catch {
+			// the lock file is already gone, or another writer replaced it
+		}
+	}
 }
 
 export function lastRefreshMessage(lastPath: string): string {

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { defaultConfig } from "../config.ts";
+import { claudeConfigPaths, defaultConfig, loadConfig } from "../config.ts";
 import { checkConfig, suggestName } from "./config-check.ts";
 import type { DoctorDeps, Finding } from "./types.ts";
 
@@ -90,6 +90,75 @@ describe("checkConfig", () => {
 	test("a key written with the value it already defaults to, padded or with a trailing slash, is not a finding", () => {
 		write("user", { grok: { baseUrl: `${defaultConfig().grok.baseUrl}/`, bin: "  grok " }, ship: { autoMerge: false } });
 		expect(aboveInfo(checkConfig(deps))).toEqual([]);
+	});
+
+	test.each<"direct" | "gateway">(["direct", "gateway"])("supported optional %s backends are known and honored in user layers", (backend) => {
+		write("user", { hindsight: { backend: "gateway" }, ragflow: { backend: "gateway" }, substrate: { backend: "gateway" } });
+		write("claude", { hindsight: { backend }, ragflow: { backend }, substrate: { backend } });
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		expect(findings.filter((finding) => finding.id.includes("unknown-key"))).toEqual([]);
+		const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+		for (const section of ["hindsight", "ragflow", "substrate"] as const) {
+			expect(effective[section].backend ?? "direct").toBe(backend);
+		}
+	});
+
+	test("invalid optional backend choices warn with the retained effective selection, not an unknown key", () => {
+		write("user", { hindsight: { backend: "gateway" }, ragflow: { backend: "gateway" } });
+		write("claude", { hindsight: { backend: "auto" }, ragflow: { backend: " gateway " }, substrate: { backend: " direct " } });
+		const findings = checkConfig(deps);
+		expect(findings.filter((finding) => finding.id.includes("unknown-key"))).toEqual([]);
+		for (const section of ["hindsight", "ragflow", "substrate"]) {
+			expect(byId(findings, `config.claude-user.ignored.${section}.backend`)).toMatchObject({ level: "warn" });
+			expect(byId(findings, `config.claude-user.ignored.${section}.backend`).title).toContain(
+				`effective value is "${section === "substrate" ? "direct" : "gateway"}"`,
+			);
+		}
+		write("claude", { hindsight: { backend: false }, ragflow: { backend: [] }, substrate: { backend: null } });
+		const wrongTypes = checkConfig(deps);
+		for (const section of ["hindsight", "ragflow", "substrate"]) {
+			expect(byId(wrongTypes, `config.claude-user.wrong-type.${section}.backend`).level).toBe("warn");
+		}
+	});
+
+	test("project optional backends retain the lower selection and report the existing restriction IDs", () => {
+		write("user", { hindsight: { backend: "gateway" }, ragflow: { backend: "gateway" }, substrate: { backend: "gateway" } });
+		write("project", { hindsight: { backend: "direct" }, ragflow: { backend: "direct" }, substrate: { backend: "direct" } });
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+		for (const section of ["hindsight", "ragflow", "substrate"] as const) {
+			expect(byId(findings, `config.project.project-restricted.${section}.backend`).level).toBe("info");
+			expect(effective[section].backend).toBe("gateway");
+		}
+	});
+
+	test("adjusted values use all preceding layers rather than fresh defaults", () => {
+		write("user", { ship: { minScore: 4 }, hindsight: { enabled: true }, teach: { recallLimit: 8 } });
+		write("claude", { ship: { minScore: 3 }, teach: { recallLimit: 99 } });
+		write("project", { ship: { minScore: 6 }, hindsight: { enabled: false }, teach: { recallLimit: 9 } });
+		const findings = checkConfig(deps);
+		expect(byId(findings, "config.claude-user.ignored.teach.recallLimit").title).toContain("effective value is 8");
+		expect(byId(findings, "config.project.ignored.ship.minScore").title).toContain("effective value is 3");
+		expect(byId(findings, "config.project.project-restricted.teach.recallLimit").level).toBe("info");
+		expect(findings.some((finding) => finding.id.endsWith("hindsight.enabled"))).toBe(false);
+		const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+		expect(effective.ship.minScore).toBe(3);
+		expect(effective.teach.recallLimit).toBe(8);
+		expect(effective.hindsight.enabled).toBe(false);
+	});
+
+	test.each(["missing", "invalid-json", "not-object", "unreadable"] as const)("a %s intermediate layer preserves lower effective values", (kind) => {
+		write("user", { ship: { minScore: 4 } });
+		if (kind === "invalid-json") write("claude", "{");
+		else if (kind === "not-object") write("claude", []);
+		else if (kind === "unreadable") mkdirSync(path("claude"), { recursive: true });
+		write("project", { ship: { minScore: 6 } });
+		const findings = checkConfig(deps);
+		expect(byId(findings, `config.claude-user.${kind}`).level).toBe(kind === "missing" ? "info" : "error");
+		expect(byId(findings, "config.project.ignored.ship.minScore").title).toContain("effective value is 4");
+		expect(loadConfig(claudeConfigPaths(deps.cwd, deps.env)).ship.minScore).toBe(4);
 	});
 
 	test("ship.autoMerg is an unknown key and suggests ship.autoMerge", () => {

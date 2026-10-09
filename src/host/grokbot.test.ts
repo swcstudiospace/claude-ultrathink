@@ -2,10 +2,12 @@
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, utimesSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionRecord, writeControl, writeSession } from "../claude/state.ts";
+import type { Clarification } from "../hitl/types.ts";
+import type { TrackingRefs } from "../track/types.ts";
 import { escapeXml } from "../uplift/xml.ts";
 import { planPrompt } from "./plan.ts";
 import {
@@ -582,7 +584,12 @@ describe("grok-bot answers", () => {
 		const root = tmp();
 		const { result } = await drive(join(root, "state"), root, hostModel(6));
 		const statePath = result.response?.statePath as string;
-		expect(recordAnswers(statePath, parseAnswersInput({ answers: { q9: "x" } })).unknownIds).toEqual(["q9"]);
+		const xmlPath = statePath.replace(/\.json$/, ".xml");
+		const lastPath = join(root, "state", "last.json");
+		const paths = [statePath, xmlPath, lastPath];
+		const before = paths.map((path) => ({ text: readFileSync(path, "utf8"), mtime: statSync(path).mtimeMs }));
+		expect(recordAnswers(statePath, parseAnswersInput({ answers: { q1: "must not apply", q9: "x" }, response: "must not append" })).unknownIds).toEqual(["q9"]);
+		expect(paths.map((path) => ({ text: readFileSync(path, "utf8"), mtime: statSync(path).mtimeMs }))).toEqual(before);
 		const outcome = recordAnswers(statePath, parseAnswersInput({ q1: "JSON lines" }), 1_700_000_000_000);
 		expect(outcome.matched.map((c) => c.id)).toEqual(["q1"]);
 		const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
@@ -592,13 +599,185 @@ describe("grok-bot answers", () => {
 		expect(buildCloudPrompt(record, dispatch)).toContain("answered: JSON lines");
 		expect(() => parseAnswersInput({ answers: {} })).toThrow(/no answers/);
 		expect(() => parseAnswersInput({ q1: 3 })).toThrow(/string/);
-		const lastPath = join(join(root, "state"), "last.json");
 		const last = JSON.parse(readFileSync(lastPath, "utf8")) as SessionRecord;
 		expect(last.clarifications?.[0]?.answer).toBe("JSON lines");
 		expect(readFileSync(lastPath, "utf8")).toContain("\t");
-		writeFileSync(lastPath, `${JSON.stringify({ sessionId: "other", result: { xml: "stale" } }, null, "\t")}\n`);
+		const other = `${JSON.stringify({ sessionId: "other", result: { xml: "stale" } }, null, "\t")}\n`;
+		writeFileSync(lastPath, other);
 		recordAnswers(statePath, parseAnswersInput({ q1: "JSON lines" }));
-		expect(JSON.parse(readFileSync(lastPath, "utf8")).sessionId).toBe("other");
+		expect(readFileSync(lastPath, "utf8")).toBe(other);
+	});
+
+	test("answers and tracker refs replace every persisted copy owner-only without touching fixed temp files", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(6));
+		const statePath = result.response?.statePath as string;
+		const xmlPath = statePath.replace(/\.json$/, ".xml");
+		const lastPath = join(stateDir, "last.json");
+		const before = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		const refs = {
+			linear: { n1: { id: "real-linear-id", identifier: "SPE-901", url: "https://linear.app/x/issue/SPE-901" } },
+			notion: { task: "https://www.notion.so/real-task", n1: "https://www.notion.so/real-node" },
+		};
+		for (const path of [statePath, xmlPath]) writeFileSync(`${path}.tmp`, "another writer's pending data");
+		const child = spawnSync(process.execPath, ["-e", `
+			import { statSync } from "node:fs";
+			import { recordAnswers, parseAnswersInput } from ${JSON.stringify(join(import.meta.dir, "grokbot-hitl.ts"))};
+			import { recordRefs } from ${JSON.stringify(join(import.meta.dir, "grokbot-track.ts"))};
+			process.umask(0o022);
+			const paths = ${JSON.stringify([statePath, xmlPath, lastPath])};
+			const answer = recordAnswers(paths[0], parseAnswersInput({ response: "confirmed" }), 101);
+			const answerModes = paths.map(path => statSync(path).mode & 0o777);
+			const refs = recordRefs(paths[0], ${JSON.stringify(refs)}, 102);
+			console.log(JSON.stringify({ answer, answerModes, refModes: paths.map(path => statSync(path).mode & 0o777), refs }));
+		`], { encoding: "utf8", env: testEnv(root) });
+		expect(child.status).toBe(0);
+		expect(child.stderr).toBe("");
+		const output = JSON.parse(child.stdout) as {
+			answer: { matched: Clarification[]; unknownIds: string[]; list: Clarification[] };
+			answerModes: number[];
+			refModes: number[];
+			refs: { tracking: TrackingRefs; todos: string };
+		};
+		expect(output.answer.matched).toEqual([expect.objectContaining({ answer: "confirmed", source: "user", answeredAt: 101 })]);
+		if (process.platform !== "win32") {
+			expect(output.answerModes).toEqual([0o600, 0o600, 0o600]);
+			expect(output.refModes).toEqual([0o600, 0o600, 0o600]);
+		}
+		expect(output.refs.tracking).toMatchObject({ status: "partial", updatedAt: 102, linear: { nodes: refs.linear }, notion: { taskUrl: refs.notion.task, nodes: { n1: refs.notion.n1 } } });
+		const saved = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		expect(saved.plan).toEqual(before.plan);
+		expect(saved.graph).toEqual(before.graph);
+		expect(saved.engine).toBe(before.engine);
+		expect(saved.clarifications).toEqual(output.answer.list);
+		expect(saved.tracking).toEqual(output.refs.tracking);
+		expect(saved.result.xml).toContain("confirmed");
+		expect(saved.result.xml).toContain("SPE-901");
+		expect(readFileSync(xmlPath, "utf8").trimEnd()).toBe(saved.result.xml);
+		expect(JSON.parse(readFileSync(lastPath, "utf8"))).toEqual(saved);
+		for (const path of [statePath, xmlPath]) expect(readFileSync(`${path}.tmp`, "utf8")).toBe("another writer's pending data");
+		expect(readdirSync(join(stateDir, "sessions")).sort()).toEqual(["s1.json", "s1.json.tmp", "s1.xml", "s1.xml.tmp"]);
+		expect(readdirSync(stateDir).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	test("answers and refs wait for an independent session mutation and retain concurrent marks", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(6));
+		const statePath = result.response?.statePath as string;
+		const before = readFileSync(statePath, "utf8");
+		const xmlPath = statePath.replace(/\.json$/, ".xml");
+		const beforeXml = readFileSync(xmlPath, "utf8");
+		const ref = { id: "concurrent-id", identifier: "SPE-902", url: "https://linear.app/x/issue/SPE-902", title: "Concurrent tracking" };
+		const holder = Bun.spawn([process.execPath, "-e", `
+			import { readSync } from "node:fs";
+			import { updateSession } from ${JSON.stringify(join(import.meta.dir, "../claude/state.ts"))};
+			updateSession(${JSON.stringify(stateDir)}, "s1", record => {
+				process.stdout.write("ready");
+				readSync(0, new Uint8Array(1), 0, 1, null);
+				return { ...record, engine: "independent-session-mutation" };
+			});
+		`], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: testEnv(root) });
+		const signal = async (stdout: ReadableStream<Uint8Array>, expected: string) => {
+			const reader = stdout.getReader();
+			let message = "";
+			try {
+				while (message.length < expected.length) {
+					const chunk = await reader.read();
+					if (chunk.done) break;
+					message += new TextDecoder().decode(chunk.value);
+				}
+				expect(message).toBe(expected);
+			} finally {
+				reader.releaseLock();
+			}
+		};
+		// Observe the real cross-process blocking primitive; do not replace the lock, file I/O or consumers.
+		const observeWait = `
+			const wait = Atomics.wait;
+			let reported = false;
+			Atomics.wait = (...args) => {
+				if (!reported) { reported = true; process.stdout.write("waiting"); }
+				return wait(...args);
+			};
+		`;
+		const workers: Bun.Subprocess<"ignore", "pipe", "pipe">[] = [];
+		try {
+			await signal(holder.stdout, "ready");
+			workers.push(...[
+				`import { recordAnswers } from ${JSON.stringify(join(import.meta.dir, "grokbot-hitl.ts"))}; ${observeWait} recordAnswers(${JSON.stringify(statePath)}, { answers: { q1: "JSON lines" } }, 201);`,
+				`import { recordRefs } from ${JSON.stringify(join(import.meta.dir, "grokbot-track.ts"))}; ${observeWait} recordRefs(${JSON.stringify(statePath)}, { linear: { n1: ${JSON.stringify(ref)} } }, 202);`,
+				...["kicked-off", "synced"].map((mark) =>
+					`import { main } from ${JSON.stringify(join(import.meta.dir, "../mcp/cli.ts"))}; ${observeWait} process.exit(await main(["session", "mark", "--state", ${JSON.stringify(statePath)}, ${JSON.stringify(mark)}]));`,
+				),
+			].map((code) => Bun.spawn([process.execPath, "-e", code], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: testEnv(root) })));
+			await Promise.all(workers.map((worker) => signal(worker.stdout, "waiting")));
+			expect(readFileSync(statePath, "utf8")).toBe(before);
+			expect(readFileSync(xmlPath, "utf8")).toBe(beforeXml);
+		} finally {
+			holder.stdin.write("go");
+			holder.stdin.end();
+			await holder.exited;
+			await Promise.all(workers.map((worker) => worker.exited));
+		}
+		expect(holder.exitCode).toBe(0);
+		expect(await new Response(holder.stderr).text()).toBe("");
+		for (const worker of workers) {
+			expect(worker.exitCode).toBe(0);
+			expect(await new Response(worker.stderr).text()).toBe("");
+		}
+		const saved = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		expect(saved.engine).toBe("independent-session-mutation");
+		expect(saved.kickedOff).toBe(true);
+		expect(saved.synced).toBe(true);
+		expect(saved.clarifications?.[0]).toMatchObject({ answer: "JSON lines", answeredAt: 201 });
+		expect(saved.tracking?.linear.nodes.n1).toEqual(ref);
+		expect(saved.result.xml).toContain("JSON lines");
+		expect(saved.result.xml).toContain("SPE-902");
+		expect(readFileSync(statePath.replace(/\.json$/, ".xml"), "utf8").trimEnd()).toBe(saved.result.xml);
+		// Marks intentionally write only the session. Subsequent consumer updates must keep both marks and refresh last.
+		recordRefs(statePath, { linear: { n1: ref } }, 202);
+		recordAnswers(statePath, { answers: { q1: "JSON lines" } }, 201);
+		expect(JSON.parse(readFileSync(join(stateDir, "last.json"), "utf8"))).toEqual(saved);
+		expect(existsSync(`${statePath}.lock`)).toBe(false);
+	}, 15_000);
+
+	test("a busy last mirror saves answers and refs but leaves the held copy untouched", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(6));
+		const statePath = result.response?.statePath as string;
+		const lastPath = join(stateDir, "last.json");
+		const before = readFileSync(lastPath, "utf8");
+		writeFileSync(`${lastPath}.lock`, String(process.pid));
+		try {
+			expect(() => recordAnswers(statePath, { answers: { q1: "JSON lines" } }, 301)).toThrow(/could not refresh/);
+			expect(() => recordRefs(statePath, { notion: { task: "https://www.notion.so/saved-task" } }, 302)).toThrow(/could not refresh/);
+			const saved = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+			expect(saved.clarifications?.[0]?.answer).toBe("JSON lines");
+			expect(saved.tracking?.notion.taskUrl).toBe("https://www.notion.so/saved-task");
+			expect(readFileSync(statePath.replace(/\.json$/, ".xml"), "utf8").trimEnd()).toBe(saved.result.xml);
+			expect(readFileSync(lastPath, "utf8")).toBe(before);
+			expect(readFileSync(`${lastPath}.lock`, "utf8")).toBe(String(process.pid));
+			expect(existsSync(`${statePath}.lock`)).toBe(false);
+		} finally {
+			unlinkSync(`${lastPath}.lock`);
+		}
+	});
+
+	test("tracker updates leave nonmatching and unreadable last copies byte-for-byte intact", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(6));
+		const statePath = result.response?.statePath as string;
+		const lastPath = join(stateDir, "last.json");
+		for (const last of ['{"sessionId":"other","result":{"xml":"other spec"}}\n', "unreadable last\n"]) {
+			writeFileSync(lastPath, last);
+			recordRefs(statePath, { notion: { task: "https://www.notion.so/preserved-last" } });
+			recordAnswers(statePath, { answers: { q1: "JSON lines" } });
+			expect(readFileSync(lastPath, "utf8")).toBe(last);
+		}
 	});
 
 	test("a held last.json lock keeps the current plan in place", () => {
@@ -622,6 +801,29 @@ describe("grok-bot answers", () => {
 		mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 });
 		expect(JSON.parse(readFileSync(lastPath, "utf8")).at).toBe(2);
 		expect(existsSync(`${lastPath}.lock`)).toBe(false);
+	});
+
+	test("an aged lock held by a live PID is never reclaimed", () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const record = { sessionId: "s1", at: 1, result: { xml: "<x/>", original: "o", root: "BUILD_PROMPT", source: "llm" } } as SessionRecord;
+		writeSession(stateDir, record);
+		const lastPath = join(stateDir, "last.json");
+		const before = readFileSync(lastPath, "utf8");
+		writeFileSync(`${lastPath}.lock`, String(process.pid));
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(`${lastPath}.lock`, old, old);
+		const lockMtime = statSync(`${lastPath}.lock`).mtimeMs;
+		try {
+			expect(() => mirrorLast(join(stateDir, "sessions", "s1.json"), { ...record, at: 2 })).toThrow(/could not refresh/);
+			expect(writeSession(stateDir, { ...record, at: 3 })).toMatch(/could not refresh/);
+			expect(readFileSync(lastPath, "utf8")).toBe(before);
+			expect(readFileSync(`${lastPath}.lock`, "utf8")).toBe(String(process.pid));
+			expect(statSync(`${lastPath}.lock`).mtimeMs).toBe(lockMtime);
+			expect(JSON.parse(readFileSync(join(stateDir, "sessions", "s1.json"), "utf8")).at).toBe(3);
+		} finally {
+			unlinkSync(`${lastPath}.lock`);
+		}
 	});
 
 	test("a fresh empty last.json lock stays held", () => {

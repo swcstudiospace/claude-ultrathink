@@ -40,7 +40,8 @@ export function serviceBackend(configured: ServiceBackend | undefined, env: Reco
 	return configured === "gateway" ? "gateway" : "direct";
 }
 
-function storedToken(storePath: string | undefined, env: Record<string, string | undefined>): { token: string; source: GatewayTokenSource } | undefined {
+/** Credential selection is independent of URL/seat readiness and uses the same store-first rule on every path. */
+export function resolveGatewayToken(storePath: string | undefined, env: Record<string, string | undefined>): { token: string; source: GatewayTokenSource } | undefined {
 	try {
 		const providers = readStore(storePath ?? defaultStorePath(env)).providers as Partial<Record<string, Credential>>;
 		const credential = providers[GATEWAY_STORE_PROVIDER];
@@ -75,7 +76,7 @@ export function resolveGateway(config: GatewayConfig, env: Record<string, string
 	const override = env[GATEWAY_SEAT_ENV]?.trim();
 	const requestedSeat = override && SEAT_PATTERN.test(override) ? override : configuredSeat;
 	if (!SEAT_PATTERN.test(requestedSeat)) return { ok: false, reason: "bad-url", detail: "seat must match [a-z][a-z0-9-]{0,31}" };
-	const token = storedToken(deps.storePath, env);
+	const token = resolveGatewayToken(deps.storePath, env);
 	if (!token) return { ok: false, reason: "no-token" };
 	return {
 		ok: true,

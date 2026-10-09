@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   schedule:
     - cron: "17 4 * * 1"
 
@@ -19,8 +18,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    # A pull request from a fork gets a read-only token that cannot upload results, so skip it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # pull_request permits CodeQL uploads with fork read-only tokens; never run untrusted code via pull_request_target.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

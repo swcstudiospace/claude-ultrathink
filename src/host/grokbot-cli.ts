@@ -318,7 +318,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			const id = session(rest);
 			const { record, path } = readRecord(stateDir, id);
 			if (sub === "payloads") {
-				const config = loadConfig(claudeConfigPaths(cwd));
+				const config = loadConfig(claudeConfigPaths(cwd, env));
 				if (trackingOff(config, readControl(stateDir))) {
 					const empty = { graphId: record.plan?.graphId, calls: [] as unknown[], counts: { linearIssues: 0, linearSubIssues: 0, notionTask: 0, notionIssues: 0, notionSubIssues: 0 }, tracking: "off" as const };
 					const out = flag(rest, "--out");
@@ -339,7 +339,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			if (sub === "record") {
 				const refsFile = flag(rest, "--refs");
 				if (!refsFile) return { code: 2, text: "track record needs --refs F" };
-				const config = loadConfig(claudeConfigPaths(cwd));
+				const config = loadConfig(claudeConfigPaths(cwd, env));
 				const parsed = JSON.parse(readFileSync(refsFile, "utf8")) as Parameters<typeof recordRefs>[1];
 				const { tracking, todos } = recordRefs(path, {
 					...parsed,

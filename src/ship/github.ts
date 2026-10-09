@@ -30,8 +30,8 @@ export interface Github {
 	syncBase(input: { base: string; branch: string }): { ok: boolean; error?: string };
 	/**
 	 * The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed.
-	 * With `opts.deadlineMs` the page scan stops fail-closed once the shared deadline passes instead of
-	 * paging past the caller's wait budget; each page keeps its own request timeout.
+	 * With `opts.deadlineMs`, repository lookup and every page share the remaining wait budget; a response
+	 * arriving after that deadline also fails closed.
 	 */
 	reviewThreads(prNumber: number, opts?: ReviewThreadsOptions): ReviewThreads;
 }
@@ -130,6 +130,7 @@ function parseThreadsPage(stdout: string): ThreadsPage {
 	const threads = obj(obj(obj(obj(root.data)?.repository)?.pullRequest)?.reviewThreads);
 	if (!threads || !Array.isArray(threads.nodes)) return { ok: false, error: "pull request review threads missing" };
 	const pageInfo = obj(threads.pageInfo);
+	if (!pageInfo || typeof pageInfo.hasNextPage !== "boolean") return { ok: false, error: "malformed review threads pageInfo" };
 	const next = pageInfo?.hasNextPage === true ? str(pageInfo.endCursor) : undefined;
 	if (pageInfo?.hasNextPage === true && !next) return { ok: false, error: PAGINATION_STALLED };
 	const out: ReviewThread[] = [];
@@ -141,8 +142,11 @@ function parseThreadsPage(stdout: string): ThreadsPage {
 		const author = str(obj(first?.author)?.login);
 		const body = str(first?.body);
 		if (!thread || !id || !first) return { ok: false, error: "malformed review thread" };
+		// A null author is GitHub's valid representation of a deleted account.
+		if (first.author === null) continue;
+		if (!author) return { ok: false, error: "malformed review thread" };
 		// The Greptile app posts as `greptile-apps[bot]`; GraphQL reports the login without the suffix.
-		if (!author?.toLowerCase().startsWith("greptile")) continue;
+		if (!author.toLowerCase().startsWith("greptile")) continue;
 		if (!body || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean") {
 			return { ok: false, error: "malformed review thread" };
 		}
@@ -160,16 +164,17 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 	const run = input.run ?? defaultRun;
 	const cwd = input.cwd;
 	const exec = (argv: string[], opts: { timeoutMs?: number; stdin?: string } = {}) => run(argv, { cwd, ...opts });
+	const repo = (timeoutMs?: number) => {
+		const r = exec(["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"], { timeoutMs });
+		if (r.exitCode !== 0) return undefined;
+		const o = obj(parseJson(r.stdout));
+		const name = str(o?.nameWithOwner);
+		const defaultBranch = str(obj(o?.defaultBranchRef)?.name);
+		return name && defaultBranch ? { name, defaultBranch } : undefined;
+	};
 
 	const gh: Github = {
-		repo() {
-			const r = exec(["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"]);
-			if (r.exitCode !== 0) return undefined;
-			const o = obj(parseJson(r.stdout));
-			const name = str(o?.nameWithOwner);
-			const defaultBranch = str(obj(o?.defaultBranchRef)?.name);
-			return name && defaultBranch ? { name, defaultBranch } : undefined;
-		},
+		repo,
 		push(branch) {
 			const r = exec(["git", "push", "-u", "origin", branch], { timeoutMs: LONG_TIMEOUT_MS });
 			return r.exitCode === 0 ? { ok: true } : { ok: false, error: errorOf(r) };
@@ -246,18 +251,18 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			return { ok: true };
 		},
 		reviewThreads(prNumber, opts = {}) {
-			const [owner, name] = gh.repo()?.name.split("/") ?? [];
-			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
 			const now = opts.now ?? Date.now;
+			let remaining = opts.deadlineMs === undefined ? undefined : opts.deadlineMs - now();
+			if (remaining !== undefined && remaining <= 0) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+			const [owner, name] = repo(remaining)?.name.split("/") ?? [];
+			if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
+			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
 			const threads: ReviewThread[] = [];
 			const seen = new Set<string>();
 			let after: string | undefined;
 			for (let page = 1; page <= MAX_THREAD_PAGES; page++) {
-				// Fail closed once the caller's wait budget is spent: no partial threads, same as other doubts.
-				// Each page keeps its own request timeout; this only stops starting another page past the deadline.
-				if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) {
-					return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
-				}
+				remaining = opts.deadlineMs === undefined ? undefined : opts.deadlineMs - now();
+				if (remaining !== undefined && remaining <= 0) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
 				const r = exec([
 					"gh", "api", "graphql",
 					"-f", `query=${THREADS_QUERY}`,
@@ -265,7 +270,8 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 					"-f", `name=${name}`,
 					"-F", `number=${prNumber}`,
 					...(after === undefined ? [] : ["-f", `after=${after}`]),
-				]);
+				], { timeoutMs: remaining });
+				if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) return { ok: false, error: THREADS_DEADLINE_EXCEEDED };
 				if (r.exitCode !== 0) return { ok: false, error: errorOf(r) };
 				const parsed = parseThreadsPage(r.stdout);
 				if (!parsed.ok) return parsed;

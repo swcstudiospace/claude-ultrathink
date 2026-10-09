@@ -180,20 +180,13 @@ describe("reviewPr", () => {
 		expect(calls.some((c) => c.name === "list_merge_request_comments")).toBe(false);
 	});
 
-	test("a failed thread lookup keeps every unaddressed Greptile comment open, however old", async () => {
+	test.each(["gh: 502", "review threads scan exceeded its deadline"])("a failed thread scan cannot authorize a completed review (%s)", async (error) => {
 		const { client } = fakeClient({
 			...headReviews,
-			list_merge_request_comments: () => ({
-				comments: [
-					{ body: "raised before the head review", filePath: "a.ts", createdAt: "2026-09-25T05:34:48Z", addressed: false },
-					{ body: "raised by the head review", filePath: "b.ts", createdAt: "2026-09-25T05:36:10Z", addressed: false },
-					{ body: "addressed", filePath: "c.ts", createdAt: "2026-09-25T05:36:10Z", addressed: true },
-				],
-			}),
+			list_merge_request_comments: () => ({ comments: [] }),
 		});
-		const result = await reviewPr({ client, ...base, ...clock(), reviewThreads: () => ({ ok: false, error: "gh: 502" }) });
-		expect(result).toMatchObject({ status: "completed", score: 5 });
-		expect(result.comments.map((c) => c.body)).toEqual(["raised before the head review", "raised by the head review"]);
+		const result = await reviewPr({ client, ...base, ...clock(), reviewThreads: () => ({ ok: false, error }) });
+		expect(result).toMatchObject({ status: "failed", score: null, error, comments: [] });
 	});
 
 	test("re-triggers when the only review for headSha failed, ignoring it afterwards", async () => {

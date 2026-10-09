@@ -324,6 +324,19 @@ describe("createGithub", () => {
 			expect(threadsOf(reply).result).toEqual({ ok: false, error: "review threads pagination did not advance" });
 		});
 
+		test.each([{ pageInfo: undefined }, { pageInfo: [] }, { pageInfo: { hasNextPage: "false" } }])("invalid pageInfo fails closed without partial threads (%p)", ({ pageInfo }) => {
+			const malformed = {
+				stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo, nodes: pageNodes("later", 1) } } } } }),
+			};
+			const { result } = threadsOf(page(pageNodes("first", 100), "next"), malformed);
+			expect(result).toEqual({ ok: false, error: "malformed review threads pageInfo" });
+		});
+
+		test.each([undefined, "greptile-apps", { login: 7 }])("malformed author classification fails closed (%p)", (author) => {
+			const malformed = page([{ id: "x", isResolved: false, isOutdated: false, comments: { nodes: [{ author, body: "finding" }] } }]);
+			expect(threadsOf(malformed).result).toEqual({ ok: false, error: "malformed review thread" });
+		});
+
 		test("a repeated cursor stops the loop", () => {
 			const { result, graphqlCalls } = threadsOf(page(pageNodes("p1", 100), "same"));
 			expect(result).toEqual({ ok: false, error: "review threads pagination did not advance" });
@@ -360,6 +373,17 @@ describe("createGithub", () => {
 			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7, { deadlineMs: 100_000, now: () => 100_000 });
 			expect(result).toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
 			expect(fake.calls.filter((c) => c.argv[1] === "api")).toHaveLength(0);
+		});
+
+		test.each(["repo", "page"])("a late %s response cannot authorize a completed scan", (late) => {
+			let now = 0;
+			const fake = fakeRun((argv) => {
+				const lookup = argv[1] === "repo";
+				if (lookup === (late === "repo")) now = 1000;
+				return lookup ? REPO_REPLY : page(pageNodes("terminal", 1));
+			});
+			expect(createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7, { deadlineMs: 1000, now: () => now }))
+				.toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
 		});
 
 		test("a scan within its deadline still pages to the end", () => {

@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { decisionsKilled, resolveDecisionsKeys } from "../decisions/gate.ts";
 import { DECISIONS_PROVIDERS, type DecisionsProvider } from "../decisions/types.ts";
+import { resolveGatewayToken, serviceBackend } from "../gateway/settings.ts";
+import { GATEWAY_STORE_PROVIDER, HINDSIGHT_BACKEND_ENV, RAGFLOW_BACKEND_ENV, SUBSTRATE_BACKEND_ENV } from "../gateway/types.ts";
 import { detectHost } from "../host/detect.ts";
 import { resolveHindsightKey } from "../hindsight/settings.ts";
 import { hasUsableCredential } from "../mcp/client.ts";
@@ -122,21 +124,28 @@ export function checkRuntime(deps: DoctorDeps): Finding[] {
 }
 
 interface Feature {
-	provider: ProviderId;
+	provider: ProviderId | typeof GATEWAY_STORE_PROVIDER;
 	features: string[];
 }
 
 function featuresOn(config: UltrathinkConfig, env: DoctorDeps["env"]): Feature[] {
-	const wanted = new Map<ProviderId, string[]>();
-	const want = (provider: ProviderId, feature: string): void => {
+	const wanted = new Map<Feature["provider"], string[]>();
+	const want = (provider: Feature["provider"], feature: string): void => {
 		wanted.set(provider, [...(wanted.get(provider) ?? []), feature]);
 	};
 	if (shipOn(config, env)) want("greptile", "ship");
 	if (config.hitl.knowledgeBase) want("greptile", "knowledge base");
 	if (config.notion.dataSourceUrl) want("notion", "Notion tracking");
 	if (config.linear.team) want("linear", "Linear tracking");
-	if (config.hindsight.enabled && env.ULTRATHINK_HINDSIGHT !== "0") want("hindsight", "Hindsight");
-	if (config.ragflow.enabled && env.ULTRATHINK_RAGFLOW?.trim() !== "0") want("ragflow", "RAGFlow");
+	if (config.hindsight.enabled && env.ULTRATHINK_HINDSIGHT !== "0") {
+		want(serviceBackend(config.hindsight.backend, env, HINDSIGHT_BACKEND_ENV) === "gateway" ? GATEWAY_STORE_PROVIDER : "hindsight", "Hindsight");
+	}
+	if (config.ragflow.enabled && env.ULTRATHINK_RAGFLOW?.trim() !== "0") {
+		want(serviceBackend(config.ragflow.backend, env, RAGFLOW_BACKEND_ENV) === "gateway" ? GATEWAY_STORE_PROVIDER : "ragflow", "RAGFlow");
+	}
+	if (env.SUBSTRATE_DISABLED !== "1" && serviceBackend(config.substrate.backend, env, SUBSTRATE_BACKEND_ENV) === "gateway") {
+		want(GATEWAY_STORE_PROVIDER, "substrate");
+	}
 	return [...wanted].map(([provider, features]) => ({ provider, features }));
 }
 
@@ -162,8 +171,19 @@ export function checkCredentials(deps: DoctorDeps): Finding[] {
 	};
 
 	for (const { provider, features } of featuresOn(config, env)) {
-		const label = PROVIDERS[provider].label;
 		const used = `needed for ${features.join(" and ")}`;
+		if (provider === GATEWAY_STORE_PROVIDER) {
+			const source = resolveGatewayToken(path, env)?.source;
+			add({
+				id: `credentials.${provider}`,
+				level: source ? "ok" : "warn",
+				title: source ? `Desk gateway: credential present (${source === "store" ? "credential store" : source})` : "Desk gateway: no credential",
+				detail: used,
+				...(source ? {} : { fix: "Set DESK_GATEWAY_TOKEN or store a desk-gateway credential." }),
+			});
+			continue;
+		}
+		const label = PROVIDERS[provider].label;
 		let source: string | undefined;
 		if (provider === "hindsight") source = resolveHindsightKey(path, env)?.source;
 		else if (provider === "ragflow") source = resolveRagflowKey(path, env)?.source;

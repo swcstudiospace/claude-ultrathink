@@ -177,9 +177,8 @@ describe("session mark", () => {
 
 	test("marks racing with ship writes lose neither: every mark and every attempt survives", async () => {
 		const path = session(record);
-		const marks = ["kicked-off", "synced"] as const;
 		const children = Array.from({ length: 8 }, (_, i) =>
-			Bun.spawn([process.execPath, CLI, "session", "mark", "--state", path, marks[i % 2]!], {
+			Bun.spawn([process.execPath, CLI, "session", "mark", "--state", path, i % 2 === 0 ? "kicked-off" : "synced"], {
 				cwd: root,
 				env: { PATH: process.env.PATH, HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, "xdg"), CLAUDE_CONFIG_DIR: join(root, "claude") },
 				stdout: "pipe",

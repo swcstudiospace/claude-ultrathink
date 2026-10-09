@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildReport, formatReport, reportJson } from "./report.ts";
@@ -218,7 +218,7 @@ describe("checkState", () => {
 		);
 	});
 
-	test("session and carrier files readable by group or others are counted with the chmod fix", () => {
+	test("session, carrier and control files readable by group or others are counted with the chmod fix", () => {
 		put("sessions/loose.json", { mode: 0o644 });
 		put("sessions/loose.xml", { mode: 0o640 });
 		put("sessions/other.json", { mode: 0o604 });
@@ -231,7 +231,7 @@ describe("checkState", () => {
 		const finding = byId(checkState(deps), "state.permissions");
 		expect(finding).toMatchObject({
 			level: "warn",
-			title: "4 session or carrier files readable by group or others",
+			title: "5 session, carrier or control files readable by group or others",
 			fix: `chmod -R go-rwx ${stateDir}`,
 		});
 		expect(finding.detail).toContain("0600");
@@ -242,6 +242,7 @@ describe("checkState", () => {
 		put("sessions/a.xml");
 		put("last.json");
 		put("last-plan.json");
+		put("control.json");
 		expect(ids(checkState(deps))).not.toContain("state.permissions");
 	});
 
@@ -255,13 +256,61 @@ describe("checkState", () => {
 		const findings = checkState(deps);
 		expect(byId(findings, "state.orphans")).toMatchObject({
 			level: "warn",
-			title: "3 leftover .tmp or .lock files older than one hour in sessions/",
+			title: "2 leftover .tmp or .lock files older than one hour in the state root or sessions/",
 		});
 		expect(byId(findings, "state.sessions").title).toStartWith("1 session record,");
 	});
 
+	test("root writer remnants join session orphans without following links or counting directories", () => {
+		const rootTmp = put(".last.json-123-a1b2.tmp", { ageMs: 2 * HOUR });
+		put("last.json.lock", { ageMs: 3 * HOUR });
+		put("control.json.lock", { ageMs: HOUR + 1 });
+		put(".last-plan.json-456-c3d4.tmp", { ageMs: 2 * HOUR });
+		put("sessions/a.json.lock", { ageMs: 2 * HOUR });
+		put("last.json.tmp", { ageMs: HOUR });
+		put("control.json.tmp", { ageMs: 10 * 60 * 1000 });
+		put("last.json", { ageMs: 5 * HOUR });
+		put("control.json", { ageMs: 5 * HOUR });
+		const oldDirectory = join(stateDir, "directory.lock");
+		mkdirSync(oldDirectory);
+		utimesSync(oldDirectory, (NOW - 3 * HOUR) / 1000, (NOW - 3 * HOUR) / 1000);
+		symlinkSync(rootTmp, join(stateDir, "linked.tmp"));
+		symlinkSync(rootTmp, join(stateDir, "sessions", "linked.lock"));
+		const findings = checkState(deps);
+		expect(byId(findings, "state.orphans")).toMatchObject({ level: "warn" });
+		expect(byId(findings, "state.orphans").title).toStartWith("5 leftover .tmp or .lock files");
+		expect(byId(findings, "state.sessions").title).toBe("No session records yet");
+		expect(ids(findings)).not.toContain("state.permissions");
+		expect(existsSync(rootTmp)).toBe(true);
+		expect(lstatSync(rootTmp).mtimeMs).toBe(NOW - 2 * HOUR);
+		expect(lstatSync(join(stateDir, "linked.tmp")).isSymbolicLink()).toBe(true);
+	});
+
+	test("root leftovers and loose control settings are diagnosed even with unusable sessions", () => {
+		put("sessions");
+		put("control.json", { mode: 0o640 });
+		const orphan = put("control.json.lock", { ageMs: 2 * HOUR });
+		const findings = checkState(deps);
+		expect(byId(findings, "state.sessions").level).toBe("error");
+		expect(byId(findings, "state.permissions").title).toStartWith("1 session, carrier or control file");
+		expect(byId(findings, "state.orphans").title).toStartWith("1 leftover .tmp or .lock file");
+		expect(existsSync(orphan)).toBe(true);
+		expect(lstatSync(join(stateDir, "control.json")).mode & 0o777).toBe(0o640);
+	});
+
+	test("symlinked control and carrier files do not count external loose permissions", () => {
+		mkdirSync(stateDir);
+		const target = join(dir, "external.json");
+		writeFileSync(target, PROMPT, { mode: 0o644 });
+		chmodSync(target, 0o644);
+		for (const name of ["control.json", "last.json", "last-plan.json"]) symlinkSync(target, join(stateDir, name));
+		expect(ids(checkState(deps))).not.toContain("state.permissions");
+	});
+
 	test("no orphan finding when nothing is stale", () => {
 		put("sessions/a.json.tmp", { ageMs: 5 * 60 * 1000 });
+		put("last.json.lock", { ageMs: 5 * 60 * 1000 });
+		put("control.json.tmp", { ageMs: HOUR });
 		expect(ids(checkState(deps))).not.toContain("state.orphans");
 	});
 
@@ -269,10 +318,13 @@ describe("checkState", () => {
 		put("sessions/secret-session-name.json", { mode: 0o644 });
 		put("sessions/secret-session-name.xml", { mode: 0o644 });
 		put("sessions/secret-session-name.json.tmp", { ageMs: 5 * HOUR });
+		put(".secret-root-name.json-abcd.tmp", { ageMs: 5 * HOUR });
+		put("control.json", { mode: 0o644 });
 		const report = buildReport(checkState(deps));
 		for (const output of [formatReport(report), reportJson(report)]) {
 			expect(output).not.toContain(PROMPT);
 			expect(output).not.toContain("secret-session-name");
+			expect(output).not.toContain("secret-root-name");
 		}
 		expect(report.summary.warn).toBe(2);
 	});

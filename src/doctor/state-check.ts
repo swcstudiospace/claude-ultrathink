@@ -17,8 +17,8 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 /** Group- or other-readable permission bits. */
 const LOOSE_MODE = 0o044;
-/** Carrier files written next to `sessions/`. */
-const CARRIER_FILES = ["last.json", "last-plan.json"] as const;
+/** State and control files written next to `sessions/`. */
+const CARRIER_FILES = ["last.json", "last-plan.json", "control.json"] as const;
 
 function statOrUndefined(path: string): Stats | undefined {
 	try {
@@ -160,12 +160,11 @@ export function checkState(deps: DoctorDeps): Finding[] {
 	let orphans = 0;
 	for (const name of names) {
 		const stats = statOrUndefined(join(sessionsDir, name));
-		if (!stats || stats.isSymbolicLink()) continue;
+		if (!stats?.isFile()) continue;
 		if (/\.(tmp|lock)$/.test(name)) {
 			if (now - stats.mtimeMs > ORPHAN_AGE_MS) orphans++;
 			continue;
 		}
-		if (!stats.isFile()) continue;
 		if (name.endsWith(".json")) {
 			sessions++;
 			bytes += stats.size;
@@ -176,6 +175,15 @@ export function checkState(deps: DoctorDeps): Finding[] {
 	for (const name of CARRIER_FILES) {
 		const stats = statOrUndefined(join(dir, name));
 		if (stats?.isFile() && stats.mode & LOOSE_MODE) loose++;
+	}
+	try {
+		for (const name of readdirSync(dir)) {
+			if (!/\.(tmp|lock)$/.test(name)) continue;
+			const stats = statOrUndefined(join(dir, name));
+			if (stats?.isFile() && now - stats.mtimeMs > ORPHAN_AGE_MS) orphans++;
+		}
+	} catch {
+		// Metadata-only diagnosis stays best-effort when the state root cannot be listed.
 	}
 
 	// When the sessions directory itself is broken an error above already explains why nothing could be counted.
@@ -201,8 +209,8 @@ export function checkState(deps: DoctorDeps): Finding[] {
 		add({
 			id: "state.permissions",
 			level: "warn",
-			title: `${plural(loose, "session or carrier file")} readable by group or others`,
-			detail: "They hold your prompts and plans. New files are written with mode 0600.",
+			title: `${plural(loose, "session, carrier or control file")} readable by group or others`,
+			detail: "They hold your prompts, plans and control settings. New files are written with mode 0600.",
 			fix: `chmod -R go-rwx ${dir}`,
 		});
 	}
@@ -210,7 +218,7 @@ export function checkState(deps: DoctorDeps): Finding[] {
 		add({
 			id: "state.orphans",
 			level: "warn",
-			title: `${plural(orphans, "leftover .tmp or .lock file")} older than one hour in sessions/`,
+			title: `${plural(orphans, "leftover .tmp or .lock file")} older than one hour in the state root or sessions/`,
 			detail: "Leftovers of a write that crashed before it finished.",
 			fix: "Delete them when no ultrathink process is running, or run `ultrathink prune --older-than 30 --dry-run`.",
 		});

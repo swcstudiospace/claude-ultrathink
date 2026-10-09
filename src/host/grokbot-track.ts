@@ -11,8 +11,9 @@
  *
  * Desk addition: every Linear create carries `project` (default "Kanban"); the plugin has no project setting.
  */
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { SessionRecord } from "../claude/state.ts";
+import { withFileLock, writeFileAtomic } from "../claude/atomic.ts";
 import { createTracking, type ToolCaller } from "../track/create.ts";
 import { formatTrackingTodos, injectTrackingXml } from "../track/render.ts";
 import { mirrorLast } from "./grokbot-hitl.ts";
@@ -138,45 +139,43 @@ export interface RealRefs {
 
 /** Writes real refs into the record's tracking and re-renders the spec, like `ultrathink-mcp track complete`. */
 export function recordRefs(statePath: string, refs: RealRefs, now = Date.now()): { tracking: TrackingRefs; todos: string } {
-	const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
-	const plan = record.plan;
-	if (!plan) throw new Error("session record has no plan");
-	const previous = record.tracking;
-	const tracking: TrackingRefs = {
-		graphId: plan.graphId,
-		status: "failed",
-		...(previous?.linearTeam ? { linearTeam: previous.linearTeam } : {}),
-		linear: { nodes: { ...previous?.linear.nodes }, steps: { ...previous?.linear.steps } },
-		notion: { ...(previous?.notion.taskUrl ? { taskUrl: previous.notion.taskUrl } : {}), nodes: { ...previous?.notion.nodes }, steps: { ...previous?.notion.steps } },
-		errors: [...(refs.errors ?? [])],
-		updatedAt: now,
-	};
-	for (const [key, ref] of Object.entries(refs.linear ?? {})) {
-		if (key.includes(".")) tracking.linear.steps[key] = ref;
-		else tracking.linear.nodes[key] = ref;
-	}
-	for (const [key, url] of Object.entries(refs.notion ?? {})) {
-		if (key === "task") tracking.notion.taskUrl = url;
-		else if (key.includes(".")) tracking.notion.steps[key] = url;
-		else tracking.notion.nodes[key] = url;
-	}
-	const linearConfigured = refs.trackers ? refs.trackers.linear === true : true;
-	const notionConfigured = refs.trackers ? refs.trackers.notion === true : true;
-	const linearDone = !linearConfigured || (plan.linearIssues.every((i) => tracking.linear.nodes[i.nodeId]) && plan.linearSubIssues.every((s) => tracking.linear.steps[`${s.nodeId}.${s.step}`]));
-	const notionDone = !notionConfigured || (!!tracking.notion.taskUrl && plan.issues.every((r) => tracking.notion.nodes[r.nodeId]) && plan.subIssues.every((r) => tracking.notion.steps[`${r.nodeId}.${r.step}`]));
-	const any = Object.keys(tracking.linear.nodes).length + Object.keys(tracking.notion.nodes).length + (tracking.notion.taskUrl ? 1 : 0);
-	tracking.status = linearDone && notionDone ? "complete" : any > 0 ? "partial" : "failed";
-	record.tracking = tracking;
-	const xml = injectTrackingXml(record.result.xml, plan, tracking);
-	record.result = { ...record.result, xml };
-	const write = (path: string, text: string) => {
-		writeFileSync(`${path}.tmp`, text);
-		renameSync(`${path}.tmp`, path);
-	};
-	write(statePath, `${JSON.stringify(record, null, 2)}\n`);
-	write(statePath.replace(/\.json$/, ".xml"), xml);
-	mirrorLast(statePath, record);
-	return { tracking, todos: formatTrackingTodos(plan, tracking) };
+	return withFileLock(statePath, () => {
+		const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		const plan = record.plan;
+		if (!plan) throw new Error("session record has no plan");
+		const previous = record.tracking;
+		const tracking: TrackingRefs = {
+			graphId: plan.graphId,
+			status: "failed",
+			...(previous?.linearTeam ? { linearTeam: previous.linearTeam } : {}),
+			linear: { nodes: { ...previous?.linear.nodes }, steps: { ...previous?.linear.steps } },
+			notion: { ...(previous?.notion.taskUrl ? { taskUrl: previous.notion.taskUrl } : {}), nodes: { ...previous?.notion.nodes }, steps: { ...previous?.notion.steps } },
+			errors: [...(refs.errors ?? [])],
+			updatedAt: now,
+		};
+		for (const [key, ref] of Object.entries(refs.linear ?? {})) {
+			if (key.includes(".")) tracking.linear.steps[key] = ref;
+			else tracking.linear.nodes[key] = ref;
+		}
+		for (const [key, url] of Object.entries(refs.notion ?? {})) {
+			if (key === "task") tracking.notion.taskUrl = url;
+			else if (key.includes(".")) tracking.notion.steps[key] = url;
+			else tracking.notion.nodes[key] = url;
+		}
+		const linearConfigured = refs.trackers ? refs.trackers.linear === true : true;
+		const notionConfigured = refs.trackers ? refs.trackers.notion === true : true;
+		const linearDone = !linearConfigured || (plan.linearIssues.every((i) => tracking.linear.nodes[i.nodeId]) && plan.linearSubIssues.every((s) => tracking.linear.steps[`${s.nodeId}.${s.step}`]));
+		const notionDone = !notionConfigured || (!!tracking.notion.taskUrl && plan.issues.every((r) => tracking.notion.nodes[r.nodeId]) && plan.subIssues.every((r) => tracking.notion.steps[`${r.nodeId}.${r.step}`]));
+		const any = Object.keys(tracking.linear.nodes).length + Object.keys(tracking.notion.nodes).length + (tracking.notion.taskUrl ? 1 : 0);
+		tracking.status = linearDone && notionDone ? "complete" : any > 0 ? "partial" : "failed";
+		record.tracking = tracking;
+		const xml = injectTrackingXml(record.result.xml, plan, tracking);
+		record.result = { ...record.result, xml };
+		writeFileAtomic(statePath, `${JSON.stringify(record, null, 2)}\n`);
+		writeFileAtomic(statePath.replace(/\.json$/, ".xml"), xml);
+		mirrorLast(statePath, record);
+		return { tracking, todos: formatTrackingTodos(plan, tracking) };
+	});
 }
 
 /**

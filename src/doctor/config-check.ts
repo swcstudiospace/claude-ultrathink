@@ -3,12 +3,12 @@
 /**
  * Static validation of the three config layers. The merge in `src/config.ts` ignores unknown keys and wrong or out-of-range
  * values by design, so a typo such as `ship.autoMerg` silently does nothing; this check is the visible half of that design.
- * It never changes the merge: known sections and keys come from `defaultConfig()` (a new default key is known here with no
- * edit), and "ignored or adjusted" is found by merging one layer onto the defaults and comparing every written leaf with
- * the effective value. Findings carry key names, types and effective values, never the written value or the file content.
+ * It never changes the merge: known sections and keys come from `defaultConfig()` plus supported optional backends,
+ * and "ignored or adjusted" compares every written leaf with the merge over the accumulated lower layers.
+ * Findings carry key names, types and effective values, never the written value or the file content.
  */
 import { readFileSync } from "node:fs";
-import { claudeConfigPaths, defaultConfig, mergeConfig } from "../config.ts";
+import { claudeConfigPaths, defaultConfig, mergeConfig, type UltrathinkConfig } from "../config.ts";
 import { isPlainObject } from "../decisions/client.ts";
 import { HOSTS, isHostId } from "../host/types.ts";
 import type { DoctorDeps, DoctorLevel, Finding } from "./types.ts";
@@ -19,6 +19,7 @@ const MAX_PARSE_MESSAGE_CHARS = 160;
 const MAX_VALUE_CHARS = 80;
 const MODELS_KEYS = ["hosts", "providerDefaults"] as const;
 const HOST_OVERRIDE_KEYS = ["provider", "model"] as const;
+const BACKEND_SECTIONS = ["hindsight", "ragflow", "substrate"] as const;
 
 function kindOf(value: unknown): string {
 	if (Array.isArray(value)) return "array";
@@ -213,9 +214,12 @@ function checkLeaf(out: Collector, section: string, key: string, written: unknow
 		);
 		return;
 	}
-	const effective = isPlainObject(merged[section]) ? merged[section][key] : undefined;
+	const value = isPlainObject(merged[section]) ? merged[section][key] : undefined;
+	// The merge intentionally omits an optional direct backend from its output.
+	const effective = key === "backend" && value === undefined ? "direct" : value;
 	const wanted = comparable(written, key);
-	if (wanted === comparable(effective, key)) return;
+	const validBackend = key !== "backend" || written === "direct" || written === "gateway";
+	if (validBackend && wanted === comparable(effective, key)) return;
 	if (keyPath === "decisions.enabled") {
 		out.add(
 			"warn",
@@ -226,8 +230,9 @@ function checkLeaf(out: Collector, section: string, key: string, written: unknow
 		);
 		return;
 	}
-	const userValue = isPlainObject(asUser[section]) ? asUser[section][key] : undefined;
-	if (out.layer.project && wanted === comparable(userValue, key)) {
+	const userBackend = isPlainObject(asUser[section]) ? asUser[section][key] : undefined;
+	const userValue = key === "backend" && userBackend === undefined ? "direct" : userBackend;
+	if (out.layer.project && validBackend && wanted === comparable(userValue, key)) {
 		out.add(
 			"info",
 			"project-restricted",
@@ -247,10 +252,8 @@ function checkLeaf(out: Collector, section: string, key: string, written: unknow
 	);
 }
 
-function checkLayer(layer: Layer, data: Json, known: Json): Finding[] {
+function checkLayer(layer: Layer, data: Json, known: Json, base: UltrathinkConfig, merged: Json): Finding[] {
 	const out = collector(layer);
-	const base = defaultConfig();
-	const merged: Json = { ...mergeConfig(data, base, { project: layer.project }) };
 	const asUser: Json = layer.project ? { ...mergeConfig(data, base, { project: false }) } : merged;
 	const sections = Object.keys(known);
 	for (const [section, value] of Object.entries(data)) {
@@ -285,6 +288,8 @@ function checkLayer(layer: Layer, data: Json, known: Json): Finding[] {
 export function checkConfig(deps: DoctorDeps): Finding[] {
 	const known: Json = { ...defaultConfig() };
 	delete known.modelProvenance;
+	for (const section of BACKEND_SECTIONS) known[section] = { ...(known[section] as Json), backend: "direct" };
+	let effective = defaultConfig();
 	const findings: Finding[] = [];
 	claudeConfigPaths(deps.cwd, deps.env).forEach((source, index) => {
 		const project = typeof source !== "string";
@@ -322,7 +327,9 @@ export function checkConfig(deps: DoctorDeps): Finding[] {
 			fail("error", "not-object", `top level is ${kindOf(parsed)}, expected an object; every key in it is ignored`, `File: ${layer.path}`);
 			return;
 		}
-		findings.push(...checkLayer(layer, parsed, known));
+		const merged = mergeConfig(parsed, effective, { project });
+		findings.push(...checkLayer(layer, parsed, known, effective, { ...merged }));
+		effective = merged;
 	});
 	return findings;
 }

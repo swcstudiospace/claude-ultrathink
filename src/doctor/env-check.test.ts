@@ -241,6 +241,90 @@ describe("env checks", () => {
 			expect(byId(findings, "credentials.ragflow").title).toBe("RAGFlow: credential present (credential store)");
 		});
 
+		test("gateway-backed features need only one desk-gateway token and never inspect direct keys", () => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, ragflow: { enabled: true, backend: "gateway" }, substrate: { backend: "gateway" } });
+			setEnv({ DESK_GATEWAY_URL: "https://gateway.example", DESK_GATEWAY_TOKEN: FAKE_KEY });
+			for (const name of ["HINDSIGHT_API_KEY", "HINDSIGHT_API_TOKEN", "RAGFLOW_API_KEY"]) {
+				Object.defineProperty(deps.env, name, { get: () => { throw new Error(`unexpected direct credential read: ${name}`); }, configurable: true });
+			}
+			const findings = checkCredentials(deps);
+			expect(findings.map((finding) => finding.id)).toEqual(["credentials.desk-gateway", "credentials.jev"]);
+			expect(byId(findings, "credentials.desk-gateway")).toMatchObject({
+				level: "ok",
+				title: "Desk gateway: credential present (DESK_GATEWAY_TOKEN)",
+				detail: "needed for Hindsight and RAGFlow and substrate",
+			});
+			const report = buildReport(findings);
+			for (const output of [formatReport(report), reportJson(report)]) {
+				expect(output).not.toContain(FAKE_KEY);
+				expect(output).not.toContain("sk-test");
+				expect(output).not.toMatch(new RegExp(`\\b${FAKE_KEY.length}\\b`));
+			}
+			expect(probed).toEqual([]);
+		});
+
+		test("a missing gateway token is not satisfied by direct service credentials", () => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, ragflow: { enabled: true, backend: "gateway" } });
+			setEnv({ DESK_GATEWAY_URL: "https://gateway.example", HINDSIGHT_API_KEY: FAKE_KEY, RAGFLOW_API_KEY: FAKE_KEY, DESK_GATEWAY_TOKEN: "  " });
+			store({ hindsight: apiKey(), ragflow: apiKey() });
+			const findings = checkCredentials(deps);
+			expect(byId(findings, "credentials.desk-gateway")).toMatchObject({
+				level: "warn",
+				title: "Desk gateway: no credential",
+				detail: "needed for Hindsight and RAGFlow",
+			});
+			expect(byId(findings, "credentials.desk-gateway").fix).toContain("DESK_GATEWAY_TOKEN");
+			expect(findings.some((finding) => finding.id === "credentials.hindsight" || finding.id === "credentials.ragflow")).toBe(false);
+		});
+
+		test.each(["api_key", "oauth"] as const)("gateway %s store credentials precede environment tokens", (kind) => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, gateway: { url: "https://gateway.example" } });
+			setEnv({ DESK_GATEWAY_TOKEN: FAKE_KEY });
+			const credential: Credential = kind === "api_key" ? apiKey() : {
+				kind: "oauth",
+				client: { clientId: "c", redirectUri: "r", issuer: "i", authorizationEndpoint: "a", tokenEndpoint: "t", registeredAt: 0 },
+				tokens: { accessToken: FAKE_KEY },
+				updatedAt: 0,
+			};
+			store({ "desk-gateway": credential } as CredentialStore["providers"]);
+			const finding = byId(checkCredentials(deps), "credentials.desk-gateway");
+			expect(finding).toMatchObject({ level: "ok", title: "Desk gateway: credential present (credential store)" });
+			expect(JSON.stringify(finding)).not.toContain(FAKE_KEY);
+			store({ "desk-gateway": { kind: "api_key", apiKey: " ", updatedAt: 0 } } as CredentialStore["providers"]);
+			expect(byId(checkCredentials(deps), "credentials.desk-gateway").title).toContain("(DESK_GATEWAY_TOKEN)");
+		});
+
+		test.each(["", "not a service URL"])("gateway token presence is independent of target URL %s", (url) => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, gateway: { url } });
+			setEnv({ DESK_GATEWAY_TOKEN: FAKE_KEY });
+			expect(byId(checkCredentials(deps), "credentials.desk-gateway").level).toBe("ok");
+			store({ "desk-gateway": apiKey() } as CredentialStore["providers"]);
+			expect(byId(checkCredentials(deps), "credentials.desk-gateway").title).toContain("(credential store)");
+			expect(JSON.stringify(checkCredentials(deps))).not.toContain(FAKE_KEY);
+		});
+
+		test("backend overrides select gateway or direct credentials and the global gateway kill switch wins", () => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, ragflow: { enabled: true, backend: "direct" } });
+			setEnv({ ULTRATHINK_HINDSIGHT_BACKEND: "direct", ULTRATHINK_RAGFLOW_BACKEND: "gateway", DESK_GATEWAY_TOKEN: FAKE_KEY, HINDSIGHT_API_KEY: FAKE_KEY });
+			let findings = checkCredentials(deps);
+			expect(byId(findings, "credentials.hindsight").level).toBe("ok");
+			expect(byId(findings, "credentials.desk-gateway")).toMatchObject({ level: "ok", detail: "needed for RAGFlow" });
+			expect(findings.some((finding) => finding.id === "credentials.ragflow")).toBe(false);
+			setEnv({ ULTRATHINK_GATEWAY: "0" });
+			findings = checkCredentials(deps);
+			expect(byId(findings, "credentials.hindsight").level).toBe("ok");
+			expect(byId(findings, "credentials.ragflow").level).toBe("warn");
+			expect(findings.some((finding) => finding.id === "credentials.desk-gateway")).toBe(false);
+		});
+
+		test("disabled gateway features remove their token need, and direct substrate adds none", () => {
+			userConfig({ hindsight: { enabled: true, backend: "gateway" }, ragflow: { enabled: true, backend: "gateway" }, substrate: { backend: "gateway" } });
+			setEnv({ ULTRATHINK_HINDSIGHT: "0", ULTRATHINK_RAGFLOW: "0", SUBSTRATE_DISABLED: "1" });
+			expect(checkCredentials(deps).map((finding) => finding.id)).toEqual(["credentials.jev"]);
+			userConfig({ substrate: { url: "https://substrate.example", backend: "direct" } });
+			expect(checkCredentials(deps).map((finding) => finding.id)).toEqual(["credentials.jev"]);
+		});
+
 		test("the kill switches remove the Hindsight and RAGFlow needs", () => {
 			userConfig({ hindsight: { enabled: true }, ragflow: { enabled: true } });
 			setEnv({ ULTRATHINK_HINDSIGHT: "0", ULTRATHINK_RAGFLOW: "0" });
