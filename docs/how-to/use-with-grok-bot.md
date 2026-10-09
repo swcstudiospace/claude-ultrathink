@@ -49,7 +49,7 @@ Direct Hindsight, RAGFlow and substrate clients stay the default. To send memory
 
 The seat token is `DESK_GATEWAY_TOKEN`, or an `api_key` / OAuth access token stored under the credential-store provider `desk-gateway`. The client calls `POST <gateway.url>/mcp/<seat>` with `tools/call`. Recall is `desk_memory_recall`, retain is `desk_memory_retain`, document search is `desk_docs_search`, the brief is `desk_brief` and plan events are `desk_event_emit`. `ULTRATHINK_GATEWAY=0` forces the direct clients again. `bin/ultrathink status` reports each integration as `gateway · ready` or `gateway · unready` with the reason. `bin/ultrathink hindsight check` and `bin/ultrathink ragflow check` are the doctor: a gateway `not_configured` or `error`/`reason` reply is a one-line degraded result, not a crash.
 
-Once this backend is on, skill steps that call those `desk_*` tools directly (the box copies of `ultrathink-plan` and `ultrathink-hindsight`) are redundant. This tree does not remove them.
+`ultrathink-plan` and `ultrathink-hindsight` pick the plane from `G ctl status`: with the gateway backend ready they use the CLI, otherwise they call the `desk_*` tools through the bot's desk gateway MCP connection, so the box copies match this tree either way.
 
 ## Skill-protocol files kept beside the native host
 

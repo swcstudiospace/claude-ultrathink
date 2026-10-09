@@ -10,7 +10,7 @@ description: >-
 # Ultrathink ship (review-only)
 
 1. Read state: `G review read --repo owner/name --pr N` (public, read-only) → score, open Greptile threads.
-2. Below 5/5 or open threads: hand the threads to the agent that owns the PR (cloud agent follow-up) to fix and push. Round count is capped at 5.
+2. Below 5/5 or open threads: hand the threads to the agent that owns the PR (cloud agent follow-up) to fix and push. Round count is capped at 5. From round 3, if the findings share one shape with earlier rounds, add "apply pstack principle-attack-the-premise" to the hand-off (`ultrathink-pstack` §5).
 3. Retrigger only when the review is stale (no new review ~20 min after the fix push): post one `@greptileai` comment on the PR. That is an external post: it needs Ming's approval for this PR.
 4. At 5/5 with no open threads and green checks: tell Ming the PR is ready and ask him to merge. **Never merge, never enable auto-merge, never delete branches.**
 
