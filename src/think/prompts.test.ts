@@ -6,8 +6,8 @@ import { MAX_RATIONALE_CHARS, MAX_STEPS, MIN_STEPS } from "./types.ts";
 
 describe("COT_SYSTEM_PROMPT", () => {
 	test("asks for the tracked step range and the matching rationale budget", () => {
-		// Each rationale step becomes a Sub-Issue, so the prompt must demand the 4-8 range explicitly.
-		expect(MIN_STEPS).toBe(4);
+		// Each rationale step becomes a Sub-Issue, so the prompt must demand the 5-8 range explicitly (desk density: 5-8 steps per node).
+		expect(MIN_STEPS).toBe(5);
 		expect(MAX_STEPS).toBe(8);
 		expect(COT_SYSTEM_PROMPT).toContain(`between ${MIN_STEPS} and ${MAX_STEPS} numbered steps`);
 		expect(COT_SYSTEM_PROMPT).toContain(`<rationale> at most ${MAX_RATIONALE_CHARS} characters`);

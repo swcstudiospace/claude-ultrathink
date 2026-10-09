@@ -29,6 +29,11 @@ export interface RagflowConfig {
 	ground: boolean;
 	/** Cap on the characters of excerpts added to the planner's context. */
 	groundChars: number;
+	/**
+	 * Absent or `"direct"` uses the RAGFlow API and its key. `"gateway"` calls the desk gateway
+	 * and does not read a RAGFlow key. A project file cannot set this.
+	 */
+	backend?: "direct" | "gateway";
 }
 
 export const DEFAULT_RAGFLOW_CONFIG: RagflowConfig = {
@@ -105,8 +110,8 @@ export interface RagflowClientOptions {
 
 /** Never rejects except with an AbortError when the caller's signal aborts. */
 export interface RagflowClient {
-	/** `GET /api/v1/datasets?page=1&page_size=1`; `value.datasets` is the server's total. */
-	health(): Promise<RagflowResult<{ datasets: number }>>;
+	/** `GET /api/v1/datasets?page=1&page_size=1`; `value.datasets` is the server's total. A gateway probe sets `scope` and does not invent a dataset count. */
+	health(): Promise<RagflowResult<{ datasets: number; scope?: "gateway" }>>;
 	/** Pages of 100 until an empty page or `total`, at most 1000 datasets. */
 	listDatasets(): Promise<RagflowResult<RagflowDataset[]>>;
 	retrieve(query: RetrieveQuery): Promise<RagflowResult<RagflowChunk[]>>;
@@ -116,8 +121,9 @@ export type RagflowKeySource = "store" | typeof RAGFLOW_KEY_ENV;
 
 export type RagflowReadiness =
 	| { state: "ready"; url: string; keySource: RagflowKeySource }
+	| { state: "ready"; backend: "gateway"; url: string; seat: string; tokenSource: "store" | "DESK_GATEWAY_TOKEN" }
 	| { state: "off"; reason: "disabled" | "killed" }
-	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key"; detail?: string };
+	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key" | "no-token"; detail?: string };
 
 export interface RagflowResolution {
 	readiness: RagflowReadiness;

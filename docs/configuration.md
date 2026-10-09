@@ -265,7 +265,8 @@ Agent Substrate is an optional service that tells the planner what other agents 
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | http(s) URL | `""` | Base URL of your Agent Substrate server. ultrathink sends `POST <url>/brief` with the repository (`owner/repo`), the branch and the host name, and, after planning, `POST <url>/events` with the Graph ID, the session id, the host name, the repository, the branch and the node count. `""` means the service is never contacted. `SUBSTRATE_URL` wins over this key, and `SUBSTRATE_DISABLED=1` turns both off. |
+| `url` | http(s) URL | `""` | Base URL of your Agent Substrate server. ultrathink sends `POST <url>/brief` with the repository (`owner/repo`), the branch and the host name, and, after planning, `POST <url>/events` with the Graph ID, the session id, the host name, the repository, the branch and the node count. `""` means the service is never contacted. `SUBSTRATE_URL` wins over this key, and `SUBSTRATE_DISABLED=1` turns both off. Ignored when `backend` is `gateway`. |
+| `backend` | `"direct"` or `"gateway"` | `"direct"` | `"direct"` is the client above. `"gateway"` calls the desk gateway (see [`gateway`](#gateway-desk-gateway)). User files only. `ULTRATHINK_SUBSTRATE_BACKEND` overrides it. `ULTRATHINK_GATEWAY=0` forces `"direct"`. |
 
 Each request times out after 1.5 seconds (`SUBSTRATE_TIMEOUT_MS` changes that). A missing, slow or failing server never blocks a prompt: the plan is built without the brief, and a refused or lost event is dropped. The event goes out after planning, so a server that accepts the connection and never answers adds up to one timeout before the plan is returned. `bin/ultrathink status` shows the `Substrate:` line with the URL in use and where it came from.
 
@@ -305,6 +306,20 @@ How Decisions work:
 
 The default thresholds were set from probes on `typesafe/jev-1.13-20260917`. Tune them on your own cases with `bin/ultrathink decisions probe` (see [Commands](commands.md#binultrathink-decisions)).
 
+### `gateway`: desk gateway
+
+Used only when `hindsight.backend`, `ragflow.backend` or `substrate.backend` is `"gateway"`. A project file cannot set this section. The seat token is not a config key.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | string | `""` | Gateway origin. User files only. Empty falls back to `DESK_GATEWAY_URL`. Same URL rules as `hindsight.url`. The client posts to `<url>/mcp/<seat>`. |
+| `seat` | string | `"lead"` | Seat path segment. Must match `^[a-z][a-z0-9-]{0,31}$`. `DESK_GATEWAY_SEAT` overrides it when that value matches. |
+| `timeoutMs` | integer, 1 to 120000 | `8000` | Budget for one tool call. `DESK_GATEWAY_TIMEOUT_MS` overrides it when it is in range. |
+
+The token comes from the credential store, provider `desk-gateway` (an `api_key`, or an OAuth `accessToken`), else `DESK_GATEWAY_TOKEN`. It is sent only as `Authorization: Bearer` on that one request, and never printed. `ULTRATHINK_GATEWAY=0` forces every integration back to `"direct"`.
+
+`bin/ultrathink status` then prints `Hindsight: gateway · ready · <origin> · seat <seat> · token from <store|DESK_GATEWAY_TOKEN>`, or `gateway · unready` with the reason (no URL, bad URL, no token). RAGFlow and Substrate use the same shape. `bin/ultrathink hindsight check` and `bin/ultrathink ragflow check` probe the gateway; `not_configured`, `unknown_tool`, an `error`/`reason` pair and a timeout are one-line degraded or unready results.
+
 ### `hindsight`: Hindsight memory server
 
 Hindsight is opt-in storage for confirmed Teachable Moments. With the defaults, nothing is contacted. See [Connect Hindsight](how-to/connect-hindsight.md) (`docs/how-to/connect-hindsight.md`).
@@ -316,6 +331,7 @@ Hindsight is opt-in storage for confirmed Teachable Moments. With the defaults, 
 | `bank` | string | `"ultrathink"` | Bank that holds ultrathink's records. User files only. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; anything else is ignored and the earlier value stays. |
 | `timeoutMs` | integer, 1 to 120000 | `5000` | Budget in milliseconds for health, bank, document and recall requests. |
 | `retainTimeoutMs` | integer, 1 to 120000 | `15000` | Budget in milliseconds for one retain. |
+| `backend` | `"direct"` or `"gateway"` | `"direct"` | `"direct"` uses the Hindsight API and its key. `"gateway"` uses the desk gateway and does not read a Hindsight key. User files only. `ULTRATHINK_HINDSIGHT_BACKEND` overrides it. `ULTRATHINK_GATEWAY=0` forces `"direct"`. |
 
 The key is not a config key. It comes from the credential store, provider `hindsight` (`bin/ultrathink-mcp auth set-key hindsight --stdin`), else `HINDSIGHT_API_KEY`, else `HINDSIGHT_API_TOKEN`. The stored key wins. `hindsight` is an API-key provider, not an MCP server: `serve`, `check` and `auth login` refuse it and name `auth set-key hindsight --stdin`.
 
@@ -348,6 +364,7 @@ RAGFlow is opt-in. With the defaults, nothing is contacted. When `ground` is on 
 | `timeoutMs` | integer, 1 to 120000 | `8000` | Budget in milliseconds for one request. |
 | `ground` | boolean | `false` | Add retrieved excerpts to the planner's context. A project file can only turn this off. Off means no request, even when `enabled` is true. |
 | `groundChars` | integer, 500 to 8000 | `3000` | Cap on the characters of excerpts added to the planner's context. |
+| `backend` | `"direct"` or `"gateway"` | `"direct"` | `"direct"` uses the RAGFlow API and its key. `"gateway"` uses the desk gateway and does not read a RAGFlow key. User files only. `ULTRATHINK_RAGFLOW_BACKEND` overrides it. `ULTRATHINK_GATEWAY=0` forces `"direct"`. |
 
 The key is not a config key. It comes from the credential store, provider `ragflow` (`bin/ultrathink-mcp auth set-key ragflow --stdin`), else `RAGFLOW_API_KEY`. The stored key wins. `ragflow` is an API-key provider, not an MCP server: `serve`, `check` and `auth login` refuse it and name `auth set-key ragflow --stdin`.
 
@@ -581,6 +598,14 @@ Every variable ultrathink reads, grouped by who sets it. Variables that expect `
 | `ULTRATHINK_DEBUG=1` | The prompt hook (`hooks/uplift.ts`, used by Claude Code, Grok Build and Muse) writes `[ultrathink]` log lines to stderr. With Decisions on, every process that asks Jev (the prompt hook, the Hermes and Omp engine, `bin/ultrathink-ship`) also writes one `[ultrathink] decisions …` line per decision: the point, P or the error kind, the model, latency, attempts and cost. Never the message, the state or the key. |
 | `ULTRATHINK_MCP_DEBUG=1` | `bin/ultrathink-mcp serve` writes relay log lines to stderr. |
 | `ULTRATHINK_HERMES_TIMEOUT` | Hermes only. Longest time in seconds the Hermes plugin lets one plan run. A positive integer; anything else means the default, `540`. The plugin stops the plan at min(this, cap − 15) seconds, where the cap is Hermes' `plugins.hook_callback_timeout`, and does not start planning when that leaves less than 90 seconds. See the note below the table. |
+| `ULTRATHINK_GATEWAY=0` | Force Hindsight, RAGFlow and the substrate brief back to their direct clients, even when a backend is `gateway`. |
+| `DESK_GATEWAY_URL` | Desk gateway origin. Wins over `gateway.url`. |
+| `DESK_GATEWAY_SEAT` | Seat path segment. Wins over `gateway.seat` when it matches `^[a-z][a-z0-9-]{0,31}$`. |
+| `DESK_GATEWAY_TOKEN` | Seat bearer token, used when the credential store has no `desk-gateway` credential. Never printed. |
+| `DESK_GATEWAY_TIMEOUT_MS` | Timeout for one gateway tool call, in milliseconds. An integer from 1 to 120000; otherwise `gateway.timeoutMs` is used. |
+| `ULTRATHINK_HINDSIGHT_BACKEND` | `direct` or `gateway`. Wins over `hindsight.backend` unless `ULTRATHINK_GATEWAY=0`. |
+| `ULTRATHINK_RAGFLOW_BACKEND` | `direct` or `gateway`. Wins over `ragflow.backend` unless `ULTRATHINK_GATEWAY=0`. |
+| `ULTRATHINK_SUBSTRATE_BACKEND` | `direct` or `gateway`. Wins over `substrate.backend` unless `ULTRATHINK_GATEWAY=0`. |
 | `SUBSTRATE_URL` | Agent Substrate base URL. Wins over `substrate.url`. |
 | `SUBSTRATE_TOKEN` | Sent as `Authorization: Bearer <token>` on Agent Substrate requests. |
 | `SUBSTRATE_TIMEOUT_MS` | Timeout for one Agent Substrate request, in milliseconds. A positive number; default `1500`. |

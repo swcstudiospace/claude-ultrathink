@@ -235,7 +235,7 @@ function startRecall(
 				env: input.env,
 				sessionId: input.sessionId,
 				stateDir: deps.stateDir,
-				config: { teach, hindsight: deps.config.hindsight },
+				config: { teach, hindsight: deps.config.hindsight, gateway: deps.config.gateway },
 				signal: arg.signal,
 				now: input.now,
 				log: input.log,
@@ -260,7 +260,14 @@ function startGround(deps: HookDeps, input: LookupInput): Promise<GroundOutcome>
 	const run =
 		seam ??
 		(async (arg: { query: string; signal: AbortSignal }): Promise<GroundOutcome> => {
-			return groundDocs({ query: arg.query, config: ragflow, env: input.env, signal: arg.signal, now: input.now });
+			return groundDocs({
+				query: arg.query,
+				config: ragflow,
+				gateway: deps.config.gateway,
+				env: input.env,
+				signal: arg.signal,
+				now: input.now,
+			});
 		});
 	return bounded(
 		(signal) => run({ query: input.query, signal }),
@@ -288,7 +295,7 @@ function startSkills(
 				env: input.env,
 				sessionId: input.sessionId,
 				stateDir: deps.stateDir,
-				config: { teach, hindsight: deps.config.hindsight },
+				config: { teach, hindsight: deps.config.hindsight, gateway: deps.config.gateway },
 				signal: arg.signal,
 				now: input.now,
 				log: input.log,
@@ -331,7 +338,11 @@ async function announcePlan(
 		const env = deps.decisionsDeps?.env ?? process.env;
 		const send =
 			deps.emit ??
-			((event: EmitInput, signal?: AbortSignal) => emitEvent(event, env, deps.config.substrate.url, signal));
+			((event: EmitInput, signal?: AbortSignal) =>
+				emitEvent(event, env, deps.config.substrate.url, signal, {
+					backend: deps.config.substrate.backend,
+					gateway: deps.config.gateway,
+				}));
 		await send(
 			{
 				kind: "note",
@@ -463,7 +474,13 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// planned knowing what other agents already did, and the round trip
 		// overlaps the uplift call instead of adding to it.
 		stage("brief", "start");
-		const fetchSessionBrief = deps.brief ?? ((brief) => fetchBrief(brief, process.env, deps.config.substrate.url));
+		const fetchSessionBrief =
+			deps.brief ??
+			((brief) =>
+				fetchBrief(brief, process.env, deps.config.substrate.url, {
+					backend: deps.config.substrate.backend,
+					gateway: deps.config.gateway,
+				}));
 		const briefPromise = fetchSessionBrief({
 			repo: git.repo,
 			branch: git.branch,
@@ -721,6 +738,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		};
 		let specPath: string | undefined;
 		let statePath: string | undefined;
+		let lastNote: string | undefined;
 		// No spec or session write for a cancelled flight.
 		throwIfCancelled(cancellation);
 		stage("state", "start");
@@ -728,8 +746,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			specPath = specFile(deps.stateDir, sessionId);
 			mkdirSync(dirname(specPath), { recursive: true });
 			writeFileSync(specPath, `${result.xml}\n`);
-			writeSession(deps.stateDir, record);
+			lastNote = writeSession(deps.stateDir, record);
 			statePath = sessionPath(deps.stateDir, sessionId);
+			if (lastNote) log(lastNote);
 			stage("state", "end", true);
 		} catch (error) {
 			log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -753,6 +772,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 					brief,
 					statePath,
 					specPath,
+					...(lastNote ? { lastNote } : {}),
 					plan,
 					tracking,
 					trackCommand: deps.trackCommand,

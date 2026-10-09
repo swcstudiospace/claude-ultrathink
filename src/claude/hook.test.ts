@@ -263,6 +263,23 @@ describe("runPromptSubmit", () => {
 		}
 	});
 
+	test("a busy last.json lock keeps the Hermes handoff and reports the missed copy", async () => {
+		const { deps, cleanup } = baseDeps({ surface: "hermes", complete: smartComplete() });
+		try {
+			mkdirSync(deps.stateDir, { recursive: true });
+			writeFileSync(`${join(deps.stateDir, "last.json")}.lock`, String(process.pid));
+			const saved = (await runPromptSubmit(input, deps)).output?.hookSpecificOutput.additionalContext ?? "";
+			const spec = join(deps.stateDir, "sessions", "s1.xml");
+			expect(saved).toContain(`Specification file: ${spec}`);
+			expect(saved).toContain(`State file: ${join(deps.stateDir, "sessions", "s1.json")}`);
+			expect(saved).toContain("could not refresh");
+			expect(saved).toContain("ultrathink-kickoff");
+			expect(existsSync(spec)).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("Hermes gets a handoff to the saved spec, or the inline spec when the spec file could not be written", async () => {
 		const { deps, cleanup } = baseDeps({ surface: "hermes", complete: smartComplete() });
 		try {

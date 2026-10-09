@@ -5,6 +5,9 @@
  * the planner, the CLI and the status line can never disagree about whether RAGFlow is reachable. Pure and synchronous:
  * nothing here touches the network.
  */
+import { createGatewayRagflowClient } from "../gateway/ragflow.ts";
+import { gatewayStatus, resolveGateway, serviceBackend } from "../gateway/settings.ts";
+import { RAGFLOW_BACKEND_ENV, type GatewayConfig } from "../gateway/types.ts";
 import { checkServiceUrl } from "../net/safe-url.ts";
 import { readStore, storePath as defaultStorePath } from "../mcp/store.ts";
 import { createRagflowClient } from "./client.ts";
@@ -39,10 +42,20 @@ export function resolveRagflowKey(
 export function resolveRagflow(
 	config: RagflowConfig,
 	env: NodeJS.ProcessEnv,
-	deps: { storePath?: string; fetch?: typeof fetch; signal?: AbortSignal } = {},
+	deps: { storePath?: string; fetch?: typeof fetch; signal?: AbortSignal; gateway?: GatewayConfig } = {},
 ): RagflowResolution {
 	if (env[RAGFLOW_KILL_ENV]?.trim() === "0") return { readiness: { state: "off", reason: "killed" } };
 	if (!config.enabled) return { readiness: { state: "off", reason: "disabled" } };
+	if (serviceBackend(config.backend, env, RAGFLOW_BACKEND_ENV) === "gateway") {
+		const gatewayConfig = deps.gateway ?? { url: "", seat: "lead", timeoutMs: config.timeoutMs };
+		const resolved = resolveGateway(gatewayConfig, env, { storePath: deps.storePath });
+		if (!resolved.ok) return { readiness: { state: "unready", reason: resolved.reason === "no-token" ? "no-token" : resolved.reason, detail: resolved.detail } };
+		const { gateway } = resolved;
+		return {
+			readiness: { state: "ready", backend: "gateway", url: gateway.url, seat: gateway.seat, tokenSource: gateway.tokenSource },
+			client: createGatewayRagflowClient({ ...gateway, fetch: deps.fetch, signal: deps.signal }),
+		};
+	}
 	const raw = config.url.trim() || env[RAGFLOW_URL_ENV]?.trim() || "";
 	if (raw === "") return { readiness: { state: "unready", reason: "no-url" } };
 	const url = checkServiceUrl(raw);
@@ -61,8 +74,15 @@ export function resolveRagflow(
 }
 
 /** One line for `ultrathink status`; starts with "RAGFlow: ". Never contains the key. */
-export function ragflowStatusLine(config: RagflowConfig, env: NodeJS.ProcessEnv, storePath?: string): string {
-	const { readiness } = resolveRagflow(config, env, { storePath });
+export function ragflowStatusLine(config: RagflowConfig, env: NodeJS.ProcessEnv, storePath?: string, gateway?: GatewayConfig): string {
+	const { readiness } = resolveRagflow(config, env, { storePath, gateway });
+	if (readiness.state === "ready" && "backend" in readiness) {
+		return `RAGFlow: gateway · ${gatewayStatus({ ok: true, gateway: { url: readiness.url, seat: readiness.seat, token: "", tokenSource: readiness.tokenSource, timeoutMs: config.timeoutMs } })}`;
+	}
+	if (readiness.state === "unready" && serviceBackend(config.backend, env, RAGFLOW_BACKEND_ENV) === "gateway") {
+		const resolved = resolveGateway(gateway ?? { url: "", seat: "lead", timeoutMs: config.timeoutMs }, env, { storePath });
+		return `RAGFlow: gateway · ${gatewayStatus(resolved)}`;
+	}
 	if (readiness.state === "off") {
 		return readiness.reason === "killed" ? `RAGFlow: off (${RAGFLOW_KILL_ENV}=0)` : "RAGFlow: off (opt-in: set ragflow.enabled)";
 	}

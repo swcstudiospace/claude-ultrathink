@@ -86,6 +86,23 @@ export function injectTrackingXml(xml: string, plan: TrackPlan, tracking: Tracki
 	return `${before}\n${block}\n${stripped.slice(rootClose)}`;
 }
 
+/**
+ * Inverse of `injectTrackingXml`: drops the `<ISSUES>` block (and the newline before it) and the issue/issueUrl/notionUrl
+ * attributes the last graph's NODE tags gained, leaving the spec as planned.
+ */
+export function stripTrackingXml(xml: string): string {
+	const stripped = xml.replace(ISSUES_BLOCK_RE, "");
+	const graphEnd = stripped.lastIndexOf(GRAPH_CLOSE);
+	if (graphEnd < 0) return stripped;
+	const openAt = stripped.lastIndexOf("<GRAPH_OF_THOUGHT", graphEnd);
+	const start = openAt >= 0 ? openAt : graphEnd;
+	const at = graphEnd + GRAPH_CLOSE.length;
+	const graph = stripped.slice(start, at).replace(NODE_TAG_RE, (whole, attrs: string, close: string) =>
+		ID_ATTR_RE.test(attrs) ? `<NODE${attrs.replace(TRACK_ATTR_RE, "")}${close}>` : whole,
+	);
+	return `${stripped.slice(0, start)}${graph}${stripped.slice(at)}`;
+}
+
 function todoLine(indent: string, id: string, ref: IssueRef | undefined, title: string, notionUrl: string | undefined): string {
 	const notion = notionUrl ? ` · notion: ${notionUrl}` : "";
 	return `${indent}- [ ] ${id} · ${ref ? `[${ref.identifier}](${ref.url})` : "(pending)"} · ${title}${notion}`;

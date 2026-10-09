@@ -147,10 +147,10 @@
           "required": ["identity", "status", "adapterPresent", "compatibilityVerified", "delivery", "entrypoints"],
           "properties": {
             "identity": { "type": "string", "const": "documented-product" },
-            "status": { "type": "string", "const": "skill-adapter" },
+            "status": { "type": "string", "const": "native-adapter" },
             "adapterPresent": { "type": "boolean", "const": true },
             "compatibilityVerified": { "type": "boolean", "const": false },
-            "delivery": { "type": "string", "const": "skill-protocol" },
+            "delivery": { "type": "string", "const": "skill-protocol-cli" },
             "entrypoints": {
               "type": "array",
               "minItems": 1,

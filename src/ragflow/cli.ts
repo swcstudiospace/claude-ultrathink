@@ -6,6 +6,7 @@
  * `ragflow.ground`, so the connection can be proven before grounding is switched on. Output never contains the key.
  */
 import { claudeConfigPaths, loadConfig } from "../config.ts";
+import type { GatewayConfig } from "../gateway/types.ts";
 import { redactSecrets } from "../grok/auth.ts";
 import type { CliResult } from "../teach/types.ts";
 import { flattenText } from "./ground.ts";
@@ -20,6 +21,8 @@ export interface CommandDeps {
 	fetch?: typeof fetch;
 	/** Tests inject the `ragflow` config slice; otherwise it is loaded like the other commands do. */
 	config?: RagflowConfig;
+	/** Desk gateway section. Loaded with `config` when omitted. */
+	gateway?: GatewayConfig;
 	stdin?: () => Promise<string>;
 	now?: () => number;
 }
@@ -82,7 +85,11 @@ async function check(client: RagflowClient, json: boolean, now: () => number): P
 	const result = await client.health();
 	const ms = Math.max(0, Math.round(now() - started));
 	if (!result.ok) return failed("check", json, result.error);
-	const { datasets } = result.value;
+	const { datasets, scope } = result.value;
+	if (scope === "gateway") {
+		if (json) return { code: 0, text: JSON.stringify({ ok: true, scope, ms }) };
+		return { code: 0, text: `RAGFlow check: ok · gateway probe · ${ms} ms` };
+	}
 	if (json) return { code: 0, text: JSON.stringify({ ok: true, datasets, ms }) };
 	return { code: 0, text: `RAGFlow check: ok · ${datasets} dataset(s) · ${ms} ms` };
 }
@@ -134,10 +141,13 @@ export async function runRagflowCommand(argv: string[], deps: CommandDeps): Prom
 	}
 	try {
 		const env = deps.env ?? process.env;
-		const config = deps.config ?? loadConfig(claudeConfigPaths(deps.cwd, env)).ragflow;
-		const { readiness, client } = resolveRagflow(config, env, { storePath: deps.storePath, fetch: deps.fetch });
+		const loaded = deps.config && deps.gateway ? undefined : loadConfig(claudeConfigPaths(deps.cwd, env));
+		const config = deps.config ?? loaded?.ragflow;
+		if (!config) return { code: 1, text: "RAGFlow: config unavailable" };
+		const gateway = deps.gateway ?? loaded?.gateway;
+		const { readiness, client } = resolveRagflow(config, env, { storePath: deps.storePath, fetch: deps.fetch, gateway });
 		if (readiness.state !== "ready" || !client) {
-			const reason = ragflowStatusLine(config, env, deps.storePath).replace(/^RAGFlow: /, "");
+			const reason = ragflowStatusLine(config, env, deps.storePath, gateway).replace(/^RAGFlow: /, "");
 			return failed(command, parsed.json, { kind: "not-ready", message: reason });
 		}
 		if (command === "check") return await check(client, parsed.json, deps.now ?? Date.now);
