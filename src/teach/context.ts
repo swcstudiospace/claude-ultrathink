@@ -96,6 +96,7 @@ export function hindsightFor(ctx: TeachContext, options: { timeoutMs?: number; s
 			storePath: ctx.storePath,
 			fetch: ctx.fetch,
 			signal: options.signal ?? ctx.signal,
+			gateway: ctx.config.gateway,
 		});
 		if (readiness.state === "ready" && client) return { client };
 		if (readiness.state === "off") return { reason: `hindsight is off (${readiness.reason})` };

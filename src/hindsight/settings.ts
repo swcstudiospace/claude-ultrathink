@@ -5,6 +5,9 @@
  * (through the URL policy in src/net/safe-url.ts) and the API key (credential store first, then the environment). Pure
  * and synchronous apart from reading the credential file; no request is made here, so callers can ask any time.
  */
+import { createGatewayHindsightClient } from "../gateway/hindsight.ts";
+import { gatewayStatus, resolveGateway, serviceBackend } from "../gateway/settings.ts";
+import { HINDSIGHT_BACKEND_ENV, type GatewayConfig } from "../gateway/types.ts";
 import { readStore, storePath as defaultStorePath } from "../mcp/store.ts";
 import { checkServiceUrl } from "../net/safe-url.ts";
 import { createHindsightClient } from "./client.ts";
@@ -45,10 +48,21 @@ export function resolveHindsightKey(
 export function resolveHindsight(
 	config: HindsightConfig,
 	env: NodeJS.ProcessEnv,
-	deps: { storePath?: string; fetch?: typeof fetch; signal?: AbortSignal } = {},
+	deps: { storePath?: string; fetch?: typeof fetch; signal?: AbortSignal; gateway?: GatewayConfig } = {},
 ): HindsightResolution {
 	if (env[HINDSIGHT_KILL_ENV] === "0") return { readiness: { state: "off", reason: "killed" } };
 	if (!config.enabled) return { readiness: { state: "off", reason: "disabled" } };
+	if (serviceBackend(config.backend, env, HINDSIGHT_BACKEND_ENV) === "gateway") {
+		const gatewayConfig = deps.gateway ?? { url: "", seat: "lead", timeoutMs: config.timeoutMs };
+		const resolved = resolveGateway(gatewayConfig, env, { storePath: deps.storePath });
+		if (!resolved.ok) return { readiness: { state: "unready", reason: resolved.reason === "no-token" ? "no-token" : resolved.reason, detail: resolved.detail } };
+		const { gateway } = resolved;
+		const client = createGatewayHindsightClient({ ...gateway, fetch: deps.fetch, signal: deps.signal });
+		return {
+			readiness: { state: "ready", backend: "gateway", url: gateway.url, bank: gateway.seat, seat: gateway.seat, tokenSource: gateway.tokenSource },
+			client,
+		};
+	}
 	const rawUrl = config.url.trim() || env[HINDSIGHT_URL_ENV]?.trim() || "";
 	if (rawUrl === "") return { readiness: { state: "unready", reason: "no-url" } };
 	const url = checkServiceUrl(rawUrl);
@@ -69,8 +83,15 @@ export function resolveHindsight(
 }
 
 /** One line for `status` output; names the origin, bank and key source, never the key or a URL path. */
-export function hindsightStatusLine(config: HindsightConfig, env: NodeJS.ProcessEnv, storePath?: string): string {
-	const { readiness } = resolveHindsight(config, env, { storePath });
+export function hindsightStatusLine(config: HindsightConfig, env: NodeJS.ProcessEnv, storePath?: string, gateway?: GatewayConfig): string {
+	const { readiness } = resolveHindsight(config, env, { storePath, gateway });
+	if (readiness.state === "ready" && "backend" in readiness) {
+		return `Hindsight: gateway · ${gatewayStatus({ ok: true, gateway: { url: readiness.url, seat: readiness.seat, token: "", tokenSource: readiness.tokenSource, timeoutMs: config.timeoutMs } })}`;
+	}
+	if (readiness.state === "unready" && serviceBackend(config.backend, env, HINDSIGHT_BACKEND_ENV) === "gateway") {
+		const resolved = resolveGateway(gateway ?? { url: "", seat: "lead", timeoutMs: config.timeoutMs }, env, { storePath });
+		return `Hindsight: gateway · ${gatewayStatus(resolved)}`;
+	}
 	if (readiness.state === "off") {
 		return readiness.reason === "killed"
 			? `Hindsight: off (${HINDSIGHT_KILL_ENV}=0)`

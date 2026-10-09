@@ -17,3 +17,5 @@ State lives in `${ULTRATHINK_STATE_DIR:-~/.local/state/ultrathink-grokbot}`. Tes
 See [Use with Grok Bot](../../docs/how-to/use-with-grok-bot.md).
 
 The conversation-preference skills from the skill-protocol adapter stay beside the native host: `ultrathink-protocol/SKILL.md` and `commands/<name>/SKILL.md`. Discovery records the native host (`native-adapter`, `skill-protocol-cli`). Those files do not replace `skills/` and they do not run the engine.
+
+The user config can switch Hindsight, RAGFlow and the substrate brief to the desk gateway (`"backend": "gateway"` plus a `gateway` section: `url`, `seat`, `timeoutMs`). That path holds no Hindsight or RAGFlow key. See [Use with Grok Bot](../../docs/how-to/use-with-grok-bot.md#gateway-backend). `ULTRATHINK_GATEWAY=0` returns all three to the direct clients.

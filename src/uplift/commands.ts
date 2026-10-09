@@ -25,6 +25,8 @@ import { hasUsableCredential } from "../mcp/client.ts";
 import { storePath } from "../mcp/store.ts";
 import { runRagflowCommand } from "../ragflow/cli.ts";
 import { ragflowStatusLine } from "../ragflow/settings.ts";
+import { gatewayStatus, resolveGateway, serviceBackend } from "../gateway/settings.ts";
+import { SUBSTRATE_BACKEND_ENV } from "../gateway/types.ts";
 import { resolveSubstrate } from "../substrate/brief.ts";
 import { runTeachCommand } from "../teach/cli.ts";
 import { teachStatusLine } from "../teach/status.ts";
@@ -129,6 +131,10 @@ function grokTransportLine(config: UltrathinkConfig): string {
 /** Where the Agent Substrate brief comes from, if anywhere; the same rule the hooks use. */
 function substrateLine(config: UltrathinkConfig, env: Record<string, string | undefined>): string {
 	if (env.SUBSTRATE_DISABLED === "1") return "Substrate: off (SUBSTRATE_DISABLED=1)";
+	if (serviceBackend(config.substrate.backend, env, SUBSTRATE_BACKEND_ENV) === "gateway") {
+		const resolved = resolveGateway(config.gateway, env, { storePath: storePath(env) });
+		return `Substrate: gateway · ${gatewayStatus(resolved)}`;
+	}
 	const target = resolveSubstrate(env, config.substrate.url);
 	return target ? `Substrate: ${target.url} (${target.source})` : "Substrate: off (optional: set substrate.url or SUBSTRATE_URL)";
 }
@@ -211,9 +217,9 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
 		shipLine(config, process.env),
 		knowledgeLine(config, state, process.env),
 		decisionsLine(config, process.env),
-		hindsightStatusLine(config.hindsight, process.env, storePath(process.env)),
-		ragflowStatusLine(config.ragflow, process.env, storePath(process.env)),
-		teachStatusLine({ teach: config.teach, hindsight: config.hindsight }, process.env, storePath(process.env), stateDir),
+		hindsightStatusLine(config.hindsight, process.env, storePath(process.env), config.gateway),
+		ragflowStatusLine(config.ragflow, process.env, storePath(process.env), config.gateway),
+		teachStatusLine({ teach: config.teach, hindsight: config.hindsight, gateway: config.gateway }, process.env, storePath(process.env), stateDir),
 		engineRequestLine(config, state, host),
 		`State: ${stateDir}`,
 	];

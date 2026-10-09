@@ -5,6 +5,7 @@
  * Retrieved text is untrusted: it is flattened to one line per excerpt, capped, stripped of closing-tag lookalikes and
  * introduced as evidence, not instructions. Fails open: `groundDocs` never throws and reports a reason instead.
  */
+import type { GatewayConfig } from "../gateway/types.ts";
 import { resolveRagflow } from "./settings.ts";
 import type { DocsLookup, GroundOutcome, RagflowChunk, RagflowConfig } from "./types.ts";
 
@@ -76,6 +77,7 @@ function bySimilarity(a: RagflowChunk, b: RagflowChunk): number {
 export async function groundDocs(input: {
 	query: string;
 	config: RagflowConfig;
+	gateway?: GatewayConfig;
 	env: NodeJS.ProcessEnv;
 	storePath?: string;
 	fetch?: typeof fetch;
@@ -97,7 +99,12 @@ export async function groundDocs(input: {
 	const budget = AbortSignal.timeout(Math.max(1, config.timeoutMs));
 	const signal = input.signal ? AbortSignal.any([input.signal, budget]) : budget;
 	try {
-		const { readiness, client } = resolveRagflow(config, input.env, { storePath: input.storePath, fetch: input.fetch, signal });
+		const { readiness, client } = resolveRagflow(config, input.env, {
+			storePath: input.storePath,
+			fetch: input.fetch,
+			signal,
+			gateway: input.gateway,
+		});
 		if (readiness.state === "off") return outcome("off", { reason: `RAGFlow is off (${readiness.reason})` });
 		if (readiness.state === "unready" || !client) {
 			return outcome("off", { reason: `RAGFlow is not ready (${readiness.state === "unready" ? readiness.reason : "no client"})` });

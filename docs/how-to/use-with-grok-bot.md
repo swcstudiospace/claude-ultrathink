@@ -34,6 +34,23 @@ Grok Bot runs the engine through `bin/ultrathink-grokbot`, and the bot's own mod
 
 The directory note is [hosts/grok-bot/README.md](../../hosts/grok-bot/README.md). The discovery record lists Grok Bot under `externalIntegrations` with status `native-adapter`, delivery `skill-protocol-cli`, `adapterPresent` true and `compatibilityVerified` false.
 
+## Gateway backend
+
+Direct Hindsight, RAGFlow and substrate clients stay the default. To send memory, document search and the substrate brief and events through the desk gateway, with no Hindsight or RAGFlow key on the bot, set this in the user config (`~/.config/ultrathink/config.json`). A project file cannot set it.
+
+```json
+{
+  "gateway": { "url": "https://gateway.example", "seat": "lead", "timeoutMs": 8000 },
+  "hindsight": { "enabled": true, "backend": "gateway" },
+  "ragflow": { "enabled": true, "backend": "gateway", "ground": true },
+  "substrate": { "backend": "gateway" }
+}
+```
+
+The seat token is `DESK_GATEWAY_TOKEN`, or an `api_key` / OAuth access token stored under the credential-store provider `desk-gateway`. The client calls `POST <gateway.url>/mcp/<seat>` with `tools/call`. Recall is `desk_memory_recall`, retain is `desk_memory_retain`, document search is `desk_docs_search`, the brief is `desk_brief` and plan events are `desk_event_emit`. `ULTRATHINK_GATEWAY=0` forces the direct clients again. `bin/ultrathink status` reports each integration as `gateway · ready` or `gateway · unready` with the reason. `bin/ultrathink hindsight check` and `bin/ultrathink ragflow check` are the doctor: a gateway `not_configured` or `error`/`reason` reply is a one-line degraded result, not a crash.
+
+Once this backend is on, skill steps that call those `desk_*` tools directly (the box copies of `ultrathink-plan` and `ultrathink-hindsight`) are redundant. This tree does not remove them.
+
 ## Skill-protocol files kept beside the native host
 
 `hosts/grok-bot/ultrathink-protocol/SKILL.md` and `hosts/grok-bot/commands/<name>/SKILL.md` remain from the skill-protocol adapter. Each file's frontmatter has exactly `name` and `description`, parsed without PyYAML. They remember a conversation preference and do not call `bin/ultrathink`. The native host above is what discovery records and what the bot runs.

@@ -6,6 +6,7 @@
  * file read and never creates the store, so asking for the status of a feature that is off leaves no trace.
  */
 import { existsSync } from "node:fs";
+import type { GatewayConfig } from "../gateway/types.ts";
 import { resolveHindsight } from "../hindsight/settings.ts";
 import type { HindsightConfig, HindsightReadiness } from "../hindsight/types.ts";
 import { openStore, storeDir } from "./store.ts";
@@ -36,18 +37,20 @@ export function hindsightReadiness(
 	config: HindsightConfig,
 	env: NodeJS.ProcessEnv,
 	storePath?: string,
+	gateway?: GatewayConfig,
 ): HindsightReadiness {
-	return resolveHindsight(config, env, storePath === undefined ? {} : { storePath }).readiness;
+	return resolveHindsight(config, env, storePath === undefined ? { gateway } : { storePath, gateway }).readiness;
 }
 
 function hindsightWord(readiness: HindsightReadiness): string {
 	if (readiness.state !== "unready") return readiness.state;
-	return { "no-url": "no URL", "bad-url": "bad URL", "no-key": "no key" }[readiness.reason];
+	const words = { "no-url": "no URL", "bad-url": "bad URL", "no-key": "no key", "no-token": "no token" } as const;
+	return words[readiness.reason];
 }
 
 /** `Teach: off (...)` or `Teach: on · capture <mode> · recall on|off[ · <n> confirmed, <m> candidate][ · Hindsight <state> · outbox <k>]`. Counts need `stateDir`. */
 export function teachStatusLine(
-	config: { teach: TeachConfig; hindsight: HindsightConfig },
+	config: { teach: TeachConfig; hindsight: HindsightConfig; gateway?: GatewayConfig },
 	env: NodeJS.ProcessEnv,
 	storePath?: string,
 	stateDir?: string,
@@ -65,7 +68,7 @@ export function teachStatusLine(
 		parts.push(`${counts.moments.confirmed} confirmed, ${counts.moments.candidate} candidate`);
 		outbox = counts.outbox;
 	}
-	parts.push(`Hindsight ${hindsightWord(hindsightReadiness(config.hindsight, env, storePath))}`);
+	parts.push(`Hindsight ${hindsightWord(hindsightReadiness(config.hindsight, env, storePath, config.gateway))}`);
 	if (outbox !== undefined) parts.push(`outbox ${outbox}`);
 	return parts.join(" · ");
 }

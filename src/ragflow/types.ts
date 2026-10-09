@@ -29,6 +29,11 @@ export interface RagflowConfig {
 	ground: boolean;
 	/** Cap on the characters of excerpts added to the planner's context. */
 	groundChars: number;
+	/**
+	 * Absent or `"direct"` uses the RAGFlow API and its key. `"gateway"` calls the desk gateway
+	 * and does not read a RAGFlow key. A project file cannot set this.
+	 */
+	backend?: "direct" | "gateway";
 }
 
 export const DEFAULT_RAGFLOW_CONFIG: RagflowConfig = {
@@ -116,8 +121,9 @@ export type RagflowKeySource = "store" | typeof RAGFLOW_KEY_ENV;
 
 export type RagflowReadiness =
 	| { state: "ready"; url: string; keySource: RagflowKeySource }
+	| { state: "ready"; backend: "gateway"; url: string; seat: string; tokenSource: "store" | "DESK_GATEWAY_TOKEN" }
 	| { state: "off"; reason: "disabled" | "killed" }
-	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key"; detail?: string };
+	| { state: "unready"; reason: "no-url" | "bad-url" | "no-key" | "no-token"; detail?: string };
 
 export interface RagflowResolution {
 	readiness: RagflowReadiness;

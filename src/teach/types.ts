@@ -129,7 +129,7 @@ export interface TeachContext {
 	cwd: string;
 	sessionId?: string;
 	/** `decisions` is the Jev (OpenRouter Decisions) section; absent = no Jev point runs (tests, hosts that build a context by hand). */
-	config: { teach: TeachConfig; hindsight: HindsightConfig; decisions?: DecisionsConfig };
+	config: { teach: TeachConfig; hindsight: HindsightConfig; decisions?: DecisionsConfig; gateway?: import("../gateway/types.ts").GatewayConfig };
 	env: NodeJS.ProcessEnv;
 	/** The host's state directory; the store lives in `<stateDir>/teach`. Never under `.planning`. */
 	stateDir: string;
