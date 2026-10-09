@@ -33,3 +33,7 @@ Grok Bot runs the engine through `bin/ultrathink-grokbot`, and the bot's own mod
 ## Files
 
 The directory note is [hosts/grok-bot/README.md](../../hosts/grok-bot/README.md). The discovery record lists Grok Bot under `externalIntegrations` with status `native-adapter`, delivery `skill-protocol-cli`, `adapterPresent` true and `compatibilityVerified` false.
+
+## Skill-protocol files kept beside the native host
+
+`hosts/grok-bot/ultrathink-protocol/SKILL.md` and `hosts/grok-bot/commands/<name>/SKILL.md` remain from the skill-protocol adapter. Each file's frontmatter has exactly `name` and `description`, parsed without PyYAML. They remember a conversation preference and do not call `bin/ultrathink`. The native host above is what discovery records and what the bot runs.

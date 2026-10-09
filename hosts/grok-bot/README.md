@@ -15,3 +15,5 @@ Grok Bot native host. Grok Bot has no prompt hook and no plugin loader, so the a
 
 State lives in `${ULTRATHINK_STATE_DIR:-~/.local/state/ultrathink-grokbot}`. Tests: `bun test src/host/grokbot.test.ts`.
 See [Use with Grok Bot](../../docs/how-to/use-with-grok-bot.md).
+
+The conversation-preference skills from the skill-protocol adapter stay beside the native host: `ultrathink-protocol/SKILL.md` and `commands/<name>/SKILL.md`. Discovery records the native host (`native-adapter`, `skill-protocol-cli`). Those files do not replace `skills/` and they do not run the engine.
