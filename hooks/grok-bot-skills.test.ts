@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,24 +14,66 @@ const PROTOCOL = join(GROK_ROOT, "ultrathink-protocol/SKILL.md");
 
 type Frontmatter = { keys: string[]; values: Record<string, string>; body: string };
 
-/** PyYAML, not a first-colon split: an unquoted colon in `description` must fail this parse. */
+/**
+ * Frontmatter these skills actually use: one `key: value` or `key: "quoted"` per line.
+ * An unquoted colon is rejected. No Python package and no extra dependency.
+ */
+function parseScalar(raw: string, file: string, key: string): string {
+	if (raw.startsWith('"')) {
+		let out = "";
+		for (let i = 1; i < raw.length; i++) {
+			const ch = raw[i];
+			if (ch === "\\") {
+				const next = raw[i + 1];
+				if (next === undefined) throw new Error(`${file} frontmatter ${key} has a dangling escape`);
+				out += next === "n" ? "\n" : next === "t" ? "\t" : next;
+				i++;
+				continue;
+			}
+			if (ch === '"') {
+				if (i !== raw.length - 1) throw new Error(`${file} frontmatter ${key} has text after its quoted value`);
+				return out;
+			}
+			out += ch;
+		}
+		throw new Error(`${file} frontmatter ${key} is missing a closing double quote`);
+	}
+	if (raw.startsWith("'")) {
+		let out = "";
+		for (let i = 1; i < raw.length; i++) {
+			if (raw[i] === "'" && raw[i + 1] === "'") {
+				out += "'";
+				i++;
+				continue;
+			}
+			if (raw[i] === "'") {
+				if (i !== raw.length - 1) throw new Error(`${file} frontmatter ${key} has text after its quoted value`);
+				return out;
+			}
+			out += raw[i];
+		}
+		throw new Error(`${file} frontmatter ${key} is missing a closing single quote`);
+	}
+	if (raw.includes(":")) throw new Error(`${file} frontmatter ${key} has an unquoted colon`);
+	return raw;
+}
+
 function frontmatter(text: string, file: string): Frontmatter {
 	const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(text);
 	if (!match?.[1] || match[2] === undefined) throw new Error(`${file} is missing YAML frontmatter`);
-	const parsed = spawnSync("python3", ["-c", "import json,sys,yaml; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout)"], {
-		input: match[1],
-		encoding: "utf8",
-	});
-	if (parsed.status !== 0) throw new Error(`${file} frontmatter is not valid YAML: ${parsed.stderr}`);
-	const doc: unknown = JSON.parse(parsed.stdout);
-	if (doc === null || typeof doc !== "object" || Array.isArray(doc)) throw new Error(`${file} frontmatter is not a YAML mapping`);
-	const record = doc as Record<string, unknown>;
+	const keys: string[] = [];
 	const values: Record<string, string> = {};
-	for (const [key, value] of Object.entries(record)) {
-		if (typeof value !== "string") throw new Error(`${file} frontmatter key ${key} is not a string`);
-		values[key] = value;
+	for (const line of match[1].split(/\r?\n/)) {
+		if (line.trim() === "") continue;
+		const sep = line.indexOf(":");
+		if (sep <= 0) throw new Error(`${file} has a frontmatter line without a key`);
+		const key = line.slice(0, sep).trim();
+		if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(key)) throw new Error(`${file} frontmatter key ${JSON.stringify(key)} is not a plain name`);
+		if (Object.hasOwn(values, key)) throw new Error(`${file} frontmatter repeats ${key}`);
+		keys.push(key);
+		values[key] = parseScalar(line.slice(sep + 1).trim(), file, key);
 	}
-	return { keys: Object.keys(record), values, body: match[2] };
+	return { keys, values, body: match[2] };
 }
 
 function skillFiles(): string[] {
@@ -99,10 +140,22 @@ describe("Grok Bot skills", () => {
 			"Linear is the default",
 			"Notion is optional",
 			"`Level` = `Task`",
+			"Before creating any row, require `Graph ID`, `Level`, and the parent relation (`Parent Item`)",
+			"skip Notion and say why once",
+			"Do not create rows that omit them",
 			"Greptile",
 		]) {
 			expect(parsed.body).toContain(phrase);
 		}
+		expect(parsed.body).not.toContain("send only fields it already has");
+	});
+
+	test("quoted frontmatter parses and an unquoted colon is rejected", () => {
+		const quoted = frontmatter('---\nname: sample\ndescription: "When to use it: plan the work"\n---\nbody\n', "quoted.md");
+		expect(quoted.values).toEqual({ name: "sample", description: "When to use it: plan the work" });
+		expect(() => frontmatter("---\nname: sample\ndescription: When to use it: plan the work\n---\nbody\n", "unquoted.md")).toThrow(
+			/unquoted colon/,
+		);
 	});
 
 	test("control skills describe a conversation preference and do not promise engine state", () => {

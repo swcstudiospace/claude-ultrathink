@@ -74,7 +74,7 @@ Linear is the default. When Linear tools are connected:
 
 Notion is optional. When Notion tools are connected, use the data source already available in this conversation. If several are connected, ask once which one. If none are, skip Notion.
 
-- Read that data source's fields once, and send only fields it already has.
+- Read that data source's fields once. Before creating any row, require `Graph ID`, `Level`, and the parent relation (`Parent Item`). If any of those is missing, skip Notion and say why once. Do not create rows that omit them.
 - One Task row: `Level` = `Task`, `Graph ID` = `<graphId>`.
 - One Issue row per node: `Level` = `Issue`, `Parent Item` = the Task, `Graph ID` = `<graphId>`.
 - One Sub-Issue row per rationale step: `Level` = `Sub-Issue`, `Parent Item` = that node's Issue, `Step` = the step number, `Graph ID` = `<graphId>`. Do not collapse steps.
