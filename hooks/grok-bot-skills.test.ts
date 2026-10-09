@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,16 +14,48 @@ const CLI = readFileSync(join(ROOT, "src/host/grokbot-cli.ts"), "utf8");
 const GROK_ROOT = join(ROOT, "hosts/grok-bot");
 const PROTOCOL = join(GROK_ROOT, "ultrathink-protocol/SKILL.md");
 
-/** PyYAML, not a first-colon split: native skill descriptions use folded scalars (`>-`). */
+/**
+ * The folded scalars native skills actually use (`key: >-` plus equally indented lines).
+ * Newlines fold to spaces and the clip marker drops the final break. No PyYAML: CI has none.
+ */
 function foldedFrontmatter(text: string, file: string): { keys: string[]; values: Record<string, string>; body: string } {
 	const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(text);
 	if (!match?.[1] || match[2] === undefined) throw new Error(`${file} is missing YAML frontmatter`);
-	const parsed = spawnSync("python3", ["-c", "import json,sys,yaml; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout)"], { input: match[1], encoding: "utf8" });
-	if (parsed.status !== 0) throw new Error(`${file} frontmatter is not valid YAML: ${parsed.stderr}`);
-	const record = JSON.parse(parsed.stdout) as Record<string, unknown>;
+	const lines = match[1].split(/\r?\n/);
+	const keys: string[] = [];
 	const values: Record<string, string> = {};
-	for (const [key, value] of Object.entries(record)) values[key] = String(value);
-	return { keys: Object.keys(record), values, body: match[2] };
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i] ?? "";
+		if (line.trim() === "") continue;
+		if (line.startsWith(" ") || line.startsWith("\t")) throw new Error(`${file} has an indented line outside a folded scalar`);
+		const sep = line.indexOf(":");
+		if (sep <= 0) throw new Error(`${file} has a frontmatter line without a key`);
+		const key = line.slice(0, sep).trim();
+		if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(key)) throw new Error(`${file} frontmatter key ${JSON.stringify(key)} is not a plain name`);
+		if (Object.hasOwn(values, key)) throw new Error(`${file} frontmatter repeats ${key}`);
+		keys.push(key);
+		const raw = line.slice(sep + 1).trim();
+		if (raw !== ">-") {
+			if (raw === "" || raw.startsWith(">") || raw.startsWith("|")) throw new Error(`${file} frontmatter ${key} uses an unsupported block scalar`);
+			values[key] = raw;
+			continue;
+		}
+		const folded: string[] = [];
+		let indent: number | undefined;
+		while (i + 1 < lines.length) {
+			const next = lines[i + 1] ?? "";
+			if (next.trim() === "") throw new Error(`${file} frontmatter ${key} has a blank line inside >-`);
+			const lead = /^ */.exec(next)?.[0].length ?? 0;
+			if (lead === 0) break;
+			if (indent === undefined) indent = lead;
+			if (lead !== indent) throw new Error(`${file} frontmatter ${key} changes indentation inside >-`);
+			folded.push(next.slice(indent));
+			i++;
+		}
+		if (folded.length === 0) throw new Error(`${file} frontmatter ${key} has an empty >- scalar`);
+		values[key] = folded.join(" ");
+	}
+	return { keys, values, body: match[2] };
 }
 
 const names = readdirSync(SKILLS).filter((name) => statSync(join(SKILLS, name)).isDirectory()).sort();
@@ -49,6 +80,7 @@ describe("Grok Bot native skills", () => {
 			expect(parsed.keys).toEqual(["name", "description"]);
 			expect(parsed.values.name).toBe(name);
 			expect(parsed.values.description.length).toBeGreaterThan(0);
+			expect(parsed.values.description).not.toContain("\n");
 		}
 	});
 

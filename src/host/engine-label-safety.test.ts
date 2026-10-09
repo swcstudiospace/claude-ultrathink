@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
@@ -189,10 +189,11 @@ describe("legacy diagnostic label safety", () => {
 			expect(childCwd).not.toContain(sentinel);
 			expect(existsSync(join(childCwd, model))).toBe(false);
 			if (route === "grok") {
-				expect(childCwd).not.toBe(cli.cwd);
-				expect(dirname(childCwd)).toBe(tmpdir());
+				expect(realpathSync(childCwd)).not.toBe(realpathSync(cli.cwd));
+				// macOS getcwd resolves /var to /private/var; compare the canonical directory.
+				expect(realpathSync(dirname(childCwd))).toBe(realpathSync(tmpdir()));
 				expect(basename(childCwd)).toStartWith("ultrathink-grok-");
-			} else expect(childCwd).toBe(cli.cwd);
+			} else expect(realpathSync(childCwd)).toBe(realpathSync(cli.cwd));
 			if (route !== "claude") {
 				const promptFile = args[args.indexOf("--prompt-file") + 1];
 				if (!promptFile) throw new Error("expected a CLI prompt file");

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Native Grok Bot skill tests fold `>-` descriptions in process, so CI no longer needs PyYAML. The label-safety cwd check compares canonical paths, which is what macOS `getcwd` returns for `/var`.
+
 ### Added
 
 - Opt-in desk gateway backend for Hindsight, RAGFlow and the substrate brief. `hindsight.backend`, `ragflow.backend` and `substrate.backend` stay `direct` unless set to `gateway`. A `gateway` section (`url`, `seat`, `timeoutMs`) plus `DESK_GATEWAY_TOKEN` or a stored `desk-gateway` credential calls `desk_memory_recall`, `desk_memory_retain`, `desk_docs_search`, `desk_brief` and `desk_event_emit` on `<url>/mcp/<seat>`. No Hindsight or RAGFlow key is read on that path. `ULTRATHINK_GATEWAY=0` forces the direct clients. Status lines report `gateway · ready` or `gateway · unready` with the reason.
