@@ -288,6 +288,46 @@ describe("runPromptSubmit", () => {
 		}
 	});
 
+	test("late answers merged at save reach the agent-visible context and summary", async () => {
+		const open: Clarification = {
+			id: "q1",
+			question: "Which database?",
+			header: "DB",
+			why: "w",
+			options: [{ label: "Postgres" }, { label: "SQLite" }],
+			default: "Postgres",
+			blocking: true,
+		};
+		const answered: Clarification = { ...open, answer: "Postgres", answeredAt: 2, source: "user" };
+		// The answer lands on disk after the flight's stale read (via the
+		// tracker call, which runs before the save) so the save merges it.
+		const { deps, cleanup } = baseDeps({ complete: smartComplete(), clarify: async () => [open] });
+		const stateDir = deps.stateDir;
+		deps.track = async () => {
+			writeSession(stateDir, {
+				sessionId: "s1",
+				at: 0,
+				result: { xml: "<X/>", original: "x", root: "X", source: "llm" },
+				clarifications: [answered],
+			});
+			return undefined;
+		};
+		try {
+			const result = await runPromptSubmit(input, deps);
+			// The merged record always had the answer; the regression was that
+			// the agent-visible output still showed the stale open question.
+			expect(result.record?.clarifications).toEqual([answered]);
+			expect(result.record?.result.xml).toContain("Postgres");
+			const ctx = result.output?.hookSpecificOutput.additionalContext ?? "";
+			expect(ctx).toContain("### Answered");
+			expect(ctx).toContain("→ Postgres");
+			expect(ctx).not.toContain("### Open (blocking)");
+			expect(result.output?.systemMessage).toContain("HITL · 0 question(s)");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("echo disabled: no systemMessage, additionalContext still returned", async () => {
 		const base = defaultConfig();
 		const { deps, cleanup } = baseDeps({ config: { ...base, claude: { ...base.claude, echo: false } } });

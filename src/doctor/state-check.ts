@@ -94,7 +94,7 @@ export function checkState(deps: DoctorDeps): Finding[] {
 	const sessionsDir = join(dir, "sessions");
 	let names: string[] = [];
 	let sessionsUsable = true;
-	const sessionsStat = statOrUndefined(sessionsDir);
+	const sessionsStat = statFollowOrUndefined(sessionsDir);
 	if (sessionsStat !== undefined) {
 		if (!sessionsStat.isDirectory()) {
 			add({

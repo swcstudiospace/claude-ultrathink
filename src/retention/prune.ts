@@ -282,16 +282,11 @@ function groupSessions(sweep: Sweep, dir: string, names: string[]): Map<string, 
 	return groups;
 }
 
-/** The session's files as they exist right now, re-read under the session lock before deleting. */
+/** The session's files as they exist right now, re-checked under the session lock before deleting. */
 function readSessionGroup(sweep: Sweep, dir: string, stem: string): SessionGroup {
 	const group: SessionGroup = { files: [], unsafe: false };
-	let names: string[];
-	try {
-		names = readdirSync(dir).sort();
-	} catch {
-		return group;
-	}
-	for (const name of names) {
+	for (const extension of [".json", ".xml"]) {
+		const name = `${stem}${extension}`;
 		if (sessionStem(name) !== stem) continue;
 		const path = join(dir, name);
 		const stat = statEntry(sweep, path, name);

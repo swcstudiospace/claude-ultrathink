@@ -221,6 +221,9 @@ async function stepPr(ctx: Ctx): Promise<Output & { ok: boolean }> {
 
 async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 	const { deps, statePath, cwd } = ctx;
+	const started = deps.now();
+	// The review call blocks up to waitMs; its thread scans share that single-call budget (same pattern as stepMerge).
+	const threadDeadline = started + deps.config.waitMs;
 	const ship = readShip(statePath);
 	const pr = ship?.pr;
 	if (!pr) return { ok: false, ready: false, reason: "no PR; run pr first" };
@@ -261,14 +264,14 @@ async function stepReview(ctx: Ctx): Promise<Output & { ready: boolean }> {
 				base: pr.base,
 				prNumber: pr.number,
 				headSha: status.headSha,
-				reviewThreads: () => github.reviewThreads(pr.number),
+				reviewThreads: () => github.reviewThreads(pr.number, { deadlineMs: threadDeadline, now: deps.now }),
 				staleReviewIds,
 				...(restart ? { restart: true } : {}),
 			});
 	if (reusedRound && result.source === "pr") {
 		// Threads resolved since the round (non-actionable findings) close without a new commit. A failed refresh must not
 		// fall back to the stored snapshot: a finding posted since then would be missed, so report not ready and persist nothing.
-		const threads = github.reviewThreads(pr.number);
+		const threads = github.reviewThreads(pr.number, { deadlineMs: threadDeadline, now: deps.now });
 		if (!threads.ok) {
 			return { ok: false, ready: false, reason: `could not read review threads: ${threads.error}`, next: "run review again" };
 		}

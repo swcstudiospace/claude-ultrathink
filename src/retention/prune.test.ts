@@ -290,6 +290,32 @@ describe("pruneSessions", () => {
 		expect(sessionFiles(state)).toEqual(["mmm-third.json", "mmm-third.xml", "zzz-second.json", "zzz-second.xml"]);
 	});
 
+	test("the locked re-check sees a sibling added after the first listing", () => {
+		const state = makeState();
+		seed(state, "aaa-first", 100);
+		seed(state, "mmm-later", 90, { xml: false });
+		const remove = (path: string): void => {
+			unlinkSync(path);
+			if (path.endsWith("aaa-first.json")) {
+				// another process writes the spec between the first listing and the locked re-check
+				put(join(state, "sessions", "mmm-later.xml"), "<spec/>", 0);
+			}
+		};
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now, remove });
+		expect(result.pruned.map((session) => session.id)).toEqual(["aaa-first"]);
+		expect(result.kept).toBe(1);
+		expect(sessionFiles(state)).toEqual(["mmm-later.json", "mmm-later.xml"]);
+	});
+
+	test("a session still missing its sibling at the locked re-check is pruned", () => {
+		const state = makeState();
+		seed(state, "solo", 90, { xml: false });
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.pruned.map((session) => session.id)).toEqual(["solo"]);
+		expect(result.kept).toBe(0);
+		expect(sessionFiles(state)).toEqual([]);
+	});
+
 	test("bounded runs resume past the previous cursor so every session is eventually reached", () => {
 		const state = makeState();
 		seed(state, "keep-a", 1);

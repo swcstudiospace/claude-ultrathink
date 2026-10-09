@@ -780,6 +780,12 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		// updates, so neither side can overwrite the other with stale content.
 		const saved = savePlanRecord(deps.stateDir, sessionId, record, log);
 		record = saved.record;
+		// A late answer merged at save time must reach the agent: `record` alone is
+		// not enough, since `result`/`clarifications` below still hold the stale
+		// pre-save values. Refresh the derived locals, keeping reference equality
+		// when the merge changed nothing.
+	if (saved.record.clarifications !== undefined && saved.record.clarifications !== clarifications) clarifications = saved.record.clarifications;
+		if (saved.record.result.xml !== result.xml) result = { ...result, xml: saved.record.result.xml };
 		specPath = saved.specPath;
 		statePath = saved.statePath;
 		stage("state", "end", true);

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { createDecisions } from "../decisions/gate.ts";
 import { DEFAULT_DECISIONS_CONFIG } from "../decisions/types.ts";
 import type { DecisionsConfig, DecisionsErrorKind } from "../decisions/types.ts";
-import type { Github, ReviewThreads } from "./github.ts";
+import type { Github, ReviewThreads, ReviewThreadsOptions } from "./github.ts";
 import { assessDone } from "./assess.ts";
 import { runShip } from "./cli.ts";
 import type { ShipDeps } from "./cli.ts";
@@ -98,7 +98,10 @@ function deps(o: FakeOpts = {}): ShipDeps {
 		deleteRemoteBranch: (b) => (calls.push(`delete:${b}`), { ok: true }),
 		comment: (n, body) => (calls.push(`comment:${n}`), comments.push(body), { ok: true }),
 		syncBase: (i) => (calls.push(`sync:${i.base}`), { ok: true }),
-		reviewThreads: () => o.threads ?? { ok: false, error: "no threads" },
+		reviewThreads: (_prNumber: number, opts?: ReviewThreadsOptions) =>
+			opts?.deadlineMs !== undefined && (opts.now ?? Date.now)() >= opts.deadlineMs
+				? { ok: false, error: "review threads scan exceeded its deadline" }
+				: (o.threads ?? { ok: false, error: "no threads" }),
 	};
 	return {
 		config: { ...CONFIG, ...o.config },
@@ -488,6 +491,32 @@ describe("runShip", () => {
 		const merge = await ship("merge", deps({ threads: { ok: true, threads: [posted] } }));
 		expect(merge.output).toMatchObject({ ok: false, merged: false, reason: "1 open review comment(s)" });
 		expect(calls.some((c) => c.startsWith("merge:"))).toBe(false);
+	});
+
+	test("review thread scans share the review call budget: an over-deadline scan stops fail-closed", async () => {
+		const open = { body: "intended behavior", path: "a.ts", threadId: "T1" };
+		const round: ReviewResult = { source: "pr", status: "completed", score: 5, comments: [open], headSha: "abc", at: 1 };
+		writeShip(statePath, { pr: PR, rounds: [round] });
+		// The refresh runs after entry, so the second clock read already passes the entry-now + waitMs deadline.
+		const base = deps({ threads: { ok: true, threads: [] } });
+		let reads = 0;
+		const d: ShipDeps = { ...base, now: () => ((reads += 1) === 1 ? 1000 : 1000 + CONFIG.waitMs) };
+		const out = await ship("review", d);
+		expect(out.output).toMatchObject({ ok: false, ready: false });
+		expect(String(out.output.reason)).toContain("review threads scan exceeded its deadline");
+		expect(readShip(statePath)?.rounds).toMatchObject([{ comments: [open] }]);
+
+		// The callback handed to a fresh review carries the same deadline: entry now 1000 + waitMs.
+		writeShip(statePath, { pr: PR, rounds: [] });
+		let tick = 1000;
+		const fresh: ShipDeps = { ...deps({ threads: { ok: true, threads: [] } }), now: () => tick };
+		expect((await ship("review", fresh)).output).toMatchObject({ ok: true, ready: true });
+		const scan = reviewInputs.at(-1)?.reviewThreads;
+		expect(scan).toBeDefined();
+		tick = 1000 + CONFIG.waitMs - 1;
+		expect(scan?.()).toEqual({ ok: true, threads: [] });
+		tick = 1000 + CONFIG.waitMs;
+		expect(scan?.()).toEqual({ ok: false, error: "review threads scan exceeded its deadline" });
 	});
 
 	test("review refuses when local HEAD differs from the PR head", async () => {

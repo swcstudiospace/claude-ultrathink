@@ -88,6 +88,18 @@ describe("checkState", () => {
 		expect(byId(findings, "state.sessions").title).toBe("1 session record, 100 B, oldest under an hour old");
 	});
 
+	test("a symlinked sessions directory is followed and its records counted", () => {
+		mkdirSync(stateDir);
+		const target = join(dir, "real-sessions");
+		mkdirSync(target);
+		symlinkSync(target, join(stateDir, "sessions"));
+		put("sessions/a.json", { size: 100 });
+		put("sessions/b.json", { size: 100 });
+		const findings = checkState(deps);
+		expect(byId(findings, "state.dir")).toMatchObject({ level: "ok" });
+		expect(byId(findings, "state.sessions").title).toBe("2 session records, 200 B, oldest under an hour old");
+	});
+
 	test("a sessions path that is a file is an error with no healthy summary", () => {
 		mkdirSync(stateDir);
 		const sessionsDir = join(stateDir, "sessions");
