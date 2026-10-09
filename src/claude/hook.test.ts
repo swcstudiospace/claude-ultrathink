@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
@@ -2725,6 +2725,45 @@ describe("caller cancellation and the resolution record (D-12)", () => {
 			expect(existsSync(sessionPath(h.deps.stateDir, "s1"))).toBe(false);
 		} finally {
 			h.cleanup();
+		}
+	});
+});
+
+describe("scheduled session retention", () => {
+	/** A record 90 days old, written straight to disk so its mtime (not a fake clock) is what ages it. */
+	function seedOldSession(stateDir: string): string {
+		const sessions = join(stateDir, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const path = join(sessions, "old-session.json");
+		writeFileSync(path, JSON.stringify({ sessionId: "old-session", at: 0, result: { xml: "", original: "old", root: "", source: "llm" } }));
+		const aged = (Date.now() - 90 * 86_400_000) / 1000;
+		utimesSync(path, aged, aged);
+		return path;
+	}
+
+	test("with state.retentionDays above 0 a planned prompt sweeps old sessions and keeps its own", async () => {
+		const config = trackedConfig();
+		config.state.retentionDays = 30;
+		const { deps, cleanup } = baseDeps({ config });
+		try {
+			const old = seedOldSession(deps.stateDir);
+			const result = await runPromptSubmit(input, deps);
+			expect(result.record).toBeDefined();
+			expect(existsSync(old)).toBe(false);
+			expect(readSession(deps.stateDir, "s1")).toBeDefined();
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("by default (state.retentionDays 0) nothing is ever removed", async () => {
+		const { deps, cleanup } = baseDeps();
+		try {
+			const old = seedOldSession(deps.stateDir);
+			await runPromptSubmit(input, deps);
+			expect(existsSync(old)).toBe(true);
+		} finally {
+			cleanup();
 		}
 	});
 });

@@ -4,8 +4,9 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { type LockOptions, withFileLock, writeFileAtomic } from "./atomic.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
 import type { Clarification } from "../hitl/types.ts";
 import { THINK_ENGINES, type ThinkEngine, type ThoughtGraph } from "../think/types.ts";
@@ -87,9 +88,9 @@ function readJson(path: string): unknown {
 	}
 }
 
+/** Owner-only and atomic: a crash mid-write leaves the previous file, never a truncated one. */
 function writeJson(path: string, value: unknown): void {
-	mkdirSync(join(path, ".."), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(value, null, "\t")}\n`);
+	writeFileAtomic(path, `${JSON.stringify(value, null, "\t")}\n`);
 }
 
 export function controlPath(dir: string): string {
@@ -110,10 +111,19 @@ export function readControl(dir: string): ControlState {
 	return out;
 }
 
+/** Merges `patch` into control.json; the read-merge-write runs under the file's lock so two toggles never undo each other. */
 export function writeControl(dir: string, patch: ControlState): ControlState {
-	const next = { ...readControl(dir), ...patch };
-	writeJson(controlPath(dir), next);
-	return next;
+	// The lock file lives next to control.json, so the directory must exist before the lock is taken.
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+	} catch {
+		// writeJson reports the same failure below
+	}
+	return withFileLock(controlPath(dir), () => {
+		const next = { ...readControl(dir), ...patch };
+		writeJson(controlPath(dir), next);
+		return next;
+	});
 }
 
 function safeSessionId(id: string): string {
@@ -135,6 +145,31 @@ export function readSession(dir: string, sessionId: string): SessionRecord | und
 export function writeSession(dir: string, record: SessionRecord): void {
 	writeJson(sessionPath(dir, record.sessionId), record);
 	writeJson(join(dir, "last.json"), record);
+}
+
+/**
+ * Locked read-mutate-write of one session record (the session file and last.json). Returns the written record, or
+ * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` must not write the
+ * same session file itself.
+ */
+export function updateSession(
+	dir: string,
+	sessionId: string,
+	mutate: (record: SessionRecord) => SessionRecord | undefined,
+	lock?: LockOptions,
+): SessionRecord | undefined {
+	return withFileLock(
+		sessionPath(dir, sessionId),
+		() => {
+			const record = readSession(dir, sessionId);
+			if (!record) return undefined;
+			const next = mutate(record);
+			if (!next) return undefined;
+			writeSession(dir, next);
+			return next;
+		},
+		lock,
+	);
 }
 
 export function readLast(dir: string): SessionRecord | undefined {

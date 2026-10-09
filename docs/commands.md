@@ -153,9 +153,13 @@ Usage: ultrathink <command>
   hindsight check        Hindsight memory server: readiness, health, optional round trip
   ragflow check|datasets|search "<query>"   RAGFlow document search
   teach status|list|show|capture|recall|confirm|forget|sync|observe|promote|export   Teachable Moments
+In an agent: /ultrathink-status, /ultrathink-off, /ultrathink-on, /ultrathink-skip, /ultrathink-track off|on,
+and /ultrathink-quick <message> sends one message as typed (no planning, no Linear/Notion rows).
+  doctor [--json]        check config files, credentials, state and environment
+  prune [--older-than <days>] [--dry-run]   remove session records older than that many days (nothing is removed by default)
 ```
 
-The top-level help and the `decisions` subcommand both list all six probe points. A bad `decisions` argument prints the decisions usage and exits 2. `hindsight`, `ragflow` and `teach` have their own usage text, also exit 2. See the sections below.
+The top-level help and the `decisions` subcommand both list all six probe points. A bad `decisions` argument prints the decisions usage and exits 2. `hindsight`, `ragflow`, `teach`, `doctor` and `prune` have their own usage text, also exit 2. See the sections below.
 
 | Verb | Effect |
 |---|---|
@@ -174,6 +178,8 @@ The top-level help and the `decisions` subcommand both list all six probe points
 | `hindsight check [--roundtrip] [--json]` | Readiness, `/health` and `/version`, and an optional throwaway-bank round trip. Exit 0, 1 or 2. See [`bin/ultrathink hindsight`](#binultrathink-hindsight). |
 | `ragflow check\|datasets\|search` | Dataset probe, dataset list, or a search. Exit 0, 1 or 2. See [`bin/ultrathink ragflow`](#binultrathink-ragflow). |
 | `teach …` | Teachable Moments. Exit 0, 1 or 2. See [`bin/ultrathink teach`](#binultrathink-teach). |
+| `doctor [--json]` | Static, offline check of the config files, credentials, state directory and runtime. Exit 0, 1 or 2. See [`bin/ultrathink doctor`](#binultrathink-doctor). |
+| `prune [--older-than <days>] [--dry-run]` | Removes session records older than the cutoff. Nothing is removed by default, and `--dry-run` deletes nothing. Exit 0, 1 or 2. See [`bin/ultrathink prune`](#binultrathink-prune). |
 
 The state directory comes from `ULTRATHINK_HOST`, or else from the detected host. A plain terminal is detected as Claude Code. To change another host's state from a terminal, set the host explicitly:
 
@@ -382,6 +388,37 @@ While Teachable Moments is off, `capture`, `confirm`, `forget`, `sync` and `prom
 | `promote <id>… --mark-promoted --skill <name> --target <t> [--path P]` | Marks the moments promoted after Hermes staged the skill through `skill_manage`. `--skill` must match `[a-z0-9][a-z0-9-]{0,63}`. Cannot be combined with `--install`. |
 | `export --a2a [<id>…]` | Prints an A2A-DRAFT Agent Card JSON for the given moments, or for confirmed and promoted moments when no id is given. Nothing is sent. |
 
+### `bin/ultrathink doctor`
+
+A static diagnosis that sends nothing anywhere: no network request, no `gh` and no `curl`. It reads the three config files for the current directory, the credential store and the host state directory. See [Diagnose with doctor](how-to/diagnose-with-doctor.md) (`docs/how-to/diagnose-with-doctor.md`).
+
+```text
+Usage: ultrathink doctor [--json]
+```
+
+Any other argument prints that line and exits 2. The report has four sections, `runtime`, `config`, `credentials` and `state`, with one line per finding marked `✓` (ok), `i` (info), `!` (warning) or `✗` (error), and ends with `<n> errors, <n> warnings`. `--json` prints one object, `{"ok","summary","findings"}`, instead.
+
+| What it reports | Findings |
+|---|---|
+| `runtime` | Bun 1.2 or later, `git`, `gh` (a warning only when `ship.enabled` is on), whether a GitHub token variable or a gh hosts file exists (not verified), Python 3.10 or later (info only), the detected host. |
+| `config` | Per file: not found (info), invalid JSON or not an object (error), unknown section or key with a `Did you mean …?`, a wrong type, a value the merge ignores or adjusts with the effective value, and a key a project file may not set (info, by design). |
+| `credentials` | Present or missing, by provider name only, for the features that are switched on, with the command that stores a missing one. |
+| `state` | Missing or unwritable directory, session count, size and oldest age (a warning above 500 sessions or 100 MB, with the hint `ultrathink prune --dry-run`), session and carrier files that group or others can read, and `*.tmp` and `*.lock` files in `sessions/` older than one hour. |
+
+Exit 0 means no error finding; warnings still exit 0. Exit 1 means at least one error finding. A credential value, a prefix of one and its length are never printed, and session records are never read.
+
+### `bin/ultrathink prune`
+
+Removes aged session records and their paired spec files from the current host's state directory. It never prints prompt text. See [Session retention](configuration.md#state-session-retention).
+
+```text
+Usage: ultrathink prune [--older-than <days>] [--dry-run]
+```
+
+`--older-than` is a whole number of days from 1 to 3650 (a trailing `d` is allowed). Below 1, above 3650, or not a whole number exits 2 and deletes nothing. Without `--older-than`, the cutoff is `state.retentionDays`; if that is also unset or 0, the command exits 2 and deletes nothing. `--dry-run` lists what would go and deletes nothing. A session with an open pull request, and the session the plan carrier points to, are kept. Orphaned `*.tmp` and `*.lock` files older than one hour are removed on a real run.
+
+Exit 0 when the prune finishes. Exit 1 when a file could not be removed (the report still says what succeeded). Exit 2 on a usage error.
+
 ### `bin/ultrathink-mcp`
 
 The shared MCP gateway for Notion, Linear and Greptile: one local stdio MCP server per provider that adds your stored credentials and relays to the provider's hosted MCP endpoint. See [Tracking](tracking.md) and [Register the MCP gateway](how-to/register-mcp-gateway.md). It also keeps API keys for OpenRouter, Hindsight and RAGFlow in the same credential store. `openrouter`, `hindsight` and `ragflow` are API-key providers, not MCP servers, so they are never served, checked or registered.
@@ -510,7 +547,7 @@ It prints one line per host and provider, `<host>: <provider> <action>`, where t
 
 | Program | Exit codes |
 |---|---|
-| `bin/ultrathink` | 0 for planner verbs, including unknown verbs (which print the usage text). `decisions check` and `decisions probe`: 0 on success, 1 on a failed decision, a missing OpenRouter key or `ULTRATHINK_DECISIONS=0`, 2 on a usage error or an invalid cases file. `hindsight` and `ragflow`: 0 ok, 1 not ready or a runtime failure, 2 usage. `teach`: 0 ok (including `help`), 1 a runtime failure or not ready, 2 usage or invalid input. |
+| `bin/ultrathink` | 0 for planner verbs, including unknown verbs (which print the usage text). `decisions check` and `decisions probe`: 0 on success, 1 on a failed decision, a missing OpenRouter key or `ULTRATHINK_DECISIONS=0`, 2 on a usage error or an invalid cases file. `hindsight` and `ragflow`: 0 ok, 1 not ready or a runtime failure, 2 usage. `teach`: 0 ok (including `help`), 1 a runtime failure or not ready, 2 usage or invalid input. `doctor`: 0 no error finding (warnings allowed), 1 any error finding, 2 usage. `prune`: 0 done, 1 a file could not be removed, 2 usage or a cutoff that would delete everything. |
 | `bin/ultrathink-mcp` | 0 on success, 1 on failure, 2 on a usage error (the usage text is printed to stderr). During an `auth login` that set up a Tailscale route, Ctrl-C removes the route and exits 130 (143 on `SIGTERM`). |
 | `bin/ultrathink-ship` | 0, even when a step refuses (`ok: false` with a `reason`); 2 on a usage error. |
 | All three CLIs above | 127 when Bun is not found. When Bun is found but cannot start, the shell's own status (for example 126). |

@@ -89,8 +89,17 @@ export function paint(theme: unknown): Paint {
 		boxChars: () =>
 			guard(() => {
 				const { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical } = t.boxRound;
-				const chars = { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical };
-				return Object.values(chars).every((value) => typeof value === "string") ? chars : PLAIN_BOX;
+				if (
+					typeof topLeft !== "string" ||
+					typeof topRight !== "string" ||
+					typeof bottomLeft !== "string" ||
+					typeof bottomRight !== "string" ||
+					typeof horizontal !== "string" ||
+					typeof vertical !== "string"
+				) {
+					return PLAIN_BOX;
+				}
+				return { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical };
 			}, PLAIN_BOX),
 		icon: (name) => guard(() => (typeof t.icon[name] === "string" ? t.icon[name] : ""), ""),
 		glyph: (name) => guard(() => (typeof t.status[name] === "string" ? t.status[name] : PLAIN_GLYPHS[name]), PLAIN_GLYPHS[name]),

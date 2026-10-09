@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { defaultConfig } from "../config.ts";
+import { checkConfig, suggestName } from "./config-check.ts";
+import type { DoctorDeps, Finding } from "./types.ts";
+
+const FAKE_KEY = "sk-test-not-a-real-key";
+
+type Layer = "user" | "claude" | "project";
+
+describe("checkConfig", () => {
+	let dir: string;
+	let deps: DoctorDeps;
+
+	function path(layer: Layer): string {
+		if (layer === "user") return join(dir, "xdg", "ultrathink", "config.json");
+		if (layer === "claude") return join(dir, "claude", "ultrathink.json");
+		return join(dir, "project", ".claude", "ultrathink.json");
+	}
+
+	function write(layer: Layer, content: unknown): void {
+		mkdirSync(dirname(path(layer)), { recursive: true });
+		writeFileSync(path(layer), typeof content === "string" ? content : JSON.stringify(content));
+	}
+
+	function aboveInfo(findings: Finding[]): Finding[] {
+		return findings.filter((finding) => finding.level === "warn" || finding.level === "error");
+	}
+
+	function byId(findings: Finding[], id: string): Finding {
+		const found = findings.find((finding) => finding.id === id);
+		if (!found) throw new Error(`no finding ${id} in ${findings.map((finding) => finding.id).join(", ")}`);
+		return found;
+	}
+
+	/** `defaultConfig()` as a user would write it: everything except the in-memory model provenance. */
+	function defaultsAsFile(): Record<string, unknown> {
+		const file: Record<string, unknown> = { ...defaultConfig() };
+		delete file.modelProvenance;
+		return file;
+	}
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ut-doctor-config-"));
+		mkdirSync(join(dir, "project"), { recursive: true });
+		deps = {
+			env: { HOME: join(dir, "home"), XDG_CONFIG_HOME: join(dir, "xdg"), CLAUDE_CONFIG_DIR: join(dir, "claude") },
+			cwd: join(dir, "project"),
+			now: () => 0,
+			which: () => undefined,
+			bunVersion: "1.2.0",
+			runVersion: () => undefined,
+		};
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("a missing file is info, never an error", () => {
+		const findings = checkConfig(deps);
+		expect(findings.map((finding) => [finding.id, finding.level])).toEqual([
+			["config.user.missing", "info"],
+			["config.claude-user.missing", "info"],
+			["config.project.missing", "info"],
+		]);
+		expect(byId(findings, "config.project.missing").detail).toContain(path("project"));
+	});
+
+	test.each<Layer>(["user", "claude", "project"])("a %s file written from defaultConfig() has nothing above info (guards schema drift)", (layer) => {
+		write(layer, defaultsAsFile());
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		expect(findings.some((finding) => finding.id.includes("project-restricted"))).toBe(false);
+		expect(findings.some((finding) => finding.level === "ok")).toBe(true);
+	});
+
+	test("every default key is known, so a new default key needs no edit here", () => {
+		const defaults = defaultsAsFile();
+		const keys = Object.entries(defaults).flatMap(([section, value]) => Object.keys(value as Record<string, unknown>).map((key) => `${section}.${key}`));
+		expect(keys.length).toBeGreaterThan(50);
+		write("user", defaults);
+		expect(checkConfig(deps).filter((finding) => finding.id.includes("unknown"))).toEqual([]);
+	});
+
+	test("a key written with the value it already defaults to, padded or with a trailing slash, is not a finding", () => {
+		write("user", { grok: { baseUrl: `${defaultConfig().grok.baseUrl}/`, bin: "  grok " }, ship: { autoMerge: false } });
+		expect(aboveInfo(checkConfig(deps))).toEqual([]);
+	});
+
+	test("ship.autoMerg is an unknown key and suggests ship.autoMerge", () => {
+		write("user", { ship: { autoMerg: true } });
+		const finding = byId(checkConfig(deps), "config.user.unknown-key.ship.autoMerg");
+		expect(finding.level).toBe("warn");
+		expect(finding.title).toContain("ship.autoMerg");
+		expect(finding.fix).toBe("Did you mean ship.autoMerge?");
+	});
+
+	test("a section typo is an unknown section and suggests the section", () => {
+		write("claude", { shipp: { enabled: true } });
+		const finding = byId(checkConfig(deps), "config.claude-user.unknown-section.shipp");
+		expect(finding.level).toBe("warn");
+		expect(finding.fix).toBe("Did you mean ship?");
+	});
+
+	test("an unknown key with nothing close has no suggestion", () => {
+		write("user", { ship: { zzzzzz: 1 } });
+		const finding = byId(checkConfig(deps), "config.user.unknown-key.ship.zzzzzz");
+		expect(finding.fix).toBeUndefined();
+	});
+
+	test("modelProvenance is internal, not a typo of models", () => {
+		write("user", { modelProvenance: { claude: "file-pin" } });
+		const finding = byId(checkConfig(deps), "config.user.unknown-section.modelProvenance");
+		expect(finding.fix).toBeUndefined();
+		expect(finding.detail).toContain("never read from a file");
+	});
+
+	test("hitl.maxQuestions out of range names the effective value", () => {
+		write("project", { hitl: { maxQuestions: 9 } });
+		const finding = byId(checkConfig(deps), "config.project.ignored.hitl.maxQuestions");
+		expect(finding.level).toBe("warn");
+		expect(finding.title).toContain(`effective value is ${defaultConfig().hitl.maxQuestions}`);
+	});
+
+	test("an effective value that differs from the written one is named for numbers, enums and arrays", () => {
+		write("user", { ship: { mergeMethod: "fast-forward", skills: ["gsd-", 7], minScore: 6 }, think: { engine: "gpt" } });
+		const findings = checkConfig(deps);
+		expect(byId(findings, "config.user.ignored.ship.mergeMethod").title).toContain('"squash"');
+		expect(byId(findings, "config.user.ignored.ship.skills").title).toContain('["gsd-"]');
+		expect(byId(findings, "config.user.ignored.ship.minScore").title).toContain("effective value is 5");
+		expect(byId(findings, "config.user.ignored.think.engine").title).toContain('"auto"');
+	});
+
+	test("a wrong type is reported with the expected and the actual type", () => {
+		write("user", { ship: { autoMerge: "yes", skills: "gsd-" }, hitl: "on" });
+		const findings = checkConfig(deps);
+		expect(byId(findings, "config.user.wrong-type.ship.autoMerge").title).toContain("expected boolean, got string");
+		expect(byId(findings, "config.user.wrong-type.ship.skills").title).toContain("expected array, got string");
+		expect(byId(findings, "config.user.wrong-type.hitl").title).toContain("expected object, got string");
+	});
+
+	test("decisions.enabled false gets the special message, in a user and a project file", () => {
+		write("user", { decisions: { enabled: false } });
+		write("project", { decisions: { enabled: false } });
+		const findings = checkConfig(deps);
+		for (const layer of ["user", "project"]) {
+			const finding = byId(findings, `config.${layer}.ignored.decisions.enabled`);
+			expect(finding.level).toBe("warn");
+			expect(finding.title).toContain("Jev is always on; set ULTRATHINK_DECISIONS=0 to turn it off");
+		}
+	});
+
+	test("invalid JSON is an error with the path and the parse message, never the file content", () => {
+		write("user", `{"k": ${FAKE_KEY}}`);
+		const finding = byId(checkConfig(deps), "config.user.invalid-json");
+		expect(finding.level).toBe("error");
+		expect(finding.detail).toContain(path("user"));
+		expect(finding.detail).toContain("JSON Parse error");
+		expect(JSON.stringify(finding)).not.toContain("sk-test");
+	});
+
+	test("an empty file and a non-object top level are errors", () => {
+		write("user", "");
+		write("claude", [1, 2]);
+		write("project", "null");
+		const findings = checkConfig(deps);
+		expect(byId(findings, "config.user.invalid-json").level).toBe("error");
+		expect(byId(findings, "config.claude-user.not-object").title).toContain("top level is array");
+		expect(byId(findings, "config.project.not-object").level).toBe("error");
+	});
+
+	test("a path that is not a readable file is an error naming the code", () => {
+		mkdirSync(path("user"), { recursive: true });
+		const finding = byId(checkConfig(deps), "config.user.unreadable");
+		expect(finding.level).toBe("error");
+		expect(finding.title).toContain("EISDIR");
+	});
+
+	test("a project file that sets keys a repository must not control gets the by-design info, not a warning", () => {
+		write("project", {
+			hindsight: { url: "https://hindsight.example", enabled: true },
+			teach: { recallLimit: 9 },
+			decisions: { zdr: false },
+			ragflow: { ground: true, url: "https://ragflow.example" },
+		});
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		for (const id of ["hindsight.url", "hindsight.enabled", "teach.recallLimit", "decisions.zdr", "ragflow.url"]) {
+			const finding = byId(findings, `config.project.project-restricted.${id}`);
+			expect(finding.level).toBe("info");
+			expect(finding.title).toContain("ignored in a project file by design");
+		}
+	});
+
+	test("the same keys in a user file are honored and produce nothing above info", () => {
+		write("user", { hindsight: { url: "https://hindsight.example", enabled: true }, teach: { recallLimit: 9 }, decisions: { zdr: false } });
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		expect(findings.some((finding) => finding.id.includes("project-restricted"))).toBe(false);
+	});
+
+	test("a project key that a user file would also adjust is a warning, not the by-design info", () => {
+		write("project", { teach: { recallLimit: 99 } });
+		const finding = byId(checkConfig(deps), "config.project.ignored.teach.recallLimit");
+		expect(finding.level).toBe("warn");
+	});
+
+	describe("models", () => {
+		test("an unknown host is a warning with a suggestion; a known host with provider and model is clean", () => {
+			write("user", { models: { hosts: { nonsense: { model: "x" }, ompp: { model: "x" }, omp: { provider: "openrouter", model: "gpt" } } } });
+			const findings = checkConfig(deps);
+			expect(byId(findings, "config.user.unknown-host.models.hosts.nonsense").level).toBe("warn");
+			expect(byId(findings, "config.user.unknown-host.models.hosts.nonsense").detail).toContain("claude-code");
+			expect(byId(findings, "config.user.unknown-host.models.hosts.ompp").fix).toBe("Did you mean models.hosts.omp?");
+			expect(findings.filter((finding) => /models\.hosts\.omp(\.|$)/.test(finding.id))).toEqual([]);
+		});
+
+		test("a host entry may hold only provider and model strings", () => {
+			write("user", { models: { hosts: { omp: { modle: "x", provider: 3 }, muse: "x" } } });
+			const findings = checkConfig(deps);
+			expect(byId(findings, "config.user.unknown-key.models.hosts.omp.modle").fix).toBe("Did you mean models.hosts.omp.model?");
+			expect(byId(findings, "config.user.wrong-type.models.hosts.omp.provider").title).toContain("expected string, got number");
+			expect(byId(findings, "config.user.wrong-type.models.hosts.muse").title).toContain("expected object, got string");
+		});
+
+		test("providerDefaults keys are free, values must be strings, reserved names are ignored", () => {
+			write("user", `{"models":{"providerDefaults":{"my-gateway":"model-a","blank":"  ","numeric":4,"__proto__":"x"}}}`);
+			const findings = checkConfig(deps);
+			expect(findings.some((finding) => finding.id.includes("my-gateway"))).toBe(false);
+			expect(findings.some((finding) => finding.id.endsWith("providerDefaults.blank"))).toBe(false);
+			expect(byId(findings, "config.user.wrong-type.models.providerDefaults.numeric").level).toBe("warn");
+			expect(byId(findings, "config.user.ignored.models.providerDefaults.__proto__").level).toBe("warn");
+		});
+
+		test("an unknown key under models suggests the real one, and a wrong-typed models is reported", () => {
+			write("user", { models: { host: {} } });
+			write("claude", { models: [] });
+			const findings = checkConfig(deps);
+			expect(byId(findings, "config.user.unknown-key.models.host").fix).toBe("Did you mean models.hosts?");
+			expect(byId(findings, "config.claude-user.wrong-type.models").title).toContain("expected object, got array");
+		});
+	});
+
+	test("no finding carries a written value", () => {
+		write("user", { ship: { autoMerg: FAKE_KEY, greptileOrganization: 5, mergeMethod: FAKE_KEY } });
+		const output = JSON.stringify(checkConfig(deps));
+		expect(output).toContain("autoMerg");
+		expect(output).not.toContain(FAKE_KEY);
+	});
+
+	test("findings come out lowest layer first", () => {
+		write("project", { shipp: {} });
+		write("user", { shipp: {} });
+		write("claude", { shipp: {} });
+		expect(checkConfig(deps).map((finding) => finding.id)).toEqual([
+			"config.user.unknown-section.shipp",
+			"config.claude-user.unknown-section.shipp",
+			"config.project.unknown-section.shipp",
+		]);
+	});
+});
+
+describe("suggestName", () => {
+	const KEYS = ["autoMerge", "maxQuestions", "enabled", "deleteBranch"];
+
+	test.each<[string, string | undefined]>([
+		["autoMerg", "autoMerge"],
+		["automerge", "autoMerge"],
+		["enabld", "enabled"],
+		["maxQuest", "maxQuestions"],
+		["deleteBranchName", "deleteBranch"],
+		["zzzzzz", undefined],
+		["ab", undefined],
+	])("%s -> %p", (name, expected) => {
+		expect(suggestName(name, KEYS)).toBe(expected);
+	});
+
+	test("the closest candidate wins when several are near", () => {
+		expect(suggestName("enable", ["enabled", "disabled", "enableAll"])).toBe("enabled");
+	});
+});

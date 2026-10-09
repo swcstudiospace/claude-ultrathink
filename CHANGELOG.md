@@ -9,7 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ultrathink doctor` checks config files, credentials, the state directory and the runtime without a network call. Unknown keys get a suggestion, ignored or adjusted values are named with the effective value, and `--json` prints a stable report. Exit 1 only when an error finding exists. See [Diagnose with doctor](docs/how-to/diagnose-with-doctor.md).
+- `ultrathink prune` removes session records older than a cutoff, with `--dry-run` and a refusal below one day. `state.retentionDays` (user config only, default 0) opts into the same prune at most once a day from the plan path. An active ship and the carrier session are never removed, and prompt text is never printed. See [Session retention](docs/configuration.md#state-session-retention).
+- A tag `vX.Y.Z` runs `.github/workflows/release.yml`, which re-runs the gates, checks the tag against every manifest and `CHANGELOG.md`, and opens a GitHub release from that changelog section. It does not publish to a package registry. `bun scripts/release-check.ts` is what the test suite runs so a drifting version cannot merge.
 - Grok Bot skill-protocol adapter in `hosts/grok-bot`. Grok Bot has no prompt hook and does not run the engine: the bot performs the method itself from `ultrathink-protocol`, and each file in `commands/*.md` is a conversation preference (`hosts/grok-bot/commands/<name>/SKILL.md`). `ultrathink.discovery.json` records `grok-bot` with status `skill-adapter`, `adapterPresent` true, `compatibilityVerified` false and delivery `skill-protocol`. Compatibility stays unverified until a recorded live Grok Bot run. GPT Dot is unchanged. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
+
+### Changed
+
+- Review threads are read page by page (100 at a time, at most 2,000). A pull request with more than 100 threads no longer fails the ship gate closed; a page that cannot be read, a bad or repeated cursor, or a 21st page still does.
+- Session, control, last, carrier and spec files are written atomically with mode `0600` in `0700` directories. Read-modify-write of one session file is locked across processes; a lock that cannot be taken in time writes unlocked instead of blocking the prompt.
+- CI cancels a superseded pull-request run, bounds each job, checks out without persisting credentials, and pins every action to a commit SHA. Dependabot updates GitHub Actions and Bun weekly. CodeQL scans JavaScript/TypeScript and Python on pull requests, on `main` and weekly.
+- The Prime Agent bridge test ignores `ULTRATHINK_STATE_DIR` and other host variables from the shell that launches it.
+- `tsconfig.json` enables `noImplicitOverride`, `noFallthroughCasesInSwitch`, `noImplicitReturns`, `noUncheckedSideEffectImports`, `noUnusedLocals`, `noUnusedParameters` and `noUncheckedIndexedAccess`.
 
 ## [1.4.0] - 2026-10-08
 

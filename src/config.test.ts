@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	claudeConfigPaths,
-	DEFAULT_CLAUDE_CONFIG,
 	defaultConfig,
 	hasControlCharacter,
 	loadConfig,
@@ -15,8 +14,6 @@ import {
 	userConfigPath,
 } from "./config.ts";
 import type { DecisionsConfig } from "./decisions/types.ts";
-import { DEFAULT_GROK_CONFIG } from "./grok/types.ts";
-import { DEFAULT_MUSE_CONFIG } from "./muse/types.ts";
 import { ROUTE_DEFAULT_MODELS } from "./route-defaults.ts";
 
 function tempConfigFile(content: unknown): { path: string; cleanup: () => void } {
@@ -708,6 +705,49 @@ describe("hindsight config", () => {
 		expect(config.hindsight).not.toHaveProperty("apiKey");
 		expect(config.hindsight).not.toHaveProperty("api_key");
 		expect(JSON.stringify(config)).not.toContain("evil");
+	});
+});
+
+describe("state config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("retention defaults to 0 (keep forever), and each defaultConfig() is independent", () => {
+		expect(base.state).toEqual({ retentionDays: 0 });
+		expect(loadLayerFiles(roots, undefined).state.retentionDays).toBe(0);
+		const mutated = defaultConfig();
+		mutated.state.retentionDays = 30;
+		expect(defaultConfig().state.retentionDays).toBe(0);
+	});
+
+	test("a user file sets retentionDays", () => {
+		expect(loadLayerFiles(roots, { state: { retentionDays: 30 } }).state.retentionDays).toBe(30);
+		expect(mergeConfig({ state: { retentionDays: 3650 } }, base).state.retentionDays).toBe(3650);
+		expect(mergeConfig({ state: { retentionDays: 0 } }, mergeConfig({ state: { retentionDays: 30 } }, base)).state.retentionDays).toBe(0);
+	});
+
+	test("a project file cannot set it, even over a user value", () => {
+		expect(loadLayerFiles(roots, undefined, undefined, { state: { retentionDays: 30 } }).state.retentionDays).toBe(0);
+		expect(
+			loadLayerFiles(roots, { state: { retentionDays: 90 } }, undefined, { state: { retentionDays: 1 } }).state.retentionDays,
+		).toBe(90);
+	});
+
+	test("invalid values keep the lower layer's value", () => {
+		const lower = mergeConfig({ state: { retentionDays: 14 } }, base);
+		for (const value of [-1, 1.5, "30", 99_999, null, Number.NaN]) {
+			expect(mergeConfig({ state: { retentionDays: value } }, lower).state.retentionDays).toBe(14);
+			expect(mergeConfig({ state: { retentionDays: value } }, base).state.retentionDays).toBe(0);
+		}
+		expect(mergeConfig({ state: "30" }, lower).state.retentionDays).toBe(14);
+	});
+
+	test("a later user layer overrides an earlier one", () => {
+		const config = loadLayerFiles(roots, { state: { retentionDays: 30 } }, { state: { retentionDays: 7 } });
+		expect(config.state.retentionDays).toBe(7);
 	});
 });
 

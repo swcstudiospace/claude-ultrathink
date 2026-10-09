@@ -137,7 +137,9 @@ describe("createTracking", () => {
 		}
 		const notion = events.filter((e) => e.type === "issue" && e.provider === "notion");
 		expect(notion).toHaveLength(9);
-		expect(notion).toContainEqual({ type: "issue", at: expect.any(Number), provider: "notion", nodeId: "n2", step: 1, url: refs.notion.steps[stepKey("n2", 1)] });
+		const stepUrl = refs.notion.steps[stepKey("n2", 1)];
+		if (stepUrl === undefined) throw new Error("expected a notion step url");
+		expect(notion).toContainEqual({ type: "issue", at: expect.any(Number), provider: "notion", nodeId: "n2", step: 1, url: stepUrl });
 		expect(notion.some((e) => e.type === "issue" && e.url === refs.notion.taskUrl)).toBe(false);
 	});
 

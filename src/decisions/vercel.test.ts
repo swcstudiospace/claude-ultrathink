@@ -192,7 +192,8 @@ describe("decideVercel", () => {
 		const outcome = await decideVercel(request(), { apiKey: K, timeoutMs: 3000, fetch: r.fetch });
 		expect(outcome.ok).toBe(true);
 		expect(r.calls).toHaveLength(1);
-		const [call] = r.calls;
+		const call = r.calls[0];
+		if (!call) throw new Error("expected a gateway call");
 		expect(call.url).toBe(VERCEL_DECISIONS_URL);
 		expect(call.headers["ai-model-id"]).toBe("typesafe-ai/jev");
 		expect(call.headers["ai-evaluation-model-specification-version"]).toBe("4");
@@ -217,7 +218,7 @@ describe("decideVercel", () => {
 	test("an explicit model travels verbatim in ai-model-id", async () => {
 		const r = recordingFetch([VEV(0.5)]);
 		await decideVercel({ ...request(), model: "custom/jev" }, { apiKey: K, timeoutMs: 3000, fetch: r.fetch });
-		expect(r.calls[0].headers["ai-model-id"]).toBe("custom/jev");
+		expect(r.calls[0]?.headers?.["ai-model-id"]).toBe("custom/jev");
 	});
 
 	test("shares the core's retry and error discipline: 503 retries once, 401 maps to auth", async () => {

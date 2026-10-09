@@ -44,6 +44,7 @@ How the merge works (`src/config.ts`):
 - The URL keys `grok.shuntBaseUrl` and `substrate.url` must be `http://` or `https://` URLs. Trailing slashes are removed.
 - The project file can only make Jev decisions more restrictive: there, `decisions.zdr` can only turn zero data retention on (a `false` is ignored), and `decisions.points` can only drop points (it is intersected with the list from the earlier files, or the default). `decisions.enabled` is ignored in every file: Jev is always on, and only `ULTRATHINK_DECISIONS=0` turns it off. The other `decisions` keys (`provider`, `model`, `timeoutMs` and the thresholds) merge as usual, and the two user files merge every key as usual. See [`decisions`](#decisions-jev-decisions-openrouter-decisions-api).
 - The project file can only tighten Hindsight, RAGFlow and Teachable Moments. For `hindsight`, only `enabled: false` counts; `url`, `bank` and the timeouts are ignored, so a repository cannot point memory traffic at its own host. For `ragflow`, only `enabled: false` and `ground: false` count; `url`, `datasetIds` and the other keys are ignored. For `teach`, `enabled`, `recall` and `autoPromote` can only turn off, and `capture` can only go down (`auto` to `observe` to `explicit`); the other `teach` keys are ignored. The two user files merge every key as usual. See [`hindsight`](#hindsight-memory-server), [`ragflow`](#ragflow-document-search) and [`teach`](#teach-teachable-moments).
+- The project file cannot set `state.retentionDays`: the whole `state` section is ignored there, because a repository must not be able to delete your session history. See [`state`](#state-session-retention).
 
 `bin/ultrathink status`, run from the project directory, prints the merged result for the parts most people change. See [Commands](commands.md#binultrathink) for its output.
 
@@ -394,6 +395,29 @@ Before anything is stored or sent, text is redacted. `Bearer` followed by a shor
 
 The confirmed/candidate counts and the outbox count are included when the status command knows the state directory, which `bin/ultrathink status` does. `Hindsight` here is the readiness word, not the `Hindsight:` line.
 
+### `state`: session retention
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `retentionDays` | integer, 0 to 3650 | `0` | Days to keep session records (`sessions/<id>.json` and its `.xml`). `0` keeps everything forever. Above `0`, the scheduled prune removes sessions whose newest file is older than this. User files only: a project file cannot set it. |
+
+#### Session retention
+
+By default nothing is ever deleted: every session record stays in the state directory until you remove it. Those records hold your prompt and the plan, so you may want to trim them. Two ways:
+
+- **On request.** `bin/ultrathink prune --older-than 30` removes sessions older than 30 days (`30d` also works). Add `--dry-run` to list what would go without deleting anything; the real run then removes exactly that set. Without `--older-than` the command uses `state.retentionDays`; if neither gives a cutoff above 0 it exits 2 and deletes nothing. `--older-than` must be a whole number from 1 to 3650: a smaller cutoff is refused, so a typo cannot empty the directory. Exit codes: 0 done, 1 a file could not be removed (the file name and error code are printed, never content), 2 usage error or refused cutoff.
+- **On a schedule, if you opt in.** With `state.retentionDays` above 0 in a user file, planning runs the same prune, best effort, at most once a day (it records the time in `<stateDir>/.last-prune`) and looking at no more than 500 directory entries per run. A failure never blocks a prompt. With the key unset nothing prunes by itself.
+
+What a prune never removes:
+
+- A session whose ship has a pull request that is neither merged nor blocked.
+- The session `last.json` names and the session the plan carrier (`last-plan.json`) points to.
+- Symlinks, and anything that is not a `sessions/<id>.json` or `sessions/<id>.xml` file, so Teachable Moments lessons under `teach/` are never touched.
+
+A prune also removes `*.tmp` and `*.lock` files older than one hour in `sessions/` or directly in the state directory: leftovers of an interrupted write.
+
+`prune` works on the current host's state directory. To prune another host's, set `ULTRATHINK_HOST=<host>`, for example `ULTRATHINK_HOST=omp bin/ultrathink prune --older-than 30 --dry-run`. The output lists session ids, sizes and ages, never prompt text.
+
 ## Full example
 
 All keys are optional; write only the ones you change. This file shows every key. The values are the defaults, with these exceptions:
@@ -502,6 +526,9 @@ All keys are optional; write only the ones you change. This file shows every key
     "autoPromote": true,
     "observeMinToolCalls": 4,
     "timeoutMs": 2500
+  },
+  "state": {
+    "retentionDays": 0
   }
 }
 ```
@@ -671,6 +698,7 @@ What a state directory holds:
 | `sessions/<session-id>.xml` | The full uplifted spec. |
 | `last.json` | A copy of the latest session record. `bin/ultrathink last` reads it. |
 | `last-plan.json` | The plan carrier for hosts that do not read hook output directly, such as Grok Build. |
+| `.last-prune` | Empty marker written by the scheduled prune; its modification time is when the prune last ran. Only exists when `state.retentionDays` is set. |
 | `teach/moments/<id>.json` | One Teachable Moments file. Written only when `teach.enabled` is on. |
 | `teach/outbox/<id>.json` | A pending Hindsight retain, delete or tag update. |
 | `teach/inbox/<id>.json` | A finished-turn digest waiting for `teach observe`. `teach observe --file` deletes the file afterwards, and only when the path resolved to a file under this directory. A refused path is left alone. |

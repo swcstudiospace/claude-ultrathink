@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionRecord } from "../claude/state.ts";
 import { classifyChecks, createGithub } from "./github.ts";
-import type { ReviewThreads } from "./github.ts";
+import type { ReviewThread, ReviewThreads } from "./github.ts";
 import { mergeGate } from "./merge.ts";
 import { buildPr } from "./pr-body.ts";
 import { DEFAULT_SHIP_CONFIG } from "./types.ts";
@@ -192,7 +192,6 @@ describe("createGithub", () => {
 		["gh failure", { exitCode: 1, stderr: "gh: HTTP 502\nmore" }, { ok: false, error: "gh: HTTP 502" }],
 		["graphql errors", { stdout: JSON.stringify({ errors: [{ message: "Could not resolve to a PullRequest" }] }) }, { ok: false, error: "Could not resolve to a PullRequest" }],
 		["missing pull request", { stdout: JSON.stringify({ data: { repository: { pullRequest: null } } }) }, { ok: false, error: "pull request review threads missing" }],
-		["truncated at 100 threads", graphql([node()], true), { ok: false, error: "more than 100 review threads" }],
 	])("reviewThreads: %s", (_name, reply, expected) => {
 		const { run, calls } = fakeRun((argv) =>
 			argv[1] === "repo" ? { stdout: JSON.stringify({ nameWithOwner: "o/r", defaultBranchRef: { name: "master" } }) } : reply,
@@ -201,6 +200,151 @@ describe("createGithub", () => {
 		const argv = calls[1]?.argv ?? [];
 		expect(argv.slice(0, 3)).toEqual(["gh", "api", "graphql"]);
 		expect(argv.slice(-6)).toEqual(["-f", "owner=o", "-f", "name=r", "-F", "number=7"]);
+		expect(argv.some((a) => a.startsWith("after="))).toBe(false);
+		expect(calls).toHaveLength(2);
+	});
+
+	describe("reviewThreads pagination", () => {
+		const REPO_REPLY = { stdout: JSON.stringify({ nameWithOwner: "o/r", defaultBranchRef: { name: "master" } }) };
+		/** A page of `count` thread nodes; every third one is by another author, every fifth resolved, every seventh outdated. */
+		const pageNodes = (tag: string, count: number) =>
+			Array.from({ length: count }, (_unused, i) => ({
+				id: `${tag}-${i}`,
+				isResolved: i % 5 === 0,
+				isOutdated: i % 7 === 0,
+				comments: {
+					nodes: [{ author: { login: i % 3 === 0 ? "octocat" : "greptile-apps" }, path: "a.ts", line: i + 1, originalLine: 0, body: `finding ${tag}-${i}` }],
+				},
+			}));
+		const expectedThreads = (tag: string, count: number): ReviewThread[] =>
+			pageNodes(tag, count).flatMap((n) => {
+				const comment = n.comments.nodes[0];
+				if (!comment || comment.author.login !== "greptile-apps") return [];
+				return [
+					{
+						id: n.id,
+						isResolved: n.isResolved,
+						isOutdated: n.isOutdated,
+						author: "greptile-apps",
+						path: "a.ts",
+						line: comment.line,
+						body: comment.body,
+					},
+				];
+			});
+		const page = (nodes: unknown[], endCursor?: string | null, hasNextPage = endCursor !== undefined) => ({
+			stdout: JSON.stringify({
+				data: {
+					repository: {
+						pullRequest: {
+							reviewThreads: { pageInfo: hasNextPage ? { hasNextPage, endCursor } : { hasNextPage }, nodes },
+						},
+					},
+				},
+			}),
+		});
+		const after = (argv: string[]) => argv.find((a) => a.startsWith("after="));
+		/** Answers `gh repo view`, then hands each GraphQL call the next scripted reply (the last one repeats). */
+		const threadsOf = (...replies: Reply[]) => {
+			let n = 0;
+			const fake = fakeRun((argv) => (argv[1] === "repo" ? REPO_REPLY : (replies[Math.min(n++, replies.length - 1)] ?? {})));
+			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7);
+			return { result, graphqlCalls: fake.calls.filter((c) => c.argv[1] === "api") };
+		};
+
+		test("100 or fewer threads take one request without a cursor", () => {
+			const { result, graphqlCalls } = threadsOf(page(pageNodes("a", 100)));
+			expect(result).toEqual({ ok: true, threads: expectedThreads("a", 100) });
+			expect(graphqlCalls).toHaveLength(1);
+			expect(graphqlCalls[0]?.argv.some((a) => a.includes("after="))).toBe(false);
+		});
+
+		test("follows cursors across three pages and keeps page order and thread flags", () => {
+			const { result, graphqlCalls } = threadsOf(
+				page(pageNodes("p1", 100), "c1"),
+				page(pageNodes("p2", 100), "c2"),
+				page(pageNodes("p3", 50)),
+			);
+			expect(result).toEqual({
+				ok: true,
+				threads: [...expectedThreads("p1", 100), ...expectedThreads("p2", 100), ...expectedThreads("p3", 50)],
+			});
+			expect(graphqlCalls).toHaveLength(3);
+			expect(after(graphqlCalls[0]?.argv ?? [])).toBeUndefined();
+			expect(after(graphqlCalls[1]?.argv ?? [])).toBe("after=c1");
+			expect(after(graphqlCalls[2]?.argv ?? [])).toBe("after=c2");
+			expect(graphqlCalls[1]?.argv.slice(-2)).toEqual(["-f", "after=c1"]);
+			if (result.ok) {
+				expect(result.threads.some((t) => t.isResolved)).toBe(true);
+				expect(result.threads.some((t) => t.isOutdated)).toBe(true);
+				expect(result.threads.every((t) => t.author === "greptile-apps")).toBe(true);
+			}
+		});
+
+		test.each<[string, Reply, string]>([
+			[
+				"graphql errors",
+				{ stdout: JSON.stringify({ errors: [{ message: "rate limited" }] }) },
+				"rate limited",
+			],
+			["a non-zero exit", { exitCode: 1, stderr: "gh: HTTP 502\nmore" }, "gh: HTTP 502"],
+			["unparseable output", { stdout: "<html>" }, "unparseable review threads response"],
+			["a malformed thread", page([{ id: "x", comments: { nodes: [] } }]), "malformed review thread"],
+			[
+				"a Greptile thread without a boolean flag",
+				page([{ id: "x", isResolved: "no", isOutdated: false, comments: { nodes: [{ author: { login: "greptile-apps" }, body: "b" }] } }]),
+				"malformed review thread",
+			],
+		])("a later page failing (%s) fails closed with no partial threads", (_name, bad, error) => {
+			const { result, graphqlCalls } = threadsOf(page(pageNodes("p1", 100), "c1"), bad);
+			expect(result).toEqual({ ok: false, error });
+			expect("threads" in result).toBe(false);
+			expect(graphqlCalls).toHaveLength(2);
+		});
+
+		test.each<[string, string | null | undefined]>([
+			["null", null],
+			["empty", ""],
+			["missing", undefined],
+		])("hasNextPage with a %s endCursor fails closed", (_name, cursor) => {
+			const first = threadsOf(page(pageNodes("p1", 100), cursor, true));
+			expect(first.result).toEqual({ ok: false, error: "review threads pagination did not advance" });
+			expect(first.graphqlCalls).toHaveLength(1);
+			const later = threadsOf(page(pageNodes("p1", 100), "c1"), page(pageNodes("p2", 100), cursor, true));
+			expect(later.result).toEqual({ ok: false, error: "review threads pagination did not advance" });
+			expect(later.graphqlCalls).toHaveLength(2);
+		});
+
+		test("a non-string endCursor fails closed", () => {
+			const reply = {
+				stdout: JSON.stringify({
+					data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: 5 }, nodes: [] } } } },
+				}),
+			};
+			expect(threadsOf(reply).result).toEqual({ ok: false, error: "review threads pagination did not advance" });
+		});
+
+		test("a repeated cursor stops the loop", () => {
+			const { result, graphqlCalls } = threadsOf(page(pageNodes("p1", 100), "same"));
+			expect(result).toEqual({ ok: false, error: "review threads pagination did not advance" });
+			expect(graphqlCalls).toHaveLength(2);
+			expect(after(graphqlCalls[1]?.argv ?? [])).toBe("after=same");
+		});
+
+		test("an endless server is cut off at 20 pages", () => {
+			let n = 0;
+			const fake = fakeRun((argv) => (argv[1] === "repo" ? REPO_REPLY : page(pageNodes("p", 100), `c${++n}`)));
+			const result = createGithub({ cwd: "/w", run: fake.run }).reviewThreads(7);
+			expect(result).toEqual({ ok: false, error: "more than 2000 review threads" });
+			expect(fake.calls.filter((c) => c.argv[1] === "api")).toHaveLength(20);
+		});
+
+		test("exactly 20 full pages still succeed", () => {
+			const replies = Array.from({ length: 20 }, (_unused, i) => page(pageNodes(`p${i}`, 100), i < 19 ? `c${i}` : undefined));
+			const { result, graphqlCalls } = threadsOf(...replies);
+			expect(result.ok).toBe(true);
+			expect(graphqlCalls).toHaveLength(20);
+		});
 	});
 
 	test("reviewThreads fails without a resolvable repo", () => {

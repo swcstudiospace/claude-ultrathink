@@ -464,7 +464,9 @@ function userScopeEntry(name: string, run: Run, claudeJson: string): UserEntry {
 	const fields: Record<string, string> = {};
 	for (const line of current.stdout.split("\n")) {
 		const match = /^\s+([A-Za-z]+):\s*(.*)$/.exec(line);
-		if (match && !(match[1] in fields)) fields[match[1]] = match[2].trim();
+		const key = match?.[1];
+		const value = match?.[2];
+		if (key !== undefined && value !== undefined && !(key in fields)) fields[key] = value.trim();
 	}
 	if (/^User config\b/i.test(fields.Scope ?? "")) return { found: true, type: fields.Type?.toLowerCase(), url: fields.URL };
 	let parsed: unknown;

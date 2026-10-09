@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { carrierPath, clearPlanCarrier, writePlanCarrier } from "./carrier.ts";
@@ -39,6 +39,28 @@ describe("clearPlanCarrier", () => {
 		mkdirSync(stateDir, { recursive: true });
 		clearPlanCarrier(stateDir);
 		expect(existsSync(carrierPath(stateDir))).toBe(false);
+	});
+});
+
+describe("writePlanCarrier", () => {
+	test("writes the carrier owner-only in a new owner-only state dir, replacing the previous one whole", () => {
+		const path = writePlanCarrier({ host: "grok-build", stateDir, sessionId: "s1", specPath: "/s/s1.xml", statePath: "/s/s1.json", graphId: "ut-1", context: "first" });
+		expect(path).toBe(carrierPath(stateDir));
+		expect(JSON.parse(readFileSync(carrierPath(stateDir), "utf8"))).toMatchObject({ host: "grok-build", sessionId: "s1", specPath: "/s/s1.xml", graphId: "ut-1", context: "first" });
+		if (process.platform !== "win32") {
+			expect(statSync(carrierPath(stateDir)).mode & 0o777).toBe(0o600);
+			expect(statSync(stateDir).mode & 0o777).toBe(0o700);
+		}
+		writePlanCarrier({ host: "grok-build", stateDir, sessionId: "s2", context: "second" });
+		expect(JSON.parse(readFileSync(carrierPath(stateDir), "utf8"))).toMatchObject({ sessionId: "s2", context: "second" });
+		expect(readdirSync(stateDir)).toEqual(["last-plan.json"]);
+	});
+
+	test.skipIf(process.platform === "win32")("a 0644 carrier from an older version is 0600 after the next write", () => {
+		mkdirSync(stateDir, { recursive: true });
+		writeFileSync(carrierPath(stateDir), "{}", { mode: 0o644 });
+		writePlanCarrier({ host: "omp", stateDir, sessionId: "s1", context: "ctx" });
+		expect(statSync(carrierPath(stateDir)).mode & 0o777).toBe(0o600);
 	});
 });
 

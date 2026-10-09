@@ -370,6 +370,8 @@ Hermes passes its host id in the engine request, and the Omp extension passes `h
 | `last-plan.json` | Carrier: host, session id, spec and state paths, graph id, reading instruction, context. On Grok it exists only while the latest prompt was planned. |
 | `claims/` | Grok per-turn claims. |
 
+**State files.** Session records hold your prompts verbatim, so every file above is written owner-only: mode `0600` in directories created `0700`. Each write goes to a temporary file in the same directory (`.<name>.<pid>.<hex>.tmp`), is flushed, and is renamed over the target, so a crash leaves the previous file and never a truncated one. Hooks overlap, so a read-modify-write of one file (a session record, `control.json`, the ship state inside a session record, the `session mark` and `track complete` updates, HITL answers) holds a lock file next to it, `<file>.lock`, while it runs. A lock older than 10 seconds is treated as left by a crashed process and taken over. A lock that stays held for 2 seconds is ignored and the update runs without it, so a stuck lock can never block a prompt; the cost is that an update racing at that moment can be lost. A file written by an earlier version with mode `0644` is tightened to `0600` the next time it is rewritten. Leftover `*.tmp` and `*.lock` files are harmless and safe to delete.
+
 Credentials are not in the state directory. They live in the [MCP gateway](#mcp-gateway) store.
 
 ## Runtime constraints
@@ -552,7 +554,7 @@ Resolved details: a plan skip's `DecisionRecord` is not written to the session r
 
 | Path | Contents |
 |---|---|
-| `src/claude/` | `runPromptSubmit` orchestration (`hook.ts`), the Jev plan gate (`plan-gate.ts`), Claude engine (`complete.ts`), context and summary formatting (`output.ts`), control and session state (`state.ts`), transcript reader. |
+| `src/claude/` | `runPromptSubmit` orchestration (`hook.ts`), the Jev plan gate (`plan-gate.ts`), Claude engine (`complete.ts`), context and summary formatting (`output.ts`), control and session state (`state.ts`), atomic owner-only writes and the file lock (`atomic.ts`), transcript reader. |
 | `src/host/` | Host ids and detection, state paths, engine and model selection (`engine.ts`), `planPrompt` for Hermes and Omp, the `last-plan.json` carrier, Grok turn claims, progress events, and the Omp extension with its native planner, status bar, graph panel and plan cards (`omp*.ts`). |
 | `src/uplift/` | Prompt decision and prefixes (`detect.ts`), skill resolution (`skill.ts`), `/ultrathink-*` commands and `bin/ultrathink` (`commands.ts`), uplift call and fallback spec, XML helpers. |
 | `src/think/` | Graph of Thought prompts, parsing, node fills, dependency levels and `WORKFLOW` waves. |

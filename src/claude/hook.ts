@@ -8,8 +8,6 @@
  * fail-open: the user's prompt always goes through. Caller or provider cancellation is re-thrown as an
  * AbortError, aborting sibling work and preventing later inference or side effects.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import type { UltrathinkConfig } from "../config.ts";
 import { createDecisions, type DecisionsDeps } from "../decisions/gate.ts";
 import type { DecisionRecord } from "../decisions/types.ts";
@@ -38,6 +36,8 @@ import { isSubagentEnvelope } from "../host/envelope.ts";
 import { decideUplift } from "../uplift/detect.ts";
 import type { SkillInvocation } from "../uplift/skill.ts";
 import { runUplift } from "../uplift/run.ts";
+import { pruneSessionsBestEffort } from "../retention/prune.ts";
+import { writeFileAtomic } from "./atomic.ts";
 import type { ClaudeCompleter } from "./complete.ts";
 import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
@@ -726,8 +726,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		stage("state", "start");
 		try {
 			specPath = specFile(deps.stateDir, sessionId);
-			mkdirSync(dirname(specPath), { recursive: true });
-			writeFileSync(specPath, `${result.xml}\n`);
+			writeFileAtomic(specPath, `${result.xml}\n`);
 			writeSession(deps.stateDir, record);
 			statePath = sessionPath(deps.stateDir, sessionId);
 			stage("state", "end", true);
@@ -737,6 +736,8 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			statePath = undefined;
 			stage("state", "end", false);
 		}
+		// Opt-in retention (state.retentionDays above 0): at most one bounded sweep a day. It never throws and never waits.
+		pruneSessionsBestEffort({ stateDir: deps.stateDir, retentionDays: deps.config.state.retentionDays, log });
 
 		const providers = { linear: deps.config.linear.team.trim() !== "", notion: deps.config.notion.dataSourceUrl.trim() !== "" };
 		const output: HookOutput = {

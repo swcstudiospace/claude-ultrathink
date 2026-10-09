@@ -43,11 +43,14 @@ const FAILED_CONCLUSIONS: Record<string, true> = {
 };
 const FAILED_STATES: Record<string, true> = { FAILURE: true, ERROR: true };
 const DONE_STATUSES: Record<string, true> = { COMPLETED: true, SUCCESS: true };
-const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+// GitHub caps `first` at 100, so a larger pull request is read page by page, up to this many pages.
+const MAX_THREAD_PAGES = 20;
+const PAGINATION_STALLED = "review threads pagination did not advance";
+const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
 	repository(owner: $owner, name: $name) {
 		pullRequest(number: $number) {
-			reviewThreads(first: 100) {
-				pageInfo { hasNextPage }
+			reviewThreads(first: 100, after: $after) {
+				pageInfo { hasNextPage endCursor }
 				nodes { id isResolved isOutdated comments(first: 1) { nodes { author { login } path line originalLine body } } }
 			}
 		}
@@ -101,7 +104,10 @@ export function classifyChecks(rollup: unknown): PrStatus["checks"] {
 	return pending ? "pending" : "passing";
 }
 
-function parseReviewThreads(stdout: string): ReviewThreads {
+type ThreadsPage = { ok: true; threads: ReviewThread[]; next?: string } | { ok: false; error: string };
+
+/** Parses one page of the reviewThreads response; `next` is the cursor of the following page when there is one. */
+function parseThreadsPage(stdout: string): ThreadsPage {
 	const root = obj(parseJson(stdout));
 	if (!root) return { ok: false, error: "unparseable review threads response" };
 	const errors = root.errors;
@@ -110,7 +116,9 @@ function parseReviewThreads(stdout: string): ReviewThreads {
 	}
 	const threads = obj(obj(obj(obj(root.data)?.repository)?.pullRequest)?.reviewThreads);
 	if (!threads || !Array.isArray(threads.nodes)) return { ok: false, error: "pull request review threads missing" };
-	if (obj(threads.pageInfo)?.hasNextPage === true) return { ok: false, error: "more than 100 review threads" };
+	const pageInfo = obj(threads.pageInfo);
+	const next = pageInfo?.hasNextPage === true ? str(pageInfo.endCursor) : undefined;
+	if (pageInfo?.hasNextPage === true && !next) return { ok: false, error: PAGINATION_STALLED };
 	const out: ReviewThread[] = [];
 	for (const node of threads.nodes) {
 		const thread = obj(node);
@@ -132,7 +140,7 @@ function parseReviewThreads(stdout: string): ReviewThreads {
 		if (typeof line === "number") entry.line = line;
 		out.push(entry);
 	}
-	return { ok: true, threads: out };
+	return next ? { ok: true, threads: out, next } : { ok: true, threads: out };
 }
 
 export function createGithub(input: { cwd: string; run?: Run }): Github {
@@ -227,14 +235,28 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 		reviewThreads(prNumber) {
 			const [owner, name] = gh.repo()?.name.split("/") ?? [];
 			if (!owner || !name) return { ok: false, error: "could not resolve GitHub repo" };
-			const r = exec([
-				"gh", "api", "graphql",
-				"-f", `query=${THREADS_QUERY}`,
-				"-f", `owner=${owner}`,
-				"-f", `name=${name}`,
-				"-F", `number=${prNumber}`,
-			]);
-			return r.exitCode === 0 ? parseReviewThreads(r.stdout) : { ok: false, error: errorOf(r) };
+			const threads: ReviewThread[] = [];
+			const seen = new Set<string>();
+			let after: string | undefined;
+			for (let page = 1; page <= MAX_THREAD_PAGES; page++) {
+				const r = exec([
+					"gh", "api", "graphql",
+					"-f", `query=${THREADS_QUERY}`,
+					"-f", `owner=${owner}`,
+					"-f", `name=${name}`,
+					"-F", `number=${prNumber}`,
+					...(after === undefined ? [] : ["-f", `after=${after}`]),
+				]);
+				if (r.exitCode !== 0) return { ok: false, error: errorOf(r) };
+				const parsed = parseThreadsPage(r.stdout);
+				if (!parsed.ok) return parsed;
+				threads.push(...parsed.threads);
+				if (!parsed.next) return { ok: true, threads };
+				if (seen.has(parsed.next)) return { ok: false, error: PAGINATION_STALLED };
+				seen.add(parsed.next);
+				after = parsed.next;
+			}
+			return { ok: false, error: `more than ${MAX_THREAD_PAGES * 100} review threads` };
 		},
 	};
 	return gh;

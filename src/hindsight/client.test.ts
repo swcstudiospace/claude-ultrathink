@@ -451,7 +451,7 @@ describe("errors", () => {
 
 	test("a redirect is not followed: one request, a classified error, no key leak", async () => {
 		const inits: (RequestInit | undefined)[] = [];
-		const redirecting = (async (input: string | URL | Request, init?: RequestInit) => {
+		const redirecting = (async (_input: string | URL | Request, init?: RequestInit) => {
 			inits.push(init);
 			throw new TypeError("fetch failed: redirect mode is set to error");
 		}) as unknown as typeof fetch;

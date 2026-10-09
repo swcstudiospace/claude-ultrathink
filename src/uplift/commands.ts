@@ -10,6 +10,7 @@ import { displayId, formatModelSelection, OPAQUE_MODEL } from "../claude/output.
 import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
 import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
 import { runDecisionsCommand } from "../decisions/cli.ts";
+import { runDoctorCommand } from "../doctor/cli.ts";
 import { decisionsKilled, resolveDecisionsKeys } from "../decisions/gate.ts";
 import { grokAuthStatusFresh, redactSecrets } from "../grok/auth.ts";
 import { formatHitlEcho } from "../hitl/format.ts";
@@ -24,6 +25,7 @@ import { runHindsightCommand } from "../hindsight/cli.ts";
 import { hasUsableCredential } from "../mcp/client.ts";
 import { storePath } from "../mcp/store.ts";
 import { runRagflowCommand } from "../ragflow/cli.ts";
+import { runPruneCommand } from "../retention/cli.ts";
 import { ragflowStatusLine } from "../ragflow/settings.ts";
 import { resolveSubstrate } from "../substrate/brief.ts";
 import { runTeachCommand } from "../teach/cli.ts";
@@ -57,6 +59,8 @@ const USAGE = [
 	"  teach status|list|show|capture|recall|confirm|forget|sync|observe|promote|export   Teachable Moments",
 	"In an agent: /ultrathink-status, /ultrathink-off, /ultrathink-on, /ultrathink-skip, /ultrathink-track off|on,",
 	"and /ultrathink-quick <message> sends one message as typed (no planning, no Linear/Notion rows).",
+	"  doctor [--json]        check config files, credentials, state and environment",
+	"  prune [--older-than <days>] [--dry-run]   remove session records older than that many days (nothing is removed by default)",
 ].join("\n");
 
 /** `ultrathink-quick`, Claude's plugin-qualified `ultrathink:ultrathink-quick`, and the older `ultrathink:quick`. */
@@ -315,7 +319,7 @@ export async function runControl(
 }
 
 // `bin/ultrathink <verb> [args…]`: the host state dir comes from ULTRATHINK_HOST, else the detected host.
-// `decisions`, `hindsight`, `ragflow` and `teach` bypass runControl, which lower-cases its args (probe takes a file path).
+// `decisions`, `hindsight`, `ragflow`, `teach`, `doctor` and `prune` bypass runControl, which lower-cases its args (probe takes a file path).
 if (import.meta.main) {
 	const argv = process.argv.slice(2);
 	const service = argv[0]?.trim().toLowerCase();
@@ -328,7 +332,11 @@ if (import.meta.main) {
 					? runRagflowCommand(argv.slice(1), { cwd: process.cwd(), env: process.env })
 					: service === "teach"
 						? runTeachCommand(argv.slice(1), { cwd: process.cwd(), env: process.env })
-						: undefined;
+						: service === "doctor"
+							? runDoctorCommand(argv.slice(1)).then(({ output, exitCode }) => ({ code: exitCode, text: output }))
+							: service === "prune"
+								? runPruneCommand(argv.slice(1), { cwd: process.cwd(), env: process.env }).then(({ output, exitCode }) => ({ code: exitCode, text: output }))
+								: undefined;
 	if (command) {
 		command.then(({ code, text }) => {
 			process.stdout.write(`${text}\n`, () => process.exit(code));

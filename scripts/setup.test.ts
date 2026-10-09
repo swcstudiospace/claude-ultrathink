@@ -130,7 +130,10 @@ function setupEntry(name: string): Reply {
 
 /** Rollback-time claude: `get` shows setup's own entry and every other call succeeds, unless `script` answers first. */
 function ownedRun(script: (cmd: string[]) => Reply | undefined = () => undefined): Run & { calls: string[][] } {
-	return fakeRun((cmd) => script(cmd) ?? (cmd[2] === "get" ? setupEntry(cmd[3]) : { stdout: "", stderr: "", code: 0 }));
+	return fakeRun((cmd) => {
+		const name = cmd[3];
+		return script(cmd) ?? (cmd[2] === "get" && name !== undefined ? setupEntry(name) : { stdout: "", stderr: "", code: 0 });
+	});
 }
 
 describe("claudeMdPath", () => {
@@ -513,7 +516,11 @@ describe("apply / status / rollback", () => {
 			cmd[2] === "get"
 				? { stdout: `${cmd[3]}:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx other-mcp\n`, stderr: "", code: 0 }
 				: undefined;
-		const claudeJson = (env: Record<string, string>) => join(env.CLAUDE_CONFIG_DIR, ".claude.json");
+		const claudeJson = (env: Record<string, string>) => {
+			const dir = env.CLAUDE_CONFIG_DIR;
+			if (dir === undefined) throw new Error("expected CLAUDE_CONFIG_DIR");
+			return join(dir, ".claude.json");
+		};
 
 		test("setup's user-scope entry in ~/.claude.json is still removed at user scope", () => {
 			const { env, repo, cleanup } = tempSetup();
@@ -648,13 +655,20 @@ describe("grok global hooks", () => {
 				hooks: Record<string, { matcher?: string; hooks: { command: string; timeout: number; env: Record<string, string> }[] }[]>;
 			};
 			expect(Object.keys(config.hooks)).toEqual(["UserPromptSubmit", "PostToolUse", "Stop"]);
-			const [prompt] = config.hooks.UserPromptSubmit[0].hooks;
+			const prompt = config.hooks.UserPromptSubmit?.[0]?.hooks[0];
+			if (!prompt) throw new Error("expected a UserPromptSubmit hook");
 			expect(prompt.command).toBe(`"${root}/bin/run-bun" "${root}/hooks/uplift.ts"`);
 			expect(prompt.timeout).toBe(600);
-			expect(config.hooks.PostToolUse[0].matcher).toBe("Bash");
-			expect(config.hooks.PostToolUse[0].hooks[0].timeout).toBe(30);
-			expect(config.hooks.Stop[0].matcher).toBeUndefined();
-			expect(config.hooks.Stop[0].hooks[0].timeout).toBe(60);
+			const post = config.hooks.PostToolUse?.[0];
+			const postHook = post?.hooks[0];
+			if (!post || !postHook) throw new Error("expected a PostToolUse hook");
+			expect(post.matcher).toBe("Bash");
+			expect(postHook.timeout).toBe(30);
+			const stop = config.hooks.Stop?.[0];
+			const stopHook = stop?.hooks[0];
+			if (!stop || !stopHook) throw new Error("expected a Stop hook");
+			expect(stop.matcher).toBeUndefined();
+			expect(stopHook.timeout).toBe(60);
 			for (const groups of Object.values(config.hooks)) {
 				for (const handler of groups.flatMap((group) => group.hooks)) {
 					expect(handler.command).not.toContain("CLAUDE_PLUGIN_ROOT");

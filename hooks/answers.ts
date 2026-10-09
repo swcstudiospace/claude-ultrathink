@@ -6,9 +6,10 @@
  * answers back into this session's clarifications and the saved spec XML.
  * Silent and fail-open.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { writeFileAtomic } from "../src/claude/atomic.ts";
 import { isChildInvocation } from "../src/claude/complete.ts";
-import { defaultStateDir, readSession, type SessionRecord, sessionPath, writeSession } from "../src/claude/state.ts";
+import { defaultStateDir, sessionPath, updateSession } from "../src/claude/state.ts";
 import { parseEnvelope } from "../src/host/envelope.ts";
 import { applyAnswers, type AskUserQuestionInput, type AskUserQuestionResponse } from "../src/hitl/answers.ts";
 import { injectClarificationsXml } from "../src/hitl/format.ts";
@@ -33,23 +34,19 @@ async function main(): Promise<void> {
 	if (input.tool_name !== "AskUserQuestion" || !input.session_id) return;
 
 	const stateDir = defaultStateDir();
-	const record = readSession(stateDir, input.session_id);
-	if (!record) return;
-
-	// `clarifications` lands on SessionRecord in src/claude/state.ts; read it defensively so this compiles either way.
-	const existing: Clarification[] = "clarifications" in record && Array.isArray(record.clarifications) ? record.clarifications : [];
-	const { list, matched } = applyAnswers(existing, input.tool_input, input.tool_response, Date.now());
-
 	const xmlPath = sessionPath(stateDir, input.session_id).replace(/\.json$/, ".xml");
-	const currentXml = existsSync(xmlPath) ? readFileSync(xmlPath, "utf8") : record.result.xml;
-	const xml = injectClarificationsXml(currentXml, list).trimEnd();
-	writeFileSync(xmlPath, `${xml}\n`);
-	const next: SessionRecord & { clarifications: Clarification[] } = {
-		...record,
-		result: { ...record.result, xml },
-		clarifications: list,
-	};
-	writeSession(stateDir, next);
+	let matched: Clarification[] = [];
+	// One locked read-apply-write, so a concurrent writer of this session record (ship, kickoff marks) is not overwritten.
+	const updated = updateSession(stateDir, input.session_id, (record) => {
+		const existing: Clarification[] = Array.isArray(record.clarifications) ? record.clarifications : [];
+		const applied = applyAnswers(existing, input.tool_input, input.tool_response, Date.now());
+		matched = applied.matched;
+		const currentXml = existsSync(xmlPath) ? readFileSync(xmlPath, "utf8") : record.result.xml;
+		const xml = injectClarificationsXml(currentXml, applied.list).trimEnd();
+		writeFileAtomic(xmlPath, `${xml}\n`);
+		return { ...record, result: { ...record.result, xml }, clarifications: applied.list };
+	});
+	if (!updated) return;
 
 	if (matched.length > 0) {
 		console.log(JSON.stringify({ systemMessage: `HITL · ${matched.length} answer(s) recorded` }));

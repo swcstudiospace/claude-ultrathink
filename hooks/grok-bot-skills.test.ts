@@ -107,7 +107,7 @@ describe("Grok Bot skills", () => {
 			const folder = file.split("/").at(-2);
 			if (folder === undefined) throw new Error(`${file} has no parent folder`);
 			expect(parsed.values.name).toBe(folder);
-			expect(parsed.values.description.length).toBeGreaterThan(0);
+			expect(parsed.values.description?.length).toBeGreaterThan(0);
 			expect(parsed.body).not.toMatch(/https?:\/\//);
 		}
 	});
@@ -115,7 +115,7 @@ describe("Grok Bot skills", () => {
 	test("ultrathink-protocol leads with when to use it and keeps the method inside the bot", () => {
 		const parsed = frontmatter(readFileSync(PROTOCOL, "utf8"), PROTOCOL);
 		expect(parsed.values.name).toBe("ultrathink-protocol");
-		expect(parsed.values.description.startsWith("When to use it:")).toBe(true);
+		expect(parsed.values.description?.startsWith("When to use it:")).toBe(true);
 		for (const phrase of [
 			"perform this method yourself",
 			"Keep the XML spec and the graph internal",
