@@ -16,6 +16,7 @@ import type {
 	RecallQuery,
 	RetainItem,
 	RetainOutcome,
+	TagsMatch,
 } from "../hindsight/types.ts";
 import { createGatewayClient, type GatewayClientOptions } from "./client.ts";
 import { GRAPH_ID_PATTERN, type GatewayFailure } from "./types.ts";
@@ -30,8 +31,26 @@ function asError(failure: GatewayFailure): HindsightResult<never> {
 	return { ok: false, error };
 }
 
+/** Not `not-found`: callers treat that as "the document is already gone" and drop the pending change. */
 function unavailable(what: string): HindsightResult<never> {
-	return { ok: false, error: { kind: "not-found", message: `unready: ${what} is not a gateway tool` } };
+	return { ok: false, error: { kind: "bad-request", message: `unready: ${what} is not a gateway tool` } };
+}
+
+function stringMetadata(value: unknown): Record<string, string> {
+	if (!isRecord(value)) return {};
+	const metadata: Record<string, string> = {};
+	for (const [name, item] of Object.entries(value)) if (typeof item === "string") metadata[name] = item;
+	return metadata;
+}
+
+/** Local stand-in for Hindsight `tags_match`. The desk recall tool has no tag argument. */
+function tagsMatch(tags: string[], wanted: string[] | undefined, mode: TagsMatch | undefined): boolean {
+	if (!wanted || wanted.length === 0) return true;
+	const have = new Set(tags);
+	const hits = wanted.filter((tag) => have.has(tag)).length;
+	if (mode === "any" || mode === "any_strict") return hits > 0;
+	if (mode === "exact") return hits === wanted.length && tags.length === wanted.length;
+	return hits === wanted.length;
 }
 
 function hitsFrom(payload: Record<string, unknown>): RecallHit[] | GatewayFailure {
@@ -55,7 +74,7 @@ function hitsFrom(payload: Record<string, unknown>): RecallHit[] | GatewayFailur
 				id: typeof item.id === "string" ? item.id : String(hits.length),
 				text,
 				tags,
-				metadata: {},
+				metadata: stringMetadata(item.metadata),
 			};
 			if (typeof item.document_id === "string") hit.documentId = item.document_id;
 			hits.push(hit);
@@ -82,6 +101,8 @@ export function createGatewayHindsightClient(options: GatewayClientOptions & { s
 		async health(): Promise<HindsightResult<HindsightHealth>> {
 			const result = await gateway.call("desk_memory_recall", { query: "ping", limit: 1, include_shared: false });
 			if (!result.ok) return asError(result);
+			const probed = hitsFrom(result.value);
+			if (!Array.isArray(probed)) return asError(probed);
 			return { ok: true, value: { ok: true, apiVersion: "gateway", databaseConnected: true, features: {} } };
 		},
 		async ensureBank(): Promise<HindsightResult<BankState>> {
@@ -120,7 +141,7 @@ export function createGatewayHindsightClient(options: GatewayClientOptions & { s
 			if (!result.ok) return asError(result);
 			const hits = hitsFrom(result.value);
 			if (!Array.isArray(hits)) return asError(hits);
-			return { ok: true, value: hits };
+			return { ok: true, value: hits.filter((hit) => tagsMatch(hit.tags, query.tags, query.tagsMatch)) };
 		},
 		getDocument(_documentId: string): Promise<HindsightResult<DocumentInfo | null>> {
 			return Promise.resolve(unavailable("getDocument"));

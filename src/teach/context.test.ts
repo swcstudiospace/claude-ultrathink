@@ -40,6 +40,17 @@ function sandbox(extraEnv: NodeJS.ProcessEnv = {}) {
 }
 
 describe("teachContext defaults", () => {
+	test("a user config gateway section is loaded with the rest of Teachable Moments config", () => {
+		const { cwd, env, writeJson } = sandbox();
+		writeJson(join(env.XDG_CONFIG_HOME!, "ultrathink", "config.json"), {
+			gateway: { url: "https://gateway.example/desk", seat: "lead", timeoutMs: 4000 },
+			hindsight: { enabled: true, backend: "gateway" },
+		});
+		const ctx = teachContext({ cwd, env });
+		expect(ctx.config.gateway).toMatchObject({ url: "https://gateway.example/desk", seat: "lead", timeoutMs: 4000 });
+		expect(ctx.config.hindsight.backend).toBe("gateway");
+	});
+
 	test("with no config files Teachable Moments is on, Hindsight is off, and the state lives in the host's directory", () => {
 		const { root, cwd, env } = sandbox();
 		const ctx = teachContext({ cwd, env });
@@ -47,6 +58,7 @@ describe("teachContext defaults", () => {
 		expect(ctx.cwd).toBe(cwd);
 		expect(ctx.config.teach).toEqual(DEFAULT_TEACH_CONFIG);
 		expect(ctx.config.hindsight).toEqual(DEFAULT_HINDSIGHT_CONFIG);
+		expect(ctx.config.gateway).toEqual({ url: "", seat: "lead", timeoutMs: 8000 });
 		expect(ctx.stateDir).toBe(join(root, "claude", "ultrathink"));
 		expect(ctx.storePath).toBe(join(root, "credentials.json"));
 		expect(teachEnabled(ctx)).toBe(true);

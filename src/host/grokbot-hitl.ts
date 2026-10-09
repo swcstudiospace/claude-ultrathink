@@ -7,6 +7,7 @@
  * `injectClarificationsXml`, so `ctl hitl last`, `summary` and `prompts build` all see "answered: …" instead of the default.
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { applyAnswers } from "../hitl/answers.ts";
 import { injectClarificationsXml } from "../hitl/format.ts";
@@ -56,5 +57,20 @@ export function recordAnswers(statePath: string, input: AnswersInput, now = Date
 	};
 	write(statePath, `${JSON.stringify(next, null, 2)}\n`);
 	write(xmlPath, `${xml}\n`);
+	mirrorLast(statePath, next);
 	return { matched, unknownIds, list };
+}
+
+/** `ctl last` and `ctl hitl last` read `last.json`, a copy of the session written when the plan was saved. */
+export function mirrorLast(statePath: string, record: SessionRecord): void {
+	const lastPath = join(dirname(dirname(statePath)), "last.json");
+	if (!existsSync(lastPath)) return;
+	try {
+		const last = JSON.parse(readFileSync(lastPath, "utf8")) as { sessionId?: string };
+		if (last.sessionId !== record.sessionId) return;
+		writeFileSync(`${lastPath}.tmp`, `${JSON.stringify(record, null, "\t")}\n`);
+		renameSync(`${lastPath}.tmp`, lastPath);
+	} catch {
+		// an unreadable last.json stays as it is
+	}
 }

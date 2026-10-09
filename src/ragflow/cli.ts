@@ -85,7 +85,11 @@ async function check(client: RagflowClient, json: boolean, now: () => number): P
 	const result = await client.health();
 	const ms = Math.max(0, Math.round(now() - started));
 	if (!result.ok) return failed("check", json, result.error);
-	const { datasets } = result.value;
+	const { datasets, scope } = result.value;
+	if (scope === "gateway") {
+		if (json) return { code: 0, text: JSON.stringify({ ok: true, scope, ms }) };
+		return { code: 0, text: `RAGFlow check: ok · gateway probe · ${ms} ms` };
+	}
 	if (json) return { code: 0, text: JSON.stringify({ ok: true, datasets, ms }) };
 	return { code: 0, text: `RAGFlow check: ok · ${datasets} dataset(s) · ${ms} ms` };
 }

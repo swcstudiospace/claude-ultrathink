@@ -16,9 +16,9 @@ import { runTeachCommand } from "../teach/cli.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
 import { workflowWaves } from "../think/graph.ts";
-import { sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../uplift/prompt.ts";
-import { runControl } from "../uplift/commands.ts";
+import { runControl, trackingOff } from "../uplift/commands.ts";
 import {
 	checkRecord,
 	createJournalCompleter,
@@ -31,6 +31,7 @@ import {
 	readMeta,
 	runGrokbotPlan,
 	storeAnswer,
+	thinkingOff,
 } from "./grokbot.ts";
 import { buildTrackPayloads, graphRegisterPayload, recordRefs } from "./grokbot-track.ts";
 import { buildCloudPrompt, type UnitDispatch, validateCloudPrompt } from "./grokbot-prompts.ts";
@@ -115,9 +116,9 @@ export function grokbotStatusLines(text: string): string {
 	return out.join("\n");
 }
 
-export async function summarize(stateDir: string, sessionId: string): Promise<Record<string, unknown>> {
+export async function summarize(stateDir: string, sessionId: string, cwd = process.cwd()): Promise<Record<string, unknown>> {
 	const { record, path } = readRecord(stateDir, sessionId);
-	const check = checkRecord(record);
+	const check = checkRecord(record, { thinkOff: thinkingOff(stateDir, cwd) });
 	const graph = record.graph;
 	return {
 		graphId: record.plan?.graphId,
@@ -157,26 +158,51 @@ export function dirFetcher(dir: string): typeof fetch {
 
 export async function reviewRead(repo: string, pr: string, fetcher: typeof fetch = fetch): Promise<Record<string, unknown>> {
 	const headers = { accept: "application/vnd.github+json", "user-agent": "ultrathink-grokbot" };
-	const get = async <T,>(path: string): Promise<T> => {
+	const get = async <T,>(path: string): Promise<{ value: T; link: string | null }> => {
 		const response = await fetcher(`https://api.github.com/repos/${repo}/${path}`, { headers });
 		if (!response.ok) throw new Error(`GitHub ${path}: HTTP ${response.status}`);
-		return (await response.json()) as T;
+		return { value: (await response.json()) as T, link: response.headers.get("link") };
+	};
+	/** Follows `rel="next"` and stops when a page is short of 100, so a fixture without a Link header is one page. */
+	const getAll = async <T,>(path: string, take: (value: unknown) => T[]): Promise<T[]> => {
+		const out: T[] = [];
+		let next: string | undefined = `https://api.github.com/repos/${repo}/${path}${path.includes("?") ? "&" : "?"}per_page=100`;
+		for (let page = 0; page < 20 && next; page++) {
+			const response: Response = await fetcher(next, { headers });
+			if (!response.ok) throw new Error(`GitHub ${path}: HTTP ${response.status}`);
+			const batch: T[] = take(await response.json());
+			out.push(...batch);
+			const link: string = response.headers.get("link") ?? "";
+			next = batch.length < 100 ? undefined : link.match(/<([^>]+)>;\s*rel="next"/)?.[1];
+		}
+		return out;
 	};
 	type Item = Record<string, unknown>;
 	const isGreptile = (c: Item) => /greptile/i.test(String((c.user as { login?: string } | undefined)?.login ?? ""));
-	const pull = await get<Item>(`pulls/${pr}`);
+	const pull = (await get<Item>(`pulls/${pr}`)).value;
 	const head = String((pull.head as { sha?: string } | undefined)?.sha ?? "");
-	const [issueComments, reviews, reviewComments, checks] = await Promise.all([
-		get<Item[]>(`issues/${pr}/comments?per_page=100`),
-		get<Item[]>(`pulls/${pr}/reviews?per_page=100`),
-		get<Item[]>(`pulls/${pr}/comments?per_page=100`),
-		head ? get<{ check_runs?: Item[] }>(`commits/${head}/check-runs?per_page=100`).catch(() => ({ check_runs: [] })) : Promise.resolve({ check_runs: [] }),
+	const [issueComments, reviews, reviewComments, checkRuns] = await Promise.all([
+		getAll<Item>(`issues/${pr}/comments`, (value) => (Array.isArray(value) ? value as Item[] : [])),
+		getAll<Item>(`pulls/${pr}/reviews`, (value) => (Array.isArray(value) ? value as Item[] : [])),
+		getAll<Item>(`pulls/${pr}/comments`, (value) => (Array.isArray(value) ? value as Item[] : [])),
+		head
+			? getAll<Item>(`commits/${head}/check-runs`, (value) => {
+				const runs = value && typeof value === "object" && !Array.isArray(value) ? (value as { check_runs?: Item[] }).check_runs : undefined;
+				return runs ?? [];
+			}).catch(() => [])
+			: Promise.resolve([]),
 	]);
-	// Greptile writes its summary (with the confidence score) into the PR description and/or a comment.
-	const bodies = [String(pull.body ?? ""), ...[...issueComments, ...reviews].filter(isGreptile).map((c) => String(c.body ?? ""))];
-	const scores = bodies.map(parseScore).filter((s): s is number => s !== null);
 	const greptileReviews = reviews.filter(isGreptile);
 	const lastReview = greptileReviews[greptileReviews.length - 1];
+	const headReview = [...greptileReviews].reverse().find((review) => review.commit_id === head);
+	const latestCommentScore = [...issueComments, ...reviews]
+		.filter(isGreptile)
+		.map((item) => parseScore(String(item.body ?? "")))
+		.filter((score): score is number => score !== null)
+		.at(-1);
+	const headScore = headReview ? parseScore(String(headReview.body ?? "")) : null;
+	const descriptionScore = parseScore(String(pull.body ?? ""));
+	const score = headScore ?? latestCommentScore ?? descriptionScore;
 	const roots = reviewComments.filter((c) => isGreptile(c) && !c.in_reply_to_id);
 	const threads = roots.map((c) => ({
 		path: c.path,
@@ -186,15 +212,15 @@ export async function reviewRead(repo: string, pr: string, fetcher: typeof fetch
 		title: String(c.body ?? "").match(/\*\*([^*]+)\*\*/)?.[1],
 		replies: reviewComments.filter((r) => r.in_reply_to_id === c.id).length,
 	}));
-	const greptileCheck = (checks.check_runs ?? []).filter((r) => /greptile/i.test(String(r.name ?? "") + String((r.app as { slug?: string } | undefined)?.slug ?? "")));
+	const greptileCheck = checkRuns.filter((r) => /greptile/i.test(String(r.name ?? "") + String((r.app as { slug?: string } | undefined)?.slug ?? "")));
 	return {
 		repo,
 		pr: Number(pr),
 		state: pull.state,
 		draft: pull.draft,
 		head: head.slice(0, 12),
-		score: scores.length ? scores[0] : null,
-		scoreSource: scores.length ? "pr-description-or-comment" : "none",
+		score,
+		scoreSource: headScore !== null ? "head-review" : latestCommentScore !== undefined ? "latest-comment" : descriptionScore !== null ? "pr-description" : "none",
 		lastGreptileReviewCommit: String(lastReview?.commit_id ?? "").slice(0, 12),
 		reviewedHead: lastReview?.commit_id === head,
 		greptileThreadsTotal: threads.length,
@@ -266,24 +292,27 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			const dir = journalDir(stateDir, id);
 			let check: unknown;
 			try {
-				check = checkRecord(readRecord(stateDir, id).record);
+				check = checkRecord(readRecord(stateDir, id).record, { thinkOff: thinkingOff(stateDir, cwd) });
 			} catch {
 				check = undefined;
 			}
 			return { code: 0, text: json({ meta: { ...readMeta(dir), original: undefined }, pending: listPending(dir).length, check }) };
 		}
 		case "deepen": {
-			const check = checkRecord(readRecord(stateDir, session(rest)).record);
+			const check = checkRecord(readRecord(stateDir, session(rest)).record, { thinkOff: thinkingOff(stateDir, cwd) });
 			return { code: 0, text: json({ totalSteps: check.totalSteps, band: check.band, belowBand: check.belowBand, deepen: deepenTargets(check) }) };
 		}
 		case "summary":
-			return { code: 0, text: json(await summarize(stateDir, session(rest))) };
+			return { code: 0, text: json(await summarize(stateDir, session(rest), cwd)) };
 		case "track": {
 			const sub = rest[0];
 			const id = session(rest);
 			const { record, path } = readRecord(stateDir, id);
 			if (sub === "payloads") {
 				const config = loadConfig(claudeConfigPaths(cwd));
+				if (trackingOff(config, readControl(stateDir))) {
+					return { code: 0, text: json({ graphId: record.plan?.graphId, calls: [], counts: { linearIssues: 0, linearSubIssues: 0, notionTask: 0, notionIssues: 0, notionSubIssues: 0 }, tracking: "off" }) };
+				}
 				const payloads = await buildTrackPayloads(record, {
 					linearTeam: config.linear.team,
 					notionDataSource: config.notion.dataSourceUrl,
@@ -298,7 +327,12 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			if (sub === "record") {
 				const refsFile = flag(rest, "--refs");
 				if (!refsFile) return { code: 2, text: "track record needs --refs F" };
-				const { tracking, todos } = recordRefs(path, JSON.parse(readFileSync(refsFile, "utf8")));
+				const config = loadConfig(claudeConfigPaths(cwd));
+				const parsed = JSON.parse(readFileSync(refsFile, "utf8")) as Parameters<typeof recordRefs>[1];
+				const { tracking, todos } = recordRefs(path, {
+					...parsed,
+					trackers: parsed.trackers ?? { linear: config.linear.team.trim() !== "", notion: config.notion.dataSourceUrl.trim() !== "" },
+				});
 				return { code: tracking.status === "failed" ? 1 : 0, text: `tracking ${tracking.status} · graph ${tracking.graphId}\n\n${todos}` };
 			}
 			if (sub === "register") return { code: 0, text: json(graphRegisterPayload(record, { withNodes: rest.includes("--with-nodes") })) };

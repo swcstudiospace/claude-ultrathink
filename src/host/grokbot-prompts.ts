@@ -191,7 +191,8 @@ export function validateCloudPrompt(xml: string, dispatch: UnitDispatch, origina
 	if (!xml.includes(`<ORIGINAL>${escapeXml(original)}</ORIGINAL>`)) errors.push("SPEC must carry ORIGINAL verbatim");
 	if (!xml.includes(`<BRANCH`) || !xml.includes(`>${escapeXml(dispatch.branch)}</BRANCH>`)) errors.push("DISPATCH branch missing");
 	if (dispatch.mode === "followup" && (!dispatch.agentId || !xml.includes("<FOLLOW_UP>"))) errors.push("follow-up prompts need an agent id and a FOLLOW_UP block");
-	if (/\{\{|\bTODO\b|\bTBD\b|lorem ipsum/i.test(xml)) errors.push("template placeholder text found");
+	const generated = xml.replace(/<ORIGINAL>[\s\S]*?<\/ORIGINAL>/g, "");
+	if (/\{\{|\bTODO\b|\bTBD\b|lorem ipsum/i.test(generated)) errors.push("template placeholder text found");
 	for (const pattern of SECRET_PATTERNS) if (pattern.test(xml)) errors.push(`secret-like string matched ${pattern.source}`);
 	return { ok: errors.length === 0, errors, chars: xml.length };
 }

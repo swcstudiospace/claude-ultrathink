@@ -71,7 +71,9 @@ export function resolveGateway(config: GatewayConfig, env: Record<string, string
 	if (rawUrl === "") return { ok: false, reason: "no-url" };
 	const url = checkServiceUrl(rawUrl);
 	if (!url.ok) return { ok: false, reason: "bad-url", detail: url.reason };
-	const requestedSeat = env[GATEWAY_SEAT_ENV]?.trim() || config.seat.trim() || DEFAULT_GATEWAY_CONFIG.seat;
+	const configuredSeat = config.seat.trim() || DEFAULT_GATEWAY_CONFIG.seat;
+	const override = env[GATEWAY_SEAT_ENV]?.trim();
+	const requestedSeat = override && SEAT_PATTERN.test(override) ? override : configuredSeat;
 	if (!SEAT_PATTERN.test(requestedSeat)) return { ok: false, reason: "bad-url", detail: "seat must match [a-z][a-z0-9-]{0,31}" };
 	const token = storedToken(deps.storePath, env);
 	if (!token) return { ok: false, reason: "no-token" };

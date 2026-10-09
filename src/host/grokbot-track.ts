@@ -15,6 +15,7 @@ import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { SessionRecord } from "../claude/state.ts";
 import { createTracking, type ToolCaller } from "../track/create.ts";
 import { formatTrackingTodos, injectTrackingXml } from "../track/render.ts";
+import { mirrorLast } from "./grokbot-hitl.ts";
 import type { IssueRef, TrackingRefs } from "../track/types.ts";
 
 /** Notion Agent Task Graph columns (docs/tracking.md); the dry run reports every one so no property is dropped. */
@@ -97,7 +98,7 @@ export async function buildTrackPayloads(
 			return {};
 		},
 	};
-	await createTracking(plan, record.graph, undefined, {
+	await createTracking(plan, record.graph, record.tracking, {
 		linear,
 		notion,
 		...(options.linearTeam ? { linearTeam: options.linearTeam } : {}),
@@ -105,7 +106,8 @@ export async function buildTrackPayloads(
 		concurrency: 1,
 		budgetMs: 600_000,
 	});
-	const created = (provider: "linear" | "notion", tool: string) => calls.filter((c) => c.provider === provider && c.tool === tool);
+	const emitted = calls.filter((call) => call.tool === "save_issue" || call.tool === "notion-create-pages" || call.tool === "notion-fetch");
+	const created = (provider: "linear" | "notion", tool: string) => emitted.filter((c) => c.provider === provider && c.tool === tool);
 	const linearCreates = created("linear", "save_issue");
 	const notionKeys = created("notion", "notion-create-pages").flatMap((c) => c.keys);
 	return {
@@ -113,7 +115,7 @@ export async function buildTrackPayloads(
 		...(options.linearTeam ? { linearTeam: options.linearTeam } : {}),
 		...(options.project ? { project: options.project } : {}),
 		...(options.notionDataSource ? { notionDataSource: options.notionDataSource } : {}),
-		calls,
+		calls: emitted,
 		counts: {
 			linearIssues: linearCreates.filter((c) => !c.keys[0]?.includes(".")).length,
 			linearSubIssues: linearCreates.filter((c) => c.keys[0]?.includes(".")).length,
@@ -130,6 +132,8 @@ export interface RealRefs {
 	/** Graph key (`task`, `n1`, `n1.3`) → Notion page URL. */
 	notion?: Record<string, string>;
 	errors?: string[];
+	/** Which trackers this kickoff was asked to fill. An omitted tracker counts as done. Absent means both. */
+	trackers?: { linear?: boolean; notion?: boolean };
 }
 
 /** Writes real refs into the record's tracking and re-renders the spec, like `ultrathink-mcp track complete`. */
@@ -156,8 +160,10 @@ export function recordRefs(statePath: string, refs: RealRefs, now = Date.now()):
 		else if (key.includes(".")) tracking.notion.steps[key] = url;
 		else tracking.notion.nodes[key] = url;
 	}
-	const linearDone = plan.linearIssues.every((i) => tracking.linear.nodes[i.nodeId]) && plan.linearSubIssues.every((s) => tracking.linear.steps[`${s.nodeId}.${s.step}`]);
-	const notionDone = !!tracking.notion.taskUrl && plan.issues.every((r) => tracking.notion.nodes[r.nodeId]) && plan.subIssues.every((r) => tracking.notion.steps[`${r.nodeId}.${r.step}`]);
+	const linearConfigured = refs.trackers ? refs.trackers.linear === true : true;
+	const notionConfigured = refs.trackers ? refs.trackers.notion === true : true;
+	const linearDone = !linearConfigured || (plan.linearIssues.every((i) => tracking.linear.nodes[i.nodeId]) && plan.linearSubIssues.every((s) => tracking.linear.steps[`${s.nodeId}.${s.step}`]));
+	const notionDone = !notionConfigured || (!!tracking.notion.taskUrl && plan.issues.every((r) => tracking.notion.nodes[r.nodeId]) && plan.subIssues.every((r) => tracking.notion.steps[`${r.nodeId}.${r.step}`]));
 	const any = Object.keys(tracking.linear.nodes).length + Object.keys(tracking.notion.nodes).length + (tracking.notion.taskUrl ? 1 : 0);
 	tracking.status = linearDone && notionDone ? "complete" : any > 0 ? "partial" : "failed";
 	record.tracking = tracking;
@@ -169,6 +175,7 @@ export function recordRefs(statePath: string, refs: RealRefs, now = Date.now()):
 	};
 	write(statePath, `${JSON.stringify(record, null, 2)}\n`);
 	write(statePath.replace(/\.json$/, ".xml"), xml);
+	mirrorLast(statePath, record);
 	return { tracking, todos: formatTrackingTodos(plan, tracking) };
 }
 

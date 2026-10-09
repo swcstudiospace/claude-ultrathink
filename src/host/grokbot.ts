@@ -22,7 +22,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CLARIFY_SYSTEM_PROMPT } from "../hitl/prompts.ts";
 import { normalizeClarifications } from "../hitl/pipeline.ts";
-import { sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
+import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { extractJsonObject, isFallbackGraph, normalizeGraph, parseNodeFill } from "../think/graph.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
@@ -378,17 +379,29 @@ export interface PlanCheck {
 	degraded: string[];
 }
 
-export function checkRecord(record: SessionRecord): PlanCheck {
+/** Thinking is off when the control says so, otherwise when the loaded config says so. */
+export function thinkingOff(stateDir: string, cwd: string, env?: Record<string, string | undefined>): boolean {
+	const control = readControl(stateDir);
+	if (typeof control.thinkEnabled === "boolean") return control.thinkEnabled === false;
+	try {
+		return loadConfig(claudeConfigPaths(cwd, env)).think.enabled === false;
+	} catch {
+		return false;
+	}
+}
+
+export function checkRecord(record: SessionRecord, options: { thinkOff?: boolean } = {}): PlanCheck {
 	const errors: string[] = [];
 	const nodes: ThoughtNode[] = record.graph?.nodes ?? [];
 	const stepsPerNode: Record<string, number> = {};
 	for (const node of nodes) stepsPerNode[node.id] = nodeStepTitles(node).length;
 	const totalSteps = Object.values(stepsPerNode).reduce((sum, n) => sum + n, 0);
 	const degraded = record.degraded ?? [];
+	const graphFree = options.thinkOff === true && nodes.length === 0;
 	if (record.result.source !== "llm") errors.push(`uplift source is ${record.result.source}`);
 	if (degraded.length > 0) errors.push(`degraded stages: ${degraded.join(", ")}`);
-	if (nodes.length < MIN_NODES || nodes.length > MAX_NODES) errors.push(`graph has ${nodes.length} nodes`);
-	for (const [id, n] of Object.entries(stepsPerNode)) if (n < MIN_STEPS || n > MAX_STEPS) errors.push(`${id} has ${n} steps`);
+	if (!graphFree && (nodes.length < MIN_NODES || nodes.length > MAX_NODES)) errors.push(`graph has ${nodes.length} nodes`);
+	if (!graphFree) for (const [id, n] of Object.entries(stepsPerNode)) if (n < MIN_STEPS || n > MAX_STEPS) errors.push(`${id} has ${n} steps`);
 	const root = record.result.root;
 	const band = DENSITY_BAND[root];
 	const belowBand = !!band && totalSteps < band[0];
@@ -466,7 +479,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 	const existing = sessionPath(stateDir, input.sessionId);
 	if (meta?.status === "planned" && !input.replan && existsSync(existing)) {
 		const record = JSON.parse(readFileSync(existing, "utf8")) as SessionRecord;
-		return { status: "planned", sessionId: input.sessionId, journal: dir, pending: [], replayed: 0, check: checkRecord(record), response: { statePath: existing, specPath: existing.replace(/\.json$/, ".xml") } as PlanResponse };
+		return { status: "planned", sessionId: input.sessionId, journal: dir, pending: [], replayed: 0, check: checkRecord(record, { thinkOff: thinkingOff(stateDir, input.cwd, env) }), response: { statePath: existing, specPath: existing.replace(/\.json$/, ".xml") } as PlanResponse };
 	}
 	writeMeta(dir, { ...meta, sessionId: input.sessionId, original: input.prompt, cwd: input.cwd, ...(input.transcriptPath ? { transcriptPath: input.transcriptPath } : {}), status: "needs-model" });
 	rmSync(join(dir, "pending"), { recursive: true, force: true });
@@ -500,7 +513,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 		return { status: "skipped", ...base, ...(response.skipped ? { skipped: response.skipped } : {}), response };
 	}
 	const record = JSON.parse(readFileSync(response.statePath, "utf8")) as SessionRecord;
-	const check = checkRecord(record);
+	const check = checkRecord(record, { thinkOff: thinkingOff(stateDir, input.cwd, env) });
 	const status = check.ok ? "planned" : "invalid";
 	writeMeta(dir, { ...readMeta(dir), sessionId: input.sessionId, status });
 	return { status, ...base, response, check };

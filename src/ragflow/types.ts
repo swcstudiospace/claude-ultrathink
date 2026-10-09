@@ -110,8 +110,8 @@ export interface RagflowClientOptions {
 
 /** Never rejects except with an AbortError when the caller's signal aborts. */
 export interface RagflowClient {
-	/** `GET /api/v1/datasets?page=1&page_size=1`; `value.datasets` is the server's total. */
-	health(): Promise<RagflowResult<{ datasets: number }>>;
+	/** `GET /api/v1/datasets?page=1&page_size=1`; `value.datasets` is the server's total. A gateway probe sets `scope` and does not invent a dataset count. */
+	health(): Promise<RagflowResult<{ datasets: number; scope?: "gateway" }>>;
 	/** Pages of 100 until an empty page or `total`, at most 1000 datasets. */
 	listDatasets(): Promise<RagflowResult<RagflowDataset[]>>;
 	retrieve(query: RetrieveQuery): Promise<RagflowResult<RagflowChunk[]>>;

@@ -11,7 +11,7 @@ description: >-
 
 # Ultrathink protocol (Grok Bot native)
 
-1. **Gate.** Skip planning when: the message starts with `raw:`; it is an `/ultrathink-*` command (route to that skill; `/ultrathink <prompt>` itself is a plan request run through the `ultrathink` skill); it is a quick question or chit-chat; `G ctl status` shows `Prompt Uplift off` or "skipping next prompt" (then run nothing, and the skip is consumed by the next `plan`). `uplift:` forces a plan.
+1. **Gate.** Skip planning when: the message starts with `raw:`; it is an `/ultrathink-*` command (route to that skill; `/ultrathink <prompt>` itself is a plan request run through the `ultrathink` skill); it is a quick question or chit-chat; `G ctl status` shows `Prompt Uplift off`. When status shows "skipping next prompt", run `G plan` on that one message: the plan command consumes the skip and returns skipped, then answer the message directly. Do not leave the skip armed. `uplift:` forces a plan.
 2. **Capture verbatim.** Write Ming's message byte-for-byte to `/workspace/ultrathink/runs/<session>/ORIGINAL.txt` (join multi-message requests with one blank line). Optional context: a `transcript.jsonl` of recent turns (`{"role":"user"|"assistant","content":"..."}` lines).
 3. **Plan.** Follow `ultrathink-plan` with a fresh session id (`desk-YYYYMMDD-HHMM-<slug>`).
 4. **Report.** `G summary --session S` gives nodes, steps per node, total, waves, questions and the spec path. Show Ming the graph summary and the questions (verbatim, each with its default); never paste the full XML into chat.

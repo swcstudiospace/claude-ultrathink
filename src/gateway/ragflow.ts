@@ -42,7 +42,7 @@ export function createGatewayRagflowClient(options: GatewayClientOptions): Ragfl
 		async health() {
 			const result = await gateway.call("desk_docs_search", { query: "ping", limit: 1 });
 			if (!result.ok) return asError(result);
-			return { ok: true, value: { datasets: chunksFrom(result.value).length } };
+			return { ok: true, value: { datasets: 0, scope: "gateway" } };
 		},
 		listDatasets(): Promise<RagflowResult<RagflowDataset[]>> {
 			return Promise.resolve({ ok: true, value: [{ id: "gateway", name: "desk" }] });
@@ -54,7 +54,9 @@ export function createGatewayRagflowClient(options: GatewayClientOptions): Ragfl
 			const args: Record<string, unknown> = { query: text.slice(0, 500), limit };
 			const result = await gateway.call("desk_docs_search", args);
 			if (!result.ok) return asError(result);
-			return { ok: true, value: chunksFrom(result.value) };
+			const threshold = query.similarityThreshold;
+			const chunks = chunksFrom(result.value).filter((chunk) => threshold === undefined || (chunk.similarity !== undefined && chunk.similarity >= threshold));
+			return { ok: true, value: chunks };
 		},
 	};
 }

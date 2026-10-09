@@ -4,11 +4,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SessionRecord } from "../claude/state.ts";
+import { type SessionRecord, writeControl } from "../claude/state.ts";
 import { escapeXml } from "../uplift/xml.ts";
 import { planPrompt } from "./plan.ts";
 import {
 	checkRecord,
+	thinkingOff,
 	createJournalCompleter,
 	deepenTargets,
 	GROKBOT_LABEL,
@@ -290,6 +291,51 @@ describe("grok-bot track bridge", () => {
 		expect(readFileSync(statePath.replace(/\.json$/, ".xml"), "utf8")).toBe(once);
 		expect(once).toContain("SPE-9000");
 	});
+
+	test("a second payload build skips rows that already exist, and one configured tracker can finish", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(5));
+		const statePath = result.response?.statePath as string;
+		const record = JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord;
+		const options = { linearTeam: "Team", notionDataSource: "collection://abc", project: "Kanban", agent: "grok-bot" };
+		const first = await buildTrackPayloads(record, options);
+		const issue = first.calls.find((call) => call.tool === "save_issue" && !String(call.keys[0]).includes("."));
+		const key = String(issue?.keys[0]);
+		const linear = {
+			[key]: { id: "id0", identifier: "SPE-1", url: "https://linear.app/x/issue/SPE-1/t", title: "t" },
+		};
+		const partial = recordRefs(statePath, { linear });
+		expect(partial.tracking.status).toBe("partial");
+		const again = await buildTrackPayloads(JSON.parse(readFileSync(statePath, "utf8")) as SessionRecord, options);
+		expect(again.calls.filter((call) => call.tool === "save_issue").some((call) => call.keys[0] === key)).toBe(false);
+		expect(again.calls.some((call) => call.tool === "list_issues" || call.tool === "notion-query-data-sources")).toBe(false);
+		expect(again.counts.linearIssues).toBe(first.counts.linearIssues - 1);
+
+		const other = tmp();
+		const otherDir = join(other, "state");
+		const planned = await drive(otherDir, other, hostModel(5));
+		const otherPath = planned.result.response?.statePath as string;
+		const payloads = await buildTrackPayloads(JSON.parse(readFileSync(otherPath, "utf8")) as SessionRecord, options);
+		const allLinear: Record<string, { id: string; identifier: string; url: string; title: string }> = {};
+		payloads.calls.filter((call) => call.tool === "save_issue").forEach((call, i) => {
+			allLinear[String(call.keys[0])] = { id: `id${i}`, identifier: `SPE-${i}`, url: `https://linear.app/x/issue/SPE-${i}/t`, title: "t" };
+		});
+		const linearOnly = recordRefs(otherPath, { linear: allLinear, trackers: { linear: true, notion: false } });
+		expect(linearOnly.tracking.status).toBe("complete");
+		expect(linearOnly.tracking.notion.taskUrl).toBeUndefined();
+
+		const env = { ...testEnv(root), ULTRATHINK_STATE_DIR: stateDir } as NodeJS.ProcessEnv;
+		const off = await main(["track", "payloads", "--session", "s1", "--cwd", root], env);
+		expect(off.code).toBe(0);
+		expect(off.text).toContain('"tracking": "off"');
+		expect(off.text).toContain('"calls": []');
+		mkdirSync(join(root, "xdg", "ultrathink"), { recursive: true });
+		writeFileSync(join(root, "xdg", "ultrathink", "config.json"), JSON.stringify({ linear: { team: "Team" }, notion: { dataSourceUrl: "collection://abc" } }));
+		writeControl(stateDir, { trackEnabled: false });
+		const forced = await main(["track", "payloads", "--session", "s1", "--cwd", root], env);
+		expect(forced.text).toContain('"tracking": "off"');
+	});
 });
 
 describe("grok-bot teach guard", () => {
@@ -321,6 +367,41 @@ describe("grok-bot review read", () => {
 		expect(read.greptileThreadsTotal).toBe(2);
 		expect(read.greptileThreadsOnHead).toBe(1);
 		expect(read.greptileCheckRuns).toEqual([{ name: "Greptile Review", status: "completed", conclusion: "success" }]);
+		expect(read.scoreSource).toBe("pr-description");
+	});
+
+	test("prefers the current head review score and follows a next page", async () => {
+		const root = tmp();
+		const bot = { login: "greptile-apps[bot]" };
+		writeFileSync(join(root, "pull.json"), JSON.stringify({ state: "open", draft: true, head: { sha: "abc" }, body: "" }));
+		writeFileSync(join(root, "issue-comments.json"), JSON.stringify([{ user: bot, body: "Confidence Score: 5/5" }]));
+		writeFileSync(join(root, "reviews.json"), JSON.stringify([{ user: bot, commit_id: "abc", body: "Confidence Score: 2/5" }]));
+		writeFileSync(join(root, "review-comments.json"), "[]");
+		writeFileSync(join(root, "check-runs.json"), JSON.stringify({ check_runs: [] }));
+		const read = await reviewRead("o/r", "21", dirFetcher(root));
+		expect(read.score).toBe(2);
+		expect(read.scoreSource).toBe("head-review");
+
+		let reviewPage = 0;
+		const paged = (async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input).split("?")[0] ?? "";
+			if (url.endsWith("/pulls/21")) return new Response(readFileSync(join(root, "pull.json"), "utf8"), { status: 200 });
+			if (url.endsWith("/reviews")) {
+				reviewPage++;
+				if (reviewPage === 1) {
+					const filler = Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: "someone" }, body: "" }));
+					return new Response(JSON.stringify(filler), { status: 200, headers: { link: '<https://api.github.com/repos/o/r/pulls/21/reviews?page=2>; rel="next"' } });
+				}
+				return new Response(readFileSync(join(root, "reviews.json"), "utf8"), { status: 200 });
+			}
+			if (url.includes("/comments")) return new Response("[]", { status: 200 });
+			if (url.includes("/check-runs")) return new Response(JSON.stringify({ check_runs: [] }), { status: 200 });
+			return new Response("{}", { status: 404 });
+		}) as typeof fetch;
+		const pagedRead = await reviewRead("o/r", "21", paged);
+		expect(reviewPage).toBe(2);
+		expect(pagedRead.score).toBe(2);
+		expect(pagedRead.scoreSource).toBe("head-review");
 	});
 });
 
@@ -354,6 +435,41 @@ describe("grok-bot prompts build", () => {
 		expect(validateCloudPrompt(buildCloudPrompt(record, follow), follow, PROMPT).errors.join()).toMatch(/agent id/);
 		const leaky = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b", notes: ["key sk-or-abcdefghijklmnop"] };
 		expect(validateCloudPrompt(buildCloudPrompt(record, leaky), leaky, PROMPT).errors.join()).toMatch(/secret-like/);
+	});
+
+	test("placeholder text inside ORIGINAL is kept and a placeholder outside still fails", async () => {
+		const root = tmp();
+		const { result } = await drive(join(root, "state"), root, hostModel(5));
+		const record = JSON.parse(readFileSync(result.response?.statePath as string, "utf8")) as SessionRecord;
+		const dispatch = { unit: "n3", mode: "new" as const, repo: "o/r", branch: "b" };
+		const original = `${PROMPT} TODO in the request`;
+		const xml = buildCloudPrompt(record, dispatch).replace(
+			`<ORIGINAL>${escapeXml(PROMPT)}</ORIGINAL>`,
+			`<ORIGINAL>${escapeXml(original)}</ORIGINAL>`,
+		);
+		expect(validateCloudPrompt(xml, dispatch, original).errors).toEqual([]);
+		const outside = xml.replace("<VERIFY>", "<VERIFY>TODO ");
+		expect(validateCloudPrompt(outside, dispatch, original).errors.join()).toMatch(/placeholder/);
+		const leaked = xml.replace("</ORIGINAL>", " sk-or-abcdefghijklmnop</ORIGINAL>");
+		expect(validateCloudPrompt(leaked, dispatch, `${original} sk-or-abcdefghijklmnop`).errors.join()).toMatch(/secret-like/);
+	});
+
+	test("a graph-free plan is valid only when thinking is off", async () => {
+		const root = tmp();
+		const stateDir = join(root, "state");
+		const { result } = await drive(stateDir, root, hostModel(5));
+		const record = JSON.parse(readFileSync(result.response?.statePath as string, "utf8")) as SessionRecord;
+		const empty = structuredClone(record);
+		if (empty.graph) empty.graph = { ...empty.graph, nodes: [] };
+		expect(checkRecord(empty).ok).toBe(false);
+		expect(checkRecord(empty).errors.join()).toMatch(/0 nodes/);
+		expect(checkRecord(empty, { thinkOff: true }).ok).toBe(true);
+		const broken = structuredClone(record);
+		broken.graph?.nodes.splice(0, 3);
+		expect(checkRecord(broken, { thinkOff: true }).ok).toBe(false);
+		expect(thinkingOff(stateDir, root, testEnv(root))).toBe(false);
+		writeControl(stateDir, { thinkEnabled: false });
+		expect(thinkingOff(stateDir, root, testEnv(root))).toBe(true);
 	});
 });
 
@@ -451,6 +567,13 @@ describe("grok-bot answers", () => {
 		expect(buildCloudPrompt(record, dispatch)).toContain("answered: JSON lines");
 		expect(() => parseAnswersInput({ answers: {} })).toThrow(/no answers/);
 		expect(() => parseAnswersInput({ q1: 3 })).toThrow(/string/);
+		const lastPath = join(join(root, "state"), "last.json");
+		const last = JSON.parse(readFileSync(lastPath, "utf8")) as SessionRecord;
+		expect(last.clarifications?.[0]?.answer).toBe("JSON lines");
+		expect(readFileSync(lastPath, "utf8")).toContain("\t");
+		writeFileSync(lastPath, `${JSON.stringify({ sessionId: "other", result: { xml: "stale" } }, null, "\t")}\n`);
+		recordAnswers(statePath, parseAnswersInput({ q1: "JSON lines" }));
+		expect(JSON.parse(readFileSync(lastPath, "utf8")).sessionId).toBe("other");
 	});
 });
 
@@ -474,6 +597,13 @@ describe("grok-bot teach digest and host", () => {
 		const tools = grokbotDigest(src, { sessionId: "s2", cwd: root });
 		expect(tools?.toolCalls).toBe(2);
 		expect(tools?.turns.filter((t) => t.role === "tool").map((t) => [t.tool, t.isError ?? false])).toEqual([["Shell", true], ["Shell", false]]);
+		writeFileSync(src, [
+			JSON.stringify({ type: "user", message: { role: "user", content: "Keep the user line." } }),
+			JSON.stringify({ role: "tool", name: "Shell", input: { command: "bun test" }, content: "1 fail", isError: true }),
+		].join("\n"));
+		const mixed = grokbotDigest(src, { sessionId: "s3", cwd: root });
+		expect(mixed?.toolCalls).toBeGreaterThanOrEqual(1);
+		expect(mixed?.turns.some((turn) => turn.role === "user" && turn.text === "Keep the user line.")).toBe(true);
 	});
 
 	test("teach captures are host grok-bot", async () => {

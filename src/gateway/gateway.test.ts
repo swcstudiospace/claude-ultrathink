@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, mergeConfig } from "../config.ts";
 import { hindsightStatusLine, resolveHindsight } from "../hindsight/settings.ts";
+import { runRagflowCommand } from "../ragflow/cli.ts";
 import { ragflowStatusLine, resolveRagflow } from "../ragflow/settings.ts";
+import { resolveGateway } from "./settings.ts";
 import { emitEvent, fetchBrief } from "../substrate/brief.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { DEFAULT_RAGFLOW_CONFIG } from "../ragflow/types.ts";
@@ -278,5 +280,88 @@ describe("gateway backend", () => {
 		);
 		const resolution = resolveHindsight(hindsightOn, { HINDSIGHT_API_KEY: HS_KEY }, { storePath: path, gateway: GATEWAY });
 		expect(resolution.readiness).toMatchObject({ state: "ready", tokenSource: "store" });
+	});
+
+	test("recall keeps string metadata and applies the caller's tag filter locally", async () => {
+		const env = { DESK_GATEWAY_TOKEN: TOKEN };
+		const fetchImpl = scripted(() =>
+			toolReply({
+				results: [{
+					body: {
+						results: [
+							{ id: "m1", text: "lesson for project a", tags: ["project:a", "status:active"], metadata: { tm_id: "tm-1", count: 3, note: "keep" } },
+							{ id: "m2", text: "lesson for project b", tags: ["project:b"], metadata: { tm_id: "tm-2" } },
+						],
+					},
+				}],
+			}),
+		);
+		const recalled = await resolveHindsight(hindsightOn, env, { fetch: fetchImpl.fetch, gateway: GATEWAY }).client?.recall({
+			query: "lesson",
+			tags: ["project:a"],
+			tagsMatch: "all_strict",
+		});
+		expect(recalled).toEqual({
+			ok: true,
+			value: [{ id: "m1", text: "lesson for project a", tags: ["project:a", "status:active"], metadata: { tm_id: "tm-1", note: "keep" } }],
+		});
+		expect(expectTool(fetchImpl.sent[0]!, "desk_memory_recall")).not.toHaveProperty("tags");
+	});
+
+	test("a per-bank not_configured fails the health check", async () => {
+		const env = { DESK_GATEWAY_TOKEN: TOKEN };
+		const fetchImpl = scripted(() => toolReply({ results: [{ error: "not_configured", reason: "hindsight bank missing" }] }));
+		const health = await resolveHindsight(hindsightOn, env, { fetch: fetchImpl.fetch, gateway: GATEWAY }).client?.health();
+		expect(health?.ok).toBe(false);
+		if (health?.ok === false) expect(health.error.message).toContain("not_configured");
+	});
+
+	test("setDocumentTags is not reported as a missing document and sends nothing", async () => {
+		const env = { DESK_GATEWAY_TOKEN: TOKEN };
+		const fetchImpl = scripted(() => toolReply({}));
+		const result = await resolveHindsight(hindsightOn, env, { fetch: fetchImpl.fetch, gateway: GATEWAY }).client?.setDocumentTags("doc-1", ["status:superseded"]);
+		expect(result?.ok).toBe(false);
+		if (result?.ok === false) {
+			expect(result.error.kind).not.toBe("not-found");
+			expect(result.error.kind).toBe("bad-request");
+		}
+		expect(fetchImpl.sent).toHaveLength(0);
+	});
+
+	test("document search drops chunks under similarityThreshold and a gateway check is a probe", async () => {
+		const env = { DESK_GATEWAY_TOKEN: TOKEN };
+		const fetchImpl = scripted(() =>
+			toolReply({
+				results: [
+					{ content: "low", score: 0.4 },
+					{ content: "high", score: 0.9 },
+					{ content: "unscored" },
+				],
+			}),
+		);
+		const client = resolveRagflow(ragflowOn, env, { fetch: fetchImpl.fetch, gateway: GATEWAY }).client;
+		const found = await client?.retrieve({ question: "docs", datasetIds: [], similarityThreshold: 0.8 });
+		expect(found).toMatchObject({ ok: true, value: [{ content: "high", similarity: 0.9 }] });
+		const loose = await client?.retrieve({ question: "docs", datasetIds: [], similarityThreshold: 0.2 });
+		expect(loose?.ok && loose.value.map((chunk) => chunk.content)).toEqual(["low", "high"]);
+		const health = await client?.health();
+		expect(health).toEqual({ ok: true, value: { datasets: 0, scope: "gateway" } });
+		const check = await runRagflowCommand(["check"], {
+			cwd: tmpdir(),
+			env,
+			config: ragflowOn,
+			gateway: GATEWAY,
+			fetch: fetchImpl.fetch,
+			now: () => 0,
+		});
+		expect(check).toEqual({ code: 0, text: "RAGFlow check: ok · gateway probe · 0 ms" });
+	});
+
+	test("an invalid DESK_GATEWAY_SEAT keeps the configured seat", () => {
+		const kept = resolveGateway(GATEWAY, { DESK_GATEWAY_SEAT: "Lead", DESK_GATEWAY_TOKEN: TOKEN });
+		expect(kept.ok).toBe(true);
+		if (kept.ok) expect(kept.gateway.seat).toBe("lead");
+		const both = resolveGateway({ ...GATEWAY, seat: "Bad Seat" }, { DESK_GATEWAY_SEAT: "Also Bad", DESK_GATEWAY_TOKEN: TOKEN });
+		expect(both.ok).toBe(false);
 	});
 });
