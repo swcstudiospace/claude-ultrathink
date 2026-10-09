@@ -193,7 +193,7 @@ describe("legacy diagnostic label safety", () => {
 				expect(childCwd).not.toBe(cli.cwd);
 				expect(realpathSync(dirname(childCwd))).toBe(realTmp);
 				expect(basename(childCwd)).toStartWith("ultrathink-grok-");
-			} else expect(childCwd).toBe(cli.cwd);
+			} else expect(realpathSync(childCwd)).toBe(realpathSync(cli.cwd));
 			if (route !== "claude") {
 				const promptFile = args[args.indexOf("--prompt-file") + 1];
 				if (!promptFile) throw new Error("expected a CLI prompt file");
