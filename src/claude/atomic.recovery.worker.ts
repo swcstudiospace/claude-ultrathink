@@ -15,11 +15,15 @@ const nodeFs = { ...fs };
 const sleepWord = new Int32Array(new SharedArrayBuffer(4));
 function signal(name: string): void {
 	nodeFs.writeFileSync(join(eventDir, name), "", { mode: 0o600 });
+	nodeFs.writeSync(1, `${name}\n`);
 }
 function wait(name: string): void {
 	const deadline = Date.now() + 20_000;
 	while (!nodeFs.existsSync(join(eventDir, name))) {
-		if (Date.now() >= deadline) throw new Error(`barrier timed out: ${name}`);
+		if (Date.now() >= deadline) {
+			console.error(`${actor}: barrier timed out: ${name}`);
+			throw new Error(`barrier timed out: ${name}`);
+		}
 		Atomics.wait(sleepWord, 0, 0, 5);
 	}
 }

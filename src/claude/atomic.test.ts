@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { withFileLock, writeFileAtomic } from "./atomic.ts";
@@ -303,22 +303,52 @@ describe("concurrent updates through updateSession", () => {
 		const events = join(dir, "events");
 		const signal = (name: string): void => writeFileAtomic(join(events, name), "");
 		signal("start");
-		const waitFor = (names: string[]): Promise<string> => new Promise((resolve, reject) => {
-			const check = (): void => {
-				const name = names.find((candidate) => existsSync(join(events, candidate)));
+		const observed = new Set<string>();
+		const waiters = new Set<{ names: string[]; resolve: (name: string) => void; reject: (error: Error) => void }>();
+		const readers: Promise<void>[] = [];
+		let failure: Error | undefined;
+		const notify = (): void => {
+			for (const waiter of waiters) {
+				const name = waiter.names.find((candidate) => observed.has(candidate));
 				if (name) {
-					watcher.close();
-					resolve(name);
+					waiters.delete(waiter);
+					waiter.resolve(name);
 				}
-			};
-			const watcher = watch(events, check);
-			watcher.once("error", reject);
-			check();
+			}
+		};
+		const waitFor = (names: string[]): Promise<string> => new Promise((resolve, reject) => {
+			if (failure) return reject(failure);
+			waiters.add({ names, resolve, reject });
+			notify();
 		});
-		const spawn = (actor: string) => Bun.spawn(
-			[process.execPath, join(import.meta.dir, "atomic.recovery.worker.ts"), stateDir, record.sessionId, events, actor],
-			{ stdout: "pipe", stderr: "pipe" },
-		);
+		const spawn = (actor: string) => {
+			const worker = Bun.spawn(
+				[process.execPath, join(import.meta.dir, "atomic.recovery.worker.ts"), stateDir, record.sessionId, events, actor],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			// Consume explicit worker messages: filesystem notification delivery is not a barrier.
+			readers.push((async () => {
+				try {
+					const decoder = new TextDecoder();
+					let buffer = "";
+					for await (const chunk of worker.stdout) {
+						buffer += decoder.decode(chunk, { stream: true });
+						let end: number;
+						while ((end = buffer.indexOf("\n")) !== -1) {
+							observed.add(buffer.slice(0, end));
+							buffer = buffer.slice(end + 1);
+							notify();
+						}
+					}
+					if (waiters.size) throw new Error(`${actor} exited before the next barrier; observed: ${[...observed].join(", ")}`);
+				} catch (error) {
+					failure = error instanceof Error ? error : new Error(String(error));
+					for (const waiter of waiters) waiter.reject(failure);
+					waiters.clear();
+				}
+			})());
+			return worker;
+		};
 		const workers = [spawn("delayed")];
 		try {
 			await waitFor(["snapshot"]);
@@ -356,6 +386,7 @@ describe("concurrent updates through updateSession", () => {
 			signal("claimed-go");
 			for (const worker of workers) if (worker.exitCode === null) worker.kill();
 			await Promise.allSettled(workers.map((worker) => worker.exited));
+			await Promise.all(readers);
 		}
 	}, 60_000);
 });
