@@ -110,6 +110,25 @@ describe("ultrathink-cursor-pstack hook (spawned with node)", () => {
 		);
 	});
 
+	test("a question that only mentions a slash command prints {}", () => {
+		withHarness(({ run }) => {
+			for (const prompt of ["What does `/gsd-ship` do?", "What does /gsd-ship do?", '"/gsd-plan-phase"', "`/gsd-ship`"]) {
+				const { status, stdout } = run(JSON.stringify({ prompt }));
+				expect(status).toBe(0);
+				expect(JSON.parse(stdout)).toEqual({});
+			}
+		});
+	});
+
+	test("a command at the start of a later line still injects", () => {
+		withHarness(({ run, skillRoot }) => {
+			const { status, stdout } = run(JSON.stringify({ prompt: "notes\n/gsd-plan-phase 24" }));
+			expect(status).toBe(0);
+			const parsed = JSON.parse(stdout) as { additional_context?: string };
+			expect(parsed.additional_context).toContain(join(skillRoot, "skills", "architect", "SKILL.md"));
+		});
+	});
+
 	test("a pstack command (/architect this) is not a gsd command: prints {}", () => {
 		withHarness(({ run }) => {
 			const { status, stdout } = run(JSON.stringify({ prompt: "/architect this" }));

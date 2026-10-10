@@ -165,6 +165,18 @@ describe("detectStage", () => {
 		expect(detectStage(undefined).reason).toBe("payload prompt is not a string");
 		expect(detectStage(42).stage).toBeNull();
 	});
+
+	test("a question or a quoted example that only mentions a command is not an invocation", () => {
+		expect(detectStage("What does `/gsd-ship` do?").stage).toBeNull();
+		expect(detectStage("What does /gsd-ship do?").stage).toBeNull();
+		expect(detectStage('"/gsd-plan-phase"').stage).toBeNull();
+		expect(detectStage("`/gsd-ship`").stage).toBeNull();
+	});
+
+	test("a command at the start of a later line is still an invocation", () => {
+		expect(detectStage("notes about the milestone\n/gsd-plan-phase 23").stage).toBe("plan");
+		expect(detectStage("/gsd-plan-phase 23\nWhat does `/gsd-ship` do?").stage).toBe("plan");
+	});
 });
 
 describe("buildBlock", () => {
@@ -190,6 +202,21 @@ describe("buildBlock", () => {
 		expect(capped.skills).toBe(1);
 	});
 
+	test("a null plugin.json does not hide a valid sibling", () => {
+		const root = mkdtempSync(join(tmpdir(), "pstack-null-manifest-"));
+		try {
+			const cache = join(root, "plugins", "cache", "cursor-public", "pstack");
+			mkPlugin(cache, "broken", "9.9.9", true);
+			writeFileSync(join(cache, "broken", ".cursor-plugin", "plugin.json"), "null");
+			mkPlugin(cache, "good", "1.0.0", true);
+			const resolved = resolvedOrThrow(resolvePstack(root));
+			expect(resolved.version).toBe("1.0.0");
+			expect(resolved.root.endsWith("good")).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("an impossible cap yields a reason", () => {
 		const tight = buildBlock("plan", resolvePstack(cursorDir), undefined, 300);
 		expect("reason" in tight).toBe(true);
@@ -198,5 +225,25 @@ describe("buildBlock", () => {
 	test("unresolved skills yield a reason (fail-open)", () => {
 		const brokenBlock = buildBlock("plan", { skillsDir: "/nonexistent" });
 		expect("reason" in brokenBlock).toBe(true);
+	});
+
+	test("a skipped-skill note is shortened or dropped before a usable instruction is removed", () => {
+		const real = resolvedOrThrow(resolvePstack(cursorDir));
+		const both = blockOrThrow(buildBlock("plan", real, { plan: ["architect", "arena"] }));
+		const short = `${both.block}\n- skipped: 1 missing skill(s)`;
+		const shortened = buildBlock("plan", real, { plan: ["architect", "arena", "not-a-skill"] }, short.length);
+		if (!("block" in shortened)) throw new Error(shortened.reason);
+		expect(shortened.skills).toBe(2);
+		expect(shortened.block).toContain("missing skill(s)");
+		expect(shortened.block).not.toContain("not-a-skill");
+		expect(shortened.block).not.toContain("truncated by cap");
+
+		const bare = blockOrThrow(buildBlock("plan", real, { plan: ["architect"] }));
+		const dropped = buildBlock("plan", real, { plan: ["architect", "not-a-skill"] }, bare.block.length);
+		if (!("block" in dropped)) throw new Error(dropped.reason);
+		expect(dropped.skills).toBe(1);
+		expect(dropped.block).toContain("architect");
+		expect(dropped.block).not.toContain("not-a-skill");
+		expect(dropped.block.length).toBeLessThanOrEqual(bare.block.length);
 	});
 });

@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import {
 	EVENT,
 	HOOK_FILE,
+	hookCommand,
 	isOwned,
 	main,
 	readHooksFile,
 	removeHook,
 	resolveNode,
+	shellQuote,
 	upsertHook,
 	writeHooksFile,
 } from "./cursor-hooks.ts";
@@ -134,13 +137,36 @@ describe("readHooksFile / writeHooksFile", () => {
 		const dir = mkdtempSync(join(tmpdir(), "cursor-hooks-write-"));
 		try {
 			const file = join(dir, "hooks.json");
-			writeHooksFile(file, { hooks: {} });
+			expect(writeHooksFile(file, { hooks: {} })).toBe(true);
 			expect(readFileSync(file, "utf8")).toBe('{\n  "hooks": {}\n}\n');
 			expect(statSync(file).mode & 0o777).toBe(0o600);
 			expect(readdirSync(dir)).toEqual(["hooks.json"]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	test("refuses a write when hooks.json no longer matches the snapshot", () => {
+		const dir = mkdtempSync(join(tmpdir(), "cursor-hooks-stale-"));
+		try {
+			const file = join(dir, "hooks.json");
+			const original = '{\n  "hooks": {}\n}\n';
+			writeFileSync(file, original);
+			expect(writeHooksFile(file, { hooks: { [EVENT]: [] } }, "stale")).toBe(false);
+			expect(readFileSync(file, "utf8")).toBe(original);
+			expect(readdirSync(dir)).toEqual(["hooks.json"]);
+			expect(writeHooksFile(file, { hooks: { [EVENT]: [WANTED] } }, original)).toBe(true);
+			expect(readFileSync(file, "utf8")).toContain(HOOK_FILE);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("shellQuote", () => {
+	test("quotes spaces and escapes embedded single quotes", () => {
+		expect(shellQuote("/opt/my cursor/node")).toBe("'/opt/my cursor/node'");
+		expect(shellQuote("/opt/o'brien/node")).toBe("'/opt/o'\\''brien/node'");
 	});
 });
 
@@ -151,8 +177,8 @@ interface Sandbox {
 	staged: string;
 	node: string;
 	lines: string[];
-	/** Runs main with hermetic env/root; `over` swaps the repo root or node candidates. */
-	run: (args: string[], over?: { root?: string; candidates?: string[] }) => number;
+	/** Runs main with hermetic env/root; `over` swaps the repo root, node candidates, or the pre-write seam. */
+	run: (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void }) => number;
 	hooksJson: () => unknown;
 	list: () => unknown[];
 }
@@ -169,13 +195,14 @@ function sandbox(fn: (box: Sandbox) => void): void {
 	writeFileSync(node, "#!/bin/sh\n", { mode: 0o755 });
 	const lines: string[] = [];
 	const cursor = join(home, ".cursor");
-	const run = (args: string[], over?: { root?: string; candidates?: string[] }) =>
+	const run = (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void }) =>
 		main(args, {
 			env: { HOME: home },
 			root: over?.root ?? repo,
 			log: (line) => lines.push(line),
 			// A missing first candidate proves the loop skips non-existent paths.
 			nodeCandidates: over?.candidates ?? [join(dir, "missing-node"), node],
+			...(over?.beforeCommit ? { beforeCommit: over.beforeCommit } : {}),
 		});
 	try {
 		fn({
@@ -198,7 +225,7 @@ describe("main", () => {
 	test("install into an empty dir creates the entry and stages the hook", () => {
 		sandbox((box) => {
 			expect(box.run(["install"])).toBe(0);
-			expect(box.hooksJson()).toEqual({ hooks: { [EVENT]: [{ ...WANTED, command: `${box.node} ${box.staged}` }] } });
+			expect(box.hooksJson()).toEqual({ hooks: { [EVENT]: [{ ...WANTED, command: hookCommand(box.node, box.staged) }] } });
 			expect(readFileSync(box.staged, "utf8")).toBe(readFileSync(box.source, "utf8"));
 			expect(statSync(box.cursor).mode & 0o777).toBe(0o700);
 			expect(statSync(join(box.cursor, "hooks")).mode & 0o777).toBe(0o755);
@@ -232,7 +259,7 @@ describe("main", () => {
 			expect(JSON.stringify(mid.filter((entry) => !isOwned(entry)))).toBe(foreign);
 			const owned = mid.filter(isOwned);
 			expect(owned).toHaveLength(1);
-			expect(owned[0]).toEqual({ ...WANTED, command: `${box.node} ${box.staged}` });
+			expect(owned[0]).toEqual({ ...WANTED, command: hookCommand(box.node, box.staged) });
 			expect(mid.indexOf(owned[0])).toBe(1); // replaced in place, foreign slots untouched
 			expect(box.hooksJson()).toHaveProperty("hooks.postToolUse", [{ ...SUBSTRATE }]);
 			expect(box.run(["remove"])).toBe(0);
@@ -300,6 +327,65 @@ describe("main", () => {
 			expect(box.run(["install"], { root: repo, candidates: [join(box.home, "not-node")] })).toBe(1);
 			expect(box.lines.join("\n")).toContain("no executable node");
 			expect(existsSync(box.cursor)).toBe(false);
+		});
+	});
+
+	test("a relative --cursor-dir is stored as an absolute quoted command", () => {
+		sandbox((box) => {
+			const fromHere = relative(process.cwd(), box.cursor);
+			expect(isAbsolute(fromHere)).toBe(false);
+			expect(box.run(["install", "--cursor-dir", fromHere])).toBe(0);
+			const installed = box.list()[0] as { command: string };
+			expect(isAbsolute(box.staged)).toBe(true);
+			expect(installed.command).toBe(hookCommand(box.node, box.staged));
+		});
+	});
+
+	test("a cursor dir with spaces is launched as one shell command", () => {
+		sandbox((box) => {
+			const cursor = join(box.home, "my cursor");
+			expect(box.run(["install", "--cursor-dir", cursor])).toBe(0);
+			const staged = join(cursor, "hooks", HOOK_FILE);
+			const parsed = JSON.parse(readFileSync(join(cursor, "hooks.json"), "utf8")) as {
+				hooks: { beforeSubmitPrompt: Array<{ command: string }> };
+			};
+			const command = parsed.hooks.beforeSubmitPrompt[0]?.command;
+			expect(command).toBe(hookCommand(box.node, staged));
+			const proc = spawnSync(command ?? "", { shell: true, encoding: "utf8" });
+			expect(proc.status).toBe(0);
+		});
+	});
+
+	test("an overlapping hooks.json edit is merged on retry instead of dropped", () => {
+		sandbox((box) => {
+			let raced = false;
+			expect(
+				box.run(["install"], {
+					beforeCommit: () => {
+						if (raced) return;
+						raced = true;
+						writeFileSync(join(box.cursor, "hooks.json"), JSON.stringify({ hooks: { [EVENT]: [FOREIGN] } }));
+					},
+				}),
+			).toBe(0);
+			expect(box.list()).toEqual([FOREIGN, { ...WANTED, command: hookCommand(box.node, box.staged) }]);
+		});
+	});
+
+	test("hooks.json edits that keep landing during the write are refused", () => {
+		sandbox((box) => {
+			let stamp = 0;
+			expect(
+				box.run(["install"], {
+					beforeCommit: () => {
+						stamp += 1;
+						writeFileSync(join(box.cursor, "hooks.json"), JSON.stringify({ hooks: { [EVENT]: [FOREIGN] }, stamp }));
+					},
+				}),
+			).toBe(1);
+			expect(box.lines.join("\n")).toContain("changed while it was being updated");
+			expect(box.list().some(isOwned)).toBe(false);
+			expect(box.list()).toContainEqual(FOREIGN);
 		});
 	});
 

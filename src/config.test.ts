@@ -778,6 +778,19 @@ describe("pstack config", () => {
 		expect(config.pstack.mapping).toEqual({ plan: ["architect", "arena"], review: ["how"] });
 	});
 
+	test("a later layer keeps earlier mapping stages it does not replace", () => {
+		const replaced = loadLayerFiles(
+			roots,
+			{ pstack: { enabled: false, mapping: { plan: ["architect"], discuss: ["how"] } } },
+			{ pstack: { enabled: true, mapping: { review: ["how"] } } },
+		);
+		expect(replaced.pstack.enabled).toBe(true);
+		expect(replaced.pstack.mapping).toEqual({ plan: ["architect"], discuss: ["how"], review: ["how"] });
+		const enabledOnly = loadLayerFiles(roots, { pstack: { mapping: { plan: ["architect"] } } }, { pstack: { enabled: true } });
+		expect(enabledOnly.pstack.enabled).toBe(true);
+		expect(enabledOnly.pstack.mapping).toEqual({ plan: ["architect"] });
+	});
+
 	test("mapping drops unknown stages, wrong-typed stages and non-string entries", () => {
 		const merged = mergeConfig({ pstack: { mapping: { plan: ["architect", 7, null, "arena"], bogus: ["x"], review: "nope" } } }, base);
 		expect(merged.pstack.mapping).toEqual({ plan: ["architect", "arena"] });

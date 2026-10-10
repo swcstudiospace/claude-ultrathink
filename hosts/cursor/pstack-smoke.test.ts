@@ -7,14 +7,13 @@
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HOOK_FILE, main, nodeCandidates, resolveNode } from "../../scripts/cursor-hooks.ts";
 
 const HOOK = join(import.meta.dir, "ultrathink-cursor-pstack.js");
 const SKILLS = ["how", "architect", "arena", "tdd", "interrogate", "no-comments"] as const;
-const LIVE_PSTACK = "/root/.cursor/plugins/cache/cursor-public/pstack/ccb5507cec1546dc88135c1139c811e6c59115ba";
 
 const GSD = { type: "command", command: "/usr/bin/node /cursor/hooks/gsd-cursor-session-start.js", "gsd-managed": true };
 const SUBSTRATE = {
@@ -23,12 +22,9 @@ const SUBSTRATE = {
 	"substrate-managed": true,
 };
 
-function plantCache(cursorDir: string): { root: string; copiedReal: boolean } {
+/** A fixed synthetic plugin. A live cache on this machine must not change what the smoke test asserts. */
+function plantCache(cursorDir: string): string {
 	const root = join(cursorDir, "plugins", "cache", "cursor-public", "pstack", "smoke");
-	if (existsSync(join(LIVE_PSTACK, "skills", "architect", "SKILL.md"))) {
-		cpSync(LIVE_PSTACK, root, { recursive: true });
-		return { root, copiedReal: true };
-	}
 	mkdirSync(join(root, ".cursor-plugin"), { recursive: true });
 	writeFileSync(join(root, ".cursor-plugin", "plugin.json"), JSON.stringify({ name: "pstack", version: "0.0.0-smoke" }));
 	writeFileSync(join(root, ".cache-complete"), "");
@@ -36,7 +32,7 @@ function plantCache(cursorDir: string): { root: string; copiedReal: boolean } {
 		mkdirSync(join(root, "skills", name), { recursive: true });
 		writeFileSync(join(root, "skills", name, "SKILL.md"), `# ${name}\n`);
 	}
-	return { root, copiedReal: false };
+	return root;
 }
 
 function entries(cursorDir: string): unknown[] {
@@ -70,8 +66,8 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			const seeded = { hooks: { beforeSubmitPrompt: [GSD, SUBSTRATE], sessionStart: [{ ...GSD }] } };
 			writeFileSync(join(cursorDir, "hooks.json"), `${JSON.stringify(seeded, null, 2)}\n`);
 			const foreignBefore = JSON.stringify([GSD, SUBSTRATE]);
-			const { root, copiedReal } = plantCache(cursorDir);
-			expect(copiedReal || existsSync(join(root, "skills", "architect", "SKILL.md"))).toBe(true);
+			const root = plantCache(cursorDir);
+			expect(existsSync(join(root, "skills", "architect", "SKILL.md"))).toBe(true);
 
 			const logs: string[] = [];
 			const node = resolveNode(nodeCandidates(process.env));
@@ -89,13 +85,17 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			expect(existsSync(join(cursorDir, "hooks", HOOK_FILE))).toBe(true);
 			expect(readFileSync(join(cursorDir, "hooks", HOOK_FILE), "utf8")).toBe(readFileSync(HOOK, "utf8"));
 
+			const command = (owned[0] as { command?: string } | undefined)?.command ?? "";
+			expect(command).toContain(join(cursorDir, "hooks", HOOK_FILE));
 			const expectSkills = (prompt: string, names: readonly string[]): void => {
-				const proc = spawnSync(node, [HOOK], {
+				// Cursor runs the command saved in hooks.json, not the checkout path.
+				const proc = spawnSync(command, {
+					shell: true,
 					input: payload(prompt),
 					encoding: "utf8",
 					env: { PATH: process.env.PATH ?? "", HOME: home, ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir },
 				});
-				expect(proc.status).toBe(0);
+				expect(proc.status, proc.stderr).toBe(0);
 				const parsed = JSON.parse(proc.stdout) as { continue?: boolean; additional_context?: string };
 				expect(parsed.continue).toBe(true);
 				for (const name of names) {
@@ -110,11 +110,18 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			expectSkills("/gsd-ship", ["interrogate", "no-comments"]);
 			expectSkills("/gsd-autonomous", SKILLS);
 
-			const quiet = spawnSync(node, [HOOK], {
-				input: payload("/architect review this"),
-				encoding: "utf8",
-				env: { PATH: process.env.PATH ?? "", HOME: home, ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir },
-			});
+			const runInstalled = (prompt: string) =>
+				spawnSync(command, {
+					shell: true,
+					input: payload(prompt),
+					encoding: "utf8",
+					env: { PATH: process.env.PATH ?? "", HOME: home, ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir },
+				});
+			const mention = runInstalled("What does `/gsd-ship` do?");
+			expect(mention.status, mention.stderr).toBe(0);
+			expect(JSON.parse(mention.stdout)).toEqual({});
+			const quiet = runInstalled("/architect review this");
+			expect(quiet.status, quiet.stderr).toBe(0);
 			expect(JSON.parse(quiet.stdout)).toEqual({});
 
 			expect(main(["remove", "--cursor-dir", cursorDir], { env: { HOME: home, PATH: process.env.PATH }, log: (line) => logs.push(line) }), logs.join("\n")).toBe(0);

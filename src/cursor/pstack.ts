@@ -88,13 +88,14 @@ export function resolvePstack(cursorDir: string, fs: PstackFs = defaultFs): Psta
 			const manifestPath = join(dir, ".cursor-plugin", "plugin.json");
 			if (!fs.existsSync(manifestPath)) continue;
 			if (!cacheComplete(dir, fs)) continue;
-			let manifest: { name?: unknown; version?: unknown };
+			let manifest: { name?: unknown; version?: unknown } | null;
 			try {
-				manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: unknown; version?: unknown };
+				manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: unknown; version?: unknown } | null;
 			} catch {
 				continue;
 			}
-			if (manifest.name !== "pstack") continue;
+			// `null` (and any other non-object) must not throw and abandon a valid sibling entry.
+			if (!manifest || manifest.name !== "pstack") continue;
 			candidates.push({
 				dir,
 				version: String(manifest.version ?? "0.0.0"),
@@ -134,14 +135,36 @@ export function skillPath(resolved: PstackInput | undefined, name: string): { pa
 	}
 }
 
+/** Remove fenced code, inline code, and quoted spans that only mention a slash command. */
+function withoutQuotedCommands(prompt: string): string {
+	return prompt
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/`[^`]*`/g, " ")
+		.replace(/(['"])[^'"\n]*\/gsd-[a-z0-9-]+[^'"\n]*\1/g, " ");
+}
+
 /**
- * Detect the workflow stage implied by `/gsd-*` slash commands in the prompt.
- * Non-string payloads and prompts without a mapped command return
+ * Invocations are `/gsd-*` tokens at the start of a line. A mention later in a sentence, or an example
+ * inside quotes or backticks, is not one — `What does /gsd-ship do?` must not select a stage.
+ */
+function commandInvocations(prompt: string): string[] {
+	const visible = withoutQuotedCommands(prompt.toLowerCase());
+	const found: string[] = [];
+	for (const match of visible.matchAll(/(?:^|[\r\n])[ \t]*(\/gsd-[a-z0-9-]+)/g)) {
+		const token = match[1];
+		if (token) found.push(token);
+	}
+	return found;
+}
+
+/**
+ * Detect the workflow stage implied by a `/gsd-*` command the user is invoking.
+ * Non-string payloads and prompts without an invoked command return
  * `stage: null` with a reason; "orchestrate" carries the four-stage router.
  */
 export function detectStage(prompt: unknown): StageDetection {
 	if (typeof prompt !== "string") return { stage: null, reason: "payload prompt is not a string" };
-	const tokens = prompt.toLowerCase().match(/\/gsd-[a-z0-9-]+/g) ?? [];
+	const tokens = commandInvocations(prompt);
 	const stages: PstackStage[] = [];
 	let matched: string | undefined;
 	for (const token of tokens) {
@@ -218,21 +241,31 @@ export function buildBlock(
 		return { reason: `no resolvable skills${dropped.length ? ` (${dropped.join("; ")})` : ""}` };
 	}
 	const header = `pstack alongside GSD (${stage === "orchestrate" ? "orchestrate: apply each at its moment" : stage})`;
-	const render = (list: typeof entries): string => {
+	const skippedFull = dropped.length > 0 ? `- skipped: ${dropped.join("; ")}` : undefined;
+	const skippedShort = dropped.length > 0 ? `- skipped: ${dropped.length} missing skill(s)` : undefined;
+	const render = (list: typeof entries, skipped: string | undefined, truncation: string | undefined): string => {
 		const lines = [
 			header,
 			"Run these pstack skills alongside the GSD step, by reading each SKILL.md, then continue the GSD workflow unchanged:",
 		];
 		for (const e of list) lines.push(`- [${e.stage}] ${e.name} — read ${e.path} — ${e.purpose} (${MOMENTS[e.stage]})`);
-		if (dropped.length) lines.push(`- skipped: ${dropped.join("; ")}`);
+		if (skipped) lines.push(skipped);
+		if (truncation) lines.push(truncation);
 		return lines.join("\n");
 	};
+	// Shorten, then drop, the missing-skill note before giving up a skill that would otherwise fit.
 	let list = entries;
-	let block = render(list);
-	while (block.length > cap && list.length > 1) {
-		list = list.slice(0, -1);
-		block = render(list) + `\n- (truncated by cap; ${entries.length - list.length} more skill(s) omitted)`;
+	let detail: 0 | 1 | 2 = skippedFull ? 0 : 2;
+	let truncation: string | undefined;
+	const skippedText = (): string | undefined => (detail === 0 ? skippedFull : detail === 1 ? skippedShort : undefined);
+	let block = render(list, skippedText(), truncation);
+	while (block.length > cap) {
+		if (detail < 2) detail = detail === 0 ? 1 : 2;
+		else if (list.length > 1) {
+			list = list.slice(0, -1);
+			truncation = `- (truncated by cap; ${entries.length - list.length} more skill(s) omitted)`;
+		} else return { reason: `cap ${cap} too small for even one skill (needed ${block.length})` };
+		block = render(list, skippedText(), truncation);
 	}
-	if (block.length > cap) return { reason: `cap ${cap} too small for even one skill (needed ${block.length})` };
 	return { block, skills: list.length };
 }

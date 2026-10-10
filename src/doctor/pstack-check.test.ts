@@ -146,4 +146,72 @@ describe("checkPstack", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("ULTRATHINK_PSTACK=0 disables the bridge even when the user config enables it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pstack-doctor-off-switch-"));
+		try {
+			const home = join(dir, "home");
+			mkdirSync(join(home, ".config", "ultrathink"), { recursive: true });
+			writeFileSync(join(home, ".config", "ultrathink", "config.json"), JSON.stringify({ pstack: { enabled: true } }));
+			const findings = checkPstack(deps(dir, { ULTRATHINK_PSTACK: "0" }));
+			expect(byId(findings, "pstack.enabled")).toMatchObject({
+				level: "info",
+				title: "pstack bridge disabled",
+				detail: expect.stringContaining("ULTRATHINK_PSTACK=0"),
+			});
+			expect(findings.some((finding) => finding.level === "warn" || finding.level === "error")).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a parsed non-object stops the search before a later enabling file", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pstack-doctor-null-"));
+		try {
+			const home = join(dir, "home");
+			mkdirSync(join(home, ".config", "ultrathink"), { recursive: true });
+			writeFileSync(join(home, ".config", "ultrathink", "config.json"), "null");
+			mkdirSync(join(home, ".claude"), { recursive: true });
+			writeFileSync(join(home, ".claude", "ultrathink.json"), JSON.stringify({ pstack: { enabled: true } }));
+			const findings = checkPstack(deps(dir));
+			const enabled = byId(findings, "pstack.enabled");
+			expect(enabled.level).toBe("info");
+			expect(enabled.detail).toContain(join(home, ".config", "ultrathink", "config.json"));
+			expect(enabled.detail).not.toContain("ultrathink.json");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("invalid JSON is skipped so a later enabling file still wins", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pstack-doctor-bad-json-"));
+		try {
+			const home = join(dir, "home");
+			mkdirSync(join(home, ".config", "ultrathink"), { recursive: true });
+			writeFileSync(join(home, ".config", "ultrathink", "config.json"), "{");
+			mkdirSync(join(home, ".claude"), { recursive: true });
+			const claude = join(home, ".claude", "ultrathink.json");
+			writeFileSync(claude, JSON.stringify({ pstack: { enabled: true } }));
+			const findings = checkPstack(deps(dir));
+			expect(byId(findings, "pstack.enabled")).toMatchObject({ level: "ok", detail: expect.stringContaining(claude) });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("missing skills are info while the bridge is disabled", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pstack-doctor-missing-off-"));
+		try {
+			const cursorDir = join(dir, "cursor");
+			plantPlugin(cursorDir, ["architect"]);
+			const findings = checkPstack(deps(dir, { ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir }));
+			const skills = byId(findings, "pstack.skills");
+			expect(skills.level).toBe("info");
+			expect(skills.title).toContain("architect");
+			expect(skills.fix).toBeUndefined();
+			expect(findings.some((finding) => finding.level === "warn" || finding.level === "error")).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });

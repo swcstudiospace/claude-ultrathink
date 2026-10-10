@@ -705,10 +705,12 @@ function pstackMapping(mapping: unknown): Partial<Record<PstackMappingStage, str
  */
 function mergePstack(pstack: Record<string, unknown> | undefined, defaults: PstackConfig, project: boolean): PstackConfig {
 	if (!pstack || project) return defaults;
+	// A later layer replaces only the stages it names. Omitting `mapping`, or naming no valid stage, keeps the earlier map.
+	const mapping = pstackMapping(pstack.mapping);
 	return {
 		enabled: booleanOr(pstack.enabled, defaults.enabled),
 		cursorDir: absolutePathField(pstack.cursorDir, defaults.cursorDir),
-		mapping: pstackMapping(pstack.mapping),
+		mapping: mapping ? { ...defaults.mapping, ...mapping } : defaults.mapping,
 		contextCapChars: positiveInt(pstack.contextCapChars, defaults.contextCapChars ?? 2000),
 	};
 }

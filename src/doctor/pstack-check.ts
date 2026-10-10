@@ -23,6 +23,8 @@ interface Decision {
 	/** Absolute path of the file the hook would read, or `default` when no user file parses. */
 	source: string;
 	enabled: boolean;
+	/** `ULTRATHINK_PSTACK=0`. The hook returns `{}` before config, so doctor must not report the bridge on. */
+	forcedOff: boolean;
 	cursorDir?: string | undefined;
 	mapping?: Partial<Record<StageKey, string[]>> | undefined;
 }
@@ -37,6 +39,16 @@ function readObject(file: string): Record<string, unknown> | undefined {
 		return isRecord(parsed) ? parsed : undefined;
 	} catch {
 		return undefined;
+	}
+}
+
+/** Missing, unreadable, or invalid JSON is skipped. A successful parse — even `null` or `[]` — is kept. */
+function readConfigValue(file: string): { status: "skip" } | { status: "parsed"; value: unknown } {
+	if (!existsSync(file)) return { status: "skip" };
+	try {
+		return { status: "parsed", value: JSON.parse(readFileSync(file, "utf8")) };
+	} catch {
+		return { status: "skip" };
 	}
 }
 
@@ -61,17 +73,25 @@ function mappingOverride(value: unknown): Partial<Record<StageKey, string[]>> | 
 	return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-/** First parseable user file wins, matching the hook. A file with no `pstack` key still decides (enabled stays false). */
+/** First successfully parsed user file wins, matching the hook. `null` or `[]` stops the search; invalid JSON does not. */
 function readDecision(env: Env): Decision {
+	const forcedOff = env.ULTRATHINK_PSTACK === "0";
 	for (const file of hookConfigCandidates(env)) {
-		const config = readObject(file);
-		if (!config) continue;
-		const pstack = config.pstack;
-		if (!isRecord(pstack)) return { source: file, enabled: false };
+		const read = readConfigValue(file);
+		if (read.status !== "parsed") continue;
+		if (!isRecord(read.value)) return { source: file, enabled: false, forcedOff };
+		const pstack = read.value.pstack;
+		if (!isRecord(pstack)) return { source: file, enabled: false, forcedOff };
 		const cursorDir = typeof pstack.cursorDir === "string" && pstack.cursorDir.startsWith("/") ? pstack.cursorDir : undefined;
-		return { source: file, enabled: pstack.enabled === true, cursorDir, mapping: mappingOverride(pstack.mapping) };
+		return {
+			source: file,
+			enabled: !forcedOff && pstack.enabled === true,
+			forcedOff,
+			cursorDir,
+			mapping: mappingOverride(pstack.mapping),
+		};
 	}
-	return { source: "default", enabled: false };
+	return { source: "default", enabled: false, forcedOff };
 }
 
 function namesFor(stage: StageKey, override: Decision["mapping"]): readonly string[] {
@@ -127,8 +147,9 @@ export function checkPstack(deps: DoctorDeps): Finding[] {
 		section: "pstack",
 		level: decision.enabled ? "ok" : "info",
 		title: decision.enabled ? "pstack bridge enabled" : "pstack bridge disabled",
-		detail:
-			decision.source === "default"
+		detail: decision.forcedOff
+			? `ULTRATHINK_PSTACK=0 turns the hook off before config is applied.${decision.source === "default" ? "" : ` Config not applied: ${decision.source}.`}`
+			: decision.source === "default"
 				? "Deciding source: default (no user config the Cursor hook can read). A project file cannot enable it."
 				: `Deciding source: ${decision.source}`,
 	});
@@ -136,7 +157,7 @@ export function checkPstack(deps: DoctorDeps): Finding[] {
 	const projectFile = join(deps.cwd, ".claude", "ultrathink.json");
 	const project = readObject(projectFile);
 	const projectPstack = project && isRecord(project.pstack) ? project.pstack : undefined;
-	if (projectPstack?.enabled === true && !decision.enabled) {
+	if (projectPstack?.enabled === true && !decision.enabled && !decision.forcedOff) {
 		findings.push({
 			id: "pstack.project-ignored",
 			section: "pstack",
@@ -191,10 +212,12 @@ export function checkPstack(deps: DoctorDeps): Finding[] {
 		findings.push({
 			id: "pstack.skills",
 			section: "pstack",
-			level: missing.length > 0 ? "warn" : "ok",
+			level: missing.length > 0 ? (decision.enabled ? "warn" : "info") : "ok",
 			title: missing.length > 0 ? `unknown or missing pstack skill: ${missing.join(", ")}` : "per-stage skills resolve",
 			detail: lines.join("\n"),
-			...(missing.length > 0 ? { fix: "Fix pstack.mapping or reinstall the pstack plugin. The hook skips a missing skill and still injects the rest." } : {}),
+			...(missing.length > 0 && decision.enabled
+				? { fix: "Fix pstack.mapping or reinstall the pstack plugin. The hook skips a missing skill and still injects the rest." }
+				: {}),
 		});
 	}
 

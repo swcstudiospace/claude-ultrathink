@@ -13,7 +13,8 @@
 //   { continue?: boolean, additional_context?: string }
 //
 // Behaviour:
-//   - Detects /gsd-* slash commands in the submitted prompt and, when the
+//   - Detects a /gsd-* command invoked at the start of a line (not a quoted
+//     example or a mention later in a sentence) and, when the
 //     user-level ultrathink config enables pstack, injects additional_context
 //     telling the agent to run the matching pstack skills alongside the GSD
 //     step, then continue the GSD workflow unchanged.
@@ -114,9 +115,25 @@ const skillPath = (fs, path, resolved, name) => {
   }
 };
 
+const withoutQuotedCommands = (prompt) =>
+  prompt
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/(['"])[^'"\n]*\/gsd-[a-z0-9-]+[^'"\n]*\1/g, ' ');
+
+// Invocations start a line. Mentions later in a sentence, and examples in quotes, do not.
+const commandInvocations = (prompt) => {
+  const visible = withoutQuotedCommands(prompt.toLowerCase());
+  const found = [];
+  for (const match of visible.matchAll(/(?:^|[\r\n])[ \t]*(\/gsd-[a-z0-9-]+)/g)) {
+    if (match[1]) found.push(match[1]);
+  }
+  return found;
+};
+
 const detectStage = (prompt) => {
   if (typeof prompt !== 'string') return { stage: null, reason: 'payload prompt is not a string' };
-  const tokens = prompt.toLowerCase().match(/\/gsd-[a-z0-9-]+/g) ?? [];
+  const tokens = commandInvocations(prompt);
   const stages = new Set();
   let matched = null;
   for (const token of tokens) {
@@ -152,19 +169,29 @@ const buildBlock = (fs, path, stage, resolved, mapping, cap) => {
     return { reason: `no resolvable skills${dropped.length ? ` (${dropped.join('; ')})` : ''}` };
   }
   const header = `pstack alongside GSD (${stage === 'orchestrate' ? 'orchestrate: apply each at its moment' : stage})`;
-  const render = (list) => {
+  const skippedFull = dropped.length > 0 ? `- skipped: ${dropped.join('; ')}` : undefined;
+  const skippedShort = dropped.length > 0 ? `- skipped: ${dropped.length} missing skill(s)` : undefined;
+  const render = (list, skipped, truncation) => {
     const lines = [header, 'Run these pstack skills alongside the GSD step, by reading each SKILL.md, then continue the GSD workflow unchanged:'];
     for (const e of list) lines.push(`- [${e.stage}] ${e.name} — read ${e.path} — ${e.purpose} (${MOMENTS[e.stage]})`);
-    if (dropped.length) lines.push(`- skipped: ${dropped.join('; ')}`);
+    if (skipped) lines.push(skipped);
+    if (truncation) lines.push(truncation);
     return lines.join('\n');
   };
+  // Shorten, then drop, the missing-skill note before giving up a skill that would otherwise fit.
   let list = entries;
-  let block = render(list);
-  while (block.length > cap && list.length > 1) {
-    list = list.slice(0, -1);
-    block = render(list) + `\n- (truncated by cap; ${entries.length - list.length} more skill(s) omitted)`;
+  let detail = skippedFull ? 0 : 2;
+  let truncation;
+  const skippedText = () => (detail === 0 ? skippedFull : detail === 1 ? skippedShort : undefined);
+  let block = render(list, skippedText(), truncation);
+  while (block.length > cap) {
+    if (detail < 2) detail = detail === 0 ? 1 : 2;
+    else if (list.length > 1) {
+      list = list.slice(0, -1);
+      truncation = `- (truncated by cap; ${entries.length - list.length} more skill(s) omitted)`;
+    } else return { reason: `cap ${cap} too small for even one skill (needed ${block.length})` };
+    block = render(list, skippedText(), truncation);
   }
-  if (block.length > cap) return { reason: `cap ${cap} too small for even one skill (needed ${block.length})` };
   return { block, skills: list.length };
 };
 
