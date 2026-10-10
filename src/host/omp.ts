@@ -1385,7 +1385,7 @@ export function createOmpExtension(
 							const root = resolveSwarmRoot(process.env);
 							if ("reason" in root) return sendInsightText(`AgentSwarm lanes unavailable: ${root.reason}`);
 							if (parsed.kind === "status") {
-								const rows = laneStatus(laneDirs(dir), orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
+								const rows = await laneStatus(laneDirs(dir), orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
 								return sendInsightText(formatLaneStatusText(rows));
 							}
 							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));

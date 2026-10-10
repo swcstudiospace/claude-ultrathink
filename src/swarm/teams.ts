@@ -8,10 +8,11 @@
  * process starts — are injectable so tests never spawn a real process. This module composes with, and never
  * modifies, the AgentSwarm runtime checked out at `ULTRATHINK_SWARM_ROOT`.
  */
-import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync } from "node:fs";
+import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { buildBlock, type PstackInput } from "../cursor/pstack.ts";
 
 /** Hard ceiling on lanes per command, whatever the environment asks for. */
@@ -19,6 +20,12 @@ export const TEAMS_MAX_LANES = 6;
 
 /** How long one lane's `orch_status.py` probe may run before it counts as a failed probe. */
 export const ORCH_STATUS_TIMEOUT_MS = 10_000;
+
+/** How many lanes `laneStatus` probes at once; the host must never block on a serial fan-out. */
+export const LANE_STATUS_CONCURRENCY = 4;
+
+/** How many historical lanes discovery reports at most (most recent by directory mtime). */
+export const MAX_DISCOVERED_LANES = 24;
 
 /** The run states AgentSwarm itself treats as finished (orch_status.py, swarm/observability.py). */
 const DONE_STATES: Record<string, true> = { DONE: true, APPROVED: true, CANCELLED: true };
@@ -38,9 +45,10 @@ export interface TeamsFs {
 	openSync(path: string, flags: string): number;
 	closeSync(fd: number): void;
 	readdirSync(path: string): string[];
+	statSync(path: string): { mtimeMs: number };
 }
 
-const defaultFs = { existsSync, mkdirSync, openSync, closeSync, readdirSync } satisfies TeamsFs;
+const defaultFs = { existsSync, mkdirSync, openSync, closeSync, readdirSync, statSync } satisfies TeamsFs;
 
 /** A usable swarm checkout, or why lanes cannot run. */
 export type SwarmRoot = { root: string } | { reason: string };
@@ -76,14 +84,15 @@ export interface LaneHandle {
 
 /** A lane addressable by status: its display id and the state directory that identifies it. */
 export interface LaneRef {
+	/** The lane state directory's full basename (`<sha8(brief)>-<i>-<nonce>`), so repeated lanes stay distinct. */
 	laneId: string;
 	stateDir: string;
 }
 
-/** Per-lane task counts, or why the probe failed. */
+/** Per-lane task counts, or why the probe failed. `logPath` always names the lane's run log. */
 export type LaneStatusRow =
-	| { laneId: string; total: number; byState: Record<string, number>; done: number; summary: string }
-	| { laneId: string; error: string };
+	| { laneId: string; logPath: string; total: number; byState: Record<string, number>; done: number; summary: string }
+	| { laneId: string; logPath: string; error: string };
 
 /** Process start seam; the default is a detached, unref'd `node:child_process` spawn. */
 export type LaneSpawnFn = (
@@ -92,12 +101,15 @@ export type LaneSpawnFn = (
 	opts: { cwd: string; env: Record<string, string>; detached: true; stdio: readonly ["ignore", number, number] },
 ) => { pid?: number };
 
-/** Synchronous probe seam for `orch_status.py`; injectable so status tests never run python. */
+/** Async probe seam for `orch_status.py`; injectable so status tests never run python. */
 export type OrchStatusSpawn = (
 	cmd: string,
 	args: readonly string[],
 	opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
-) => { stdout?: string | null; stderr?: string | null; error?: Error | null };
+) => Promise<{ stdout?: string | null; stderr?: string | null; error?: Error | null }>;
+
+/** One lane's Task Store probe result: stdout to parse, or why the probe failed. */
+export type LaneStatusProbe = (stateDir: string) => Promise<{ stdout: string } | { error: string }>;
 
 /**
  * Validate `ULTRATHINK_SWARM_ROOT`: absolute, an existing directory, and containing `hooks/autonomous_run.py`.
@@ -149,27 +161,38 @@ const sha8 = (brief: string): string => createHash("sha256").update(brief, "utf8
 
 export interface PlanLanesOptions {
 	cwd: string;
-	/** The host state directory; each lane gets `<stateDir>/swarm/<sha8(brief)>-<i>`. */
+	/** The host state directory; each lane gets `<stateDir>/swarm/<sha8(brief)>-<i>-<nonce>`. */
 	stateDir: string;
 	swarmRoot: string;
-	/** Parent env, read for the optional `SWARM_AUTONOMOUS_RUN_CAP_S` passthrough. */
+	/** Parent env snapshot; the lane env merges it under the lane's own overrides (SWARM_DIR, cap). */
 	env?: NodeJS.ProcessEnv;
 	/** A pstack resolution (or a stand-in); when absent or unresolved the skills block is dropped. */
 	pstack?: PstackInput;
+	/** Invocation clock feeding the state-directory nonce; defaults to `Date.now`. */
+	now?: () => number;
 }
 
 /**
- * Plan one lane per brief, 1-based: id `lane-i`, an isolated state directory, the runner argv, and the lane
- * env. Deterministic — the same briefs and options always produce the same plan.
+ * Plan one lane per brief, 1-based: id `lane-i`, a per-invocation state directory (hash, index, nonce — so
+ * repeated runs of the same briefs never share state), the runner argv, and the lane env: the parent env
+ * merged under the lane's own overrides, so `PATH`/`HOME` and friends survive while `SWARM_DIR` and the cap
+ * stay lane-local.
  */
 export function planLanes(briefs: readonly string[], opts: PlanLanesOptions): LanePlan[] {
 	const built = opts.pstack ? buildBlock("orchestrate", opts.pstack) : undefined;
 	// Lanes never fail because of skills: an unresolved block is dropped silently.
 	const skills = built && !("reason" in built) ? built.block : undefined;
 	const cap = opts.env?.SWARM_AUTONOMOUS_RUN_CAP_S?.trim();
+	const parentEnv: Record<string, string> = {};
+	for (const [key, value] of Object.entries(opts.env ?? {})) {
+		if (value !== undefined) parentEnv[key] = value;
+	}
+	// One nonce per invocation: base36 timestamp plus a few random hex digits so two invocations in the
+	// same millisecond still land in distinct directories.
+	const nonce = `${(opts.now ?? Date.now)().toString(36)}${randomBytes(2).toString("hex")}`;
 	return briefs.map((brief, index) => {
 		const i = index + 1;
-		const stateDir = join(opts.stateDir, "swarm", `${sha8(brief)}-${i}`);
+		const stateDir = join(opts.stateDir, "swarm", `${sha8(brief)}-${i}-${nonce}`);
 		const laneBrief = skills ? `${brief}\n\n${skills}` : brief;
 		return {
 			id: `lane-${i}`,
@@ -187,7 +210,7 @@ export function planLanes(briefs: readonly string[], opts: PlanLanesOptions): La
 				"--brief",
 				laneBrief,
 			],
-			env: { SWARM_DIR: stateDir, ...(cap ? { SWARM_AUTONOMOUS_RUN_CAP_S: cap } : {}) },
+			env: { ...parentEnv, SWARM_DIR: stateDir, ...(cap ? { SWARM_AUTONOMOUS_RUN_CAP_S: cap } : {}) },
 		};
 	});
 }
@@ -245,9 +268,14 @@ export function spawnLanes(
 	});
 }
 
+/** Lane state directories are `<sha8(brief)>-<i>-<nonce>`; the nonce is base36 alphanumerics. */
+const LANE_DIR_PATTERN = /^([0-9a-f]{8})-(\d+)-([0-9a-z]+)$/;
+
 /**
- * Discover previously spawned lanes under a host state directory: every `swarm/<sha8>-<i>` subdirectory
- * becomes `lane-<i>`, ordered by index; anything else is ignored.
+ * Discover recently spawned lanes under a host state directory: every `swarm/<sha8>-<i>-<nonce>`
+ * subdirectory becomes a lane labelled by its full basename, ordered by lane index (then nonce). Discovery
+ * is bounded to the {@link MAX_DISCOVERED_LANES} most recent directories by mtime, so history never floods
+ * a status reply; anything else is ignored.
  */
 export function laneDirs(stateDir: string, fs: TeamsFs = defaultFs): LaneRef[] {
 	const swarmDir = join(stateDir, "swarm");
@@ -257,75 +285,118 @@ export function laneDirs(stateDir: string, fs: TeamsFs = defaultFs): LaneRef[] {
 	} catch {
 		return [];
 	}
-	const lanes: LaneRef[] = [];
+	const lanes: Array<{ laneId: string; stateDir: string; index: number; nonce: string; mtimeMs: number }> = [];
 	for (const name of names) {
-		const match = /^([0-9a-f]{8})-(\d+)$/.exec(name);
+		const match = LANE_DIR_PATTERN.exec(name);
 		if (!match) continue;
-		lanes.push({ laneId: `lane-${match[2]}`, stateDir: join(swarmDir, name) });
+		const full = join(swarmDir, name);
+		let mtimeMs = 0;
+		try {
+			mtimeMs = fs.statSync(full).mtimeMs;
+		} catch {
+			// an entry that vanished mid-scan still counts, just as the oldest
+		}
+		lanes.push({ laneId: name, stateDir: full, index: Number.parseInt(match[2]!, 10), nonce: match[3]!, mtimeMs });
 	}
-	lanes.sort((a, b) => a.laneId.localeCompare(b.laneId, undefined, { numeric: true }));
-	return lanes;
+	lanes.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	return lanes
+		.slice(0, MAX_DISCOVERED_LANES)
+		.sort((a, b) => a.index - b.index || a.nonce.localeCompare(b.nonce))
+		.map(({ laneId, stateDir }) => ({ laneId, stateDir }));
 }
 
 /**
  * Read every lane's Task Store through `runFn` (the injected `orch_status.py` probe) and aggregate
  * `{ total, byState, done }` per lane, tolerantly: bad JSON, a failed probe or a throwing one is an error
- * row for that lane alone. `done` follows AgentSwarm's own convention (DONE, APPROVED, CANCELLED).
+ * row for that lane alone. Probes run concurrently but at most {@link LANE_STATUS_CONCURRENCY} at a time,
+ * and rows come back in input order. `done` follows AgentSwarm's own convention (DONE, APPROVED, CANCELLED).
  */
-export function laneStatus(
-	lanes: readonly LaneRef[],
-	runFn: (stateDir: string) => { stdout: string } | { error: string },
-): LaneStatusRow[] {
-	return lanes.map((lane) => {
-		let probe: { stdout: string } | { error: string };
-		try {
-			probe = runFn(lane.stateDir);
-		} catch (error) {
-			return { laneId: lane.laneId, error: error instanceof Error ? error.message.slice(0, 200) : "status probe failed" };
+export async function laneStatus(lanes: readonly LaneRef[], runFn: LaneStatusProbe): Promise<LaneStatusRow[]> {
+	const results = new Array<LaneStatusRow>(lanes.length);
+	let next = 0;
+	const worker = async (): Promise<void> => {
+		for (;;) {
+			const index = next;
+			if (index >= lanes.length) return;
+			next += 1;
+			results[index] = await probeLane(lanes[index]!, runFn);
 		}
-		if ("error" in probe) return { laneId: lane.laneId, error: probe.error };
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(probe.stdout) as unknown;
-		} catch {
-			return { laneId: lane.laneId, error: "unreadable status output (not JSON)" };
-		}
-		let tasks: unknown[] | undefined;
-		if (parsed && typeof parsed === "object" && "tasks" in parsed && Array.isArray(parsed.tasks)) tasks = parsed.tasks;
-		if (!tasks) return { laneId: lane.laneId, error: "status output had no task list" };
-		const byState: Record<string, number> = {};
-		let done = 0;
-		for (const task of tasks) {
-			let state = "UNKNOWN";
-			if (task && typeof task === "object" && "state" in task && typeof task.state === "string") state = task.state;
-			byState[state] = (byState[state] ?? 0) + 1;
-			if (DONE_STATES[state]) done += 1;
-		}
-		const total = tasks.length;
-		const counts = Object.entries(byState)
-			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-			.map(([state, count]) => `${count} ${state}`)
-			.join(", ");
-		const summary =
-			total === 0
-				? `${lane.laneId}: no tasks yet`
-				: `${lane.laneId}: ${total} task${total === 1 ? "" : "s"} — ${counts} · ${done} done`;
-		return { laneId: lane.laneId, total, byState, done, summary };
-	});
+	};
+	await Promise.all(Array.from({ length: Math.min(LANE_STATUS_CONCURRENCY, lanes.length) }, () => worker()));
+	return results;
 }
 
+/** Probe one lane and fold its Task Store into a status row; every failure mode stays lane-local. */
+async function probeLane(lane: LaneRef, runFn: LaneStatusProbe): Promise<LaneStatusRow> {
+	const logPath = join(lane.stateDir, "run.log");
+	let probe: { stdout: string } | { error: string };
+	try {
+		probe = await runFn(lane.stateDir);
+	} catch (error) {
+		return { laneId: lane.laneId, logPath, error: error instanceof Error ? error.message.slice(0, 200) : "status probe failed" };
+	}
+	if ("error" in probe) return { laneId: lane.laneId, logPath, error: probe.error };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(probe.stdout) as unknown;
+	} catch {
+		return { laneId: lane.laneId, logPath, error: "unreadable status output (not JSON)" };
+	}
+	let tasks: unknown[] | undefined;
+	if (parsed && typeof parsed === "object" && "tasks" in parsed && Array.isArray(parsed.tasks)) tasks = parsed.tasks;
+	if (!tasks) return { laneId: lane.laneId, logPath, error: "status output had no task list" };
+	const byState: Record<string, number> = {};
+	let done = 0;
+	for (const task of tasks) {
+		let state = "UNKNOWN";
+		if (task && typeof task === "object" && "state" in task && typeof task.state === "string") state = task.state;
+		byState[state] = (byState[state] ?? 0) + 1;
+		if (DONE_STATES[state]) done += 1;
+	}
+	const total = tasks.length;
+	const counts = Object.entries(byState)
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.map(([state, count]) => `${count} ${state}`)
+		.join(", ");
+	const summary =
+		total === 0
+			? `${lane.laneId}: no tasks yet`
+			: `${lane.laneId}: ${total} task${total === 1 ? "" : "s"} — ${counts} · ${done} done`;
+	return { laneId: lane.laneId, logPath, total, byState, done, summary };
+}
+
+const execFileP = promisify(nodeExecFile);
+
 /**
- * Build the default `runFn` for {@link laneStatus}: `orch_status.py --json --repo <cwd>` against the lane's
- * `SWARM_DIR`, capped at {@link ORCH_STATUS_TIMEOUT_MS}. A probe that exits non-zero but printed JSON still
- * reads; only missing output or a hard error is a failure.
+ * Default probe seam: promisified `execFile`, so a slow or hung `orch_status.py` never blocks the host's
+ * hot path. A non-zero exit still surfaces whatever the probe printed, in `stdout`/`stderr`.
+ */
+const defaultStatusSpawn: OrchStatusSpawn = async (cmd, args, opts) => {
+	try {
+		const { stdout, stderr } = await execFileP(cmd, args as string[], { ...opts, encoding: "utf8" });
+		return { stdout, stderr };
+	} catch (error) {
+		const err = error as (Error & { stdout?: unknown; stderr?: unknown }) | undefined;
+		return {
+			stdout: typeof err?.stdout === "string" ? err.stdout : "",
+			stderr: (typeof err?.stderr === "string" ? err.stderr : "") || (err?.message ?? String(error)),
+		};
+	}
+};
+
+/**
+ * Build the default probe for {@link laneStatus}: `orch_status.py --json --repo <cwd>` against the lane's
+ * `SWARM_DIR`, capped at {@link ORCH_STATUS_TIMEOUT_MS}, run off the hot path through an injected async
+ * seam. A probe that exits non-zero but printed JSON still reads; only missing output or a hard error is a
+ * failure.
  */
 export function orchStatusRunner(
 	opts: { swarmRoot: string; cwd: string; env?: NodeJS.ProcessEnv },
-	spawnSyncFn: OrchStatusSpawn = (cmd, args, opts) => nodeSpawnSync(cmd, args as string[], { ...opts, encoding: "utf8" }),
-): (stateDir: string) => { stdout: string } | { error: string } {
-	return (stateDir) => {
+	spawnFn: OrchStatusSpawn = defaultStatusSpawn,
+): LaneStatusProbe {
+	return async (stateDir) => {
 		try {
-			const result = spawnSyncFn(
+			const result = await spawnFn(
 				"python3",
 				[join(opts.swarmRoot, "scripts", "orch_status.py"), "--json", "--repo", opts.cwd],
 				{ cwd: opts.cwd, env: { ...opts.env, SWARM_DIR: stateDir }, timeout: ORCH_STATUS_TIMEOUT_MS },
@@ -352,8 +423,10 @@ export function formatLaneHandles(handles: readonly LaneHandle[]): string {
 	return [`Swarm lanes: ${started}/${handles.length} spawned`, ...lines].join("\n");
 }
 
-/** The status reply: one summary line per lane, errors in place of counts. */
+/** The status reply: one summary per lane labelled by its state directory, with the log path; errors in place of counts. */
 export function formatLaneStatusText(rows: readonly LaneStatusRow[]): string {
 	if (rows.length === 0) return "No swarm lanes found under this state directory yet.";
-	return rows.map((row) => ("error" in row ? `${row.laneId}: ${row.error}` : row.summary)).join("\n");
+	return rows
+		.map((row) => `${"error" in row ? `${row.laneId}: ${row.error}` : row.summary}\n    log ${row.logPath}`)
+		.join("\n");
 }

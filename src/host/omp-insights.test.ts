@@ -511,6 +511,21 @@ describe("readInsightSnapshot lessons", () => {
 		})();
 	});
 
+	test("policy reflects effective config, kill switch and jev presence", () => {
+		return (async () => {
+			const off = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ env: { ULTRATHINK_TEACH: "0" } }));
+			expect(off.policy.enabled).toBe(false);
+			const on = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ teach: { capture: "explicit", autoPromote: false, promoteAfter: 7 } }));
+			expect(on.policy.enabled).toBe(true);
+			expect(on.policy.capture).toBe("explicit");
+			expect(on.policy.autoPromote).toBe(false);
+			expect(on.policy.promoteAfter).toBe(7);
+			expect(on.policy.jevEnabled).toBe(true);
+			const noJev = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ decisions: false }));
+			expect(noJev.policy.jevEnabled).toBe(false);
+		})();
+	});
+
 	test("the shell Jev kill switch changes visible current policy without hiding saved history", async () => {
 		writeSessionRecord("sess-a", [decision({ p: 0.19, threshold: 0.2 })]);
 		const saved = readFileSync(sessionPath(stateDir, "sess-a"));
