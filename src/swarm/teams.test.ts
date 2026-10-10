@@ -6,7 +6,7 @@
 // No test spawns a real process, no real wall-clock timers, and real fs touches only tmpdirs.
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -34,7 +34,7 @@ import {
 const sha8 = (brief: string): string => createHash("sha256").update(brief, "utf8").digest("hex").slice(0, 8);
 
 /** A fs seam over real syscalls; tests only ever point it at tmpdir paths. */
-const realFs: TeamsFs = { existsSync, mkdirSync, openSync, closeSync: () => {}, readdirSync, statSync };
+const realFs: TeamsFs = { existsSync, mkdirSync, openSync, closeSync, readdirSync, statSync };
 
 const baseOpts = (stateDir: string, env: NodeJS.ProcessEnv = {}): PlanLanesOptions => ({
 	cwd: "/repo",
@@ -392,7 +392,7 @@ describe("laneDirs", () => {
 			existsSync: () => false,
 			mkdirSync: () => {},
 			openSync: () => 0,
-			closeSync: () => {},
+			closeSync,
 			readdirSync: () => Object.keys(entries),
 			statSync: (path: string) => {
 				const entry = entries[basename(path)];
