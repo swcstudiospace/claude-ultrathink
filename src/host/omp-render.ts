@@ -862,8 +862,9 @@ function swarmRows(details: unknown, expanded: boolean, p: Paint, room: number):
 	if (!expanded) {
 		// compact budget: lanes dropped by the row cap are counted in a notice, never silently sliced
 		const budget = Math.max(0, SWARM_COMPACT_ROWS - head.length);
-		const dropped = Math.max(0, swarm.lanes.length - budget);
-		const shown = dropped > 0 ? Math.max(0, budget - 1) : budget;
+		const reserve = swarm.lanes.length > budget ? 1 : 0; // the notice row itself
+		const shown = Math.max(0, budget - reserve);
+		const dropped = Math.max(0, swarm.lanes.length - shown);
 		const rows = [...head, ...swarm.lanes.slice(0, shown).map(swarmCompactRow)];
 		if (dropped > 0) rows.push(`${dropped} more lanes not shown — ${SWARM_RECOVERY}`);
 		return rows;

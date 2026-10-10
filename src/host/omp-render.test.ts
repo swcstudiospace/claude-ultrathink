@@ -864,7 +864,7 @@ describe("swarm card", () => {
 		const { rows, plain } = swarmCard(manyLanes(10), false, 160);
 		expect(rows.length).toBeLessThanOrEqual(6 + 2);
 		const text = plain.join("\n");
-		expect(text).toContain("6 more lanes not shown — run /ultrathink-swarm status for the full list");
+		expect(text).toContain("7 more lanes not shown — run /ultrathink-swarm status for the full list");
 		expect(text).toContain("Brief 3");
 		expect(text).not.toContain("Brief 4");
 	});
@@ -901,7 +901,7 @@ describe("swarm card", () => {
 		const compact = swarmCard(oversized, false, 80);
 		expect(compact.rows.length).toBeLessThanOrEqual(6 + 2);
 		// only the first 64 lanes are considered at all; the rest are counted, never drawn
-		expect(compact.plain.join("\n")).toContain("60 more lanes not shown — run /ultrathink-swarm status for the full list");
+		expect(compact.plain.join("\n")).toContain("61 more lanes not shown — run /ultrathink-swarm status for the full list");
 		const expanded = swarmCard(oversized, true, 80);
 		expect(expanded.rows.length).toBeLessThanOrEqual(24 + 4);
 		expect(expanded.plain.join("\n")).toMatch(/of 64 lanes shown — run \/ultrathink-swarm status for the full list/);
