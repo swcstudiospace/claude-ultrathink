@@ -405,7 +405,7 @@ describe("laneDirs", () => {
 		const ids = lanes.map((entry) => entry.laneId);
 		expect(ids).not.toContain("abcd1234-1-m1"); // oldest dropped
 		expect(ids).not.toContain("abcd1234-7-m7");
-		expect(ids).toContain("abcd1234-30-m30");
+		expect(ids).toContain("abcd1234-30-mu");
 		expect(ids).toContain("abcd1234-2-mzz"); // recent despite its low index
 		// Within the kept set, labels order by lane index then nonce.
 		const keys = ids.map((id) => {
