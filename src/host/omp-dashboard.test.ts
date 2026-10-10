@@ -94,6 +94,15 @@ const plain = (rows: readonly string[]): string[] => rows.map((row) => Bun.strip
 
 test("Jev details preserve numeric thresholds and zero cost with and without question rows", () => {
 	for (const threshold of [0.9, 0]) {
+		const overview = createInsightDashboard(snapshot({ decisions: [{
+			point: "plan", outcome: "ok", model: "fixture-model", action: "hold",
+			threshold, latencyMs: 0, attempts: 1, at: 1_700_000_000_000, p: 0,
+			probabilities: {}, questions: [],
+		}] }), stubs(), { theme: {}, initialPanel: "overview", rows: () => 40 });
+		const summary = plain(overview.render(120)).join("\n");
+		expect(summary).toContain(`Jev threshold: ${threshold === 0 ? "0.00" : "0.90"}`);
+		expect(summary).toMatch(/not a complete history/i);
+		overview.dispose();
 		const ui = createInsightDashboard(snapshot({ decisions: [{
 			point: "plan", outcome: "ok", model: "fixture-model", action: "hold",
 			threshold, cost: 0, latencyMs: 0, attempts: 1, at: 1_700_000_000_000,
@@ -608,6 +617,8 @@ describe("dashboard action receipts survive refresh", () => {
 		let text = plain(ui.render(80)).join("\n");
 		expect(text).toContain("Refreshing local snapshot");
 		expect(text).toContain(RECEIPT);
+		expect(text).not.toMatch(/Unavailable: terminal too small/);
+		expect(text).toMatch(/Unavailable: operation in progress/);
 		// Refresh lands with the confirmed row live; the receipt still stands.
 		pending.shift()?.(
 			snapshot({
@@ -626,7 +637,9 @@ describe("dashboard action receipts survive refresh", () => {
 	});
 
 	test("install receipt stays visible during and after its follow-up refresh", async () => {
-		const RECEIPT = "Omp install recorded receipt-9.";
+		const destination = `/owned/${"d".repeat(190)}/SKILL.md`;
+		const recordedAt = "2026-10-10T12:34:56.000Z";
+		const RECEIPT = `Skill created in Omp. Installed to ${destination}. Promotion recorded at ${recordedAt}.`;
 		const pending: Array<(next: InsightSnapshot) => void> = [];
 		const cb = stubs({
 			installPreview: async () => {
@@ -660,12 +673,14 @@ describe("dashboard action receipts survive refresh", () => {
 		await flush();
 		let text = plain(ui.render(80)).join("\n");
 		expect(text).toContain("Refreshing local snapshot");
-		expect(text).toContain(RECEIPT);
+		expect(text.replaceAll("\n", "")).toContain(destination);
+		expect(text.replaceAll("\n", "")).toContain(recordedAt);
 		pending.shift()?.(snapshot());
 		await flush();
 		await flush();
 		text = plain(ui.render(80)).join("\n");
-		expect(text).toContain(RECEIPT);
+		expect(text.replaceAll("\n", "")).toContain(destination);
+		expect(text.replaceAll("\n", "")).toContain(recordedAt);
 		ui.dispose();
 	});
 

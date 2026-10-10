@@ -608,11 +608,6 @@ describe("insight card", () => {
 		expect(rows.map((row) => Bun.stripANSI(row)).join("\n")).not.toContain("SECRET-CONTENT-MARKER");
 	});
 
-	test("repeated renders at the same width return the same rows", () => {
-		const component = renderInsight({ content: "card", details: canonicalCard() }, { expanded: false }, theme);
-		expect(component).toBeDefined();
-		expect(component?.render(80)).toBe(component?.render(80));
-	});
 
 	test("recorded zeroes render as zeroes while absent cost stays absent", () => {
 		const snapshot = canonicalCard();

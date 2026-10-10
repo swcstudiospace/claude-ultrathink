@@ -864,7 +864,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			emitWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`, "error");
 		}
 		if (busy) {
-			emit(`${busy.label}${busyCancelled ? " · cancelling…" : "…"}`);
+			emit(`${busy.label}${busyCancelled ? " · cancelling…" : ""}`);
 			// The settled confirm/install receipt stays on screen while its
 			// owned follow-up refresh re-reads; every other busy run keeps the
 			// existing behavior of showing only the busy label.
@@ -890,7 +890,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		for (const [index, action] of list.entries()) {
 			const focused = focus === "actions" && (actionCursor[view] ?? 0) === index;
 			const marker = focused ? ">" : " ";
-			const reason = action.disabledReason ?? TINY_REASON;
+			const reason = action.disabledReason ?? (busy ? "operation in progress" : TINY_REASON);
 			const state = action.enabled
 				? ""
 				: tiny && reason === TINY_REASON
@@ -1106,7 +1106,9 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		} else {
 			const latest = decisionList[0];
 			if (latest) {
-				lines.push({ text: `Latest decision: ${truncateGraphemes(latest.point, 60)} · ${latest.action} · P ${latest.pText}`, tone: "head" });
+				const threshold = formatP(latest.source.threshold);
+				lines.push({ text: `Latest saved-plan decision: ${truncateGraphemes(latest.point, 60)} · ${latest.action} · P ${latest.pText}${threshold === undefined ? "" : ` · Jev threshold: ${threshold}`}`, tone: "head" });
+				lines.push({ text: LATEST_PLAN_NOTE, tone: "meta" });
 			}
 		}
 		const parts = Object.entries(snapshot.counts)
@@ -1199,21 +1201,24 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		if (safeWidth <= 0) return [];
 		const height = viewportHeight();
 		// Transient layout guidance never outlives the viewport that caused it:
-		// a cleared fit refusal recomputes against the grown viewport while
-		// durable receipts in `notice` are untouched. Conversely, an affirmative
-		// withheld by the fit check is announced once in the status path — the
-		// notice is the only place the full reason appears, so the screen that
-		// says "withheld" is exactly the screen whose affirmative is disabled.
+		// a stale fit refusal is cleared BEFORE the resized budget is measured,
+		// so the warning's own status rows cannot count against the fit check —
+		// a grown viewport recovers in one render instead of re-refusing from
+		// its own leftover warning. Durable receipts in `notice` are untouched.
+		// Conversely, an affirmative withheld by the fit check is announced once
+		// in the status path — the notice is the only place the full reason
+		// appears, so the screen that says "withheld" is exactly the screen
+		// whose affirmative is disabled.
 		if (view === "confirm-candidate" || view === "confirm-install") {
+			const hadFitNotice = notice === FIT_REASON;
+			const savedKind = noticeKind;
+			if (hadFitNotice) setNotice("");
 			const list = actions(safeWidth);
 			const affirmative = view === "confirm-candidate" ? "confirm-yes" : "install-yes";
 			const fits = list.some((action) => action.id === affirmative && action.enabled) && confirmScreenFits(safeWidth, list);
-			if (notice === FIT_REASON) {
-				const savedKind = noticeKind;
-				setNotice("");
-				if (!fits) setNotice(FIT_REASON, savedKind);
-			} else if (!fits && notice === "") {
-				setNotice(FIT_REASON, "warn");
+			if (!fits) {
+				if (hadFitNotice) setNotice(FIT_REASON, savedKind);
+				else if (notice === "") setNotice(FIT_REASON, "warn");
 			}
 		}
 		if (notice === TINY_REASON && canMutate(safeWidth)) setNotice("");
@@ -1308,8 +1313,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					{ text: "Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading.", tone: "plain" },
 				);
 			}
-			const wrappedPrefix: string[] = [];
-			for (const line of prefix) wrappedPrefix.push(...wrapRich(line, safeWidth));
+			// Prefix notes stay grouped by logical line: the scrolled browse
+			// surface below cuts whole sentences, never a mid-sentence fragment.
+			const prefixGroups: string[][] = prefix.map((line) => wrapRich(line, safeWidth));
+			const wrappedPrefix: string[] = prefixGroups.flat();
 			const rows_list = listRows(tab);
 			if (rows_list.length === 0) {
 				const wrapped: string[] = [];
@@ -1350,16 +1357,17 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				}
 				const wrappedCore: string[] = [];
 				for (const line of core) wrappedCore.push(...wrapRich(line, safeWidth));
-				const wrappedExtras: string[] = [];
-				for (const line of extras) wrappedExtras.push(...wrapRich(line, safeWidth));
+				const extraGroups: string[][] = extras.map((line) => wrapRich(line, safeWidth));
+				const wrappedExtras: string[] = extraGroups.flat();
 				// One shared invariant for every browse panel: the record window
 				// keeps at least one visible row in every geometry, and the notes
 				// around it (latest-plan label, partial banner, policy prefix,
 				// count line, subset extras) take bounded leftover space. When
-				// the combined surface exceeds the budget it scrolls as one —
-				// the lesson window and count line stay on screen while prefix
-				// and extras scroll away above them, so notes can never consume
-				// the entire window and strand an invisible selection.
+				// the surface exceeds the budget the notes scroll away above the
+				// list — the lesson window and count line stay on screen while
+				// prefix and extras give up whole sentences first, so notes can
+				// never consume the entire window and strand an invisible
+				// selection.
 				const sharedBudget = Math.max(1, layout.budget(0));
 				const windowRows = Math.max(1, Math.min(LIST_WINDOW, sharedBudget - wrappedPrefix.length - wrappedCore.length - wrappedExtras.length));
 				const start = clampScroll(cursor - Math.floor(windowRows / 2), total, windowRows);
@@ -1370,15 +1378,37 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					const fitted = fitRow(`${focusedRow ? ">" : " "} ${row.label}`, safeWidth);
 					rows.push(focusedRow ? dashboardPaint.fg("accent", fitted) : fitted);
 				});
-				// Subset notes sit above the list so the tail slice always keeps
-				// the lesson window and the core count on screen.
-				const combined = tab === "skills"
-					? [...wrappedPrefix, ...wrappedExtras, ...rows, ...wrappedCore]
-					: [...wrappedPrefix, ...rows, ...wrappedCore];
+				// Notes (prefix, and subset extras on skills) sit above the list
+				// so the tail slice always keeps the lesson window and the core
+				// count complete on screen. The cut follows note sentence
+				// boundaries — a partially visible sentence is dropped whole,
+				// or compacted to one bounded line when no complete sentence
+				// fits — so a scrolled surface never shows a meaningless
+				// fragment like a bare "history." or "this read." in place of
+				// the warning it came from.
+				const noteGroups = tab === "skills" ? [...prefixGroups, ...extraGroups] : prefixGroups;
+				const noteSources = tab === "skills" ? [...prefix, ...extras] : [...prefix];
+				const noteRowsTotal = noteGroups.reduce((sum, group) => sum + group.length, 0);
 				// Never smaller than the lesson window plus the core count, so a
 				// scrolled surface keeps the selection on screen.
-				const surface = Math.min(combined.length, Math.max(sharedBudget, windowRows + wrappedCore.length));
-				body = combined.slice(Math.max(0, combined.length - surface));
+				const surface = Math.min(rows.length + wrappedCore.length + noteRowsTotal, Math.max(sharedBudget, windowRows + wrappedCore.length));
+				const noteBudget = Math.max(0, surface - rows.length - wrappedCore.length);
+				const visibleNotes: string[] = [];
+				let usedNotes = 0;
+				for (let index = noteGroups.length - 1; index >= 0; index -= 1) {
+					const group = noteGroups[index];
+					if (group === undefined || usedNotes + group.length > noteBudget) break;
+					visibleNotes.unshift(...group);
+					usedNotes += group.length;
+				}
+				if (visibleNotes.length === 0 && noteBudget > 0 && noteGroups.length > 0) {
+					// Not even one complete note sentence fits the leftover
+					// space: a compact one-line form of the tailmost note keeps
+					// its meaning within the bounded leftover row.
+					const tailNote = noteSources[noteSources.length - 1];
+					if (tailNote) visibleNotes.push(styleRow(tailNote.tone, fitRow(tailNote.text, safeWidth)));
+				}
+				body = [...visibleNotes, ...rows, ...wrappedCore];
 			}
 		}
 
@@ -1626,10 +1656,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					busy = undefined;
 					busyCancelled = false;
 					if (result && result.status === "ok") {
-						const receipt = cleanInline(result.message, 200) || "Candidate confirmed.";
-						const retention = result.retention ? ` Retention: ${cleanInline(result.retention, 40)}.` : "";
-						const lifecycle = result.lifecycle ? ` Lifecycle: ${cleanInline(result.lifecycle, 40)}.` : "";
-						setNotice(`${receipt}${retention}${lifecycle}`, "success");
+						setNotice(canonicalMessage(result) ?? "Candidate confirmed.", "success");
 						closeToBrowseSilent();
 						focus = "list";
 						touch();
@@ -1665,10 +1692,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					busy = undefined;
 					busyCancelled = false;
 					if (result && result.status === "ok") {
-						const receipt = cleanInline(result.message, 200) || "Omp install returned success.";
-						const install = result.install;
-						const recorded = install ? ` Recorded action: ${cleanInline(install.action, 40)}${install.skill ? ` · Skill: ${cleanInline(install.skill, 80)}` : ""}${install.path ? ` · Path: ${cleanInline(install.path, 120)}` : ""}.` : "";
-						setNotice(`${receipt}${recorded}`, "success");
+						setNotice(canonicalMessage(result) ?? "Omp install returned success.", "success");
 						closeToBrowseSilent();
 						focus = "list";
 						touch();
