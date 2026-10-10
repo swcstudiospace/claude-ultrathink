@@ -378,7 +378,7 @@ function projectPromotion(raw: TeachableMoment["promoted"], redact: SanitizeCont
 	if (raw === undefined) return undefined;
 	if (!SKILL_TARGET_LIST.includes(raw.target)) return undefined;
 	const promotion: InsightPromotion = {
-		at: capCodePoints(raw.at, 64),
+		at: sanitizeInsightText(raw.at, { ...redact, maxChars: 64 }),
 		skill: sanitizeInsightText(raw.skill, { ...redact, maxChars: 120 }),
 		target: raw.target,
 	};
@@ -403,8 +403,8 @@ function projectLesson(moment: TeachableMoment, promoteAfter: number, redact: Sa
 		host: sanitizeInsightText(moment.host, { ...redact, maxChars: 120 }),
 		occurrences: moment.occurrences,
 		recalled: moment.recalled,
-		createdAt: capCodePoints(moment.createdAt, 64),
-		lastSeenAt: capCodePoints(moment.lastSeenAt, 64),
+		createdAt: sanitizeInsightText(moment.createdAt, { ...redact, maxChars: 64 }),
+		lastSeenAt: sanitizeInsightText(moment.lastSeenAt, { ...redact, maxChars: 64 }),
 		sourcePhase: sanitizeInsightText(moment.sourcePhase, { ...redact, maxChars: 300 }),
 		sourceArtifacts: cleanStringList(moment.sourceArtifacts, 200, redact),
 		tags: cleanStringList(moment.tags, 40, redact),
@@ -421,6 +421,8 @@ const TEACH_JEV_NOTE = "Teaching Jev history is not recorded. Lesson state is no
 const WORKER_NOTE = "Detached worker outcomes are not recorded. No completion or install result can be inferred.";
 const PARTIAL_NOTE = "Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.";
 const SCAN_LIMIT_NOTE = "Showing up to 100 local records; this is not a complete inventory.";
+/** Neutral display-cap disclosure: a complete read capped for display is healthy, never a failed read. */
+const RECORD_LIMIT_NOTE = `Only the newest ${INSIGHT_MAX_ROWS} records are shown.`;
 const CANCEL_NOTE = "Snapshot refresh was cancelled; showing available records.";
 
 /**
@@ -436,6 +438,10 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 	let partial = false;
 	const markPartial = (note: string): void => {
 		partial = true;
+		if (!limitations.includes(note)) limitations.push(note);
+	};
+	/** Disclosure without the failure flag: the display cap hides nothing that was unread. */
+	const noteLimit = (note: string): void => {
 		if (!limitations.includes(note)) limitations.push(note);
 	};
 	const cancelled = (): boolean => signal?.aborted === true || ctx.signal?.aborted === true;
@@ -479,7 +485,7 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 				valid.sort((a, b) => b.at - a.at);
 				if (valid.length > INSIGHT_MAX_ROWS) {
 					decisions = valid.slice(0, INSIGHT_MAX_ROWS);
-					markPartial(SCAN_LIMIT_NOTE);
+					noteLimit(RECORD_LIMIT_NOTE);
 				} else {
 					decisions = valid;
 				}
@@ -521,7 +527,7 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 			scoped.sort((a, b) => (a.createdAt === b.createdAt ? (a.id < b.id ? -1 : 1) : a.createdAt < b.createdAt ? 1 : -1));
 			if (scoped.length > INSIGHT_MAX_ROWS) {
 				lessons = scoped.slice(0, INSIGHT_MAX_ROWS).map((moment) => projectLesson(moment, promoteAfter, redact));
-				markPartial(SCAN_LIMIT_NOTE);
+				noteLimit(RECORD_LIMIT_NOTE);
 			} else {
 				lessons = scoped.map((moment) => projectLesson(moment, promoteAfter, redact));
 			}
@@ -670,11 +676,13 @@ export function formatInsightText(snapshot: InsightSnapshot): string {
 	rows.push(
 		`Autonomy: teaching ${snapshot.policy.enabled ? "on" : "off"}; capture ${snapshot.policy.capture}; eligible ${snapshot.eligible}; promoted ${snapshot.promoted}`,
 	);
-	const shown = snapshot.lessons.slice(0, Math.max(0, INSIGHT_TEXT_MAX_ROWS - rows.length - snapshot.limitations.length - 2));
-	rows.push(`Lessons for ${snapshot.project} (${snapshot.lessons.length} shown):`);
+	const available = Math.max(0, INSIGHT_TEXT_MAX_ROWS - rows.length - snapshot.limitations.length - 2);
+	const shown = snapshot.lessons.slice(0, Math.max(0, available - (snapshot.lessons.length > available ? 1 : 0)));
+	rows.push(`Lessons for ${snapshot.project} (${shown.length} of ${snapshot.lessons.length} shown):`);
 	for (const lesson of shown) {
 		rows.push(`- [${lesson.status}] ${lesson.name} (x${lesson.occurrences})${lesson.eligible ? " — eligible by saved lesson rules" : ""}`);
 	}
+	if (shown.length < snapshot.lessons.length) rows.push(`Note: ${snapshot.lessons.length - shown.length} more lessons omitted from this text.`);
 	for (const limitation of snapshot.limitations) rows.push(`Note: ${limitation}`);
 	rows.push("Guarded actions require the Omp TUI (/ultrathink-ui).");
 	return rows

@@ -341,7 +341,10 @@ describe("readInsightSnapshot Jev scope", () => {
 			const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
 			expect(snap.decisions.length).toBe(100);
 			expect(snap.decisions[0]?.at).toBe(1100);
-			expect(snap.partial).toBe(true);
+			// A complete read capped for display is not a failed read: neutral
+			// limitation note, and the snapshot never warns partial.
+			expect(snap.partial).toBe(false);
+			expect(snap.limitations).toContain("Only the newest 100 records are shown.");
 		})();
 	});
 });
@@ -614,6 +617,37 @@ describe("toInsightCardSnapshot", () => {
 });
 
 describe("formatInsightText", () => {
+	test("fallback counts only rendered lessons and discloses the rest within its budget", async () => {
+		for (let index = 0; index < 30; index += 1) writeMoment({ id: `fallback-${index}` });
+		const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+		const rows = formatInsightText(snap).split("\n");
+		const displayed = rows.filter((row) => row.startsWith("- [")).length;
+		expect(rows.find((row) => row.startsWith("Lessons for"))).toContain(`(${displayed} of 30 shown)`);
+		expect(rows.join("\n")).toContain(`${30 - displayed} more lessons omitted`);
+		expect(displayed).toBeLessThan(30);
+		expect(rows.length).toBeLessThanOrEqual(24);
+		expect(rows.at(-1)).toContain("Omp TUI");
+	});
+
+	test("stored timestamps strip controls before redacting supported secret patterns", async () => {
+		const secret = `sk-${"x".repeat(40)}`;
+		const splitSecret = `${secret.slice(0, 12)}${CSI}${secret.slice(12)}`;
+		writeMoment({
+			id: "timestamp-intake",
+			createdAt: splitSecret,
+			lastSeenAt: splitSecret,
+			status: "promoted",
+			promoted: { at: splitSecret, target: "omp", skill: "fixture" },
+		});
+		const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+		const lesson = snap.lessons[0];
+		for (const timestamp of [lesson?.createdAt, lesson?.lastSeenAt, lesson?.promoted?.at]) {
+			expect(timestamp).toContain("[redacted]");
+			expect(timestamp).not.toContain(secret);
+			expect(timestamp).not.toContain(ESC);
+		}
+	});
+
 	test("fallback stays within row and column bounds with no controls", () => {
 		return (async () => {
 			writeSessionRecord("sess-a", [decision({ p: 0.75 })]);

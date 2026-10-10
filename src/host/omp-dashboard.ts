@@ -302,7 +302,6 @@ function normalizeKey(data: unknown): string | undefined {
 		case "enter":
 		case "escape":
 		case "esc":
-		case "q":
 		case "pageup":
 		case "pagedown":
 			return data.toLowerCase() === "esc" ? "escape" : data.toLowerCase();
@@ -561,14 +560,14 @@ export function createInsightDashboard(
 		const key = selectedKeys[tab];
 		const all = tab === "skills" ? skillRows() : lessons();
 		if (key === undefined) return all[0];
-		return all.find((row) => row.id === key) ?? all[0];
+		return all.find((row) => row.id === key);
 	};
 
 	const currentDecision = (): DecisionRow | undefined => {
 		const key = selectedKeys.jev;
 		const all = decisions();
 		if (key === undefined) return all[0];
-		return all.find((row) => row.key === key) ?? all[0];
+		return all.find((row) => row.key === key);
 	};
 
 	const focusable = (): FocusRegion[] => {
@@ -1820,6 +1819,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			}
 			confirmTarget = row;
 			actionCursor["confirm-candidate"] = 0;
+			// A stale receipt (e.g. a long install success note) must never be
+			// measured against this confirmation: clear it before the screen is
+			// sized so the fit check reflects only the confirmation's own text.
+			setNotice("");
 			openView("confirm-candidate", "actions");
 			return;
 		}
@@ -1848,6 +1851,9 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				return;
 			}
 			actionCursor["confirm-install"] = 0;
+			// Same as open-confirm: the previous receipt never counts against the
+			// installation confirmation's fit budget.
+			setNotice("");
 			openView("confirm-install", "actions");
 			return;
 		}
