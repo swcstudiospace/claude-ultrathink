@@ -1308,8 +1308,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		} else {
 			// Browse prefixes keep live policy plus the saved-rules caveat (never
 			// a fresh Jev or installation claim), the Jev latest-plan label, and
-			// the bounded partial qualifier beside the affected collection.
-			const prefix: RichLine[] = [...partialBanner(), ...recordCapNote()];
+			// the bounded partial qualifier beside the affected collection. The
+			// partial banner goes LAST: note truncation keeps the tailmost
+			// notes, so a real read error survives the neutral cap note.
+			const prefix: RichLine[] = [...recordCapNote(), ...partialBanner()];
 			if (tab === "jev") prefix.unshift({ text: LATEST_PLAN_NOTE, tone: "meta" });
 			if (tab === "skills") {
 				prefix.unshift(
