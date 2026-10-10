@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
 import { INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
-import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightSnapshot } from "./omp-insights.ts";
+import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightDecision, type InsightSnapshot } from "./omp-insights.ts";
 import type { PlanView } from "./view.ts";
 
 const FG = ["accent", "muted", "dim", "success", "warning", "error", "borderMuted", "borderAccent", "customMessageLabel", "customMessageText"];
@@ -305,7 +305,16 @@ describe("insight card", () => {
 		project: "demo",
 		session: "s1",
 		at: 1_700_000_000_000,
-		policy: { enabled: true, capture: "explicit" },
+		policy: {
+			enabled: true,
+			capture: "explicit",
+			recall: true,
+			recallLimit: 5,
+			recallChars: 4000,
+			autoPromote: false,
+			promoteAfter: 3,
+			jevEnabled: true,
+		},
 		decisions: [
 			{ point: "teachable", outcome: "ok", action: "keep", model: "m1" },
 			{ point: "skillworthy", outcome: "error", action: "skip", model: "m1" },
@@ -368,7 +377,16 @@ describe("insight card", () => {
 			project: "x\x1b[2Jcgi",
 			session: "s\x1b]0;pwned\x07",
 			at: 1_700_000_000_000,
-			policy: { enabled: true, capture: "observe" },
+			policy: {
+				enabled: true,
+				capture: "observe",
+				recall: true,
+				recallLimit: 5,
+				recallChars: 4000,
+				autoPromote: false,
+				promoteAfter: 3,
+				jevEnabled: true,
+			},
 			decisions: [{ point: "plan", outcome: "ok", action: "plan", model: "m" }],
 			lessons: [{ id: "h-1", name: "a\u202eb", status: "candidate", kind: "bug", occurrences: 1, eligible: false }],
 			counts: { candidate: 1, confirmed: 0, promoted: 0, superseded: 0 },
@@ -535,18 +553,20 @@ describe("insight card", () => {
 		expect(text).toMatch(/worth-keeping/);
 		expect(text).toMatch(/0\.82/);
 		expect(text).toMatch(/second-skill/);
-		expect(text).toMatch(/Policy: teaching on/);
+		expect(text).toMatch(/Effective policy: teaching on/);
 	});
 
 	test("expanded card never rounds a saved probability across its threshold", () => {
 		const snapshot = canonicalCard();
 		const first = snapshot.decisions[0];
 		if (first === undefined) throw new Error("canonical fixture must carry a decision");
-		const near = { ...first, threshold: 0.2, questions: [{ key: "edge-case", p: 0.1999 }] };
+		const near = { ...first, p: 0.1999, threshold: 0.2, questions: [{ key: "edge-case", p: 0.1999 }] };
 		const { plain } = insightCard(canonicalCard({ decisions: [near, ...snapshot.decisions.slice(1)] }), true, 160);
 		const text = plain.join("\n");
 		expect(text).toContain("edge-case (0.19)");
-		expect(text).not.toContain("0.20");
+		expect(text).toContain("P 0.19");
+		expect(text).toContain("thr 0.20");
+		expect(text).not.toContain("P 0.20");
 		expect(text).not.toContain("20%");
 	});
 
@@ -592,5 +612,103 @@ describe("insight card", () => {
 		const component = renderInsight({ content: "card", details: canonicalCard() }, { expanded: false }, theme);
 		expect(component).toBeDefined();
 		expect(component?.render(80)).toBe(component?.render(80));
+	});
+
+	test("recorded zeroes render as zeroes while absent cost stays absent", () => {
+		const snapshot = canonicalCard();
+		const first = snapshot.decisions[0];
+		if (first === undefined) throw new Error("canonical fixture must carry a decision");
+		const zeroed = { ...first, p: 0, threshold: 0.5, latencyMs: 0, attempts: 0, cost: 0, questions: [] };
+		for (const width of [80, 120]) {
+			const { plain, rows } = insightCard(canonicalCard({ decisions: [zeroed] }), true, width);
+			const text = plain.map((row) => row.slice(1, -1).trim()).join(" ").replace(/\s+/g, " ");
+			expect(text).toContain("P 0.00");
+			expect(text).toContain("thr 0.50");
+			expect(text).toContain("0ms");
+			expect(text).toContain("0 attempts");
+			expect(text).toContain("Cost 0");
+			expect(text).toContain("2023-11-14T22:13:20.000Z");
+			expect(rows.length).toBeLessThanOrEqual(24 + 4);
+		}
+		const { plain: noCost } = insightCard(canonicalCard(), true, 160);
+		expect(noCost.join("\n")).not.toContain("Cost");
+	});
+
+	test("classified failure kinds render while invented kinds are dropped with the row kept", () => {
+		const snapshot = canonicalCard();
+		const second = snapshot.decisions[1];
+		if (second === undefined) throw new Error("canonical fixture must carry two decisions");
+		const { plain } = insightCard(canonicalCard({ decisions: [snapshot.decisions[0]!, { ...second, error: "timeout" }] }), true, 160);
+		expect(plain.join("\n")).toContain("err timeout");
+		const invented = { ...second, error: "meltdown" } as unknown as InsightDecision;
+		const { plain: dropped } = insightCard(canonicalCard({ decisions: [snapshot.decisions[0]!, invented] }), true, 160);
+		const text = dropped.join("\n");
+		expect(text).not.toContain("meltdown");
+		expect(text).not.toContain("err ");
+		expect(text).toMatch(/fail-open/);
+	});
+
+	test("compact autonomy reflects effective capture/recall/auto-promotion settings", () => {
+		const { plain } = insightCard(canonicalCard(), false, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("capture observe");
+		expect(text).toContain("recall on (5/4000)");
+		expect(text).toContain("auto-promote off");
+		expect(text).toContain("after 3");
+		const snapshot = canonicalCard();
+		const off = canonicalCard({
+			policy: { ...snapshot.policy, capture: "auto", recall: false, autoPromote: true, promoteAfter: 5 },
+		});
+		const { plain: offPlain } = insightCard(off, false, 160);
+		const offText = offPlain.join("\n");
+		expect(offText).toContain("capture auto");
+		expect(offText).toContain("recall off");
+		expect(offText).toContain("auto-promote on");
+		expect(offText).toContain("after 5");
+	});
+
+	test("expanded card discloses shown counts and omitted-skill overflow", () => {
+		const snapshot = canonicalCard();
+		const base = snapshot.lessons[0];
+		if (base === undefined) throw new Error("canonical fixture must carry a lesson");
+		const lessons = [0, 1, 2, 3, 4].map((index) => ({ ...base, id: `eligible-${index}`, name: `Eligible ${index}` }));
+		const { rows, plain } = insightCard({ ...snapshot, lessons }, true, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("5 shown");
+		expect(text).toMatch(/2 more lessons — open \/ultrathink-ui/);
+		expect(text).toMatch(/2 more skills omitted — open \/ultrathink-ui/);
+		expect(rows.length).toBeLessThanOrEqual(24 + 4);
+	});
+
+	test("scarce limitation rows prefer actionable cap/read notes over boilerplate", () => {
+		const card = {
+			...cardDetails,
+			limitations: [
+				"Teaching Jev history is not recorded. Lesson state is not a verdict receipt.",
+				"Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.",
+			],
+		};
+		const { plain } = insightCard(card, false, 160);
+		const countsRow = plain.find((row) => row.includes("Counts (shown)")) ?? "";
+		expect(countsRow).toContain("Partial snapshot");
+		expect(countsRow).not.toContain("Teaching Jev history");
+	});
+
+	test("compact card discloses capture omissions before a long lesson title can clip them", () => {
+		const snapshot = canonicalCard();
+		const first = snapshot.lessons[0]!;
+		const lessons = Array.from({ length: 24 }, (_, index) => ({ ...first, id: `lesson-${index}`, name: "long ".repeat(24) }));
+		const { plain } = insightCard({ ...snapshot, lessons, counts: { candidate: 1, confirmed: 31, promoted: 0, superseded: 0 } }, false, 120);
+		const text = plain.join("\n");
+		expect(text).toContain("24 shown");
+		expect(text).toContain("8 omitted from card");
+		expect(text).toContain("31 confirmed");
+	});
+
+	test("compact drops vertical padding while expanded keeps it", () => {
+		const compact = insightCard(cardDetails, false, 80);
+		expect(compact.rows.length).toBeLessThanOrEqual(6 + 2);
+		const expanded = insightCard(cardDetails, true, 80);
+		expect(expanded.rows.length).toBeLessThanOrEqual(24 + 4);
 	});
 });

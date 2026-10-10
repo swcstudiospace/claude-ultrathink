@@ -40,7 +40,7 @@ import { confirmInsightLesson, installInsightSkill, previewInsightSkill, type In
 import { createInsightDashboard, type InsightDashboardCallbacks, type InsightPanel } from "./omp-dashboard.ts";
 import type { InsightActionResult, InsightScope, InsightSnapshot, LessonSelection, SkillPreview } from "./omp-insights.ts";
 import { formatInsightText, readInsightSnapshot, toInsightCardSnapshot } from "./omp-insights.ts";
-import { truncateToWidth } from "./omp-paint.ts";
+import { paint, truncateToWidth } from "./omp-paint.ts";
 import { INSIGHT_TYPE } from "./omp-render.ts";
 import { projectOf } from "../teach/mapping.ts";
 import type { TeachContext } from "../teach/types.ts";
@@ -881,6 +881,7 @@ export function createOmpExtension(
 		const UI_SCOPE_COPY =
 			"Scope unavailable. Cross-project/session inspection and actions are disabled; reopen from a top-level Omp session.";
 		const UI_STALE_COPY = "Session changed. Dashboard closed; no further action was started for the old selection.";
+		const UI_LOADING_COPY = "Loading local snapshot… No model calls or lesson changes.";
 
 		/** Plain-text fallback budget (UI-SPEC): at most 24 rows of 120 visible columns. */
 		const UI_FALLBACK_ROWS = 24;
@@ -910,6 +911,7 @@ export function createOmpExtension(
 			disposed: boolean;
 			refreshSeq: number;
 			lastSnapshot?: InsightSnapshot;
+			loadingUi?: ExtensionUI;
 		}
 
 		let insightEpoch = 0;
@@ -923,6 +925,9 @@ export function createOmpExtension(
 		const teardownInsight = (lifetime: InsightLifetime): void => {
 			if (lifetime.disposed) return;
 			lifetime.disposed = true;
+			const loadingUi = lifetime.loadingUi;
+			lifetime.loadingUi = undefined;
+			if (loadingUi) guard(() => loadingUi.setWidget?.(INSIGHT_TYPE, undefined));
 			if (activeInsight === lifetime) activeInsight = undefined;
 			guard(() => lifetime.controller.abort());
 			const dashboard = lifetime.dashboard;
@@ -1046,24 +1051,37 @@ export function createOmpExtension(
 			activeInsight = lifetime;
 			const isCurrent = (): boolean => insightCurrent(lifetime);
 			const scope: InsightScope = { sessionId, cwd, stateDir: dir, epoch: lifetime.epoch };
+			const hostUi =
+				ctx?.hasUI && ctx.mode === "tui" && ctx.ui && typeof ctx.ui.custom === "function" ? ctx.ui : undefined;
+			if (hostUi?.setWidget) {
+				lifetime.loadingUi = hostUi;
+				guard(() => hostUi.setWidget?.(INSIGHT_TYPE, (_tui, theme) => {
+					const p = paint(theme);
+					return { render: (width) => [truncateToWidth(p.fg("muted", UI_LOADING_COPY), width)] };
+				}, { placement: "aboveEditor" }));
+			} else if (hostUi) {
+				guard(() => hostUi.notify?.(UI_LOADING_COPY, "info"));
+			}
 			let snapshot: InsightSnapshot;
 			try {
 				snapshot = await readInsightSnapshot(scope, insightTeachContext(lifetime), lifetime.controller.signal);
 			} catch (error) {
+				if (!isCurrent()) return;
 				teardownInsight(lifetime);
 				const reason = uiOneLine(error instanceof Error ? error.message : String(error)).slice(0, 200) || "unknown error";
 				sendInsightText(`Could not read local snapshot: ${reason}. No lesson changes were made by this read.`);
 				return;
 			}
 			if (!isCurrent()) return;
+			const loadingUi = lifetime.loadingUi;
+			lifetime.loadingUi = undefined;
+			if (loadingUi) guard(() => loadingUi.setWidget?.(INSIGHT_TYPE, undefined));
 			lifetime.lastSnapshot = snapshot;
 			if (panel === "card") {
 				publishInsightCard(lifetime, snapshot);
 				teardownInsight(lifetime);
 				return;
 			}
-			const hostUi =
-				ctx?.hasUI && ctx.mode === "tui" && ctx.ui && typeof ctx.ui.custom === "function" ? ctx.ui : undefined;
 			if (!hostUi?.custom) {
 				sendSnapshotFallback(snapshot, lifetime);
 				return;

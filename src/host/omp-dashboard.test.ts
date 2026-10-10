@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { createInsightDashboard, type InsightDashboard, type InsightDashboardCallbacks } from "./omp-dashboard.ts";
+import { createInsightDashboard, type InsightDashboard, type InsightDashboardCallbacks, type InsightPanel } from "./omp-dashboard.ts";
 import type { InsightActionResult, InsightLesson, InsightSnapshot } from "./omp-insights.ts";
 
 function mkLesson(id: string, name: string, overrides: Partial<InsightLesson> = {}): InsightLesson {
@@ -1095,6 +1095,116 @@ describe("dashboard physical viewport boundaries", () => {
 		expect(rows.join("\n")).toContain(RECEIPT);
 		ui.dispose();
 	});
+
+	test("window invariant matrix: a record row survives every width, height, and state", async () => {
+		// Finding geometries: notes/labels/status could previously consume the
+		// whole content window (or an infinite height could bypass the fit
+		// check). One invariant everywhere: at least one record/lesson/refusal
+		// row is visible or reachable by scroll, every row fits its width, the
+		// frame fits its height (bounded fallback when height is unknown), and
+		// a withheld affirmative never dispatches.
+		const widths = [24, 40, 80];
+		const heights: Array<number | undefined> = [8, 12, 20, undefined];
+		const longId = `l-${"x".repeat(898)}`;
+		const longName = "A candidate identity long enough that its confirmation can never fit any matrix viewport".padEnd(120, ".");
+		const offPolicy = { ...snapshot().policy!, enabled: false };
+		const bannerSnapshot = {
+			partial: true,
+			limitations: [
+				"Teaching Jev history is not recorded. Lesson state is not a verdict receipt.",
+				"Detached worker outcomes are not recorded. No completion or install result can be inferred.",
+			],
+		};
+		const cells: Array<{ name: string; snap: InsightSnapshot; panel: InsightPanel; open: "browse" | "detail" | "confirm"; probe: string; guardConfirm?: boolean }> = [
+			{ name: "jev with latest-plan notes", snap: snapshot(), panel: "jev", open: "browse", probe: "teachable" },
+			{ name: "moments with partial banner", snap: snapshot(bannerSnapshot), panel: "moments", open: "browse", probe: "First lesson" },
+			{ name: "teaching-off candidate detail", snap: snapshot({ policy: offPolicy, lessons: [mkLesson("l1", "First lesson", { selection: { id: "l1", revision: "r1" } })] }), panel: "moments", open: "detail", probe: "First lesson" },
+			{
+				name: "teaching-off eligible detail",
+				snap: snapshot({
+					policy: offPolicy,
+					lessons: [mkLesson("l2", "Second lesson", { status: "confirmed", kind: "playbook", occurrences: 9, eligible: true, selection: { id: "l2", revision: "r2" } })],
+				}),
+				panel: "moments",
+				open: "detail",
+				probe: "Second lesson",
+			},
+			{
+				name: "confirm withheld",
+				snap: snapshot({ lessons: [mkLesson(longId, longName, { selection: { id: longId, revision: "r" } })] }),
+				panel: "moments",
+				open: "confirm",
+				// The refusal's stable leading words: the strip label never
+				// contains "is", so this matches only the withheld-identity row.
+				probe: "Confirm candidate is",
+				guardConfirm: true,
+			},
+		];
+		const reachable = (ui: InsightDashboard, width: number, probe: string): string => {
+			let text = plain(ui.render(width)).join("\n");
+			for (let i = 0; i < 60 && !text.includes(probe); i += 1) {
+				ui.handleInput("down");
+				const next = plain(ui.render(width)).join("\n");
+				if (next === text) break;
+				text = next;
+			}
+			return text;
+		};
+		for (const width of widths) {
+			for (const height of heights) {
+				for (const cell of cells) {
+					const cb = stubs();
+					const ui = createInsightDashboard(cell.snap, cb, { theme: {}, initialPanel: cell.panel, rows: height === undefined ? undefined : () => height });
+					ui.render(width);
+					if (cell.open === "browse") {
+						// Tab focuses the list; the selection row stays rendered.
+						ui.handleInput("tab");
+					} else if (cell.open === "detail") {
+						ui.handleInput("tab");
+						ui.handleInput("enter");
+					} else {
+						// Detail -> tab strip -> Enter opens the named confirmation.
+						ui.handleInput("tab");
+						ui.handleInput("enter");
+						ui.handleInput("tab");
+						ui.handleInput("tab");
+						ui.handleInput("enter");
+					}
+					// Bounds hold in every cell: each row fits its width and the
+					// frame fits the viewport (bounded fallback without a height).
+					let rows = plain(ui.render(width));
+					for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width);
+					if (height === undefined) {
+						expect(rows.length).toBeLessThanOrEqual(2 + 12 + 12);
+					} else {
+						expect(rows.length).toBeLessThanOrEqual(height);
+					}
+					// At least one record/lesson/refusal row is visible or reachable.
+					const text = reachable(ui, width, cell.probe);
+					expect(text).toContain(cell.probe);
+					rows = plain(ui.render(width));
+					for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width);
+					if (height === undefined) {
+						expect(rows.length).toBeLessThanOrEqual(2 + 12 + 12);
+					} else {
+						expect(rows.length).toBeLessThanOrEqual(height);
+					}
+					if (cell.guardConfirm) {
+						// The withheld screen never dispatches: the fit check used
+						// the normalized finite height, so the affirmative is
+						// disabled exactly when the identity is not on screen.
+						expect(text).not.toContain("xxxxxxxxxxxxxxxxxxxx");
+						ui.handleInput("down");
+						ui.handleInput("enter");
+						await flush();
+						await flush();
+						expect(cb.calls).not.toContain("confirm");
+					}
+					ui.dispose();
+				}
+			}
+		}
+	});
 });
 
 describe("dashboard source fidelity and partial truth", () => {
@@ -1168,12 +1278,24 @@ describe("dashboard source fidelity and partial truth", () => {
 	});
 
 	test("partial snapshots qualify every panel list, count, and selected details", () => {
-		const partial = snapshot({ partial: true, limitations: ["scan capped at 500 files"] });
-		for (const panel of ["jev", "moments", "skills"] as const) {
+		const partial = snapshot({
+			partial: true,
+			limitations: [
+				"Teaching Jev history is not recorded. Lesson state is not a verdict receipt.",
+				"Detached worker outcomes are not recorded. No completion or install result can be inferred.",
+				"scan capped at 500 files",
+				"Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.",
+			],
+		});
+		for (const panel of ["overview", "jev", "moments", "skills"] as const) {
 			const ui = createInsightDashboard(partial, stubs(), { theme: {}, initialPanel: panel, rows: () => 40 });
 			const browse = plain(ui.render(80)).join("\n");
-			expect(browse).toMatch(/Partial snapshot/);
-			expect(browse).toMatch(/partial/);
+			expect(browse.match(/Partial snapshot/g)).toHaveLength(1);
+			expect(browse).toContain("scan capped at 500 files");
+			if (panel === "overview") {
+				expect(browse).toMatch(/Moments[^\n]*shown/);
+				expect(browse).toMatch(/Skills[^\n]*shown/);
+			}
 			ui.handleInput("tab");
 			ui.handleInput("enter");
 			const detail = plain(ui.render(80)).join("\n");

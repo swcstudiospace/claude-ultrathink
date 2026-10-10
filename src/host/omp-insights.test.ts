@@ -574,6 +574,43 @@ describe("toInsightCardSnapshot", () => {
 			expect(toInsightCardSnapshot(snap).lessons.length).toBeLessThanOrEqual(24);
 		})();
 	});
+
+	test("24-row truncation appends bounded omission notes without widening the DTO", () => {
+		return (async () => {
+			writeSessionRecord(
+				"sess-a",
+				Array.from({ length: 30 }, (_, index) => decision({ at: 1000 + index })),
+			);
+			for (let index = 0; index < 30; index += 1) {
+				writeMoment({ id: `bulk-${index}`, createdAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z` });
+			}
+			const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+			const card = toInsightCardSnapshot(snap);
+			expect(card.decisions.length).toBe(24);
+			expect(card.lessons.length).toBe(24);
+			const notes = card.limitations.join("\n");
+			expect(notes).toContain("6 more decisions omitted");
+			expect(notes).toContain("6 more lessons omitted");
+			expect(notes).toContain("/ultrathink-ui");
+		})();
+	});
+
+	test("question keys and promotion pointers are re-sanitized with no path leak", () => {
+		return (async () => {
+			writeSessionRecord("sess-a", [decision({ probabilities: { ok: 0.5, [`bad${ESC}[31mkey`]: 0.7 } })]);
+			writeMoment({
+				id: "promo-1",
+				status: "promoted",
+				promoted: { at: "2026-01-04T00:00:00Z", skill: "some-skill", target: "omp", path: "/secret/SENTINEL-PATH-4d2c" },
+			});
+			const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+			const card = toInsightCardSnapshot(snap);
+			const serialized = JSON.stringify(card);
+			expect(serialized).not.toContain(ESC);
+			expect(serialized).not.toContain("SENTINEL-PATH-4d2c");
+			expect(serialized).toContain("some-skill");
+		})();
+	});
 });
 
 describe("formatInsightText", () => {

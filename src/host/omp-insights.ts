@@ -548,50 +548,93 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 	return { project, session, at: Date.now(), decisions, lessons, policy, counts, eligible, promoted, partial, limitations };
 }
 
-/**
- * Independent transcript-persisted card DTO. All free text is re-sanitized on
- * intake (persisted cards are untrusted), and bodies, selection revisions,
- * runtime scope and private objects are excluded by construction.
- */
-export function toInsightCardSnapshot(snapshot: InsightSnapshot): InsightCardSnapshot {
-	const redact: SanitizeContext = {};
-	const decisions = snapshot.decisions.slice(0, INSIGHT_CARD_MAX_ROWS).map((decision) => ({
-		...decision,
-		model: sanitizeInsightText(decision.model, { ...redact, maxChars: 200 }),
-		probabilities: { ...decision.probabilities },
-		questions: decision.questions.map((question) => ({ ...question })),
-	}));
-	const lessons: InsightCardLessonSummary[] = snapshot.lessons.slice(0, INSIGHT_CARD_MAX_ROWS).map((lesson) => ({
-		id: sanitizeInsightText(lesson.id, { ...redact, maxChars: 80 }),
-		name: sanitizeInsightText(lesson.name, { ...redact, maxChars: 120 }),
-		status: lesson.status,
-		kind: lesson.kind,
-		occurrences: lesson.occurrences,
-		eligible: lesson.eligible,
-		...(lesson.promoted === undefined
-			? {}
-			: {
-					promoted: {
-						at: capCodePoints(lesson.promoted.at, 64),
-						skill: sanitizeInsightText(lesson.promoted.skill, { ...redact, maxChars: 120 }),
-						target: lesson.promoted.target,
-					},
-				}),
-	}));
-	return {
-		project: sanitizeInsightText(snapshot.project, { ...redact, maxChars: 120 }),
-		session: sanitizeInsightText(snapshot.session, { ...redact, maxChars: 120 }),
-		at: snapshot.at,
-		decisions,
-		lessons,
-		policy: { ...snapshot.policy },
-		counts: { ...snapshot.counts },
-		eligible: snapshot.eligible,
-		promoted: snapshot.promoted,
-		partial: snapshot.partial,
-		limitations: snapshot.limitations.map((limitation) => sanitizeInsightText(limitation, { ...redact, maxChars: 300 })),
-	};
+/** Re-sanitized question rows for transcript persistence; invalid rows are dropped, never clamped. */
+function cleanCardQuestions(raw: unknown): { key: string; p: number }[] {
+	if (!Array.isArray(raw)) return [];
+	const out: { key: string; p: number }[] = [];
+	for (const item of raw) {
+		if (out.length >= INSIGHT_MAX_QUESTIONS) break;
+		if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+		const key = sanitizeInsightText((item as Record<string, unknown>).key, { maxChars: 80 });
+		const p = (item as Record<string, unknown>).p;
+		if (key === "" || !isFiniteInRange(p, 0, 1)) continue;
+		out.push({ key, p: p as number });
+	}
+	return out;
 }
+
+/** Re-sanitized probability map for transcript persistence; invalid entries are dropped. */
+function cleanCardProbabilities(raw: unknown): Record<string, number> {
+	const out: Record<string, number> = {};
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
+	for (const [key, p] of Object.entries(raw)) {
+		if (Object.keys(out).length >= INSIGHT_MAX_QUESTIONS) break;
+		const cleanKey = sanitizeInsightText(key, { maxChars: 80 });
+		if (cleanKey === "" || !isFiniteInRange(p, 0, 1)) continue;
+		out[cleanKey] = p as number;
+	}
+	return out;
+}
+
+ /**
+  * Independent transcript-persisted card DTO. All free text is re-sanitized on
+  * intake (persisted cards are untrusted), and bodies, selection revisions,
+  * runtime scope and private objects are excluded by construction. Truncation
+  * to INSIGHT_CARD_MAX_ROWS per collection is disclosed with bounded omission
+  * notes in `limitations`; the DTO shape itself is unchanged.
+  */
+ export function toInsightCardSnapshot(snapshot: InsightSnapshot): InsightCardSnapshot {
+ 	const redact: SanitizeContext = {};
+ 	const decisions = snapshot.decisions.slice(0, INSIGHT_CARD_MAX_ROWS).map((decision) => ({
+ 		...decision,
+ 		model: sanitizeInsightText(decision.model, { ...redact, maxChars: 200 }),
+		probabilities: cleanCardProbabilities(decision.probabilities),
+		questions: cleanCardQuestions(decision.questions),
+ 	}));
+ 	const lessons: InsightCardLessonSummary[] = snapshot.lessons.slice(0, INSIGHT_CARD_MAX_ROWS).map((lesson) => ({
+ 		id: sanitizeInsightText(lesson.id, { ...redact, maxChars: 80 }),
+ 		name: sanitizeInsightText(lesson.name, { ...redact, maxChars: 120 }),
+ 		status: lesson.status,
+ 		kind: lesson.kind,
+ 		occurrences: lesson.occurrences,
+ 		eligible: lesson.eligible,
+ 		...(lesson.promoted === undefined
+ 			? {}
+ 			: {
+ 					promoted: {
+						at: sanitizeInsightText(lesson.promoted.at, { ...redact, maxChars: 64 }),
+ 						skill: sanitizeInsightText(lesson.promoted.skill, { ...redact, maxChars: 120 }),
+ 						target: lesson.promoted.target,
+ 					},
+ 				}),
+ 	}));
+	const limitations = snapshot.limitations.map((limitation) => sanitizeInsightText(limitation, { ...redact, maxChars: 300 }));
+	const omittedDecisions = snapshot.decisions.length - decisions.length;
+	if (omittedDecisions > 0) {
+		limitations.push(
+			`${omittedDecisions} more decision${omittedDecisions === 1 ? "" : "s"} omitted — card keeps ${INSIGHT_CARD_MAX_ROWS} per collection; open /ultrathink-ui for the full view.`,
+		);
+	}
+	const omittedLessons = snapshot.lessons.length - lessons.length;
+	if (omittedLessons > 0) {
+		limitations.push(
+			`${omittedLessons} more lesson${omittedLessons === 1 ? "" : "s"} omitted — card keeps ${INSIGHT_CARD_MAX_ROWS} per collection; open /ultrathink-ui for the full view.`,
+		);
+	}
+ 	return {
+ 		project: sanitizeInsightText(snapshot.project, { ...redact, maxChars: 120 }),
+ 		session: sanitizeInsightText(snapshot.session, { ...redact, maxChars: 120 }),
+ 		at: snapshot.at,
+ 		decisions,
+ 		lessons,
+ 		policy: { ...snapshot.policy },
+ 		counts: { ...snapshot.counts },
+ 		eligible: snapshot.eligible,
+ 		promoted: snapshot.promoted,
+ 		partial: snapshot.partial,
+		limitations,
+ 	};
+ }
 
 function fitCell(text: string, width: number): string {
 	const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });

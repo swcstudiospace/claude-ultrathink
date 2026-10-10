@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { formatP } from "../decisions/types.ts";
+import { DECISIONS_ERROR_KINDS, formatP } from "../decisions/types.ts";
 import { formatModelSelection } from "../claude/output.ts";
 import { type GraphModel, renderGraph } from "./omp-graph.ts";
 import { sanitizeInsightText } from "./omp-insights.ts";
@@ -191,13 +191,40 @@ function insightCount(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+type InsightCardQuestion = {
+	key: string;
+	p: number;
+};
+
 type InsightCardDecision = {
 	point: string;
 	outcome: string;
 	model: string;
 	action: string;
-	question: string;
+	/** Recorded P; absent stays absent — never defaulted to zero. */
+	p?: number;
+	/** The decision's own recorded threshold; never the current policy. */
+	threshold?: number;
+	/** Classified failure kind; unlisted strings are dropped, never shown raw. */
+	error?: string;
+	latencyMs?: number;
+	attempts?: number;
+	at?: number;
+	/** Recorded cost; rendered only when present, never as an invented zero. */
+	cost?: number;
+	questions: InsightCardQuestion[];
 };
+type InsightCardPolicy = {
+	teaching: boolean;
+	capture: string;
+	recall: boolean;
+	recallLimit: number;
+	recallChars: number;
+	autoPromote: boolean;
+	promoteAfter: number;
+	jevEnabled: boolean;
+};
+
 
 type InsightCardLesson = {
 	name: string;
@@ -214,8 +241,7 @@ type InsightCard = {
 	at: number;
 	decisions: InsightCardDecision[];
 	lessons: InsightCardLesson[];
-	teaching: boolean;
-	capture: string;
+	policy: InsightCardPolicy;
 	counts: { status: string; total: number }[];
 	eligible: number;
 	promoted: number;
@@ -223,27 +249,72 @@ type InsightCard = {
 	limitations: string[];
 };
 
+/** Recorded 0..1 probability; anything else leaves the field unrecorded. */
+function insightProbability(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
+}
+
+/** Non-negative finite bound for latency/cost/epoch millis; anything else leaves the field unrecorded. */
+function insightMillis(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? value : undefined;
+}
+
+function insightQuestion(value: unknown): InsightCardQuestion | undefined {
+	if (!isRecord(value)) return undefined;
+	const key = insightText(value.key, 80);
+	const p = insightProbability(value.p);
+	if (key === "" || p === undefined) return undefined;
+	return { key, p };
+}
+
 function insightDecision(value: unknown): InsightCardDecision | undefined {
 	if (!isRecord(value)) return undefined;
 	if (!isLiteral(INSIGHT_POINTS, value.point)) return undefined;
 	if (!isLiteral(INSIGHT_OUTCOMES, value.outcome)) return undefined;
 	if (!isLiteral(INSIGHT_ACTIONS, value.action)) return undefined;
 	const model = insightText(value.model, 40);
-	let question = "";
-	if (Array.isArray(value.questions) && isRecord(value.questions[0])) {
-		const first = value.questions[0];
-		const key = insightText(first.key, 24);
-		if (key !== "" && typeof first.p === "number" && Number.isFinite(first.p)) {
-			question = " · First question: " + key + " (" + formatP(first.p) + ")";
+	const questions: InsightCardQuestion[] = [];
+	if (Array.isArray(value.questions)) {
+		for (const item of value.questions) {
+			if (questions.length >= 32) break;
+			const question = insightQuestion(item);
+			if (question !== undefined) questions.push(question);
 		}
 	}
-	return {
+	const decision: InsightCardDecision = {
 		point: value.point,
 		outcome: value.outcome,
 		model: model === "" ? "Not recorded" : model,
 		action: value.action,
-		question,
+		questions,
 	};
+	if (value.p !== undefined) {
+		const p = insightProbability(value.p);
+		if (p !== undefined) decision.p = p;
+	}
+	if (value.threshold !== undefined) {
+		const threshold = insightProbability(value.threshold);
+		if (threshold !== undefined) decision.threshold = threshold;
+	}
+	if (typeof value.error === "string" && (DECISIONS_ERROR_KINDS as readonly string[]).includes(value.error)) {
+		decision.error = value.error;
+	}
+	if (value.latencyMs !== undefined) {
+		const latencyMs = insightMillis(value.latencyMs);
+		if (latencyMs !== undefined) decision.latencyMs = latencyMs;
+	}
+	if (value.attempts !== undefined && typeof value.attempts === "number" && Number.isInteger(value.attempts) && value.attempts >= 0) {
+		decision.attempts = value.attempts;
+	}
+	if (value.at !== undefined) {
+		const at = insightMillis(value.at);
+		if (at !== undefined) decision.at = at;
+	}
+	if (value.cost !== undefined) {
+		const cost = insightMillis(value.cost);
+		if (cost !== undefined) decision.cost = cost;
+	}
+	return decision;
 }
 
 function insightLesson(value: unknown): InsightCardLesson | undefined {
@@ -287,6 +358,13 @@ function asInsightCard(details: unknown): InsightCard | undefined {
 	if (!isRecord(details.policy)) return undefined;
 	if (typeof details.policy.enabled !== "boolean") return undefined;
 	if (!isLiteral(INSIGHT_CAPTURES, details.policy.capture)) return undefined;
+	if (typeof details.policy.recall !== "boolean") return undefined;
+	const recallLimit = insightCount(details.policy.recallLimit);
+	const recallChars = insightCount(details.policy.recallChars);
+	const promoteAfter = insightCount(details.policy.promoteAfter);
+	if (recallLimit === undefined || recallChars === undefined || promoteAfter === undefined) return undefined;
+	if (typeof details.policy.autoPromote !== "boolean") return undefined;
+	if (typeof details.policy.jevEnabled !== "boolean") return undefined;
 	if (!isRecord(details.counts)) return undefined;
 	const counts: { status: string; total: number }[] = [];
 	for (const status of INSIGHT_STATUSES) {
@@ -322,8 +400,16 @@ function asInsightCard(details: unknown): InsightCard | undefined {
 		at: details.at,
 		decisions,
 		lessons,
-		teaching: details.policy.enabled,
-		capture: details.policy.capture,
+		policy: {
+			teaching: details.policy.enabled,
+			capture: details.policy.capture,
+			recall: details.policy.recall,
+			recallLimit,
+			recallChars,
+			autoPromote: details.policy.autoPromote,
+			promoteAfter,
+			jevEnabled: details.policy.jevEnabled,
+		},
 		counts,
 		eligible,
 		promoted,
@@ -332,7 +418,87 @@ function asInsightCard(details: unknown): InsightCard | undefined {
 	};
 }
 
-function insightRows(details: unknown, expanded: boolean, p: Paint): string[] {
+/** Invalid epoch millis render as unavailable instead of throwing out of the card. */
+function insightTimestamp(at: number | undefined): string | undefined {
+	if (at === undefined) return undefined;
+	const time = new Date(at).getTime();
+	if (!Number.isFinite(time)) return undefined;
+	return new Date(at).toISOString();
+}
+
+/** Actionable cap/read truth outranks fixed no-history boilerplate when rows are scarce. */
+function isActionableLimitation(line: string): boolean {
+	return /partial|showing up to|could not|excluded|omitt|more .*open|cancel/i.test(line);
+}
+
+function pickLimitations(limitations: string[], budget: number): string[] {
+	if (budget <= 0) return [];
+	const actionable = limitations.filter(isActionableLimitation);
+	const rest = limitations.filter((line) => !isActionableLimitation(line));
+	return [...actionable, ...rest].slice(0, budget);
+}
+
+/** One expanded Jev row: labeled recorded fields only, canonical truncating formatP, no invented zeroes. */
+function decisionRow(decision: InsightCardDecision): string {
+	const parts = [
+		decision.point,
+		decision.outcome,
+		decision.action,
+		decision.model,
+		"P " + (decision.p === undefined ? "Not recorded" : formatP(decision.p)),
+		"thr " + (decision.threshold === undefined ? "Not recorded" : formatP(decision.threshold)),
+	];
+	if (decision.error !== undefined) parts.push("err " + decision.error);
+	parts.push(decision.latencyMs === undefined ? "latency Not recorded" : decision.latencyMs + "ms");
+	parts.push(decision.attempts === undefined ? "attempts Not recorded" : decision.attempts + (decision.attempts === 1 ? " attempt" : " attempts"));
+	if (decision.cost !== undefined) parts.push("Cost " + decision.cost);
+	const first = decision.questions[0];
+	if (first !== undefined) {
+		const extra = decision.questions.length > 1 ? " +" + (decision.questions.length - 1) + " more" : "";
+		parts.push("Q " + first.key + " (" + formatP(first.p) + ")" + extra);
+	}
+	const at = insightTimestamp(decision.at);
+	if (at !== undefined) parts.push(at);
+	return "  Jev: " + parts.join(" · ");
+}
+
+/** Wrap sanitized card metadata by terminal cells, retaining whole graphemes. */
+function wrapInsightLines(lines: string[], room: number): string[] {
+	const rows: string[] = [];
+	const width = Math.max(1, room);
+	const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	for (const line of lines) {
+		let row = "";
+		let cells = 0;
+		for (const word of line.split(" ").filter(Boolean)) {
+			const wordCells = visibleWidth(word);
+			if (row !== "" && cells + 1 + wordCells > width) {
+				rows.push(row);
+				row = "";
+				cells = 0;
+			}
+			if (row !== "") {
+				row += " ";
+				cells += 1;
+			}
+			for (const { segment } of segments.segment(word)) {
+				const size = visibleWidth(segment);
+				if (cells + size > width && row !== "") {
+					rows.push(row);
+					row = "";
+					cells = 0;
+				}
+				const fitted = size > width ? truncateToWidth(segment, width) : segment;
+				row += fitted;
+				cells += visibleWidth(fitted);
+			}
+		}
+		rows.push(row);
+	}
+	return rows;
+}
+
+function insightRows(details: unknown, expanded: boolean, p: Paint, room: number): string[] {
 	// the frame truncates every row to the room (width - 4), so the not-live marker rides on the
 	// label row: after time/scope it vanishes at common widths and the card reads as live state.
 	const label = p.fg("customMessageLabel", p.bold(INSIGHT_TYPE + " · captured — not live"));
@@ -345,37 +511,54 @@ function insightRows(details: unknown, expanded: boolean, p: Paint): string[] {
 		" · Session: " +
 		card.session +
 		" · Snapshot: " +
-		new Date(card.at).toISOString();
+		(insightTimestamp(card.at) ?? "unavailable");
 	const latest = card.decisions[0];
 	const latestLine =
 		latest === undefined
 			? "No saved Jev decisions for this session"
-			: "Latest decision: " + latest.point + " · " + latest.outcome + " · " + latest.action;
+			: "Latest decision: " +
+				latest.point +
+				" · " +
+				latest.outcome +
+				" · " +
+				latest.action +
+				" · P " +
+				(latest.p === undefined ? "Not recorded" : formatP(latest.p));
 	const first = card.lessons[0];
+	const omittedLessons = Math.max(0, card.counts.reduce((total, entry) => total + entry.total, 0) - card.lessons.length);
 	const lessonLine =
 		first === undefined
 			? "No lessons recorded for this project"
-			: "Moments: " +
-				(card.lessons.length === 1 ? "1 lesson" : card.lessons.length + " lessons") +
-				" · " +
-				first.name +
-				" · " +
-				first.status;
+			: "Moments: " + card.lessons.length + " shown" + (omittedLessons > 0 ? " · " + omittedLessons + " omitted from card" : "") + " · " + first.name + " · " + first.status;
 	const autonomyLine =
-		"Autonomy: " + card.eligible + " eligible · " + card.promoted + " promoted" + (card.partial ? " · partial snapshot" : "");
+		"Autonomy: " +
+		card.eligible +
+		" eligible · " +
+		card.promoted +
+		" promoted · capture " +
+		card.policy.capture +
+		" · recall " +
+		(card.policy.recall ? "on (" + card.policy.recallLimit + "/" + card.policy.recallChars + ")" : "off") +
+		" · auto-promote " +
+		(card.policy.autoPromote ? "on" : "off") +
+		" after " +
+		card.policy.promoteAfter +
+		(card.partial ? " · partial snapshot" : "");
+	const countsLine =
+		card.counts.length === 0
+			? "Counts (shown): none recorded"
+			: "Counts (shown): " + card.counts.map((entry) => entry.total + " " + entry.status).join(" · ");
 	if (!expanded) {
 		const rows = [`${label}`, scopeLine, latestLine, lessonLine, autonomyLine];
 		// Counts lead on the final row so they survive truncation: real snapshots always carry
 		// limitation notes, so a separate counts row never fits the compact budget.
-		const counts = card.counts.length === 0 ? "none recorded" : card.counts.map((entry) => entry.total + " " + entry.status).join(" · ");
-		rows.push("Counts: " + counts + (card.limitations[0] === undefined ? "" : " · " + card.limitations[0]));
+		const note = pickLimitations(card.limitations, 1)[0];
+		rows.push(countsLine + (note === undefined ? "" : " · " + note));
 		return rows.slice(0, INSIGHT_COMPACT_ROWS);
 	}
-	const rows = [`${label}`, scopeLine, latestLine];
+	const rows = [`${label}`, scopeLine, latestLine, lessonLine];
 	const jevShown = card.decisions.slice(0, INSIGHT_SUMMARY_CAP);
-	for (const decision of jevShown) {
-		rows.push("  Jev: " + decision.point + " · " + decision.outcome + " · " + decision.action + " · " + decision.model + decision.question);
-	}
+	for (const decision of jevShown) rows.push(decisionRow(decision));
 	if (card.decisions.length > jevShown.length) rows.push("  " + (card.decisions.length - jevShown.length) + " more decisions — open /ultrathink-ui");
 	const lessonsShown = card.lessons.slice(0, INSIGHT_SUMMARY_CAP);
 	for (const lesson of lessonsShown) {
@@ -384,16 +567,40 @@ function insightRows(details: unknown, expanded: boolean, p: Paint): string[] {
 		);
 	}
 	if (card.lessons.length > lessonsShown.length) rows.push("  " + (card.lessons.length - lessonsShown.length) + " more lessons — open /ultrathink-ui");
-	const flagged = card.lessons.filter((lesson) => lesson.eligible || lesson.promotion !== "").slice(0, INSIGHT_SUMMARY_CAP);
-	for (const lesson of flagged) {
+	const flagged = card.lessons.filter((lesson) => lesson.eligible || lesson.promotion !== "");
+	const skillsShown = flagged.slice(0, INSIGHT_SUMMARY_CAP);
+	for (const lesson of skillsShown) {
 		rows.push("  Skill: " + lesson.name + " · " + (lesson.promotion === "" ? "eligible by saved lesson rules" : lesson.promotion));
 	}
-	rows.push(autonomyLine);
-	if (card.counts.length === 0) rows.push("Counts: none recorded");
-	else rows.push("Counts: " + card.counts.map((entry) => entry.total + " " + entry.status).join(" · "));
-	rows.push("Policy: teaching " + (card.teaching ? "on" : "off") + " · capture " + card.capture);
-	for (const limitation of card.limitations.slice(0, 2)) rows.push("Limitation: " + limitation);
-	return rows.slice(0, INSIGHT_EXPANDED_ROWS);
+	if (flagged.length > skillsShown.length) {
+		rows.push("  " + (flagged.length - skillsShown.length) + " more skills omitted — open /ultrathink-ui");
+	}
+	const footer = [autonomyLine, countsLine];
+	footer.push(
+		"Effective policy: teaching " +
+			(card.policy.teaching ? "on" : "off") +
+			" · capture " +
+			card.policy.capture +
+			" · recall " +
+			(card.policy.recall ? "on (" + card.policy.recallLimit + "/" + card.policy.recallChars + ")" : "off") +
+			" · auto-promote " +
+			(card.policy.autoPromote ? "on" : "off") +
+			" after " +
+			card.policy.promoteAfter +
+			" · Jev " +
+			(card.policy.jevEnabled ? "on" : "off"),
+	);
+	for (const limitation of pickLimitations(card.limitations, 2)) footer.push("Limitation: " + limitation);
+	const identity = [rows[0]!, ...wrapInsightLines(rows.slice(1, 4), room)];
+	const detailsRows = wrapInsightLines(rows.slice(4), room);
+	const footerRows = wrapInsightLines(footer, room);
+	const available = Math.max(0, INSIGHT_EXPANDED_ROWS - identity.length - footerRows.length);
+	if (detailsRows.length > available) {
+		const shown = Math.max(0, available - 1);
+		const notice = (detailsRows.length - shown) + " more detail lines — open /ultrathink-ui";
+		return [...identity, ...detailsRows.slice(0, shown), truncateToWidth(notice, room), ...footerRows].slice(0, INSIGHT_EXPANDED_ROWS);
+	}
+	return [...identity, ...detailsRows, ...footerRows].slice(0, INSIGHT_EXPANDED_ROWS);
 }
 
 export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: string, renderer: Renderer): void }): void {
@@ -444,7 +651,7 @@ export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: 
 		// bounded display-only card, never throwing raw text into the host.
 		try {
 			const p = paint(theme);
-			return card(() => insightRows(message.details, options.expanded, p), p, { border: "borderMuted", padY: 1 });
+			return card((room) => insightRows(message.details, options.expanded, p, room), p, { border: "borderMuted", padY: options.expanded ? 1 : 0 });
 		} catch {
 			return undefined;
 		}

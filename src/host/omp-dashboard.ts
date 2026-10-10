@@ -59,6 +59,16 @@ const HEAD_ROWS = 2;
 const TINY_REASON = "Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.";
 const CLIPPED_PREVIEW_REASON = "Preview exceeds the supported 60KB bound; the complete draft cannot be reviewed here, so install is unavailable.";
 const FIT_REASON = "Action identity does not fit the current viewport. Resize to review the full identity and effect; browsing and Escape remain available.";
+// Strip labels stay bounded to one row per action: the tag above is the only
+// reason text inlined there, and the full reason lives in the status/notice
+// path (activation, guidance rows), so a disabled label can never wrap the
+// strip over the content window.
+const SHORT_REASONS: Record<string, string> = {
+	[POLICY_OFF_REASON]: "Teaching is off",
+	[CLIPPED_PREVIEW_REASON]: "preview exceeds 60KB",
+	[FIT_REASON]: "identity does not fit",
+	[TINY_REASON]: "terminal too small",
+};
 const TAB_LABELS: Record<InsightPanel, string> = {
 	overview: "Overview",
 	jev: "Jev",
@@ -869,9 +879,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	};
 
 	/**
-	 * Action-strip rows. Below the mutation floor every mutating entry already
-	 * carries the full guidance in the status rows above, so the strip compacts
-	 * to a short marker instead of repeating the whole reason per action.
+	 * Action-strip rows: exactly one bounded row per action. A state tag that
+	 * cannot fit beside the label degrades to a bare "(Unavailable)" marker
+	 * and then to the plain label — the full reason stays in the status rows,
+	 * so the strip can never wrap itself over the content window.
 	 */
 	const actionRows = (width: number, list: DashboardAction[]): string[] => {
 		const rows: string[] = [];
@@ -880,11 +891,17 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			const focused = focus === "actions" && (actionCursor[view] ?? 0) === index;
 			const marker = focused ? ">" : " ";
 			const reason = action.disabledReason ?? TINY_REASON;
-			const state = action.enabled ? "" : tiny && reason === TINY_REASON ? " (Unavailable)" : ` (Unavailable: ${reason})`;
-			for (const line of wrapRow(`${marker} ${action.label}${state}`, width, "")) {
-				const fitted = fitRow(line, width);
-				rows.push(!action.enabled && state !== "" ? styleRow("warn", fitted) : focused ? dashboardPaint.fg("accent", fitted) : fitted);
-			}
+			const state = action.enabled
+				? ""
+				: tiny && reason === TINY_REASON
+					? " (Unavailable)"
+					: ` (Unavailable: ${SHORT_REASONS[reason] ?? reason})`;
+			const plain = `${marker} ${action.label}`;
+			let row = state === "" ? plain : `${plain}${state}`;
+			if (visibleWidth(row) > width) row = `${plain} (Unavailable)`;
+			if (visibleWidth(row) > width) row = plain;
+			const fitted = fitRow(row, width);
+			rows.push(!action.enabled && state !== "" ? styleRow("warn", fitted) : focused ? dashboardPaint.fg("accent", fitted) : fitted);
 		}
 		return rows;
 	};
@@ -899,12 +916,19 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		styleRow("meta", fitRow(helpLine(), width)),
 	];
 
-	/** The affirmative may fire only when its full identity/effect text fits the actual content window. */
+	/**
+	 * The affirmative may fire only when its full identity/effect text fits
+	 * the actual content window. Fit compares against the same budget the
+	 * renderer windows content with: unknown host height normalizes to the
+	 * bounded fallback before any comparison, so an infinite height can never
+	 * wave through a confirmation the screen cannot display.
+	 */
 	const confirmScreenFits = (width: number, list: DashboardAction[]): boolean => {
 		const body = confirmBodyLines();
 		if (body.length === 0) return false;
-		const tail = buildTail(width, list);
-		const budget = Math.max(0, viewportHeight() - HEAD_ROWS - tail.length);
+		const budget = rawHeight() !== undefined
+			? Math.max(0, viewportHeight() - HEAD_ROWS - buildTail(width, list).length)
+			: FALLBACK_CONTENT_ROWS;
 		return body.flatMap((line) => wrapRow(line.text, width, "")).length <= budget;
 	};
 
@@ -966,17 +990,23 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		};
 	};
 
-	/** Preview content rows: the position header keeps one reserved row. */
-	const previewWindow = (layout: DashboardLayout): number => Math.min(DETAIL_WINDOW, layout.budget(1));
+	/**
+	 * Preview content rows: the position header keeps one reserved row. The
+	 * window itself never collapses to zero — a saturated tail trims at the
+	 * frame instead of hiding the draft surface entirely.
+	 */
+	const previewWindow = (layout: DashboardLayout): number => Math.max(1, Math.min(DETAIL_WINDOW, layout.budget(1)));
 
 	/**
 	 * Detail and overview content rows: the position footer keeps one reserved
-	 * row only when the content actually overflows the windowless budget.
+	 * row only when the content actually overflows the windowless budget. The
+	 * window keeps at least one visible row in every geometry, so notices and
+	 * the action strip can never shrink records or lessons out of existence.
 	 */
 	const contentWindow = (layout: DashboardLayout, totalWrapped: number): number => {
 		let windowRows = Math.min(DETAIL_WINDOW, layout.budget(0));
-		if (totalWrapped > windowRows && windowRows > 0) windowRows = Math.min(DETAIL_WINDOW, layout.budget(1));
-		return windowRows;
+		if (totalWrapped > windowRows) windowRows = Math.min(DETAIL_WINDOW, layout.budget(1));
+		return Math.max(1, windowRows);
 	};
 
 	/**
@@ -1014,6 +1044,15 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		return rows.map((row) => styleRow(line.tone === "body" ? "plain" : line.tone, fitRow(row, room)));
 	};
 
+	/** Surface actionable read bounds before permanent no-history caveats. */
+	const readLimitations = (limit: number): string[] => {
+		const notes = snapshot.limitations.map((entry) => cleanInline(entry, 300)).filter((entry) => entry !== "" && entry !== PARTIAL_COPY);
+		const actionable = /partial|scan|showing up to|could not|excluded|omitt|cancel/i;
+		const important = notes.filter((entry) => actionable.test(entry));
+		const other = notes.filter((entry) => !actionable.test(entry));
+		return [...important, ...other].slice(0, limit);
+	};
+
 	/**
 	 * Bounded per-panel partial/read-error qualifier: the partial banner plus
 	 * at most two limitation lines, so affected tabs and details stay truthful
@@ -1022,7 +1061,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	const partialBanner = (): RichLine[] => {
 		if (!snapshot.partial) return [];
 		const banner: RichLine[] = [{ text: PARTIAL_COPY, tone: "warn" }];
-		for (const item of snapshot.limitations.map((entry) => cleanInline(entry, 160)).filter(Boolean).slice(0, 2)) {
+		for (const item of readLimitations(2)) {
 			banner.push({ text: `Limitation: ${item}`, tone: "warn" });
 		}
 		return banner;
@@ -1073,10 +1112,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		const parts = Object.entries(snapshot.counts)
 			.slice(0, 8)
 			.map(([status, value]) => `${cleanInline(status, 20)}: ${asFiniteNumber(value) ?? 0}`);
-		lines.push({ text: `Moments: ${parts.join(" · ") || `${lessonList.length} shown`}`, tone: "plain" });
-		lines.push({ text: `Skills: ${snapshot.eligible} eligible · ${snapshot.promoted} promoted`, tone: "plain" });
+		lines.push({ text: `Moments${snapshot.partial ? " (shown)" : ""}: ${parts.join(" · ") || `${lessonList.length} shown`}`, tone: "plain" });
+		lines.push({ text: `Skills${snapshot.partial ? " (shown)" : ""}: ${snapshot.eligible} eligible · ${snapshot.promoted} promoted`, tone: "plain" });
 		lines.push(...policyLines());
-		const limitations = snapshot.limitations.map((item) => cleanInline(item, 160)).filter(Boolean).slice(0, 4);
+		const limitations = readLimitations(4);
 		for (const limitation of limitations) lines.push({ text: `Limitation: ${limitation}`, tone: "warn" });
 		if (snapshot.partial) lines.push({ text: PARTIAL_COPY, tone: "warn" });
 		return lines;
@@ -1161,14 +1200,20 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		const height = viewportHeight();
 		// Transient layout guidance never outlives the viewport that caused it:
 		// a cleared fit refusal recomputes against the grown viewport while
-		// durable receipts in `notice` are untouched.
-		if (notice === FIT_REASON && (view === "confirm-candidate" || view === "confirm-install")) {
-			const savedKind = noticeKind;
-			setNotice("");
+		// durable receipts in `notice` are untouched. Conversely, an affirmative
+		// withheld by the fit check is announced once in the status path — the
+		// notice is the only place the full reason appears, so the screen that
+		// says "withheld" is exactly the screen whose affirmative is disabled.
+		if (view === "confirm-candidate" || view === "confirm-install") {
 			const list = actions(safeWidth);
 			const affirmative = view === "confirm-candidate" ? "confirm-yes" : "install-yes";
-			if (!(list.some((action) => action.id === affirmative && action.enabled) && confirmScreenFits(safeWidth, list))) {
-				setNotice(FIT_REASON, savedKind);
+			const fits = list.some((action) => action.id === affirmative && action.enabled) && confirmScreenFits(safeWidth, list);
+			if (notice === FIT_REASON) {
+				const savedKind = noticeKind;
+				setNotice("");
+				if (!fits) setNotice(FIT_REASON, savedKind);
+			} else if (!fits && notice === "") {
+				setNotice(FIT_REASON, "warn");
 			}
 		}
 		if (notice === TINY_REASON && canMutate(safeWidth)) setNotice("");
@@ -1209,7 +1254,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				for (const line of full) emitRich(line);
 			} else if (full.length > 0) {
 				for (const line of confirmRefusalLines()) emitRich(line);
-				body = body.slice(0, layout.budget(0));
+				// The refusal keeps at least one visible row even where the
+				// status-heavy tail already fills the viewport; the frame trim
+				// below trades tail rows, never this row, for space.
+				body = body.slice(0, Math.max(1, layout.budget(0)));
 			}
 		} else if (view === "preview") {
 			const { clipped } = previewLines();
@@ -1304,15 +1352,16 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				for (const line of core) wrappedCore.push(...wrapRich(line, safeWidth));
 				const wrappedExtras: string[] = [];
 				for (const line of extras) wrappedExtras.push(...wrapRich(line, safeWidth));
-				// Skills shares one row budget across the policy prefix and the
-				// list: the prefix renders first, the list keeps at least one
-				// row, and the combined surface scrolls as one when it exceeds
-				// the budget — the lesson window and count line stay reachable
-				// while the prefix scrolls away above them.
-				const skillsBudget = Math.max(1, layout.budget(0));
-				const windowRows = tab === "skills"
-					? Math.max(1, Math.min(LIST_WINDOW, skillsBudget - wrappedPrefix.length - wrappedCore.length - wrappedExtras.length))
-					: Math.min(LIST_WINDOW, layout.budget(wrappedPrefix.length + wrappedCore.length));
+				// One shared invariant for every browse panel: the record window
+				// keeps at least one visible row in every geometry, and the notes
+				// around it (latest-plan label, partial banner, policy prefix,
+				// count line, subset extras) take bounded leftover space. When
+				// the combined surface exceeds the budget it scrolls as one —
+				// the lesson window and count line stay on screen while prefix
+				// and extras scroll away above them, so notes can never consume
+				// the entire window and strand an invisible selection.
+				const sharedBudget = Math.max(1, layout.budget(0));
+				const windowRows = Math.max(1, Math.min(LIST_WINDOW, sharedBudget - wrappedPrefix.length - wrappedCore.length - wrappedExtras.length));
 				const start = clampScroll(cursor - Math.floor(windowRows / 2), total, windowRows);
 				const shown = rows_list.slice(start, Math.min(total, start + windowRows));
 				const rows: string[] = [];
@@ -1321,27 +1370,41 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					const fitted = fitRow(`${focusedRow ? ">" : " "} ${row.label}`, safeWidth);
 					rows.push(focusedRow ? dashboardPaint.fg("accent", fitted) : fitted);
 				});
-				if (tab === "skills") {
-					// Subset notes sit above the list so the tail slice always
-					// keeps the lesson window and the core count on screen.
-					const combined = [...wrappedPrefix, ...wrappedExtras, ...rows, ...wrappedCore];
-					// Never smaller than the lesson window plus the core count,
-					// so a scrolled surface keeps the selection on screen.
-					const surface = Math.min(combined.length, Math.max(skillsBudget, windowRows + wrappedCore.length));
-					body = combined.slice(Math.max(0, combined.length - surface));
-				} else {
-					body = [...wrappedPrefix, ...rows, ...wrappedCore];
-				}
+				// Subset notes sit above the list so the tail slice always keeps
+				// the lesson window and the core count on screen.
+				const combined = tab === "skills"
+					? [...wrappedPrefix, ...wrappedExtras, ...rows, ...wrappedCore]
+					: [...wrappedPrefix, ...rows, ...wrappedCore];
+				// Never smaller than the lesson window plus the core count, so a
+				// scrolled surface keeps the selection on screen.
+				const surface = Math.min(combined.length, Math.max(sharedBudget, windowRows + wrappedCore.length));
+				body = combined.slice(Math.max(0, combined.length - surface));
 			}
 		}
 
 		// The segments above already bound body to the exact remainder, but a
-		// status-heavy tail can itself exceed a tiny viewport: trim without
-		// ever losing the header, the close/help row, or the leading status.
+		// status-heavy tail can itself exceed a tiny viewport: trim surplus
+		// content rows first (one always stays), then action rows, then status
+		// rows — the header, the leading content row, and the close/help row
+		// are never dropped, so records and lessons cannot vanish behind
+		// notices at any height.
 		const help = layout.help;
 		const status = layout.status;
 		const strip = layout.strip;
 		let rows = [...head, ...body, ...status, ...strip, help];
+		if (rows.length > height && body.length > 0) {
+			const lead = body.slice(0, 1);
+			rows = [...head, ...lead, ...status, ...strip, help];
+			if (rows.length > height) {
+				const keepStrip = Math.max(0, height - head.length - lead.length - status.length - 1);
+				rows = [...head, ...lead, ...status, ...strip.slice(0, keepStrip), help];
+			}
+			if (rows.length > height) {
+				const keepStatus = Math.max(0, height - head.length - lead.length - 1);
+				rows = [...head, ...lead, ...status.slice(0, keepStatus), help].slice(0, height);
+			}
+			return rows;
+		}
 		if (rows.length > height) {
 			rows = [...head, ...status, ...strip, help];
 		}
