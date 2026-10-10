@@ -258,6 +258,28 @@ export function stageAnswer(user: string): { stage: string; text: string } {
 	return { stage: "graph", text: JSON.stringify({ goal: "Ship it", nodes }) };
 }
 
+/** Coincident-handoff insertion order exercised against the real host consumer. */
+export type HandoffOrder = "provider-first" | "race-first";
+
+/** Observable coincident-handoff boundary proof reported by the spawned child. */
+export interface ChildHandoffProof {
+	order: HandoffOrder;
+	dueMs: number;
+	raceDue: number;
+	providerDue: number;
+	raceSeq: number;
+	providerSeq: number;
+	firedRoles: string[];
+	raceFired: boolean;
+	providerFired: boolean;
+	raceCleared: boolean;
+	inlineContent: string | null;
+	pending: boolean;
+	asideContent: string | null;
+	asideCustomType: string | null;
+	asideDeliverAs: string | null;
+}
+
 /**
  * Elapsed-lifetime proof in a spawned child: the child imports the real extension and the real
  * native pipeline, replaces only its own setTimeout/clearTimeout with a due-time/insertion-order
@@ -268,7 +290,8 @@ export function stageAnswer(user: string): { stage: string; text: string } {
 export async function runChildLifetimeScenario(scenario: {
 	maxRunMs?: number;
 	cancelHung: boolean;
-}): Promise<{ planAsides: number; nativeCalls: number }> {
+	handoffOrder?: HandoffOrder;
+}): Promise<{ planAsides: number; nativeCalls: number; handoff?: ChildHandoffProof }> {
 	const root = mkdtempSync(join(tmpdir(), "ut-omp-life-"));
 	try {
 		const hostDir = fileURLToPath(new URL("./", import.meta.url));
@@ -298,11 +321,101 @@ export async function runChildLifetimeScenario(scenario: {
 			if (code !== 0) throw new Error("child lifetime scenario exited " + code + ": " + err.slice(-2000));
 			const line = out.split("\n").find((entry) => entry.startsWith("SCENARIO-RESULT "));
 			if (!line) throw new Error("child lifetime scenario printed no result: " + err.slice(-2000));
-			const result = JSON.parse(line.slice("SCENARIO-RESULT ".length)) as { planAsides: number; nativeCalls: number };
-			if (typeof result.planAsides !== "number" || typeof result.nativeCalls !== "number") {
+			const parsed: unknown = JSON.parse(line.slice("SCENARIO-RESULT ".length));
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 				throw new Error("child lifetime scenario result malformed: " + line);
 			}
-			return result;
+			if (!("planAsides" in parsed) || !("nativeCalls" in parsed)) {
+				throw new Error("child lifetime scenario result malformed: " + line);
+			}
+			const planAsides: unknown = parsed.planAsides;
+			const nativeCalls: unknown = parsed.nativeCalls;
+			if (typeof planAsides !== "number" || typeof nativeCalls !== "number") {
+				throw new Error("child lifetime scenario result malformed: " + line);
+			}
+			if (scenario.handoffOrder === undefined) return { planAsides, nativeCalls };
+			if (!("handoff" in parsed)) throw new Error("child handoff proof missing: " + line);
+			const handoffValue: unknown = parsed.handoff;
+			if (typeof handoffValue !== "object" || handoffValue === null || Array.isArray(handoffValue)) {
+				throw new Error("child handoff proof missing: " + line);
+			}
+			if (
+				!("order" in handoffValue) ||
+				!("dueMs" in handoffValue) ||
+				!("raceDue" in handoffValue) ||
+				!("providerDue" in handoffValue) ||
+				!("raceSeq" in handoffValue) ||
+				!("providerSeq" in handoffValue) ||
+				!("firedRoles" in handoffValue) ||
+				!("raceFired" in handoffValue) ||
+				!("providerFired" in handoffValue) ||
+				!("raceCleared" in handoffValue) ||
+				!("inlineContent" in handoffValue) ||
+				!("pending" in handoffValue) ||
+				!("asideContent" in handoffValue) ||
+				!("asideCustomType" in handoffValue) ||
+				!("asideDeliverAs" in handoffValue)
+			) {
+				throw new Error("child handoff proof malformed: " + line);
+			}
+			const order: unknown = handoffValue.order;
+			const dueMs: unknown = handoffValue.dueMs;
+			const raceDue: unknown = handoffValue.raceDue;
+			const providerDue: unknown = handoffValue.providerDue;
+			const raceSeq: unknown = handoffValue.raceSeq;
+			const providerSeq: unknown = handoffValue.providerSeq;
+			const firedRoles: unknown = handoffValue.firedRoles;
+			const raceFired: unknown = handoffValue.raceFired;
+			const providerFired: unknown = handoffValue.providerFired;
+			const raceCleared: unknown = handoffValue.raceCleared;
+			const inlineContent: unknown = handoffValue.inlineContent;
+			const pending: unknown = handoffValue.pending;
+			const asideContent: unknown = handoffValue.asideContent;
+			const asideCustomType: unknown = handoffValue.asideCustomType;
+			const asideDeliverAs: unknown = handoffValue.asideDeliverAs;
+			if ((order !== "provider-first" && order !== "race-first") || order !== scenario.handoffOrder) {
+				throw new Error("child handoff proof order mismatch: " + line);
+			}
+			if (
+				typeof dueMs !== "number" ||
+				typeof raceDue !== "number" ||
+				typeof providerDue !== "number" ||
+				typeof raceSeq !== "number" ||
+				typeof providerSeq !== "number" ||
+				!Array.isArray(firedRoles) ||
+				!firedRoles.every((entry: unknown) => typeof entry === "string") ||
+				typeof raceFired !== "boolean" ||
+				typeof providerFired !== "boolean" ||
+				typeof raceCleared !== "boolean" ||
+				(inlineContent !== null && typeof inlineContent !== "string") ||
+				typeof pending !== "boolean" ||
+				(asideContent !== null && typeof asideContent !== "string") ||
+				(asideCustomType !== null && typeof asideCustomType !== "string") ||
+				(asideDeliverAs !== null && typeof asideDeliverAs !== "string")
+			) {
+				throw new Error("child handoff proof malformed: " + line);
+			}
+			return {
+				planAsides,
+				nativeCalls,
+				handoff: {
+					order,
+					dueMs,
+					raceDue,
+					providerDue,
+					raceSeq,
+					providerSeq,
+					firedRoles,
+					raceFired,
+					providerFired,
+					raceCleared,
+					inlineContent,
+					pending,
+					asideContent,
+					asideCustomType,
+					asideDeliverAs,
+				},
+			};
 		} finally {
 			clearTimeout(watchdog);
 			// A throw above must not leave the child running or the watchdog armed.
@@ -324,7 +437,7 @@ export async function runChildLifetimeScenario(scenario: {
  * microtask drains between callbacks; I/O and delivery use real started/completed/delivered
  * barriers, never the parent process clock. No paid provider, no live auth, disposable roots only.
  */
-function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; cancelHung: boolean }): string {
+function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; cancelHung: boolean; handoffOrder?: HandoffOrder }): string {
 	const ompPath = JSON.stringify(join(hostDir, "omp.ts"));
 	const helpersPath = JSON.stringify(join(hostDir, "omp-test.helpers.ts"));
 	const planPath = JSON.stringify(join(hostDir, "plan.ts"));
@@ -332,6 +445,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 	const progressPath = JSON.stringify(join(hostDir, "progress.ts"));
 	const maxRunMs = JSON.stringify(scenario.maxRunMs);
 	const cancelHung = JSON.stringify(scenario.cancelHung);
+	const handoffOrder = JSON.stringify(scenario.handoffOrder ?? null);
 	return [
 		"import { createNativeEngineSelector } from " + ompPath + ";",
 		"import { fakeModel, fakeRuntime, isolatedPlanEnv, quietConfig, recorder, reply, setup, stageAnswer, userText } from " + helpersPath + ";",
@@ -346,6 +460,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"",
 		"const SCENARIO_MAX_RUN_MS: number | undefined = " + maxRunMs + ";",
 		"const SCENARIO_CANCEL_HUNG: boolean = " + cancelHung + ";",
+		"const SCENARIO_HANDOFF_ORDER: string | null = " + handoffOrder + ";",
 		"",
 		"const realSetTimeout: typeof setTimeout = globalThis.setTimeout;",
 		"const realClearTimeout: typeof clearTimeout = globalThis.clearTimeout;",
@@ -363,6 +478,10 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"let insertion = 0;",
 		"const queue: QueueEntry[] = [];",
 		"const handleToEntry = new Map<unknown, QueueEntry>();",
+		"interface QueueMark { due: number; seq: number; handle: unknown; }",
+		"const scheduledLog: QueueMark[] = [];",
+		"const firedLog: QueueMark[] = [];",
+		"const clearedLog: unknown[] = [];",
 		"",
 		"function virtualSetTimeout(callback: (...args: unknown[]) => void, delay?: unknown, ...args: unknown[]): unknown {",
 		"	const ms = typeof delay === 'number' && Number.isFinite(delay) && delay > 0 ? delay : 0;",
@@ -375,6 +494,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"	entry.handle = handle;",
 		"	queue.push(entry);",
 		"	handleToEntry.set(handle, entry);",
+		"	scheduledLog.push({ due: entry.due, seq: entry.seq, handle });",
 		"	return handle;",
 		"}",
 		"",
@@ -382,6 +502,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"	const entry = handleToEntry.get(handle);",
 		"	if (entry !== undefined) {",
 		"		entry.cleared = true;",
+		"		clearedLog.push(handle);",
 		"		handleToEntry.delete(handle);",
 		"	}",
 		"}",
@@ -402,6 +523,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"		queue.splice(queue.indexOf(pick), 1);",
 		"		handleToEntry.delete(pick.handle);",
 		"		virtualNow = pick.due;",
+		"		firedLog.push({ due: pick.due, seq: pick.seq, handle: pick.handle });",
 		"		pick.callback(...pick.args);",
 		"		await tick(25);",
 		"	}",
@@ -626,6 +748,204 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"	check(capturedIsCurrent !== undefined && !capturedIsCurrent(), 'settled flight still current');",
 		"	return { planAsides: 1, nativeCalls };",
 		"}",
+		"interface HandoffProof {",
+		"	order: string;",
+		"	dueMs: number;",
+		"	raceDue: number;",
+		"	providerDue: number;",
+		"	raceSeq: number;",
+		"	providerSeq: number;",
+		"	firedRoles: string[];",
+		"	raceFired: boolean;",
+		"	providerFired: boolean;",
+		"	raceCleared: boolean;",
+		"	inlineContent: string | null;",
+		"	pending: boolean;",
+		"	asideContent: string | null;",
+		"	asideCustomType: string | null;",
+		"	asideDeliverAs: string | null;",
+		"}",
+		"",
+		"async function runHandoffScenario(root: string, order: string): Promise<{ planAsides: number; nativeCalls: number; handoff: HandoffProof }> {",
+		"	check(order === 'provider-first' || order === 'race-first', 'unknown handoff order ' + order);",
+		"	const config = quietConfig((value: UltrathinkConfig) => {",
+		"		value.track.enabled = true;",
+		"		value.linear.team = 'Team';",
+		"	});",
+		"	const stateDir = join(root, 'state');",
+		"	let plannerCalls = 0;",
+		"	let capturedSignal: AbortSignal | undefined = undefined;",
+		"	let capturedIsCurrent: (() => boolean) | undefined = undefined;",
+		"	let startResolve: () => void = () => {};",
+		"	const startedGate = new Promise<void>((resolve) => { startResolve = resolve; });",
+		"	let releaseProvider: () => void = () => {};",
+		"	const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });",
+		"	const planner: OmpPlanner = async (request, signal) => {",
+		"		plannerCalls++;",
+		"		check(plannerCalls === 1, 'new planner on same-submission reentry');",
+		"		capturedSignal = signal;",
+		"		capturedIsCurrent = request.isCurrent;",
+		"		startResolve();",
+		"		await providerGate;",
+		"		check(!signal.aborted, 'flight aborted at coincident handoff');",
+		"		return { context: 'PLAN' };",
+		"	};",
+		"	const extra: Record<string, unknown> = { stateDir, config: () => config };",
+		"	const h = setup(planner, 1000, extra, { cwd: root }, { getThinkingLevel: () => 'low' }, true);",
+		"	let providerHandle: unknown = undefined;",
+		"	let raceHandle: unknown = undefined;",
+		"	let providerDue = -1;",
+		"	let providerSeq = -1;",
+		"	let raceDue = -1;",
+		"	let raceSeq = -1;",
+		"	const markOf = (handle: unknown): QueueMark | undefined => {",
+		"		for (const mark of scheduledLog) {",
+		"			if (mark.handle === handle) return mark;",
+		"		}",
+		"		return undefined;",
+		"	};",
+		"	const findCoincident = (knownDue: number, knownHandle: unknown): QueueMark => {",
+		"		let found: QueueMark | undefined = undefined;",
+		"		for (const mark of scheduledLog) {",
+		"			if (mark.due !== knownDue || mark.handle === knownHandle) continue;",
+		"			if (found !== undefined) fail('more than one coincident timer at due ' + knownDue);",
+		"			found = mark;",
+		"		}",
+		"		if (found === undefined) fail('coincident race timer missing at due ' + knownDue);",
+		"		return found;",
+		"	};",
+		"	let consumerPromise: unknown = undefined;",
+		"	if (order === 'provider-first') {",
+		"		providerHandle = globalThis.setTimeout(() => { releaseProvider(); }, 25000);",
+		"		const providerMark = markOf(providerHandle);",
+		"		check(providerMark !== undefined, 'provider timer missing from child queue');",
+		"		if (providerMark === undefined) fail('provider timer missing from child queue');",
+		"		providerDue = providerMark.due;",
+		"		providerSeq = providerMark.seq;",
+		"		check(providerDue === 25000, 'provider timer missed the real 25s default, due ' + providerDue);",
+		"		consumerPromise = h.run('coincident plan');",
+		"		await startedGate;",
+		"		await tick(25);",
+		"		const raceMark = findCoincident(providerDue, providerHandle);",
+		"		raceHandle = raceMark.handle;",
+		"		raceDue = raceMark.due;",
+		"		raceSeq = raceMark.seq;",
+		"		check(raceDue === providerDue, 'race and provider missed the same due');",
+		"		check(providerSeq < raceSeq, 'provider-first insertion order not observed');",
+		"	} else {",
+		"		consumerPromise = h.run('coincident plan');",
+		"		await startedGate;",
+		"		await tick(25);",
+		"		let raceFound: QueueMark | undefined = undefined;",
+		"		for (const mark of scheduledLog) {",
+		"			if (mark.due !== 25000) continue;",
+		"			if (raceFound !== undefined) fail('more than one race timer before provider');",
+		"			raceFound = mark;",
+		"		}",
+		"		check(raceFound !== undefined, 'race timer missing from child queue');",
+		"		if (raceFound === undefined) fail('race timer missing from child queue');",
+		"		raceHandle = raceFound.handle;",
+		"		raceDue = raceFound.due;",
+		"		raceSeq = raceFound.seq;",
+		"		const remaining = raceDue - virtualNow;",
+		"		check(remaining >= 0, 'race due already passed');",
+		"		providerHandle = globalThis.setTimeout(() => { releaseProvider(); }, remaining);",
+		"		const providerMark = markOf(providerHandle);",
+		"		check(providerMark !== undefined, 'provider timer missing from child queue');",
+		"		if (providerMark === undefined) fail('provider timer missing from child queue');",
+		"		providerDue = providerMark.due;",
+		"		providerSeq = providerMark.seq;",
+		"		check(providerDue === raceDue, 'race and provider missed the same due');",
+		"		check(raceSeq < providerSeq, 'race-first insertion order not observed');",
+		"	}",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'flight aborted before coincident fire');",
+		"	check(capturedIsCurrent !== undefined && capturedIsCurrent(), 'flight not current before coincident fire');",
+		"	check(plannerCalls === 1, 'planner not admitted before coincident fire');",
+		"	await fireThrough(25000);",
+		"	await tick(25);",
+		"	const firedRoles: string[] = [];",
+		"	for (const mark of firedLog) {",
+		"		if (mark.handle === providerHandle) firedRoles.push('provider');",
+		"		else if (mark.handle === raceHandle) firedRoles.push('race');",
+		"	}",
+		"	let raceFired = false;",
+		"	let providerFired = false;",
+		"	for (const role of firedRoles) {",
+		"		if (role === 'race') raceFired = true;",
+		"		if (role === 'provider') providerFired = true;",
+		"	}",
+		"	let raceCleared = false;",
+		"	for (const handle of clearedLog) {",
+		"		if (handle === raceHandle) raceCleared = true;",
+		"	}",
+		"	check(providerFired, 'provider gate never fired at the coincident due');",
+		"	if (order === 'provider-first') {",
+		"		check(raceCleared, 'provider-first race timeout was not cleared after inline completion');",
+		"		check(!raceFired, 'provider-first race callback fired instead of clearing');",
+		"	} else {",
+		"		check(raceFired, 'race-first race callback never dispatched before provider');",
+		"		const raceIndex = firedRoles.indexOf('race');",
+		"		const providerIndex = firedRoles.indexOf('provider');",
+		"		check(raceIndex !== -1 && providerIndex !== -1 && raceIndex < providerIndex, 'race-first fire order not observed');",
+		"	}",
+		"	const outcome: unknown = await consumerPromise;",
+		"	const outcomeType = customTypeOf(outcome);",
+		"	const outcomeContent: unknown = contentOf(outcome);",
+		"	let inlineContent: string | null = null;",
+		"	let pending = false;",
+		"	if (outcomeType === 'ultrathink-pending') {",
+		"		pending = true;",
+		"		check(order === 'race-first', 'pending arrived on provider-first insertion');",
+		"	} else {",
+		"		check(order === 'provider-first', 'inline arrived on race-first insertion');",
+		"		check(outcomeType === 'ultrathink-plan', 'inline missing plan customType');",
+		"		check(outcomeContent === 'PLAN', 'inline lost opaque plan bytes');",
+		"		if (typeof outcomeContent === 'string') inlineContent = outcomeContent;",
+		"	}",
+		"	let asideContent: string | null = null;",
+		"	let asideCustomType: string | null = null;",
+		"	let asideDeliverAs: string | null = null;",
+		"	if (pending) {",
+		"		for (let round = 0; round < 200 && h.sent.length === 0; round++) await Promise.resolve();",
+		"		check(h.sent.length === 1, 'pending never delivered its aside');",
+		"		const aside: unknown = h.sent[0];",
+		"		check(deliverAsOf(aside) === 'aside', 'aside missing deliverAs');",
+		"		check(customTypeOf(aside) === 'ultrathink-plan', 'aside missing plan customType');",
+		"		const body: unknown = contentOf(aside);",
+		"		check(body === 'PLAN', 'aside lost opaque plan bytes');",
+		"		if (typeof body === 'string') asideContent = body;",
+		"		const kind: unknown = customTypeOf(aside);",
+		"		if (typeof kind === 'string') asideCustomType = kind;",
+		"		const how: unknown = deliverAsOf(aside);",
+		"		if (typeof how === 'string') asideDeliverAs = how;",
+		"		check(asideContent === 'PLAN', 'aside content differs from opaque plan');",
+		"	} else {",
+		"		check(h.sent.length === 0, 'inline plan sent an aside');",
+		"	}",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'flight aborted at coincident settlement');",
+		"	check(plannerCalls === 1, 'coincident flight admitted a second planner');",
+		"	const reentry: unknown = await h.run('coincident plan');",
+		"	check(plannerCalls === 1, 'same-submission reentry admitted a new planner');",
+		"	if (pending) {",
+		"		check(reentry === undefined, 'settled pending reentry planned again');",
+		"	} else {",
+		"		check(customTypeOf(reentry) === 'ultrathink-plan', 'settled inline reentry lost its plan');",
+		"		check(contentOf(reentry) === 'PLAN', 'settled inline reentry lost opaque bytes');",
+		"	}",
+		"	check(h.sent.length === (pending ? 1 : 0), 'reentry duplicated delivery');",
+		"	await fireThrough(50000);",
+		"	await tick(25);",
+		"	for (let round = 0; round < 200; round++) await Promise.resolve();",
+		"	check(h.sent.length === (pending ? 1 : 0), 'late second delivery after advancement');",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'flight aborted late');",
+		"	check(capturedIsCurrent !== undefined && !capturedIsCurrent(), 'settled flight still current');",
+		"	const dueMs = raceDue;",
+		"	check(dueMs === 25000, 'coincident due missed the real 25s default, saw ' + dueMs);",
+		"	check(raceDue === providerDue, 'scheduled same-due proof missing');",
+		"	const handoff: HandoffProof = { order, dueMs, raceDue, providerDue, raceSeq, providerSeq, firedRoles, raceFired, providerFired, raceCleared, inlineContent, pending, asideContent, asideCustomType, asideDeliverAs };",
+		"	console.log('HANDOFF-PROOF ' + order + ' due=' + dueMs + ' scheduled=race:' + raceDue + '#' + raceSeq + ',provider:' + providerDue + '#' + providerSeq + ' fired=' + firedRoles.join('+') + ' inline=' + inlineContent + ' pending=' + pending + ' asides=' + h.sent.length);",
+		"	return { planAsides: h.sent.length, nativeCalls: 0, handoff };",
+		"}",
 		"",
 		"async function main(): Promise<void> {",
 		"	const stashSetTimeout = globalThis.setTimeout;",
@@ -634,9 +954,16 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"	globalThis.clearTimeout = virtualClearTimeout as typeof clearTimeout;",
 		"	const root = mkdtempSync(join(tmpdir(), 'ut-omp-life-child-'));",
 		"	try {",
-		"		const result = await runScenario(root);",
-		"		console.log('SCENARIO-RESULT ' + JSON.stringify(result));",
-		"		process.exitCode = 0;",
+		"		if (SCENARIO_HANDOFF_ORDER !== null) {",
+		"			check(SCENARIO_HANDOFF_ORDER === 'provider-first' || SCENARIO_HANDOFF_ORDER === 'race-first', 'unknown handoff order');",
+		"			const result = await runHandoffScenario(root, SCENARIO_HANDOFF_ORDER);",
+		"			console.log('SCENARIO-RESULT ' + JSON.stringify(result));",
+		"			process.exitCode = 0;",
+		"		} else {",
+		"			const result = await runScenario(root);",
+		"			console.log('SCENARIO-RESULT ' + JSON.stringify(result));",
+		"			process.exitCode = 0;",
+		"		}",
 		"	} finally {",
 		"		globalThis.setTimeout = stashSetTimeout;",
 		"		globalThis.clearTimeout = stashClearTimeout;",

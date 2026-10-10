@@ -1030,18 +1030,49 @@ describe("flight lifecycle (D-12)", () => {
 		await flush();
 	}, 10_000);
 
-	test("handoff-ordering same-turn provider settlement around race dispatch stays exactly once", async () => {
-		const planner = gated();
-		const h = setup(planner.plan, 5, {});
-		const promise = h.run();
-		await untilStarted(planner);
-		planner.runs[0]?.gate.resolve("PLAN");
-		expect(await promise).toMatchObject({ message: { content: "PLAN" } });
-		expect(planner.runs).toHaveLength(1);
-		expect(h.sent).toEqual([]);
-		h.emit("session_shutdown");
-		await flush();
-	}, 10_000);
+	test("handoff-ordering coincident provider-first clears race and returns inline with no aside", async () => {
+		const result = await runChildLifetimeScenario({ cancelHung: false, handoffOrder: "provider-first" });
+		expect(result.planAsides).toBe(0);
+		expect(result.nativeCalls).toBe(0);
+		const handoff = result.handoff;
+		expect(handoff?.order).toBe("provider-first");
+		expect(handoff?.dueMs).toBe(25_000);
+		expect(handoff?.raceDue).toBe(25_000);
+		expect(handoff?.providerDue).toBe(25_000);
+		expect(handoff?.raceDue).toBe(handoff?.providerDue);
+		expect(handoff?.providerSeq).toBeLessThan(handoff?.raceSeq ?? Number.POSITIVE_INFINITY);
+		expect(handoff?.providerFired).toBe(true);
+		expect(handoff?.raceFired).toBe(false);
+		expect(handoff?.raceCleared).toBe(true);
+		expect(handoff?.firedRoles).toEqual(["provider"]);
+		expect(handoff?.pending).toBe(false);
+		expect(handoff?.inlineContent).toBe("PLAN");
+		expect(handoff?.asideContent).toBeNull();
+		expect(handoff?.asideCustomType).toBeNull();
+		expect(handoff?.asideDeliverAs).toBeNull();
+	}, 120_000);
+
+	test("handoff-ordering coincident race-first dispatches race then delivers one aside", async () => {
+		const result = await runChildLifetimeScenario({ cancelHung: false, handoffOrder: "race-first" });
+		expect(result.planAsides).toBe(1);
+		expect(result.nativeCalls).toBe(0);
+		const handoff = result.handoff;
+		expect(handoff?.order).toBe("race-first");
+		expect(handoff?.dueMs).toBe(25_000);
+		expect(handoff?.raceDue).toBe(25_000);
+		expect(handoff?.providerDue).toBe(25_000);
+		expect(handoff?.raceDue).toBe(handoff?.providerDue);
+		expect(handoff?.raceSeq).toBeLessThan(handoff?.providerSeq ?? Number.POSITIVE_INFINITY);
+		expect(handoff?.raceFired).toBe(true);
+		expect(handoff?.providerFired).toBe(true);
+		expect(handoff?.raceCleared).toBe(false);
+		expect(handoff?.firedRoles).toEqual(["race", "provider"]);
+		expect(handoff?.pending).toBe(true);
+		expect(handoff?.inlineContent).toBeNull();
+		expect(handoff?.asideContent).toBe("PLAN");
+		expect(handoff?.asideCustomType).toBe("ultrathink-plan");
+		expect(handoff?.asideDeliverAs).toBe("aside");
+	}, 120_000);
 
 	test("handoff-ordering completion after pending delivers exactly one aside", async () => {
 		const planner = gated();
