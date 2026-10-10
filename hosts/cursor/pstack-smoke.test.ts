@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HOOK_FILE, main } from "../../scripts/cursor-hooks.ts";
+import { HOOK_FILE, main, nodeCandidates, resolveNode } from "../../scripts/cursor-hooks.ts";
 
 const HOOK = join(import.meta.dir, "ultrathink-cursor-pstack.js");
 const SKILLS = ["how", "architect", "arena", "tdd", "interrogate", "no-comments"] as const;
@@ -74,7 +74,13 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			expect(copiedReal || existsSync(join(root, "skills", "architect", "SKILL.md"))).toBe(true);
 
 			const logs: string[] = [];
-			expect(main(["install", "--cursor-dir", cursorDir], { env: { HOME: home }, log: (line) => logs.push(line), nodeCandidates: ["/usr/bin/node"] })).toBe(0);
+			const node = resolveNode(nodeCandidates(process.env));
+			if (node === undefined) throw new Error("a node binary must be on PATH so the installer can record a command");
+			const code = main(["install", "--cursor-dir", cursorDir], {
+				env: { HOME: home, PATH: process.env.PATH },
+				log: (line) => logs.push(line),
+			});
+			expect(code, logs.join("\n")).toBe(0);
 			const installed = entries(cursorDir);
 			expect(installed.filter((entry) => JSON.stringify(entry) === JSON.stringify(GSD) || JSON.stringify(entry) === JSON.stringify(SUBSTRATE))).toHaveLength(2);
 			const owned = installed.filter((entry) => JSON.stringify(entry).includes("ultrathink-managed"));
@@ -84,7 +90,7 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			expect(readFileSync(join(cursorDir, "hooks", HOOK_FILE), "utf8")).toBe(readFileSync(HOOK, "utf8"));
 
 			const expectSkills = (prompt: string, names: readonly string[]): void => {
-				const proc = spawnSync("node", [HOOK], {
+				const proc = spawnSync(node, [HOOK], {
 					input: payload(prompt),
 					encoding: "utf8",
 					env: { PATH: process.env.PATH ?? "", HOME: home, ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir },
@@ -104,14 +110,14 @@ describe("pstack bridge smoke (temp HOME)", () => {
 			expectSkills("/gsd-ship", ["interrogate", "no-comments"]);
 			expectSkills("/gsd-autonomous", SKILLS);
 
-			const quiet = spawnSync("node", [HOOK], {
+			const quiet = spawnSync(node, [HOOK], {
 				input: payload("/architect review this"),
 				encoding: "utf8",
 				env: { PATH: process.env.PATH ?? "", HOME: home, ULTRATHINK_PSTACK_CURSOR_DIR: cursorDir },
 			});
 			expect(JSON.parse(quiet.stdout)).toEqual({});
 
-			expect(main(["remove", "--cursor-dir", cursorDir], { env: { HOME: home }, log: (line) => logs.push(line), nodeCandidates: ["/usr/bin/node"] })).toBe(0);
+			expect(main(["remove", "--cursor-dir", cursorDir], { env: { HOME: home, PATH: process.env.PATH }, log: (line) => logs.push(line) }), logs.join("\n")).toBe(0);
 			expect(existsSync(join(cursorDir, "hooks", HOOK_FILE))).toBe(false);
 			expect(JSON.stringify(entries(cursorDir))).toBe(foreignBefore);
 			const after = JSON.parse(readFileSync(join(cursorDir, "hooks.json"), "utf8")) as { hooks: { sessionStart: unknown[] } };
