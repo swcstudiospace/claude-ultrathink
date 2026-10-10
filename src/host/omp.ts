@@ -41,6 +41,8 @@ import {
 	planLanes,
 	resolveSwarmRoot,
 	spawnLanes,
+	toSwarmSpawnCard,
+	toSwarmStatusCard,
 	TEAMS_USAGE,
 } from "../swarm/teams.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
@@ -56,7 +58,7 @@ import { createInsightDashboard, type InsightDashboardCallbacks, type InsightPan
 import type { InsightActionResult, InsightScope, InsightSnapshot, LessonSelection, SkillPreview } from "./omp-insights.ts";
 import { formatInsightText, readInsightSnapshot, toInsightCardSnapshot } from "./omp-insights.ts";
 import { paint, truncateToWidth } from "./omp-paint.ts";
-import { INSIGHT_TYPE } from "./omp-render.ts";
+import { INSIGHT_TYPE, SWARM_TYPE } from "./omp-render.ts";
 import { projectOf } from "../teach/mapping.ts";
 import type { TeachContext } from "../teach/types.ts";
 import { type PlanView, projectResolution } from "./view.ts";
@@ -998,6 +1000,17 @@ export function createOmpExtension(
 			sendInsightText(content);
 		};
 
+		/**
+		 * Publish a swarm card (spawn or status) as a display-only custom message; the transcript renders it
+		 * through the SWARM_TYPE renderer when the host has a card surface, and shows `content` as plain text
+		 * otherwise. A stale session (switch or shutdown during an await) sends nothing — same rule as
+		 * {@link sendSessionText}.
+		 */
+		const sendSwarmCard = (sessionId: string, ctx: ExtensionContext | undefined, content: string, details: unknown): void => {
+			if (shutDown || (ctx?.sessionManager?.getSessionId?.() ?? "") !== sessionId) return;
+			guard(() => pi.sendMessage({ customType: SWARM_TYPE, content, display: true, details }, { triggerTurn: false }));
+		};
+
 		/** Publish a captured summary card without a model turn. A stale lifetime sends nothing. */
 		const publishInsightCard = (lifetime: InsightLifetime, snapshot: InsightSnapshot): InsightActionResult => {
 			if (!insightCurrent(lifetime)) return { status: "cancelled", message: UI_STALE_COPY };
@@ -1405,11 +1418,16 @@ export function createOmpExtension(
 							if (parsed.kind === "status") {
 								const discovery = laneDirs(dir);
 								const rows = await laneStatus(discovery.lanes, orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
-								return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
+								if (uiEnabled && ctx?.hasUI) sendSwarmCard(sessionId, ctx, `Swarm lanes — ${rows.filter((row) => !("error" in row)).length}/${rows.length} reported${discovery.omitted > 0 ? ` · ${discovery.omitted} older not shown` : ""}`, toSwarmStatusCard(rows, discovery.omitted));
+								else return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
+								return;
 							}
 							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
 							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
-							sendSessionText(sessionId, ctx, formatLaneHandles(spawnLanes(plan)));
+							const handles = spawnLanes(plan);
+							const started = handles.filter((handle) => handle.pid !== undefined).length;
+							if (uiEnabled && ctx?.hasUI) sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned`, toSwarmSpawnCard(handles, plan));
+							else sendSessionText(sessionId, ctx, formatLaneHandles(handles));
 						} catch {}
 					},
 				}),

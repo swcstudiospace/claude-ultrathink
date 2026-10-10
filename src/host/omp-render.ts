@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { DECISIONS_ERROR_KINDS, formatP } from "../decisions/types.ts";
 import { formatModelSelection } from "../claude/output.ts";
+import { type SwarmLaneCard, type SwarmSpawnCardSnapshot, type SwarmStatusCardSnapshot, type SwarmStatusLane } from "../swarm/teams.ts";
 import { type GraphModel, renderGraph } from "./omp-graph.ts";
 import { sanitizeInsightText } from "./omp-insights.ts";
 import { formatElapsed, type Paint, paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
@@ -13,6 +14,8 @@ export const SYNC_TYPE = "ultrathink-sync";
 export const SHIP_TYPE = "ultrathink-ship";
 /** Display-only insight card over a captured card DTO; dashboard actions never live in transcript rows. */
 export const INSIGHT_TYPE = "ultrathink-insight";
+/** Display-only swarm card over the spawn/status lane DTOs from ../swarm/teams.ts; transcript rows stay read-only. */
+export const SWARM_TYPE = "ultrathink-swarm";
 
 /** Graph rows in the collapsed card; the graph degrades its layout to fit. */
 const COLLAPSED_GRAPH_ROWS = 18;
@@ -630,6 +633,142 @@ function insightRows(details: unknown, expanded: boolean, p: Paint, room: number
 	return [...shownIdentity, ...detailsRows, ...shownFooter];
 }
 
+/** Compact content rows for the swarm card; the frame truncates each row to the room. */
+const SWARM_COMPACT_ROWS = 6;
+/** Expanded content rows for the swarm card; the rest stays in the dashboard. */
+const SWARM_EXPANDED_ROWS = 24;
+/** Field caps keep one hostile lane from pushing megabytes through the sanitizer before width truncation. */
+const SWARM_ID_CHARS = 48;
+const SWARM_TEXT_CHARS = 160;
+const SWARM_PATH_CHARS = 240;
+
+/** Trailing segment of a state dir or log path; computed inline so the card needs no node:path import. */
+function pathBasename(path: string): string {
+	const parts = path.split(/[\\/]/).filter(Boolean);
+	return parts.length === 0 ? path : parts[parts.length - 1]!;
+}
+
+/** Validated spawn lane; pid/error stay only when recorded, exactly as the frozen DTO carries them. */
+function swarmSpawnLane(value: unknown): SwarmLaneCard | undefined {
+	if (!isRecord(value)) return undefined;
+	if (typeof value.laneId !== "string" || value.laneId === "") return undefined;
+	if (typeof value.brief !== "string") return undefined;
+	if (typeof value.stateDir !== "string" || value.stateDir === "" || typeof value.logPath !== "string") return undefined;
+	const lane: SwarmLaneCard = { laneId: value.laneId, brief: value.brief, stateDir: value.stateDir, logPath: value.logPath };
+	if (value.pid !== undefined) {
+		if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) return undefined;
+		lane.pid = value.pid;
+	}
+	if (value.error !== undefined) {
+		if (typeof value.error !== "string") return undefined;
+		lane.error = value.error;
+	}
+	return lane;
+}
+
+/** Validated status lane: a probed lane carries strict done/total counts; a failed probe is bare (error only). */
+function swarmStatusLane(value: unknown): SwarmStatusLane | undefined {
+	if (!isRecord(value)) return undefined;
+	if (typeof value.laneId !== "string" || value.laneId === "" || typeof value.summary !== "string") return undefined;
+	if (typeof value.error === "string") return { laneId: value.laneId, summary: value.summary, error: value.error };
+	const done = insightCount(value.done);
+	const total = insightCount(value.total);
+	if (done === undefined || total === undefined) return undefined;
+	return { laneId: value.laneId, summary: value.summary, done, total };
+}
+
+/**
+ * Validates untrusted persisted details against the frozen swarm card DTOs. Both snapshots share
+ * the `lanes` array; a valid `spawned`/`total` pair selects the spawn snapshot, otherwise a valid
+ * `omitted` selects the status one. Lanes that fail their own shape are dropped silently, mirroring
+ * the insight card's per-item leniency; anything off at the top level returns undefined and the
+ * caller renders the bounded SAFE fallback. Recorded text is never rewritten here — sanitization
+ * happens at draw time on every rendered row.
+ */
+function asSwarmCard(details: unknown): SwarmSpawnCardSnapshot | SwarmStatusCardSnapshot | undefined {
+	if (!isRecord(details) || !Array.isArray(details.lanes)) return undefined;
+	const spawned = insightCount(details.spawned);
+	const total = insightCount(details.total);
+	if (spawned !== undefined && total !== undefined) {
+		const lanes: SwarmLaneCard[] = [];
+		for (const item of details.lanes) {
+			const lane = swarmSpawnLane(item);
+			if (lane !== undefined) lanes.push(lane);
+		}
+		return { spawned, total, lanes };
+	}
+	const omitted = insightCount(details.omitted);
+	if (omitted !== undefined) {
+		const lanes: SwarmStatusLane[] = [];
+		for (const item of details.lanes) {
+			const lane = swarmStatusLane(item);
+			if (lane !== undefined) lanes.push(lane);
+		}
+		return { lanes, omitted };
+	}
+	return undefined;
+}
+
+/** Lane buckets by recorded state: fully done, still running, or failed probe; the buckets always sum to the lane count. */
+function swarmStatusCounts(lanes: readonly SwarmStatusLane[]): string {
+	const failed = lanes.filter((lane) => "error" in lane).length;
+	const done = lanes.filter((lane) => !("error" in lane) && lane.total > 0 && lane.done >= lane.total).length;
+	const running = lanes.length - done - failed;
+	const parts: string[] = [];
+	if (done > 0) parts.push(`${done} done`);
+	if (running > 0) parts.push(`${running} running`);
+	if (failed > 0) parts.push(`${failed} failed`);
+	return parts.join(" · ");
+}
+
+/** One row per lane, every dynamic field sanitized at draw time; compact rows trade full paths for the state dir basename. */
+function swarmLaneRows(swarm: SwarmSpawnCardSnapshot | SwarmStatusCardSnapshot, expanded: boolean): string[] {
+	if ("spawned" in swarm) {
+		return swarm.lanes.map((lane) => {
+			const id = insightText(lane.laneId, SWARM_ID_CHARS);
+			const failure = lane.error === undefined ? undefined : insightText(lane.error, SWARM_TEXT_CHARS);
+			const lead = failure ?? insightText(lane.brief, SWARM_TEXT_CHARS);
+			if (expanded) {
+				return [id, lead, insightText(lane.stateDir, SWARM_PATH_CHARS), `log ${insightText(lane.logPath, SWARM_PATH_CHARS)}`]
+					.filter((part) => part !== "")
+					.join(" · ");
+			}
+			return [id, lead, pathBasename(insightText(lane.stateDir, SWARM_PATH_CHARS))].filter((part) => part !== "").join(" · ");
+		});
+	}
+	return swarm.lanes.map((lane) => {
+		const id = insightText(lane.laneId, SWARM_ID_CHARS);
+		if ("error" in lane) return [id, insightText(lane.error, SWARM_TEXT_CHARS)].filter((part) => part !== "").join(" · ");
+		const lead = `${lane.done}/${lane.total} done`;
+		const summary = insightText(lane.summary, SWARM_TEXT_CHARS);
+		return [id, lead, summary].filter((part) => part !== "").join(" · ");
+	});
+}
+
+function swarmRows(details: unknown, expanded: boolean, p: Paint): string[] {
+	const label = p.fg("customMessageLabel", p.bold(SWARM_TYPE));
+	const fallback = [`${label}`, "Swarm lanes — details unavailable. Open /ultrathink-ui for the live view."];
+	const swarm = asSwarmCard(details);
+	if (swarm === undefined) return fallback;
+	const omitted = "omitted" in swarm ? swarm.omitted : 0;
+	// a zero-lane report is a real state, not an empty frame: one bounded content row names it
+	if (swarm.lanes.length === 0) {
+		return omitted === 0 ? ["No swarm lanes"] : ["No swarm lanes", `${omitted} older lanes not shown`];
+	}
+	const counts = "spawned" in swarm ? `${swarm.spawned}/${swarm.total} lanes spawned` : swarmStatusCounts(swarm.lanes);
+	// counts — and any omission notice — lead so they survive truncation before the per-lane rows
+	const head = [`${label}`, counts];
+	if (omitted > 0) head.push(`${omitted} older lanes not shown`);
+	const lanes = swarmLaneRows(swarm, expanded);
+	if (!expanded) return [...head, ...lanes].slice(0, SWARM_COMPACT_ROWS);
+	// one row is reserved for the overflow notice so "N more lanes" always fits the expanded budget
+	const shown = Math.max(0, SWARM_EXPANDED_ROWS - head.length - 1);
+	if (lanes.length > shown) {
+		return [...head, ...lanes.slice(0, shown), `${lanes.length - shown} more lanes — open /ultrathink-ui`];
+	}
+	return [...head, ...lanes];
+}
+
 export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: string, renderer: Renderer): void }): void {
 	pi.registerMessageRenderer(PLAN_TYPE, (message, options, theme) => {
 		// details are untrusted session data: a malformed view falls back to Omp's default card instead of throwing into Omp
@@ -679,6 +818,16 @@ export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: 
 		try {
 			const p = paint(theme);
 			return card((room) => insightRows(message.details, options.expanded, p, room), p, { border: "borderMuted", padY: options.expanded ? 1 : 0 });
+		} catch {
+			return undefined;
+		}
+	});
+	pi.registerMessageRenderer(SWARM_TYPE, (message, options, theme) => {
+		// details are untrusted persisted data: validated defensively into a
+		// bounded display-only card, never throwing raw text into the host.
+		try {
+			const p = paint(theme);
+			return card(() => swarmRows(message.details, options.expanded, p), p, { border: "borderMuted", padY: options.expanded ? 1 : 0 });
 		} catch {
 			return undefined;
 		}

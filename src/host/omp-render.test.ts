@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
-import { INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SWARM_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
 import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightDecision, type InsightSnapshot } from "./omp-insights.ts";
 import type { PlanView } from "./view.ts";
@@ -47,6 +47,7 @@ registerUltrathinkRenderers({ registerMessageRenderer: (type, renderer) => void 
 const renderPlan = renderers[PLAN_TYPE] as Renderer;
 const renderPending = renderers[PENDING_TYPE] as Renderer;
 const renderSync = renderers[SYNC_TYPE] as Renderer;
+const renderSwarm = renderers[SWARM_TYPE] as Renderer;
 
 function planCard(view: PlanView, expanded: boolean, width: number, cardTheme: unknown = theme) {
 	const rows = renderPlan({ content: "md", details: view }, { expanded }, cardTheme)?.render(width) ?? [];
@@ -705,5 +706,161 @@ describe("insight card", () => {
 		expect(compact.rows.length).toBeLessThanOrEqual(6 + 2);
 		const expanded = insightCard(cardDetails, true, 80);
 		expect(expanded.rows.length).toBeLessThanOrEqual(24 + 4);
+	});
+});
+
+describe("swarm card", () => {
+	// fixtures match the frozen swarm DTOs (asSwarmCard over ../swarm/teams.ts); extra fields ride along
+	// as leak bait the renderer must drop. lane-c never started, so spawned counts 2 of 3 plans.
+	const spawnDetails = {
+		spawned: 2,
+		total: 3,
+		lanes: [
+			{ laneId: "lane-a", brief: "Fix the login redirect", stateDir: "/tmp/swarm/aa11-1-x", logPath: "/tmp/swarm/aa11-1-x/run.log", pid: 101 },
+			{ laneId: "lane-b", brief: "Write the migration", stateDir: "/tmp/swarm/bb22-2-x", logPath: "/tmp/swarm/bb22-2-x/run.log", pid: 102 },
+			{ laneId: "lane-c", brief: "Update the docs", stateDir: "/tmp/swarm/cc33-3-x", logPath: "/tmp/swarm/cc33-3-x/run.log", error: "spawn blocked: no pty" },
+		],
+		body: "leak bait",
+	};
+	const statusDetails = {
+		omitted: 0,
+		lanes: [
+			{ laneId: "lane-a", summary: "auth flow implemented", done: 4, total: 4 },
+			{ laneId: "lane-b", summary: "half the tables migrated", done: 2, total: 5 },
+			{ laneId: "lane-c", summary: "", done: 0, total: 0, error: "task store locked" },
+		],
+	};
+	const omittedDetails = {
+		omitted: 2,
+		lanes: [
+			{ laneId: "lane-1", summary: "finished already", done: 1, total: 1 },
+			{ laneId: "lane-2", summary: "still going", done: 0, total: 3 },
+		],
+	};
+
+	function manyLanes(count: number) {
+		const lanes = Array.from({ length: count }, (_, i) => ({
+			laneId: `lane-${i + 1}`,
+			brief: `Brief ${i + 1}`,
+			stateDir: `/tmp/swarm/ee${String(i + 1).padStart(3, "0")}-${i + 1}-x`,
+			logPath: `/tmp/swarm/ee${String(i + 1).padStart(3, "0")}-${i + 1}-x/run.log`,
+			pid: 1000 + i,
+		}));
+		return { spawned: count, total: count, lanes };
+	}
+
+	function swarmCard(details: unknown, expanded: boolean, width: number, cardTheme: unknown = theme) {
+		const rows = renderSwarm({ content: "card", details }, { expanded }, cardTheme)?.render(width) ?? [];
+		return { rows, plain: rows.map((row) => Bun.stripANSI(row)) };
+	}
+
+	test("SWARM_TYPE is exported and registered as its own display-only card", () => {
+		expect(SWARM_TYPE).toBe("ultrathink-swarm");
+		expect(renderers[SWARM_TYPE]).toBeDefined();
+		expect(renderers[SWARM_TYPE]).not.toBe(renderers[INSIGHT_TYPE]);
+	});
+
+	test("compact card stays within six content rows with the counts row leading", () => {
+		const { rows, plain } = swarmCard(spawnDetails, false, 80);
+		expect(rows.length).toBeLessThanOrEqual(6 + 2);
+		const countsIndex = plain.findIndex((row) => row.includes("2/3 lanes spawned"));
+		expect(countsIndex).toBeGreaterThan(-1);
+		expect(countsIndex).toBeLessThanOrEqual(2);
+		expect(plain.join("\n")).not.toContain("leak bait");
+		expect(plain.join("\n")).toContain("no pty");
+		const status = swarmCard(statusDetails, false, 80);
+		const countsRow = status.plain.find((row) => row.includes("1 done")) ?? "";
+		expect(countsRow).toContain("1 running");
+		expect(countsRow).toContain("1 failed");
+		expect(status.plain.join("\n")).toContain("4/4 done");
+		expect(status.plain.join("\n")).toContain("task store locked");
+	});
+
+	test("compact omission notice leads the per-lane rows and survives at width 80", () => {
+		const { plain } = swarmCard(omittedDetails, false, 80);
+		const omissionIndex = plain.findIndex((row) => row.includes("2 older lanes not shown"));
+		expect(omissionIndex).toBeGreaterThan(-1);
+		const laneIndex = plain.findIndex((row) => row.includes("lane-1"));
+		expect(omissionIndex).toBeLessThan(laneIndex);
+	});
+
+	test("expanded card stays within twenty-four content rows with an omission notice when capped", () => {
+		const { rows, plain } = swarmCard(manyLanes(40), true, 80);
+		expect(rows.length).toBeLessThanOrEqual(24 + 4);
+		expect(plain.join("\n")).toMatch(/more lanes — open \/ultrathink-ui/);
+	});
+
+	test("expanded card shows full state dirs and log paths", () => {
+		const { plain } = swarmCard(spawnDetails, true, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("/tmp/swarm/aa11-1-x/run.log");
+		expect(text).toContain("/tmp/swarm/bb22-2-x");
+	});
+
+	test("compact card never shows full paths, only state dir basenames", () => {
+		const { plain } = swarmCard(spawnDetails, false, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("aa11-1-x");
+		expect(text).not.toContain("run.log");
+		expect(text).not.toContain("/tmp/swarm/aa11-1-x");
+	});
+
+	test("malformed details fall back to a safe bounded card naming the event", () => {
+		for (const details of [undefined, null, "x", 42, ["array"], {}, { lanes: [] }, { lanes: [], spawned: 1, total: "x" }, { lanes: "nope", omitted: 0 }]) {
+			const { rows, plain } = swarmCard(details, false, 80, {});
+			expect(rows.length).toBeLessThanOrEqual(6 + 2);
+			expect(plain.join("\n")).toContain("Swarm lanes — details unavailable");
+			for (const row of rows) expect(row).not.toContain(String.fromCharCode(27));
+		}
+	});
+
+	test("zero lanes renders a single no-lanes row instead of an empty frame", () => {
+		const spawn = swarmCard({ spawned: 0, total: 0, lanes: [] }, false, 80);
+		expect(spawn.rows.length).toBe(3);
+		expect(spawn.plain[1]).toContain("No swarm lanes");
+		const status = swarmCard({ omitted: 0, lanes: [] }, false, 80);
+		expect(status.plain[1]).toContain("No swarm lanes");
+	});
+
+	test("hostile lane ids, briefs and errors never reach the terminal unsanitized", () => {
+		const hostile = {
+			spawned: 1,
+			total: 2,
+			lanes: [
+				{ laneId: "lane\x1b[2J-a", brief: "b\x1b]0;pwned\x07rief", stateDir: "/tmp/\x1b[31mswarm/ff11-1-x", logPath: "/tmp/swarm/ff11-1-x/run.log" },
+				{ laneId: "lane\x07-b", brief: "ok", stateDir: "/tmp/swarm/gg22-2-x", logPath: "/tmp/swarm/gg22-2-x/run.log", error: "\x1b[31merrored\x07" },
+			],
+			content: "SECRET-CONTENT-BAIT",
+		};
+		for (const expanded of [false, true]) {
+			const { rows, plain } = swarmCard(hostile, expanded, 80, {});
+			for (const row of rows) {
+				expect(row).not.toContain(String.fromCharCode(27));
+				expect(row).not.toContain(String.fromCharCode(7));
+			}
+			// sanitized lanes still render, and raw message content never does
+			const text = plain.join("\n");
+			expect(text).toContain("lane-a");
+			expect(text).toContain("lane-b");
+			expect(text).toContain("ff11-1-x");
+			expect(text).toContain("brief");
+			expect(text).not.toContain("SECRET-CONTENT-BAIT");
+		}
+	});
+
+	test("raw message content is never rendered", () => {
+		const rows = renderSwarm({ content: "SECRET-MARKER", details: spawnDetails }, { expanded: true }, theme)?.render(160) ?? [];
+		expect(rows.map((row) => Bun.stripANSI(row)).join("\n")).not.toContain("SECRET-MARKER");
+	});
+
+	test("every row keeps the render width", () => {
+		for (const width of [8, 40, 80, 160]) {
+			for (const expanded of [false, true]) {
+				for (const details of [spawnDetails, statusDetails, omittedDetails, manyLanes(40)]) {
+					const { rows } = swarmCard(details, expanded, width);
+					expect({ width, expanded, widths: rows.map(visibleWidth) }).toEqual({ width, expanded, widths: rows.map(() => width) });
+				}
+			}
+		}
 	});
 });
