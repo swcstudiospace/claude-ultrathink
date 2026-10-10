@@ -10,9 +10,11 @@
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
 import { existsSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, AssistantMessage, Context, Effort, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { resolvePstack } from "../cursor/pstack.ts";
 import type { ClaudeCompleter } from "../claude/complete.ts";
 import { type ControlState, readControl, readSession, type SessionRecord, sessionPath } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
@@ -28,6 +30,19 @@ import { digestFromAgentMessages } from "../teach/digest.ts";
 import { spawnObserveDetached } from "../teach/spawn.ts";
 import { status as authStatus } from "../mcp/oauth.ts";
 import { storePath } from "../mcp/store.ts";
+import {
+	formatLaneHandles,
+	formatLaneStatusText,
+	laneDirs,
+	laneStatus,
+	maxLanes,
+	orchStatusRunner,
+	parseLaneArgs,
+	planLanes,
+	resolveSwarmRoot,
+	spawnLanes,
+	TEAMS_USAGE,
+} from "../swarm/teams.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
@@ -1350,6 +1365,32 @@ export function createOmpExtension(
 					handler: async (args, ctx) => {
 						try {
 							await openInsightUi(args, ctx);
+						} catch {}
+					},
+				}),
+			);
+			// `/ultrathink-swarm brief|brief|…` fans out one detached AgentSwarm orchestrator lane per brief; each
+			// lane runs `hooks/autonomous_run.py` with its own SWARM_DIR, so Task Stores and logs never contend.
+			// `/ultrathink-swarm status` probes every lane's Task Store through orch_status.py. Replies are
+			// display-only text (never a model turn); child sessions may use it like the verbs above.
+			guard(() =>
+				pi.registerCommand?.("ultrathink-swarm", {
+					description: "Fan out AgentSwarm lanes from `|`-separated briefs, or show lane status",
+					handler: async (args, ctx) => {
+						try {
+							const cwd = ctx?.cwd || process.cwd();
+							const dir = stateDir(cwd);
+							const parsed = parseLaneArgs(args ?? "", { maxLanes: maxLanes(process.env) });
+							if (parsed.kind === "usage") return sendInsightText(`${parsed.reason}. ${TEAMS_USAGE}`);
+							const root = resolveSwarmRoot(process.env);
+							if ("reason" in root) return sendInsightText(`AgentSwarm lanes unavailable: ${root.reason}`);
+							if (parsed.kind === "status") {
+								const rows = laneStatus(laneDirs(dir), orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
+								return sendInsightText(formatLaneStatusText(rows));
+							}
+							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
+							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
+							sendInsightText(formatLaneHandles(spawnLanes(plan)));
 						} catch {}
 					},
 				}),
