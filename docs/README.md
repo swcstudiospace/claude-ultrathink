@@ -28,6 +28,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Upgrade and move](how-to/upgrade-and-move.md): update each host and move the clone.
 - [Uninstall](how-to/uninstall.md): remove ultrathink from each host, plus its shared config, credentials and state.
 - [Use with Grok Bot](how-to/use-with-grok-bot.md): the native Grok Bot host (`bin/ultrathink-grokbot` plus skills; no prompt hook).
+- [Run pstack skills beside GSD in Cursor](how-to/use-pstack-with-cursor.md): install the Cursor hook, enable it in your user config, and check it with doctor.
 
 ## Reference
 

@@ -2,7 +2,8 @@
 // Copyright (C) 2026 SWC Studio
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { type PstackStage } from "./cursor/pstack.ts";
 import { DEFAULT_GATEWAY_CONFIG, SEAT_PATTERN, type GatewayConfig } from "./gateway/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG, type HindsightConfig } from "./hindsight/types.ts";
 import { DEFAULT_RAGFLOW_CONFIG, type RagflowConfig } from "./ragflow/types.ts";
@@ -109,6 +110,29 @@ export const DEFAULT_STATE_CONFIG: StateConfig = {
 	retentionDays: 0,
 };
 
+/** Stages a user mapping may remap: every pstack stage except `orchestrate`, the router that carries all moments. */
+type PstackMappingStage = Exclude<PstackStage, "orchestrate">;
+
+/**
+ * Cursor pstack bridge (`src/cursor/pstack.ts`): `/gsd-*` slash commands detected in Cursor's beforeSubmitPrompt
+ * hook. Opt-in and user-only — every key comes from user files; a project layer is ignored entirely.
+ */
+export interface PstackConfig {
+	/** Whether the bridge injects pstack skill instructions; only a user file can turn this on. */
+	enabled: boolean;
+	/** Absolute Cursor directory to resolve pstack from; absent uses the hook's own resolution. */
+	cursorDir?: string;
+	/** Per-stage skill names replacing the default mapping; unknown stages and non-string entries are dropped. */
+	mapping?: Partial<Record<PstackMappingStage, string[]>>;
+	/** Character cap for the injected context block. */
+	contextCapChars?: number;
+}
+
+export const DEFAULT_PSTACK_CONFIG: PstackConfig = {
+	enabled: false,
+	contextCapChars: 2000,
+};
+
 /** A per-host planning model override; "" in a field means no override for it. */
 export interface HostModelOverride {
 	/** Exact credential-bearing provider id the planning target must belong to; "" = no provider constraint. */
@@ -154,6 +178,8 @@ export interface UltrathinkConfig {
 	teach: TeachConfig;
 	/** On-disk session state. Opt-in retention; a project file can never set it. */
 	state: StateConfig;
+	/** Cursor pstack bridge (opt-in; user files only — a project layer cannot enable or retarget it). */
+	pstack: PstackConfig;
 	/** Planning model overrides and exact-provider default selectors; built-in `{ hosts: {}, providerDefaults: {} }`. */
 	models: ModelsConfig;
 	/**
@@ -192,6 +218,7 @@ export function defaultConfig(): UltrathinkConfig {
 		gateway: { ...DEFAULT_GATEWAY_CONFIG },
 		teach: { ...DEFAULT_TEACH_CONFIG },
 		state: { ...DEFAULT_STATE_CONFIG },
+		pstack: { ...DEFAULT_PSTACK_CONFIG },
 		models: { hosts: {}, providerDefaults: providerDictionary({}) },
 		modelProvenance: { claude: "route-default", grok: "route-default", muse: "route-default" },
 	};
@@ -649,6 +676,45 @@ function mergeState(state: Record<string, unknown> | undefined, defaults: StateC
 	return { retentionDays: intInRange(state.retentionDays, 0, 3650, defaults.retentionDays) };
 }
 
+/** An absolute path as written (trimmed); blank, relative or wrong-typed values keep the lower layer's. */
+function absolutePathField(value: unknown, fallback: string | undefined): string | undefined {
+	if (typeof value !== "string") return fallback;
+	const trimmed = value.trim();
+	return trimmed && isAbsolute(trimmed) ? trimmed : fallback;
+}
+
+/** The four stages a user mapping may remap; `orchestrate` routes over all of them and is not a mapping key. */
+const PSTACK_MAPPING_STAGES: readonly PstackMappingStage[] = ["discuss", "plan", "execute", "review"];
+
+/** A fresh mapping holding only the known stages and only their string entries; everything else is dropped. */
+function pstackMapping(mapping: unknown): Partial<Record<PstackMappingStage, string[]>> | undefined {
+	const record = asRecord(mapping);
+	if (!record) return undefined;
+	const merged: Partial<Record<PstackMappingStage, string[]>> = {};
+	for (const stage of PSTACK_MAPPING_STAGES) {
+		const value = record[stage];
+		if (!Array.isArray(value)) continue;
+		merged[stage] = value.filter((name): name is string => typeof name === "string");
+	}
+	return Object.keys(merged).length ? merged : undefined;
+}
+
+/**
+ * The pstack bridge is opt-in and user-only: a project layer (a file a cloned repository controls) is ignored
+ * entirely — its `enabled: true` stays the default false, and it can retarget neither cursorDir nor mapping.
+ */
+function mergePstack(pstack: Record<string, unknown> | undefined, defaults: PstackConfig, project: boolean): PstackConfig {
+	if (!pstack || project) return defaults;
+	// A later layer replaces only the stages it names. Omitting `mapping`, or naming no valid stage, keeps the earlier map.
+	const mapping = pstackMapping(pstack.mapping);
+	return {
+		enabled: booleanOr(pstack.enabled, defaults.enabled),
+		cursorDir: absolutePathField(pstack.cursorDir, defaults.cursorDir),
+		mapping: mapping ? { ...defaults.mapping, ...mapping } : defaults.mapping,
+		contextCapChars: positiveInt(pstack.contextCapChars, defaults.contextCapChars ?? 2000),
+	};
+}
+
 /** Merges one config layer onto `base`; `project` marks a repository-controlled layer (consent may only tighten, K5). */
 export function mergeConfig(
 	file: Record<string, unknown> | undefined,
@@ -677,6 +743,7 @@ export function mergeConfig(
 		gateway: mergeGateway(asRecord(file.gateway), base.gateway, options.project === true),
 		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
 		state: mergeState(asRecord(file.state), base.state, options.project === true),
+		pstack: mergePstack(asRecord(file.pstack), base.pstack, options.project === true),
 		models: mergeModels(asRecord(file.models), base.models),
 		modelProvenance: {
 			claude: modelPin(claude, base.modelProvenance.claude, true),

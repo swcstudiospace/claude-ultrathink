@@ -80,6 +80,15 @@ describe("checkConfig", () => {
 		expect(findings.some((finding) => finding.level === "ok")).toBe(true);
 	});
 
+	test("documented pstack.cursorDir and pstack.mapping are known settings", () => {
+		write("user", {
+			pstack: { enabled: true, cursorDir: "/opt/cursor", mapping: { plan: ["how"], review: ["interrogate"] } },
+		});
+		const findings = checkConfig(deps);
+		expect(findings.filter((finding) => finding.id.includes("unknown"))).toEqual([]);
+		expect(aboveInfo(findings)).toEqual([]);
+	});
+
 	test("every default key is known, so a new default key needs no edit here", () => {
 		const defaults = defaultsAsFile();
 		const keys = Object.entries(defaults).flatMap(([section, value]) => Object.keys(value as Record<string, unknown>).map((key) => `${section}.${key}`));

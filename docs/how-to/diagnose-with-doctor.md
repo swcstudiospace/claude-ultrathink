@@ -24,7 +24,7 @@ Run it from the project you have the problem in: the project file `<cwd>/.claude
 
 ## What it checks
 
-The report has four sections, always in this order.
+The report has five sections, always in this order.
 
 | Section | What doctor looks at |
 |---|---|
@@ -32,6 +32,7 @@ The report has four sections, always in this order.
 | `config` | The three config files, lowest precedence first: `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json`, `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink.json` and `<cwd>/.claude/ultrathink.json`. See below. |
 | `credentials` | For each feature your config switches on, whether its provider has a credential. Providers are named as present or missing and nothing more. |
 | `state` | The state directory: whether it exists and is writable, how many session records it holds and how large they are, which files other users can read, and leftover temporary and lock files. |
+| `pstack` | The Cursor bridge: whether it is enabled and which user file decided that (a project file cannot enable it), the resolved pstack plugin path and version, each stage's skills (a warning for a mapped name with no `SKILL.md`), and whether the `beforeSubmitPrompt` hook is installed. Info when the bridge is off. See [Run pstack skills beside GSD in Cursor](use-pstack-with-cursor.md). |
 
 ### Config files
 

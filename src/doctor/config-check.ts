@@ -320,6 +320,9 @@ export function checkConfig(deps: DoctorDeps): Finding[] {
 	const known: Json = { ...defaultConfig() };
 	delete known.modelProvenance;
 	for (const section of BACKEND_SECTIONS) known[section] = { ...(known[section] as Json), backend: "direct" };
+	// cursorDir and mapping are documented and accepted by the merge, but defaultConfig() omits them
+	// because unset is not the same as an empty value. Doctor still has to recognize them.
+	known.pstack = { ...(known.pstack as Json), cursorDir: "", mapping: {} };
 	let effective = defaultConfig();
 	const findings: Finding[] = [];
 	claudeConfigPaths(deps.cwd, deps.env).forEach((source, index) => {

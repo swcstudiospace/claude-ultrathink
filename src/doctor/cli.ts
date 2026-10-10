@@ -7,6 +7,7 @@
  */
 import { checkConfig } from "./config-check.ts";
 import { checkCredentials, checkRuntime } from "./env-check.ts";
+import { checkPstack } from "./pstack-check.ts";
 import { buildReport, formatReport, reportJson } from "./report.ts";
 import { checkState } from "./state-check.ts";
 import type { DoctorDeps, DoctorSection, Finding, PythonCommand } from "./types.ts";
@@ -60,6 +61,7 @@ export async function runDoctorCommand(args: string[], overrides: Partial<Doctor
 		...guarded("config", checkConfig, deps),
 		...guarded("credentials", checkCredentials, deps),
 		...guarded("state", checkState, deps),
+		...guarded("pstack", checkPstack, deps),
 	]);
 	return { output: json ? reportJson(report) : formatReport(report), exitCode: report.ok ? 0 : 1 };
 }

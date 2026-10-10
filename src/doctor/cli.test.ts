@@ -45,12 +45,12 @@ describe("runDoctorCommand", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	test("a healthy machine exits 0 and the text report has the four sections and a summary", async () => {
+	test("a healthy machine exits 0 and the text report has the five sections and a summary", async () => {
 		const { output, exitCode } = await runDoctorCommand([], deps);
 		expect(exitCode).toBe(0);
 		const lines = output.split("\n");
 		expect(lines[0]).toBe("ultrathink doctor");
-		expect(lines.filter((line) => /^[a-z]+$/.test(line))).toEqual(["runtime", "config", "credentials", "state"]);
+		expect(lines.filter((line) => /^[a-z]+$/.test(line))).toEqual(["runtime", "config", "credentials", "state", "pstack"]);
 		expect(lines.at(-1)).toBe("0 errors, 0 warnings");
 		expect(output).not.toEndWith("\n");
 	});
@@ -101,7 +101,7 @@ describe("runDoctorCommand", () => {
 		expect(report.summary).toMatchObject({ error: 0, warn: 1 });
 		expect(report.findings.map((finding) => finding.section)).toEqual(
 			[...report.findings.map((finding) => finding.section)].sort(
-				(a, b) => ["runtime", "config", "credentials", "state"].indexOf(a) - ["runtime", "config", "credentials", "state"].indexOf(b),
+				(a, b) => ["runtime", "config", "credentials", "state", "pstack"].indexOf(a) - ["runtime", "config", "credentials", "state", "pstack"].indexOf(b),
 			),
 		);
 		const typo = report.findings.find((finding) => finding.id === "config.project.unknown-section.shipp");

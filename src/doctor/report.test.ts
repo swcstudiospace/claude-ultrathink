@@ -42,7 +42,7 @@ describe("buildReport", () => {
 });
 
 describe("formatReport", () => {
-	test("prints the four sections in order with markers, indented detail and fix lines, and a summary", () => {
+	test("prints the sections in order with markers, indented detail and fix lines, and a summary", () => {
 		expect(formatReport(buildReport(FINDINGS))).toBe(
 			[
 				"ultrathink doctor",
@@ -60,13 +60,14 @@ describe("formatReport", () => {
 				"  ! Greptile: no credential",
 				"state",
 				"  ✓ State directory is writable: /s",
+				"pstack",
 				"1 error, 2 warnings",
 			].join("\n"),
 		);
 	});
 
 	test("an empty report still lists the sections and a zero summary", () => {
-		expect(formatReport(buildReport([]))).toBe("ultrathink doctor\nruntime\nconfig\ncredentials\nstate\n0 errors, 0 warnings");
+		expect(formatReport(buildReport([]))).toBe("ultrathink doctor\nruntime\nconfig\ncredentials\nstate\npstack\n0 errors, 0 warnings");
 	});
 
 	test("a bearer token or JWT that reached a finding is masked", () => {

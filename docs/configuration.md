@@ -42,6 +42,7 @@ How the merge works (`src/config.ts`):
 - A value with the wrong type or outside its allowed range is ignored, and the value from the earlier file (or the default) stays.
 - Some string keys only accept a non-empty value, so an empty string in a later file does not clear a value an earlier file set: `notion.dataSourceUrl`, `linear.team`, `grok.baseUrl`, `grok.model`, `grok.bin`, `grok.shuntModel`, `claude.bin`, `decisions.model`, `hindsight.url`, `hindsight.bank`, `ragflow.url`, and the URL keys `grok.shuntBaseUrl` and `substrate.url`. To stop row creation, use `/ultrathink-track off` (see [Turning tracking off](tracking.md#turning-tracking-off)). To turn the Agent Substrate brief off, set `SUBSTRATE_DISABLED=1`.
 - The URL keys `grok.shuntBaseUrl` and `substrate.url` must be `http://` or `https://` URLs. Trailing slashes are removed.
+- `pstack` is user-only. The merge ignores a project file's whole `pstack` section, so `pstack.enabled: true` there does not turn the Cursor bridge on. The Cursor hook never reads the project file. See [`pstack`](#pstack-cursor-bridge).
 - The project file can only make Jev decisions more restrictive: there, `decisions.zdr` can only turn zero data retention on (a `false` is ignored), and `decisions.points` can only drop points (it is intersected with the list from the earlier files, or the default). `decisions.enabled` is ignored in every file: Jev is always on, and only `ULTRATHINK_DECISIONS=0` turns it off. The other `decisions` keys (`provider`, `model`, `timeoutMs` and the thresholds) merge as usual, and the two user files merge every key as usual. See [`decisions`](#decisions-jev-decisions-openrouter-decisions-api).
 - The project file can only tighten Hindsight, RAGFlow and Teachable Moments. For `hindsight`, only `enabled: false` counts; `url`, `bank` and the timeouts are ignored, so a repository cannot point memory traffic at its own host. For `ragflow`, only `enabled: false` and `ground: false` count; `url`, `datasetIds` and the other keys are ignored. For `teach`, `enabled`, `recall` and `autoPromote` can only turn off, and `capture` can only go down (`auto` to `observe` to `explicit`); the other `teach` keys are ignored. The two user files merge every key as usual. See [`hindsight`](#hindsight-memory-server), [`ragflow`](#ragflow-document-search) and [`teach`](#teach-teachable-moments).
 - The project file cannot set `state.retentionDays`: the whole `state` section is ignored there, because a repository must not be able to delete your session history. See [`state`](#state-session-retention).
@@ -270,6 +271,19 @@ Agent Substrate is an optional service that tells the planner what other agents 
 | `backend` | `"direct"` or `"gateway"` | `"direct"` | `"direct"` is the client above. `"gateway"` calls the desk gateway (see [`gateway`](#gateway-desk-gateway)). User files only. `ULTRATHINK_SUBSTRATE_BACKEND` overrides it. `ULTRATHINK_GATEWAY=0` forces `"direct"`. |
 
 Each request times out after 1.5 seconds (`SUBSTRATE_TIMEOUT_MS` changes that). A missing, slow or failing server never blocks a prompt: the plan is built without the brief, and a refused or lost event is dropped. The event goes out after planning, so a server that accepts the connection and never answers adds up to one timeout before the plan is returned. `bin/ultrathink status` shows the `Substrate:` line with the URL in use and where it came from.
+
+### `pstack`: Cursor bridge
+
+Opt-in instructions that tell Cursor, on a `/gsd-*` prompt, to read the matching pstack skills alongside that GSD step. Off until you set `enabled`. The planning engine never sees this section. The hook writes nothing and sends nothing off the machine. Walk-through: [Run pstack skills beside GSD in Cursor](how-to/use-pstack-with-cursor.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Turn the bridge on. Only a user file counts: the same key in `<project>/.claude/ultrathink.json` is ignored. `ULTRATHINK_PSTACK=0` forces it off for one process. |
+| `cursorDir` | absolute path | unset | Cursor directory whose plugin cache and `hooks.json` the hook and doctor use. Unset means `$ULTRATHINK_PSTACK_CURSOR_DIR`, else `~/.cursor`. A relative path is ignored. User file only. |
+| `mapping` | object | the built-in mapping | Per-stage skill names. Stages are `discuss`, `plan`, `execute` and `review`. A listed stage replaces that stage's default list; unknown stage names and non-strings are dropped. Defaults: `discuss` → `how`; `plan` → `architect`, `arena`; `execute` → `tdd`; `review` → `interrogate`, `no-comments`. `/gsd-autonomous` uses every stage. User file only. |
+| `contextCapChars` | integer, >= 1 | `2000` | Longest instruction block, in characters. The hook drops skills from the right until the block fits, and injects nothing when even one skill cannot fit. `0`, a negative number or a non-integer is ignored. User file only. |
+
+The hook does not merge config layers. It reads the first file that exists and is JSON: `$ULTRATHINK_CONFIG_DIR/config.json` when that variable is set, otherwise `${XDG_CONFIG_HOME:-~/.config}/ultrathink/config.json` and then `${CLAUDE_CONFIG_DIR:-~/.claude}/ultrathink.json`. Put `pstack` in whichever of those the hook actually reads (the first one that parses). `ultrathink doctor` names that file as the deciding source.
 
 ### `decisions`: Jev decisions (OpenRouter Decisions API)
 
@@ -500,6 +514,7 @@ All keys are optional; write only the ones you change. This file shows every key
     "mergeTimeoutMs": 3600000
   },
   "substrate": { "url": "" },
+  "pstack": { "enabled": false, "contextCapChars": 2000 },
   "decisions": {
     "enabled": true,
     "provider": "auto",
@@ -608,6 +623,9 @@ Every variable ultrathink reads, grouped by who sets it. Variables that expect `
 | `ULTRATHINK_UPLIFT=0` | Do not plan any prompt in this process. The `uplift:` prefix does not override it. Useful for automation and `claude -p` runs. |
 | `ULTRATHINK_TRACK=0` | The planner creates no rows in this process. The `ultrathink-kickoff` skill still creates them through `track complete`. To stop all rows, use `/ultrathink-track off`. |
 | `ULTRATHINK_SHIP=0` | No ship instruction in the plan and no ship nudge at the end of a run, even with `ship.enabled: true`. `bin/ultrathink-ship` still works when you run it yourself. |
+| `ULTRATHINK_PSTACK=0` | The Cursor pstack hook injects nothing for this process, even with `pstack.enabled: true`. The exact string `0`. |
+| `ULTRATHINK_PSTACK_CURSOR_DIR` | Absolute Cursor directory for the hook and for `ultrathink doctor`'s pstack section. Wins over `pstack.cursorDir`. |
+| `ULTRATHINK_CONFIG_DIR` | When set, the Cursor hook reads only `<this directory>/config.json` for `pstack` and does not look at the usual user files. |
 | `ULTRATHINK_DECISIONS=0` | No Jev decision at any point in this process, whatever the config says: no request to either rail, no decision record, no plan-skip notice and no `Decisions ·` summary segment. It is the only off switch: `bin/ultrathink status` shows `Decisions: off (ULTRATHINK_DECISIONS=0)`, and `bin/ultrathink decisions check` and `decisions probe` print `Decisions check: off (ULTRATHINK_DECISIONS=0)` or `Decisions probe: off (ULTRATHINK_DECISIONS=0)` and exit 1 without a request. |
 | `ULTRATHINK_HOST` | Which host's state directory to use: `claude-code`, `grok-build`, `hermes`, `muse` or `omp`. Any other value is ignored. Without it the host is detected from its environment, and Claude Code is the fallback. Set it for `bin/ultrathink` to change another host's control state, for example `ULTRATHINK_HOST=omp bin/ultrathink off`. The Grok hook file, the Muse hook wrappers, the Hermes plugin and the Omp extension set it for their own processes. |
 | `ULTRATHINK_STATE_DIR` | Use this directory instead of the host's state directory. Give an absolute path: a relative one is resolved against the session's working directory on Claude Code, Grok Build, Muse and Omp, but against the ultrathink checkout on Hermes. It is ignored when the path is inside a `.planning` directory. Teachable Moments state is `<this directory>/teach/`, never `<cwd>/.planning`. The Hermes plugin sets it for its own control commands. |
