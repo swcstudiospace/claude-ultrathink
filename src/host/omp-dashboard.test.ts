@@ -768,6 +768,53 @@ describe("dashboard physical viewport boundaries", () => {
 		ui.dispose();
 	});
 
+	test("short viewports keep eligibility facts and the full body reachable by scrolling", () => {
+		const tail = "tiny-viewport-body-tail";
+		const candidate = mkLesson("tc", "Tiny candidate lesson", {
+			body: [`top ${"c".repeat(400)}`, `${"d".repeat(400)}`, tail].join("\n"),
+			selection: { id: "tc", revision: "rtc" },
+		});
+		const cases: Array<[number, number, InsightLesson, string, string]> = [
+			[80, 8, longBodyLesson(), "Eligible: confirmed", TAIL],
+			[40, 8, candidate, "Not eligible: status candidate", tail],
+		];
+		for (const [width, height, lesson, factPrefix, scrollTarget] of cases) {
+			const ui = createInsightDashboard(snapshot({ lessons: [lesson] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => height });
+			ui.render(width);
+			ui.handleInput("tab");
+			ui.handleInput("enter");
+			// The eligibility facts lead the scrolled surface, so a fresh detail
+			// shows them first even at the shortest eligible viewport.
+			const top = plain(ui.render(width)).join("\n");
+			expect(top).toContain(factPrefix);
+			expect(top).toMatch(/Details 1–\d+ of \d+ shown/);
+			// The complete body, tail included, is reachable by scrolling while
+			// the frame stays inside the short viewport.
+			expect(scrollTo(scrollTarget, ui, width, "down")).toContain(scrollTarget);
+			const rows = plain(ui.render(width));
+			expect(rows.length).toBeLessThanOrEqual(height);
+			for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width);
+			ui.dispose();
+		}
+	});
+
+	test("overview scrolls to lesson totals and teaching settings at 40x12", () => {
+		const ui = createInsightDashboard(snapshot({ decisions: [] }), stubs(), { theme: {}, initialPanel: "overview", rows: () => 12 });
+		const first = plain(ui.render(40));
+		expect(first.length).toBeLessThanOrEqual(12);
+		// Clipping alone would drop the totals and settings below the fold;
+		// scrolling reaches each of them instead of losing them irretrievably.
+		expect(scrollTo("candidate: 1", ui, 40, "down")).toContain("candidate: 1");
+		expect(scrollTo("Skills: 1 eligible", ui, 40, "down")).toContain("Skills: 1 eligible");
+		const settings = scrollTo("Capture:", ui, 40, "down");
+		expect(settings).toContain("Capture:");
+		expect(settings).toMatch(/Overview \d+–\d+ of \d+ shown/);
+		const rows = plain(ui.render(40));
+		expect(rows.length).toBeLessThanOrEqual(12);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(40);
+		ui.dispose();
+	});
+
 	test("skills panel shares one scroll budget between policy prefix and lesson list", () => {
 		// Tiny viewport: the policy prefix and the list fit one shared budget —
 		// the panel never overflows and at least one lesson row stays reachable.

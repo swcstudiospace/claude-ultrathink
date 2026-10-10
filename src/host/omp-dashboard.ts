@@ -317,6 +317,7 @@ export function createInsightDashboard(
 	};
 	let detailScroll = 0;
 	let previewScroll = 0;
+	let overviewScroll = 0;
 	// previewLines() is width-independent; memoize on preview identity so action
 	// gates and scroll handlers reuse the render's computation.
 	let previewMemo: { preview: SkillPreview; result: { lines: string[]; clipped: boolean } } | undefined;
@@ -561,6 +562,7 @@ export function createInsightDashboard(
 		confirmTarget = undefined;
 		detailScroll = 0;
 		previewScroll = 0;
+		overviewScroll = 0;
 		syncSelection(tab);
 		focus = listRows(tab).length > 0 && tab !== "overview" ? "list" : "tabs";
 		touch();
@@ -701,10 +703,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 };
 
 	/**
-	 * Saved eligibility facts for the selected lesson as pinned physical rows:
-	 * they sit above the scrolled detail window and share its budget, so
-	 * scrolling, reflow, and resize never move them out of view — they are the
-	 * consent context for the strip's confirm/preview actions.
+	 * Saved eligibility facts for the selected lesson as physical rows that
+	 * lead the scrolled detail surface: they are the consent context for the
+	 * strip's confirm/preview actions, so a freshly opened detail always shows
+	 * them first and scrolling can always bring them back at any viewport.
 	 */
 	const detailFactRows = (width: number): string[] => {
 		if (tab === "jev") return [];
@@ -904,13 +906,12 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	const previewWindow = (layout: DashboardLayout): number => Math.min(DETAIL_WINDOW, layout.budget(1));
 
 	/**
-	 * Detail content rows: the position footer keeps one reserved row only when
-	 * the content actually overflows the windowless budget, and callers reserve
-	 * the pinned fact rows from the same shared budget.
+	 * Detail and overview content rows: the position footer keeps one reserved
+	 * row only when the content actually overflows the windowless budget.
 	 */
-	const detailWindow = (layout: DashboardLayout, totalWrapped: number, reservedRows = 0): number => {
-		let windowRows = Math.min(DETAIL_WINDOW, layout.budget(reservedRows));
-		if (totalWrapped > windowRows && windowRows > 0) windowRows = Math.min(DETAIL_WINDOW, layout.budget(reservedRows + 1));
+	const contentWindow = (layout: DashboardLayout, totalWrapped: number): number => {
+		let windowRows = Math.min(DETAIL_WINDOW, layout.budget(0));
+		if (totalWrapped > windowRows && windowRows > 0) windowRows = Math.min(DETAIL_WINDOW, layout.budget(1));
 		return windowRows;
 	};
 
@@ -1006,6 +1007,16 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		return rows;
 	};
 
+	/** The detail surface: eligibility facts lead the scrolled lesson body rows. */
+	const detailSurface = (width: number): string[] => [...detailFactRows(width), ...wrappedRows(detailLines(), width)];
+
+	/** Overview body reflowed to physical rows; scroll positions index these rows. */
+	const overviewSurface = (width: number): string[] => {
+		const rows: string[] = [];
+		for (const line of overviewLines()) for (const row of wrapRow(line, width, "")) rows.push(fitRow(row, width));
+		return rows;
+	};
+
 	const fitRow = (text: string, width: number): string => {
 		if (width <= 0) return "";
 		return truncateToWidth(text, width);
@@ -1064,24 +1075,29 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				for (const line of lines.slice(start, end)) emitBody(line);
 			}
 		} else if (view === "detail") {
-			const lines = wrappedRows(detailLines(), safeWidth);
-			// Pinned saved-fact rows draw above the scrolled window and are
-			// reserved from the same shared budget, so the facts stay visible at
-			// every scroll offset without pushing header, status, strip, or help
-			// off screen.
-			const factRows = detailFactRows(safeWidth);
-			const windowRows = detailWindow(layout, lines.length, factRows.length);
+			// Eligibility facts lead the lesson body as one scrolled surface:
+			// every line — facts included — stays reachable by scrolling at any
+			// viewport, and a freshly opened detail shows the consent facts first.
+			const lines = detailSurface(safeWidth);
+			const windowRows = contentWindow(layout, lines.length);
 			detailScroll = clampScroll(detailScroll, lines.length, windowRows);
 			if (windowRows > 0) {
-				for (const row of factRows) emitBody(row);
 				const start = detailScroll;
 				for (const line of lines.slice(start, start + windowRows)) emitBody(line);
 				if (lines.length > windowRows) emitBody(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
 			}
 		} else if (tab === "overview") {
-			const wrapped: string[] = [];
-			for (const line of overviewLines()) for (const row of wrapRow(line, safeWidth, "")) wrapped.push(fitRow(row, safeWidth));
-			body = wrapped.slice(0, layout.budget(0));
+			// The overview body scrolls like detail/preview content: lesson
+			// totals and teaching settings stay reachable when scope/time text
+			// fills a short viewport instead of being clipped away.
+			const lines = overviewSurface(safeWidth);
+			const windowRows = contentWindow(layout, lines.length);
+			overviewScroll = clampScroll(overviewScroll, lines.length, windowRows);
+			if (windowRows > 0) {
+				const start = overviewScroll;
+				for (const row of lines.slice(start, start + windowRows)) emitBody(row);
+				if (lines.length > windowRows) emitBody(`Overview ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
+			}
 		} else {
 			// Skills root keeps Main's effective-policy prefix: live policy plus
 			// the saved-rules caveat, never a fresh Jev or installation claim.
@@ -1169,7 +1185,11 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		}
 		if (view === "preview") return "Esc back to lesson · ↑/↓ scroll preview · Enter actions · Tab change focus";
 		if (view === "detail") return "Esc back to list · ↑/↓ scroll details · Enter actions · r refresh snapshot · Tab change focus";
-		if (focus === "tabs") return "Esc close dashboard · ←/→ choose panel · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Tab change focus";
+		if (focus === "tabs") {
+			return tab === "overview"
+				? "Esc close dashboard · ←/→ choose panel · ↑/↓ scroll overview · Enter actions · r refresh snapshot · Tab change focus"
+				: "Esc close dashboard · ←/→ choose panel · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Tab change focus";
+		}
 		return "Esc close dashboard · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Tab change focus";
 	};
 
@@ -1188,6 +1208,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			selectedKeys.skills ?? "",
 			detailScroll,
 			previewScroll,
+			overviewScroll,
 			actionCursor[view] ?? 0,
 			notice,
 			snapshotError,
@@ -1271,6 +1292,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		confirmTarget = undefined;
 		detailScroll = 0;
 		previewScroll = 0;
+		overviewScroll = 0;
 	};
 
 	const startRefresh = (fromAction = false): void => {
@@ -1677,6 +1699,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					view = "browse";
 					pendingPreview = undefined;
 					confirmTarget = undefined;
+					overviewScroll = 0;
 					syncSelection(tab);
 					touch();
 					return;
@@ -1693,13 +1716,23 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					moveCursor(delta as 1 | -1);
 					return;
 				}
+				if (tab === "overview" && focus === "tabs") {
+					// The overview body scrolls like detail/preview content: steps
+					// share layoutFor with the renderer, so a step stops exactly on
+					// the displayed tail and never past it.
+					const layout = layoutFor(lastWidth);
+					const total = overviewSurface(lastWidth).length;
+					overviewScroll = clampScroll(overviewScroll + delta, total, contentWindow(layout, total));
+					touch();
+					return;
+				}
 				if (focus === "details" && (view === "detail" || view === "preview")) {
 					// Steps share layoutFor with the renderer, so a step can stop
 					// exactly on the displayed tail and never past it.
 					const layout = layoutFor(lastWidth);
 					if (view === "detail") {
-						const total = wrappedRows(detailLines(), lastWidth).length;
-						detailScroll = clampScroll(detailScroll + delta, total, detailWindow(layout, total, detailFactRows(lastWidth).length));
+						const total = detailSurface(lastWidth).length;
+						detailScroll = clampScroll(detailScroll + delta, total, contentWindow(layout, total));
 					} else {
 						const total = wrappedRows(previewLines().lines, lastWidth).length;
 						previewScroll = clampScroll(previewScroll + delta, total, previewWindow(layout));
@@ -1718,12 +1751,19 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			}
 			if (key === "pageup" || key === "pagedown") {
 				const layout = layoutFor(lastWidth);
-				const detailTotal = wrappedRows(detailLines(), lastWidth).length;
+				if (tab === "overview" && focus === "tabs") {
+					const total = overviewSurface(lastWidth).length;
+					const step = contentWindow(layout, total);
+					overviewScroll = clampScroll(overviewScroll + (key === "pagedown" ? step : -step), total, step);
+					touch();
+					return;
+				}
+				const detailTotal = detailSurface(lastWidth).length;
 				const previewTotal = wrappedRows(previewLines().lines, lastWidth).length;
-				const step = view === "preview" ? previewWindow(layout) : detailWindow(layout, detailTotal, detailFactRows(lastWidth).length);
+				const step = view === "preview" ? previewWindow(layout) : contentWindow(layout, detailTotal);
 				const delta = key === "pagedown" ? step : -step;
 				if (focus === "details" && view === "detail") {
-					detailScroll = clampScroll(detailScroll + delta, detailTotal, detailWindow(layout, detailTotal, detailFactRows(lastWidth).length));
+					detailScroll = clampScroll(detailScroll + delta, detailTotal, contentWindow(layout, detailTotal));
 					touch();
 					return;
 				}
