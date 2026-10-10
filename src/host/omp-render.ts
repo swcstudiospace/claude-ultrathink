@@ -602,24 +602,27 @@ function insightRows(details: unknown, expanded: boolean, p: Paint, room: number
 	const footerRows = wrapInsightLines(footer, room);
 	// Records keep their rows; the footer (teaching state + limitations) takes bounded leftover
 	// space but always stays reachable: both bookends are capped so their sum can never overflow
-	// the 24-row budget and push the footer out of the slice, and any overflow hides behind a
-	// one-line notice pointing at the dashboard.
-	let shownIdentity = identity;
-	const identityCap = INSIGHT_EXPANDED_ROWS - INSIGHT_FOOTER_FLOOR;
-	if (shownIdentity.length > identityCap) {
-		const hidden = shownIdentity.length - identityCap + 1;
-		shownIdentity = [...shownIdentity.slice(0, identityCap - 1), truncateToWidth(hidden + " more record lines — open /ultrathink-ui", room)];
-	}
-	let shownFooter = footerRows;
-	const footerBudget = Math.max(INSIGHT_FOOTER_FLOOR, INSIGHT_EXPANDED_ROWS - shownIdentity.length);
-	if (shownFooter.length > footerBudget) {
-		const hidden = shownFooter.length - footerBudget + 1;
-		shownFooter = [...shownFooter.slice(0, footerBudget - 1), truncateToWidth(hidden + " more policy and limitation lines — open /ultrathink-ui", room)];
-	}
-	const available = Math.max(0, INSIGHT_EXPANDED_ROWS - shownIdentity.length - shownFooter.length);
+	// the 24-row budget, and when that saturation would swallow omitted details entirely, one
+	// row is reclaimed from the budgets for the detail-omission notice — the dashboard carries
+	// the detail rows the card omits, but the omission itself is always announced here.
+	const fitBookends = (reserved: number): { id: string[]; footer: string[]; available: number } => {
+		let id = identity;
+		const identityCap = INSIGHT_EXPANDED_ROWS - INSIGHT_FOOTER_FLOOR - reserved;
+		if (id.length > identityCap) {
+			const hidden = id.length - identityCap + 1;
+			id = [...id.slice(0, identityCap - 1), truncateToWidth(hidden + " more record lines — open /ultrathink-ui", room)];
+		}
+		let booked = footerRows;
+		const footerBudget = Math.max(INSIGHT_FOOTER_FLOOR, INSIGHT_EXPANDED_ROWS - reserved - id.length);
+		if (booked.length > footerBudget) {
+			const hidden = booked.length - footerBudget + 1;
+			booked = [...booked.slice(0, footerBudget - 1), truncateToWidth(hidden + " more policy and limitation lines — open /ultrathink-ui", room)];
+		}
+		return { id, footer: booked, available: Math.max(0, INSIGHT_EXPANDED_ROWS - id.length - booked.length) };
+	};
+	let { id: shownIdentity, footer: shownFooter, available } = fitBookends(0);
+	if (detailsRows.length > 0 && available === 0) ({ id: shownIdentity, footer: shownFooter, available } = fitBookends(1));
 	if (detailsRows.length > available) {
-		// with zero detail room there is no row for the omission notice; the dashboard carries the rest
-		if (available === 0) return [...shownIdentity, ...shownFooter];
 		const shown = available - 1;
 		const notice = (detailsRows.length - shown) + " more detail lines — open /ultrathink-ui";
 		return [...shownIdentity, ...detailsRows.slice(0, shown), truncateToWidth(notice, room), ...shownFooter];
