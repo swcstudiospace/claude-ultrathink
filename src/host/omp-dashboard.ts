@@ -1,6 +1,6 @@
 import { formatP as formatDecisionP } from "../decisions/types.ts";
 import { MAX_BODY_CHARS } from "../teach/types.ts";
-import { sanitizeInsightText } from "./omp-insights.ts";
+import { RECORD_LIMIT_NOTE, sanitizeInsightText } from "./omp-insights.ts";
 import { paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
 import type {
 	InsightActionResult,
@@ -1066,6 +1066,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		return banner;
 	};
 
+	/** Neutral display-cap disclosure: shown even on healthy reads so a capped list is never mistaken for complete. */
+	const recordCapNote = (): RichLine[] =>
+		snapshot.limitations.some((entry) => entry.includes("Only the newest")) ? [{ text: RECORD_LIMIT_NOTE, tone: "meta" }] : [];
+
 	const panelEmptyCopy = (panel: InsightPanel): RichLine[] => {
 		switch (panel) {
 			case "jev":
@@ -1082,6 +1086,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				// Both collections are labeled independently even though they
 				// share one stacked list: an empty list means both are absent.
 				return [
+					...recordCapNote(),
 					{ text: "No lessons meet the promotion rules", tone: "head" },
 					{ text: "Eligible lessons are confirmed and unpromoted, with the configured occurrence count or playbook exception. Refresh after lesson state changes.", tone: "plain" },
 					{ text: "No promotions recorded for this project", tone: "head" },
@@ -1304,7 +1309,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			// Browse prefixes keep live policy plus the saved-rules caveat (never
 			// a fresh Jev or installation claim), the Jev latest-plan label, and
 			// the bounded partial qualifier beside the affected collection.
-			const prefix: RichLine[] = [...partialBanner()];
+			const prefix: RichLine[] = [...partialBanner(), ...recordCapNote()];
 			if (tab === "jev") prefix.unshift({ text: LATEST_PLAN_NOTE, tone: "meta" });
 			if (tab === "skills") {
 				prefix.unshift(

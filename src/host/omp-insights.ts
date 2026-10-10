@@ -422,7 +422,7 @@ const WORKER_NOTE = "Detached worker outcomes are not recorded. No completion or
 const PARTIAL_NOTE = "Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.";
 const SCAN_LIMIT_NOTE = "Showing up to 100 local records; this is not a complete inventory.";
 /** Neutral display-cap disclosure: a complete read capped for display is healthy, never a failed read. */
-const RECORD_LIMIT_NOTE = `Only the newest ${INSIGHT_MAX_ROWS} records are shown.`;
+export const RECORD_LIMIT_NOTE = `Only the newest ${INSIGHT_MAX_ROWS} records are shown.`;
 const CANCEL_NOTE = "Snapshot refresh was cancelled; showing available records.";
 
 /**
