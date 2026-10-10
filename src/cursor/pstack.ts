@@ -135,17 +135,69 @@ export function skillPath(resolved: PstackInput | undefined, name: string): { pa
 	}
 }
 
-/** Remove fenced code, inline code, and quoted spans that only mention a slash command. */
+/** Keep line breaks so a real command on a later line stays at the start of that line. */
+function blankKeepingBreaks(span: string): string {
+	return span.replace(/[^\r\n]/g, " ");
+}
+
+/** A `'` or `‘` after a letter or digit is an apostrophe (`don't`), not the start of a quote. */
+function isOpeningQuote(prompt: string, index: number): boolean {
+	const ch = prompt[index];
+	if (ch !== "'" && ch !== "\u2018") return false;
+	const prev = index === 0 ? "" : (prompt[index - 1] ?? "");
+	return prev === "" || /[\s([{"-]/.test(prev);
+}
+
+/** Closing delimiter for a quote opener. Curly quotes close on their matching twin. */
+function quoteCloser(opener: string): string {
+	if (opener === "\u201c") return "\u201d";
+	if (opener === "\u2018") return "\u2019";
+	return opener;
+}
+
+/**
+ * Blank fenced code, backtick spans, and quoted spans that mention a slash command.
+ * A quote may span lines: `"\n/gsd-ship\n"` is an example, not an invocation.
+ * Apostrophes in contractions are not quotes, so `don't\n/gsd-plan-phase` still counts.
+ */
 function withoutQuotedCommands(prompt: string): string {
-	return prompt
-		.replace(/```[\s\S]*?```/g, " ")
-		.replace(/`[^`]*`/g, " ")
-		.replace(/(['"])[^'"\n]*\/gsd-[a-z0-9-]+[^'"\n]*\1/g, " ");
+	let out = "";
+	let i = 0;
+	while (i < prompt.length) {
+		if (prompt.startsWith("```", i)) {
+			const end = prompt.indexOf("```", i + 3);
+			if (end < 0) {
+				out += blankKeepingBreaks(prompt.slice(i));
+				break;
+			}
+			out += blankKeepingBreaks(prompt.slice(i, end + 3));
+			i = end + 3;
+			continue;
+		}
+		const ch = prompt[i] ?? "";
+		const quoted = ch === '"' || ch === "\u201c" || isOpeningQuote(prompt, i);
+		if (ch === "`" || quoted) {
+			const closer = ch === "`" ? "`" : quoteCloser(ch);
+			const end = prompt.indexOf(closer, i + 1);
+			if (end < 0) {
+				out += ch;
+				i += 1;
+				continue;
+			}
+			const span = prompt.slice(i, end + closer.length);
+			out += ch === "`" || /\/gsd-[a-z0-9-]+/i.test(span) ? blankKeepingBreaks(span) : span;
+			i = end + closer.length;
+			continue;
+		}
+		out += ch;
+		i += 1;
+	}
+	return out;
 }
 
 /**
  * Invocations are `/gsd-*` tokens at the start of a line. A mention later in a sentence, or an example
- * inside quotes or backticks, is not one — `What does /gsd-ship do?` must not select a stage.
+ * inside quotes or backticks (including a quote that spans lines), is not one.
  */
 function commandInvocations(prompt: string): string[] {
 	const visible = withoutQuotedCommands(prompt.toLowerCase());

@@ -52,7 +52,7 @@ Every key is in [Configuration](../configuration.md#pstack-cursor-bridge).
 
 Use the `bin/ultrathink` from the clone. The `pstack` section names the deciding config file, the resolved plugin version and path, each stage's skills (a warning when a mapped name has no `SKILL.md`), and whether the hook entry is installed. `--json` prints the same findings. Nothing is changed.
 
-Submit a prompt such as `/gsd-plan-phase 24` in Cursor. With the bridge on and pstack installed, the agent receives an instruction that includes `architect` and `arena` and the path of each `SKILL.md`. The command has to be invoked at the start of a line. A mention later in a sentence or inside quotes, such as "What does /gsd-ship do?", is left alone, as is a prompt that is not a `/gsd-*` command, including a pstack command such as `/architect`.
+Submit a prompt such as `/gsd-plan-phase 24` in Cursor. With the bridge on and pstack installed, the agent receives an instruction that includes `architect` and `arena` and the path of each `SKILL.md`. The command has to be invoked at the start of a line. A mention later in a sentence or inside quotes, including a quote that spans lines, such as "What does /gsd-ship do?", is left alone, as is a prompt that is not a `/gsd-*` command, including a pstack command such as `/architect`.
 
 The plugin ultrathink resolves is the newest completed pstack directory under `<cursor dir>/plugins/cache/cursor-public/pstack` (a `plugin.json` whose name is `pstack`, plus a zero-byte `.cache-complete` marker).
 

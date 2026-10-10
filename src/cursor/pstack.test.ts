@@ -171,6 +171,16 @@ describe("detectStage", () => {
 		expect(detectStage("What does /gsd-ship do?").stage).toBeNull();
 		expect(detectStage('"/gsd-plan-phase"').stage).toBeNull();
 		expect(detectStage("`/gsd-ship`").stage).toBeNull();
+		expect(detectStage('"\n/gsd-ship\n"').stage).toBeNull();
+		expect(detectStage("'\n/gsd-plan-phase 23\n'").stage).toBeNull();
+		expect(detectStage("What does\n`/gsd-ship`\ndo?").stage).toBeNull();
+		expect(detectStage("```\n/gsd-ship\n```").stage).toBeNull();
+		expect(detectStage("\u201c\n/gsd-ship\n\u201d").stage).toBeNull();
+	});
+
+	test("a contraction before a command on the next line is still an invocation", () => {
+		expect(detectStage("don't stop\n/gsd-plan-phase 23").stage).toBe("plan");
+		expect(detectStage('notes\n"\n/gsd-ship\n"\n/gsd-plan-phase 23').stage).toBe("plan");
 	});
 
 	test("a command at the start of a later line is still an invocation", () => {

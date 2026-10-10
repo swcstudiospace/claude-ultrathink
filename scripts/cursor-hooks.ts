@@ -196,6 +196,15 @@ function commitHooks(
 	return { code: fail(log, "hooks.json changed while it was being updated; re-run the command") };
 }
 
+/** Puts the staged hook back after a refused install. `undefined` means the file did not exist. */
+function restoreStaged(file: string, previous: Buffer | undefined): void {
+	if (previous === undefined) {
+		rmSync(file, { force: true });
+		return;
+	}
+	writeFileSync(file, previous);
+}
+
 /** Creates dir (and parents) with `mode` only when missing; existing directories keep their mode. */
 function ensureDir(dir: string, mode: number): boolean {
 	if (existsSync(dir)) return false;
@@ -261,13 +270,26 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		const node = resolveNode(candidates);
 		if (node === undefined) return fail(log, `no executable node found (tried ${candidates.join(", ")})`);
 		const wanted: Json = { type: "command", command: hookCommand(node, staged), [OUR_MARKER]: true };
+		// Refuse a parseable but unusable hooks.json before copying the script.
+		// {"hooks":[]} is valid JSON and would otherwise replace a staged hook that never gets registered.
+		const preview = upsertHook(initial.config, wanted);
+		if (preview.reason) return fail(log, preview.reason);
+		const previous = existsSync(staged) ? readFileSync(staged) : undefined;
 		ensureDir(cursorDir, 0o700);
 		ensureDir(dirname(staged), 0o755);
-		copyFileSync(source, staged);
-		chmodSync(staged, 0o644);
+		try {
+			copyFileSync(source, staged);
+			chmodSync(staged, 0o644);
+		} catch (error) {
+			restoreStaged(staged, previous);
+			throw error;
+		}
 		log(`staged ${staged}`);
 		const committed = commitHooks(file, (current) => upsertHook(current, wanted), log, deps.beforeCommit);
-		if (committed.code !== 0) return committed.code;
+		if (committed.code !== 0) {
+			restoreStaged(staged, previous);
+			return committed.code;
+		}
 		log(
 			committed.action === "unchanged"
 				? `hooks.json: ${EVENT} entry already current`

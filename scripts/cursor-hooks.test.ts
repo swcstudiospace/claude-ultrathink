@@ -372,6 +372,52 @@ describe("main", () => {
 		});
 	});
 
+	test("a parseable but malformed hooks.json is refused before the hook file changes", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor);
+			const hooks = join(box.cursor, "hooks.json");
+			writeFileSync(hooks, '{"hooks":[]}\n');
+			mkdirSync(dirname(box.staged), { recursive: true });
+			writeFileSync(box.staged, "previous hook\n");
+			expect(box.run(["install"])).toBe(1);
+			expect(box.lines.join("\n")).toContain('"hooks" is not an object');
+			expect(readFileSync(box.staged, "utf8")).toBe("previous hook\n");
+			expect(readFileSync(hooks, "utf8")).toBe('{"hooks":[]}\n');
+		});
+	});
+
+	test("a refused install does not leave a new unregistered hook file", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor);
+			writeFileSync(join(box.cursor, "hooks.json"), '{"hooks":[]}\n');
+			expect(box.run(["install"])).toBe(1);
+			expect(existsSync(box.staged)).toBe(false);
+		});
+	});
+
+	test("a commit that never lands restores the previous staged hook", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor);
+			writeFileSync(join(box.cursor, "hooks.json"), "{}\n");
+			mkdirSync(dirname(box.staged), { recursive: true });
+			writeFileSync(box.staged, "previous hook\n");
+			let stamp = 0;
+			expect(
+				box.run(["install"], {
+					beforeCommit: () => {
+						stamp += 1;
+						writeFileSync(
+							join(box.cursor, "hooks.json"),
+							JSON.stringify({ hooks: { [EVENT]: [FOREIGN] }, stamp }),
+						);
+					},
+				}),
+			).toBe(1);
+			expect(readFileSync(box.staged, "utf8")).toBe("previous hook\n");
+			expect(box.list().some(isOwned)).toBe(false);
+		});
+	});
+
 	test("hooks.json edits that keep landing during the write are refused", () => {
 		sandbox((box) => {
 			let stamp = 0;

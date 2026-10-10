@@ -112,7 +112,15 @@ describe("ultrathink-cursor-pstack hook (spawned with node)", () => {
 
 	test("a question that only mentions a slash command prints {}", () => {
 		withHarness(({ run }) => {
-			for (const prompt of ["What does `/gsd-ship` do?", "What does /gsd-ship do?", '"/gsd-plan-phase"', "`/gsd-ship`"]) {
+			for (const prompt of [
+				"What does `/gsd-ship` do?",
+				"What does /gsd-ship do?",
+				'"/gsd-plan-phase"',
+				"`/gsd-ship`",
+				'"\n/gsd-ship\n"',
+				"'\n/gsd-plan-phase 23\n'",
+				"```\n/gsd-ship\n```",
+			]) {
 				const { status, stdout } = run(JSON.stringify({ prompt }));
 				expect(status).toBe(0);
 				expect(JSON.parse(stdout)).toEqual({});
