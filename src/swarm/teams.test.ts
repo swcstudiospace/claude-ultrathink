@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
 	type LaneHandle,
+	type LanePlan,
 	formatLaneHandles,
 	formatLaneStatusText,
 	laneDirs,
@@ -29,6 +30,8 @@ import {
 	type TeamsFs,
 	TEAMS_MAX_LANES,
 	TEAMS_USAGE,
+	toSwarmSpawnCard,
+	toSwarmStatusCard,
 } from "./teams.ts";
 
 const sha8 = (brief: string): string => createHash("sha256").update(brief, "utf8").digest("hex").slice(0, 8);
@@ -483,5 +486,122 @@ describe("display formatting", () => {
 		expect(TEAMS_USAGE).toContain("ULTRATHINK_SWARM_ROOT");
 		expect(TEAMS_USAGE).toContain("ULTRATHINK_SWARM_MAX_LANES");
 		expect(TEAMS_USAGE).toContain("status");
+	});
+});
+
+describe("toSwarmSpawnCard", () => {
+	const plans: LanePlan[] = [
+		{
+			id: "lane-1",
+			brief: "fix the gate",
+			laneBrief: "fix the gate + pstack block",
+			cwd: "/repo",
+			stateDir: "/s/aa11bb22-1-x1",
+			argv: [],
+			env: {},
+		},
+		{
+			id: "lane-2",
+			brief: "write the docs",
+			laneBrief: "write the docs + pstack block",
+			cwd: "/repo",
+			stateDir: "/s/cc33dd44-2-x2",
+			argv: [],
+			env: {},
+		},
+	];
+	const handles: LaneHandle[] = [
+		{ laneId: "aa11bb22-1-x1", pid: 4242, stateDir: "/s/aa11bb22-1-x1", logPath: "/s/aa11bb22-1-x1/run.log" },
+		{ laneId: "cc33dd44-2-x2", stateDir: "/s/cc33dd44-2-x2", logPath: "/s/cc33dd44-2-x2/run.log", error: "boom" },
+	];
+
+	test("joins briefs by position and carries each handle's pid, log, and start error", () => {
+		const card = toSwarmSpawnCard(handles, plans);
+		expect(card.total).toBe(2);
+		expect(card.lanes).toEqual([
+			{
+				laneId: "aa11bb22-1-x1",
+				brief: "fix the gate",
+				stateDir: "/s/aa11bb22-1-x1",
+				logPath: "/s/aa11bb22-1-x1/run.log",
+				pid: 4242,
+			},
+			{
+				laneId: "cc33dd44-2-x2",
+				brief: "write the docs",
+				stateDir: "/s/cc33dd44-2-x2",
+				logPath: "/s/cc33dd44-2-x2/run.log",
+				error: "boom",
+			},
+		]);
+		// Cards carry exactly the frozen keys: no pid on a failed lane, no error on a started one.
+		expect(Object.keys(card.lanes[0]!).sort()).toEqual(["brief", "laneId", "logPath", "pid", "stateDir"]);
+		expect(Object.keys(card.lanes[1]!).sort()).toEqual(["brief", "error", "laneId", "logPath", "stateDir"]);
+	});
+
+	test("spawned counts only lanes that actually started", () => {
+		expect(toSwarmSpawnCard(handles, plans).spawned).toBe(1);
+		const started = toSwarmSpawnCard(
+			[{ laneId: "aa11bb22-1-x1", pid: 7, stateDir: "/s/aa11bb22-1-x1", logPath: "/s/aa11bb22-1-x1/run.log" }],
+			plans,
+		);
+		expect(started.spawned).toBe(1);
+		const failed = toSwarmSpawnCard(
+			[{ laneId: "aa11bb22-1-x1", stateDir: "/s/aa11bb22-1-x1", logPath: "/s/aa11bb22-1-x1/run.log", error: "no pid" }],
+			plans,
+		);
+		expect(failed.spawned).toBe(0);
+		expect(failed.lanes[0]!.brief).toBe("fix the gate");
+	});
+
+	test("projects real planLanes + spawnLanes output without any real process", () => {
+		const dir = mkdtempSync(join(tmpdir(), "teams-card-"));
+		const briefs = ["alpha task", "beta task", "gamma task"];
+		const plans = planLanes(briefs, baseOpts(dir));
+		const spawner = recordingSpawner(true); // the second lane fails to start
+		const handles = spawnLanes(plans, spawner.fn, realFs);
+		const card = toSwarmSpawnCard(handles, plans);
+		expect(card.total).toBe(3);
+		expect(card.spawned).toBe(2);
+		// Briefs join by position, and every log path is the handle's own run log.
+		expect(card.lanes.map((lane) => lane.brief)).toEqual(briefs);
+		for (const lane of card.lanes) expect(lane.logPath).toBe(join(lane.stateDir, "run.log"));
+		expect(card.lanes[1]!.error).toBe("boom");
+		expect("pid" in card.lanes[1]!).toBe(false);
+	});
+
+	test("empty handles and plans produce an empty lanes array, never undefined fields", () => {
+		expect(toSwarmSpawnCard([], [])).toEqual({ spawned: 0, total: 0, lanes: [] });
+	});
+});
+
+describe("toSwarmStatusCard", () => {
+	test("maps success rows to counts and error rows to bare error lanes, both with the run log path", () => {
+		const rows: LaneStatusRow[] = [
+			{
+				laneId: "aa11bb22-1-x1",
+				logPath: "/s/aa11bb22-1-x1/run.log",
+				total: 3,
+				byState: { DONE: 2, RUNNING: 1 },
+				done: 2,
+				summary: "aa11bb22-1-x1: 3 tasks — 2 done",
+			},
+			{ laneId: "cc33dd44-2-x2", logPath: "/s/cc33dd44-2-x2/run.log", error: "probe timed out" },
+		];
+		const card = toSwarmStatusCard(rows, 2);
+		expect(card.omitted).toBe(2);
+		expect(card.lanes).toEqual([
+			{ laneId: "aa11bb22-1-x1", summary: "aa11bb22-1-x1: 3 tasks — 2 done", logPath: "/s/aa11bb22-1-x1/run.log", done: 2, total: 3 },
+			{ laneId: "cc33dd44-2-x2", summary: "", logPath: "/s/cc33dd44-2-x2/run.log", error: "probe timed out" },
+		]);
+		// A probed lane carries no error key; a failed probe lane carries none of the counts.
+		expect("error" in card.lanes[0]!).toBe(false);
+		expect("done" in card.lanes[1]!).toBe(false);
+		expect(card.lanes[1]!.summary).toBe("");
+	});
+
+	test("omitted passes through even with no rows, and lanes is always an array", () => {
+		expect(toSwarmStatusCard([], 5)).toEqual({ lanes: [], omitted: 5 });
+		expect(toSwarmStatusCard([], 0)).toEqual({ lanes: [], omitted: 0 });
 	});
 });

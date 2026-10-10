@@ -451,3 +451,67 @@ export function formatLaneStatusText(rows: readonly LaneStatusRow[], omitted = 0
 		);
 	return lines.join("\n");
 }
+
+/** One GenUI card lane: the planned brief, where its state and log live, and how (or whether) it started. */
+export interface SwarmLaneCard {
+	laneId: string;
+	brief: string;
+	stateDir: string;
+	logPath: string;
+	pid?: number;
+	error?: string;
+}
+
+/** The spawn reply as a card snapshot: how many lanes started out of how many planned, one card per lane. */
+export interface SwarmSpawnCardSnapshot {
+	spawned: number;
+	total: number;
+	lanes: SwarmLaneCard[];
+}
+
+/** One status card lane: the lane's own summary line and counts, or the probe error in their place; both carry the run log path. */
+export type SwarmStatusLane =
+	| { laneId: string; summary: string; logPath: string; done: number; total: number }
+	| { laneId: string; summary: string; logPath: string; error: string };
+
+/** The status reply as a card snapshot, plus how many discovered lanes the recency bound hid. */
+export interface SwarmStatusCardSnapshot {
+	lanes: SwarmStatusLane[];
+	omitted: number;
+}
+
+/**
+ * Project spawn results into a card snapshot: each handle joins its plan by position, so the lane card
+ * carries the plan's display brief plus the handle's state dir, log path, pid, or start error. A plain
+ * projection — text sanitization stays at render time, and nothing here touches fs or env.
+ */
+export function toSwarmSpawnCard(handles: readonly LaneHandle[], plans: readonly LanePlan[]): SwarmSpawnCardSnapshot {
+	return {
+		spawned: handles.filter((handle) => handle.pid !== undefined).length,
+		total: plans.length,
+		lanes: handles.map((handle, i) => ({
+			laneId: handle.laneId,
+			brief: plans[i]?.brief ?? handle.laneId,
+			stateDir: handle.stateDir,
+			logPath: handle.logPath,
+			...(handle.pid === undefined ? {} : { pid: handle.pid }),
+			...(handle.error === undefined ? {} : { error: handle.error }),
+		})),
+	};
+}
+
+/**
+ * Project status rows into a card snapshot: a probed lane keeps its own summary and counts; a failed probe
+ * becomes a bare error lane with empty counts; every lane carries its run log path, and the discovery
+ * bound's omitted count passes through untouched.
+ */
+export function toSwarmStatusCard(rows: readonly LaneStatusRow[], omitted: number): SwarmStatusCardSnapshot {
+	return {
+		lanes: rows.map((row) =>
+			"error" in row
+				? { laneId: row.laneId, summary: "", logPath: row.logPath, error: row.error }
+				: { laneId: row.laneId, summary: row.summary, logPath: row.logPath, done: row.done, total: row.total },
+		),
+		omitted,
+	};
+}
