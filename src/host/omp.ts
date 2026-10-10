@@ -1418,10 +1418,12 @@ export function createOmpExtension(
 							if (parsed.kind === "status") {
 								const discovery = laneDirs(dir);
 								const rows = await laneStatus(discovery.lanes, orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
-								// The card is only sent when a renderer can actually draw it; otherwise the full text reply keeps log paths and errors visible.
+								const full = formatLaneStatusText(rows, discovery.omitted);
+								// The card summarizes; the text listing is the complete enumeration (every reported
+								// lane with its counts or error and log path), so the two never point at each
+								// other circularly. Hosts without a card renderer get the listing alone.
 								if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${rows.filter((row) => !("error" in row)).length}/${rows.length} reported${discovery.omitted > 0 ? ` · ${discovery.omitted} older not shown` : ""}`, toSwarmStatusCard(rows, discovery.omitted));
-								else return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
-								return;
+								return sendSessionText(sessionId, ctx, full);
 							}
 							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
 							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
