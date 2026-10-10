@@ -1,7 +1,7 @@
 import { formatP as formatDecisionP } from "../decisions/types.ts";
 import { MAX_BODY_CHARS } from "../teach/types.ts";
 import { sanitizeInsightText } from "./omp-insights.ts";
-import { truncateToWidth, visibleWidth } from "./omp-paint.ts";
+import { paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
 import type {
 	InsightActionResult,
 	InsightDecision,
@@ -46,6 +46,10 @@ const PREVIEW_MAX_CHARS = 200_000;
 const MIN_MUTATE_COLS = 24;
 const MIN_MUTATE_ROWS = 8;
 const MIN_TAB_STRIP_COLS = 32;
+const FALLBACK_CONTENT_ROWS = 12;
+const POLICY_OFF_REASON = "Teaching is off. Saved lessons remain readable; confirmation, preview, and installation are unavailable.";
+const LATEST_PLAN_NOTE = "Latest saved plan — not a complete history.";
+const PARTIAL_COPY = "Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.";
 // Header is always the title row plus the tab-strip/position row.
 const HEAD_ROWS = 2;
 // Lesson bodies arrive sanitized and bounded by the read model at the imported
@@ -132,7 +136,7 @@ function toDecisionRows(snapshot: InsightSnapshot): DecisionRow[] {
 			point,
 			action: cleanInline(raw.action, 80) || "Not recorded",
 			outcome: cleanInline(raw.outcome, 40) || "Not recorded",
-			model: cleanInline(raw.model, 80) || "Not recorded",
+		model: cleanInline(raw.model, 200) || "Not recorded",
 			pText: formatP(raw.p) ?? "Not recorded",
 			failure:
 				cleanInline(raw.error, 120) ||
@@ -186,10 +190,14 @@ type DashboardAction = { id: string; label: string; mutating: boolean; enabled: 
 
 type FocusRegion = "tabs" | "list" | "details" | "actions";
 type ViewKind = "browse" | "detail" | "preview" | "confirm-candidate" | "confirm-install";
-
-// The host delivers raw terminal bytes to handleInput (data: string).
-// Decode the same wire protocols the host key matcher understands — legacy
-// xterm, SS3 application-cursor, CSI-u/Kitty, and modifyOtherKeys — without
+/** Presentation tone for one logical line; style is applied after wrapping so ANSI never splits across rows. */
+type Tone = "plain" | "body" | "head" | "meta" | "warn" | "error" | "success";
+interface RichLine {
+	text: string;
+	tone: Tone;
+}
+type NoticeKind = "info" | "warn" | "error" | "success";
+ // The host delivers raw terminal bytes to handleInput (data: string).
 // importing the host runtime. Releases never act; modified keys (ctrl/alt or
 // shift beyond shift+tab) never act either.
 const CSI_U = /^\x1b\[(\d+)((?::\d+)*)(?:;(\d+)((?::\d+)*))?u$/;
@@ -320,8 +328,32 @@ export function createInsightDashboard(
 	let overviewScroll = 0;
 	// previewLines() is width-independent; memoize on preview identity so action
 	// gates and scroll handlers reuse the render's computation.
-	let previewMemo: { preview: SkillPreview; result: { lines: string[]; clipped: boolean } } | undefined;
+	let previewMemo: { preview: SkillPreview; result: { lines: RichLine[]; clipped: boolean } } | undefined;
 	let notice = "";
+	let noticeKind: NoticeKind = "info";
+	const setNotice = (text: string, kind: NoticeKind = "info"): void => {
+		notice = text;
+		noticeKind = kind;
+	};
+	// Guarded host paint: every access falls back to plain text, so monochrome
+	// hosts keep the same markers and layout. Applied after sanitation only.
+	const dashboardPaint = paint(options.theme);
+	const styleRow = (tone: Tone, row: string): string => {
+		switch (tone) {
+			case "head":
+				return dashboardPaint.bold(row);
+			case "meta":
+				return dashboardPaint.fg("muted", row);
+			case "warn":
+				return dashboardPaint.fg("warning", row);
+			case "error":
+				return dashboardPaint.fg("error", row);
+			case "success":
+				return dashboardPaint.fg("success", row);
+			default:
+				return row;
+		}
+	};
 	// True while the follow-up refresh owned by a settled confirm/install is in
 	// flight. The receipt in `notice` survives that refresh (busy render,
 	// success, failure, or disappeared selection); the next explicit manual
@@ -348,14 +380,18 @@ export function createInsightDashboard(
 		requestRender();
 	};
 
-	const viewportHeight = (): number => {
+	const rawHeight = (): number | undefined => {
 		try {
-			const rows = options.rows?.() ?? 40;
-			return Number.isFinite(rows) && rows > 0 ? Math.floor(rows) : 40;
+			const rows = options.rows?.();
+			return typeof rows === "number" && Number.isFinite(rows) && rows > 0 ? Math.floor(rows) : undefined;
 		} catch {
-			return 40;
+			return undefined;
 		}
 	};
+	// Unknown host height is never a fictional 40 physical rows: chrome renders
+	// without a total cap while every content window falls back to the bounded
+	// 12-row window through layoutFor.
+	const viewportHeight = (): number => rawHeight() ?? Number.POSITIVE_INFINITY;
 
 	const decisions = (): DecisionRow[] => {
 		try {
@@ -430,14 +466,21 @@ export function createInsightDashboard(
 		selectedKeys[panel] = rows[cursors[panel]]?.key;
 	};
 
-	const canMutate = (width: number): boolean => width >= MIN_MUTATE_COLS && viewportHeight() >= MIN_MUTATE_ROWS;
-
+	// With unknown host height the mutation guard is width-based only; a known
+	// short viewport still refuses mutations with resize guidance.
+	const canMutate = (width: number): boolean => width >= MIN_MUTATE_COLS && (rawHeight() !== undefined ? viewportHeight() >= MIN_MUTATE_ROWS : true);
+	const isPolicyOff = (): boolean => snapshot.policy !== undefined && !snapshot.policy.enabled;
+	// Known teaching-off disables only these explicit-mutation entries; the
+	// adapter revalidates on dispatch, so this is an affordance, not the guard.
+	const OFF_GATED: Record<string, true> = { "confirm-yes": true, "open-confirm": true, "open-preview": true, "open-install": true, "install-yes": true };
 	const actions = (width: number): DashboardAction[] => {
 		const tiny = !canMutate(width);
-		const gate = (action: DashboardAction): DashboardAction =>
-			action.mutating && tiny ? { ...action, enabled: false, disabledReason: TINY_REASON } : action;
-		// A clipped preview exceeded the 60KB producer bound: its tail/ownership
-		// marker cannot be reviewed, so every install path stays disabled.
+		const off = isPolicyOff();
+		const gate = (action: DashboardAction): DashboardAction => {
+			if (action.mutating && tiny) return { ...action, enabled: false, disabledReason: TINY_REASON };
+			if (off && OFF_GATED[action.id] === true && action.enabled) return { ...action, enabled: false, disabledReason: POLICY_OFF_REASON };
+			return action;
+		};
 		const previewClipped = pendingPreview !== undefined && previewLines().clipped;
 		const installBlocked: DashboardAction | undefined = previewClipped
 			? { id: "open-install", label: "Install into Omp", mutating: true, enabled: false, disabledReason: CLIPPED_PREVIEW_REASON }
@@ -520,6 +563,13 @@ export function createInsightDashboard(
 
 	const focusable = (): FocusRegion[] => {
 		if (view === "confirm-candidate" || view === "confirm-install") return ["actions"];
+		// Preview focus stays on the draft viewport and the action strip:
+		// unrelated tabs are out of the Tab cycle while previewing.
+		if (view === "preview") {
+			const regions: FocusRegion[] = ["details"];
+			if (visibleActions(lastWidth).length > 0) regions.push("actions");
+			return regions;
+		}
 		const regions: FocusRegion[] = ["tabs"];
 		// The size guard only gates data-changing actions. List navigation
 		// (Tab focus and ↑/↓ selection) stays available below the mutation
@@ -527,7 +577,7 @@ export function createInsightDashboard(
 		if (view === "browse" && (tab === "jev" || tab === "moments" || tab === "skills") && listRows(tab).length > 0) {
 			regions.push("list");
 		}
-		if (view === "detail" || view === "preview") regions.push("details");
+		if (view === "detail") regions.push("details");
 		if (visibleActions(lastWidth).length > 0) regions.push("actions");
 		return regions;
 	};
@@ -576,102 +626,112 @@ export function createInsightDashboard(
 
 	const snapshotTime = (): string => formatTime(snapshot.at);
 
-	const policyLines = (): string[] => {
+	const policyLines = (): RichLine[] => {
 		const policy = snapshot.policy;
-		if (!policy) return ["Autonomy policy is unavailable. Saved lessons remain readable; no current policy can be inferred."];
-		const lines: string[] = [];
-		if (!policy.enabled) lines.push("Teaching is off. Saved lessons remain readable; confirmation, preview, and installation are unavailable.");
+		if (!policy) return [{ text: "Autonomy policy is unavailable. Saved lessons remain readable; no current policy can be inferred.", tone: "warn" }];
+		const lines: RichLine[] = [];
+		if (!policy.enabled) lines.push({ text: POLICY_OFF_REASON, tone: "warn" });
 		const capture = cleanInline(policy.capture, 24);
-		lines.push(
-			`Capture: ${capture || "Not recorded"} · Recall: ${policy.recall ? `enabled (limit ${policy.recallLimit}, ${policy.recallChars} chars)` : "disabled"} · Auto-promotion: ${policy.autoPromote ? "enabled" : "disabled"} · Threshold: ${policy.promoteAfter}`,
-		);
+		lines.push({
+			text: `Capture: ${capture || "Not recorded"} · Recall: ${policy.recall ? `enabled (limit ${policy.recallLimit}, ${policy.recallChars} chars)` : "disabled"} · Auto-promotion: ${policy.autoPromote ? "enabled" : "disabled"} · Threshold: ${policy.promoteAfter}`,
+			tone: "plain",
+		});
 		if (!policy.jevEnabled) {
-			lines.push("Jev is off for current policy. Recorded past decisions remain readable; this view performs no evaluation.");
+			lines.push({ text: "Jev is off for current policy. Recorded past decisions remain readable; this view performs no evaluation.", tone: "warn" });
 		}
 		return lines;
 	};
 
-	const detailLines = (): string[] => {
+	const detailLines = (): RichLine[] => {
 		if (tab === "jev") {
 			const row = currentDecision();
 			if (!row) return [];
 			const source = row.source;
-			const lines = [
-				`Point: ${row.point}`,
-				`Outcome: ${row.outcome}`,
-				`Action: ${row.action}`,
-				`Model: ${row.model}`,
-				`Settled: ${formatTime(source.at)}`,
+			const lines: RichLine[] = [
+				{ text: LATEST_PLAN_NOTE, tone: "meta" },
+				...partialBanner(),
+				{ text: `Point: ${row.point}`, tone: "head" },
+				{ text: `Outcome: ${row.outcome}`, tone: "plain" },
+				{ text: `Action: ${row.action}`, tone: "plain" },
+				{ text: `Model: ${row.model}`, tone: "plain" },
+				{ text: `Settled: ${formatTime(source.at)}`, tone: "meta" },
 			];
 			const threshold = formatP(source.threshold) ?? "Not recorded";
 			const questions = source.questions.slice(0, COLLECTION_CAP);
 			if (questions.length > 0) {
-				lines.push("Recorded question probabilities:");
+				lines.push({ text: "Recorded question probabilities:", tone: "plain" });
 				for (const question of questions) {
 					const label = cleanInline(question.key, 100);
 					const p = formatP(question.p);
 					if (label === "") continue;
-					lines.push(`  ${label} · P ${p ?? "Not recorded"}`);
+					lines.push({ text: `  ${label} · P ${p ?? "Not recorded"}`, tone: "plain" });
 				}
 			} else {
-				lines.push(`P: ${row.pText} · Threshold: ${threshold}`);
+				lines.push({ text: `P: ${row.pText} · Threshold: ${threshold}`, tone: "plain" });
 			}
-			if (questions.length > 0) lines.push(`Threshold: ${threshold}`);
+			if (questions.length > 0) lines.push({ text: `Threshold: ${threshold}`, tone: "plain" });
 			const latency = source.latencyMs;
 			const attempts = source.attempts;
 			if (latency !== undefined || attempts !== undefined) {
-				lines.push(
-					`Latency: ${latency !== undefined ? `${latency} ms` : "Not recorded"} · Attempts: ${attempts !== undefined ? String(attempts) : "Not recorded"}`,
-				);
+				lines.push({
+					text: `Latency: ${latency !== undefined ? `${latency} ms` : "Not recorded"} · Attempts: ${attempts !== undefined ? String(attempts) : "Not recorded"}`,
+					tone: "meta",
+				});
 			}
-			if (source.cost !== undefined) lines.push(`Cost: ${String(source.cost)}`);
-			if (row.failure) lines.push(`Failure: ${row.failure}`);
+			if (source.cost !== undefined) lines.push({ text: `Cost: ${String(source.cost)}`, tone: "plain" });
+			if (row.failure) lines.push({ text: `Failure: ${row.failure}`, tone: "error" });
 			return lines;
 		}
 		const row = currentLesson();
 		if (!row) return [];
 		const source = row.source;
-		const lines = [
-			`Title: ${row.title}`,
-			`Id: ${cleanInline(row.id, 120)}`,
-			`Lifecycle: ${row.status} · Kind: ${row.kind}${row.occurrences !== undefined ? ` · Occurrences: ${row.occurrences}` : ""}`,
-			`Description: ${cleanInline(source.description, 400) || "Not recorded"}`,
+		const lines: RichLine[] = [
+			...partialBanner(),
+			{ text: `Title: ${row.title}`, tone: "head" },
+			{ text: `Id: ${cleanInline(row.id, 120)}`, tone: "plain" },
+			{ text: `Lifecycle: ${row.status} · Kind: ${row.kind}${row.occurrences !== undefined ? ` · Occurrences: ${row.occurrences}` : ""}`, tone: "plain" },
+			{ text: `Description: ${cleanInline(source.description, 400) || "Not recorded"}`, tone: "plain" },
 		];
 	// The body arrives sanitized and bounded from the read model; every in-bound
 	// line stays complete here and the viewport wraps/scrolls it into cells.
 	const body = cleanText(source.body, MAX_BODY_CHARS);
 	if (body) {
-		lines.push("Body:");
-		for (const chunk of body.split("\n")) lines.push(`  ${chunk}`);
+		lines.push({ text: "Body:", tone: "meta" });
+		for (const chunk of body.split("\n")) lines.push({ text: `  ${chunk}`, tone: "body" });
 	}
+		// Detail provenance uses the producer's own bounds (phase 300, artifact
+		// 200, related/supersedes 80, skill 120, path 300): in-bound values wrap
+		// and scroll complete instead of a silent narrower recap.
 		const origin = cleanInline(source.origin, 60);
-			const host = cleanInline(source.host, 60);
-		if (origin || host) lines.push(`Provenance: ${[origin, host ? `host ${host}` : ""].filter(Boolean).join(" · ") || "Not recorded"}`);
-		const phase = cleanInline(source.sourcePhase, 60);
+			const host = cleanInline(source.host, 120);
+		if (origin || host) lines.push({ text: `Provenance: ${[origin, host ? `host ${host}` : ""].filter(Boolean).join(" · ") || "Not recorded"}`, tone: "meta" });
+		const phase = cleanInline(source.sourcePhase, 300);
 			const artifacts = Array.isArray(source.sourceArtifacts) ? source.sourceArtifacts : [];
 		if (phase || artifacts.length > 0) {
 			const shown = artifacts
 				.slice(0, 8)
-				.map((item) => cleanInline(item, 80))
+				.map((item) => cleanInline(item, 200))
 				.filter(Boolean);
 			const omitted = artifacts.length - shown.length;
-			lines.push(`Sources: ${[phase, ...shown].filter(Boolean).join(" · ") || "Not recorded"}${omitted > 0 ? ` · ${omitted} more` : ""}`);
+			lines.push({ text: `Sources: ${[phase, ...shown].filter(Boolean).join(" · ") || "Not recorded"}${omitted > 0 ? ` · ${omitted} more` : ""}`, tone: "meta" });
 		}
-		lines.push(`Created: ${formatTime(source.createdAt)} · Last seen: ${formatTime(source.lastSeenAt)}`);
+		lines.push({ text: `Created: ${formatTime(source.createdAt)} · Last seen: ${formatTime(source.lastSeenAt)}`, tone: "meta" });
 			const recalled = source.recalled;
-		if (recalled !== undefined) lines.push(`Stored recall count: ${recalled}`);
+		if (recalled !== undefined) lines.push({ text: `Stored recall count: ${recalled}`, tone: "meta" });
 			const related = Array.isArray(source.relatedIds) ? source.relatedIds : [];
 			const supersedes = source.supersedes === undefined ? [] : [source.supersedes];
 			if (related.length > 0 || supersedes.length > 0) {
-				lines.push(
-					`Related: ${related.map((item) => cleanInline(item, 48)).filter(Boolean).join(", ") || "none"} · Supersedes: ${supersedes.map((item) => cleanInline(item, 48)).filter(Boolean).join(", ") || "none"}`,
-				);
+				lines.push({
+					text: `Related: ${related.map((item) => cleanInline(item, 80)).filter(Boolean).join(", ") || "none"} · Supersedes: ${supersedes.map((item) => cleanInline(item, 80)).filter(Boolean).join(", ") || "none"}`,
+					tone: "meta",
+				});
 			}
 	const promotion = source.promoted;
 	if (promotion) {
-		lines.push(
-			`Promotion recorded — current installation not verified · Skill: ${cleanInline(promotion.skill, 80) || "Not recorded"} · Target: ${cleanInline(promotion.target, 24) || "Not recorded"} · At: ${formatTime(promotion.at)}${promotion.path ? ` · Path: ${cleanInline(promotion.path, 100)}` : ""}`,
-		);
+		lines.push({
+			text: `Promotion recorded — current installation not verified · Skill: ${cleanInline(promotion.skill, 120) || "Not recorded"} · Target: ${cleanInline(promotion.target, 24) || "Not recorded"} · At: ${formatTime(promotion.at)}${promotion.path ? ` · Path: ${cleanInline(promotion.path, 300)}` : ""}`,
+			tone: "warn",
+		});
 	}
 		return lines;
 	};
@@ -708,17 +768,17 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	 * strip's confirm/preview actions, so a freshly opened detail always shows
 	 * them first and scrolling can always bring them back at any viewport.
 	 */
-	const detailFactRows = (width: number): string[] => {
+	const detailFactRows = (): RichLine[] => {
 		if (tab === "jev") return [];
 		const row = currentLesson();
 		if (!row) return [];
 		const reason = eligibilityLine(row);
-		return reason ? wrappedRows([reason], width) : [];
+		return reason ? [{ text: reason, tone: "plain" }] : [];
 	};
 
-	const previewLines = (): { lines: string[]; clipped: boolean } => {
+	const previewLines = (): { lines: RichLine[]; clipped: boolean } => {
 		if (!pendingPreview) {
-			return { lines: ["Preview unavailable. Go back and preview again."], clipped: false };
+			return { lines: [{ text: "Preview unavailable. Go back and preview again.", tone: "plain" }], clipped: false };
 		}
 		if (previewMemo?.preview === pendingPreview) return previewMemo.result;
 		const preview: SkillPreview = pendingPreview;
@@ -735,42 +795,44 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		const text = overBound ? "" : cleanText(preview.content, PREVIEW_MAX_CHARS);
 		const clipped = overBound || utf8Bytes(text) > PREVIEW_MAX_BYTES;
 		const contentLines = text.split("\n");
-		const header = [
-			"Preview only — not installed. Deterministic content from the selected lesson.",
-			`Draft: ${name} · Source: ${sourceId || "Not recorded"} · Target: Omp`,
-			`Description: ${description}`,
-			"Terminal controls are removed from this display; existing draft redaction warnings are shown below.",
+		const header: RichLine[] = [
+			{ text: "Preview only — not installed. Deterministic content from the selected lesson.", tone: "head" },
+			{ text: `Draft: ${name} · Source: ${sourceId || "Not recorded"} · Target: Omp`, tone: "plain" },
+			{ text: `Description: ${description}`, tone: "plain" },
+			{ text: "Terminal controls are removed from this display; existing draft redaction warnings are shown below.", tone: "meta" },
 		];
-		const warningLines = warnings.map((warning) => `Warning: ${warning}`);
+		const warningLines: RichLine[] = warnings.map((warning): RichLine => ({ text: `Warning: ${warning}`, tone: "warn" }));
 		// A clipped preview exceeded the producer bound: the tail/ownership marker
 		// cannot be reviewed, so install stays disabled and nothing claims review
 		// of regenerated content under this consent.
-		if (clipped) warningLines.push("Preview exceeds the 60KB bound; draft content is withheld and install is unavailable.");
-		const result = {
-			// In-bound lines stay whole and scrollable. An over-bound draft is
-			// withheld, not expensively wrapped into an unreviewable fragment.
-			lines: [...header, ...warningLines, ...(clipped ? [] : ["---", ...contentLines.map((line) => cleanInline(line, PREVIEW_MAX_CHARS))])],
-			clipped,
-		};
+		if (clipped) warningLines.push({ text: "Preview exceeds the 60KB bound; draft content is withheld and install is unavailable.", tone: "warn" });
+		// Draft source text is already sanitized whole above; per-line display
+		// keeps every in-bound line (leading/internal spaces included) instead
+		// of folding it into a shell label.
+		const content: RichLine[] = clipped
+			? []
+			: [{ text: "---", tone: "meta" }, ...contentLines.map((line): RichLine => ({ text: line, tone: "body" }))];
+		const lines = [...header, ...warningLines, ...content];
+		const result = { lines, clipped };
 		previewMemo = { preview, result };
 		return result;
 	};
 
-	const candidateConfirmLines = (row: LessonRow): string[] => [
-		"Confirm this candidate?",
-		`Confirm lesson ${row.title} (${row.id}) for the current project. Existing retention may run or queue; this action does not install a skill.`,
+	const candidateConfirmLines = (row: LessonRow): RichLine[] => [
+		{ text: "Confirm this candidate?", tone: "head" },
+		{ text: `Confirm lesson ${row.title} (${row.id}) for the current project. Existing retention may run or queue; this action does not install a skill.`, tone: "plain" },
 	];
 
-	const installConfirmLines = (): string[] => {
+	const installConfirmLines = (): RichLine[] => {
 		const name = pendingPreview ? cleanInline(pendingPreview.name, 80) || "the preview" : "the preview";
 		return [
-			"Install this preview into Omp?",
-			`Source lesson: ${pendingPreview ? cleanInline(pendingPreview.selection.id, 120) : "Not recorded"}`,
-			`Install ${name} into Omp managed skills. Only an owned generated slot may be updated; authored, foreign, symlinked, or conflicting slots are refused.`,
+			{ text: "Install this preview into Omp?", tone: "head" },
+			{ text: `Source lesson: ${pendingPreview ? cleanInline(pendingPreview.selection.id, 120) : "Not recorded"}`, tone: "plain" },
+			{ text: `Install ${name} into Omp managed skills. Only an owned generated slot may be updated; authored, foreign, symlinked, or conflicting slots are refused.`, tone: "plain" },
 		];
 	};
 
-	const confirmBodyLines = (): string[] => {
+	const confirmBodyLines = (): RichLine[] => {
 		if (view === "confirm-install") return installConfirmLines();
 		if (view === "confirm-candidate" && confirmTarget) return candidateConfirmLines(confirmTarget);
 		return [];
@@ -782,26 +844,26 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	 */
 	const statusRows = (width: number): string[] => {
 		const status: string[] = [];
-		const emit = (text: string): void => {
-			status.push(fitRow(text, width));
+		const emit = (text: string, tone: Tone = "plain"): void => {
+			status.push(styleRow(tone, fitRow(text, width)));
 		};
-		const emitWrapped = (text: string, indent = ""): void => {
-			for (const line of wrapRow(text, width, indent)) emit(line);
+		const emitWrapped = (text: string, tone: Tone = "plain", indent = ""): void => {
+			for (const line of wrapRow(text, width, indent)) emit(line, tone);
 		};
 		if (snapshotError) {
-			emitWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`);
+			emitWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`, "error");
 		}
 		if (busy) {
 			emit(`${busy.label}${busyCancelled ? " · cancelling…" : "…"}`);
 			// The settled confirm/install receipt stays on screen while its
 			// owned follow-up refresh re-reads; every other busy run keeps the
 			// existing behavior of showing only the busy label.
-			if (busy.kind === "refresh" && actionRefresh && notice) emitWrapped(notice);
+			if (busy.kind === "refresh" && actionRefresh && notice) emitWrapped(notice, noticeKind === "info" ? "plain" : noticeKind);
 		} else if (notice) {
-			emitWrapped(notice);
+			emitWrapped(notice, noticeKind === "info" ? "plain" : noticeKind);
 		}
 		if (!canMutate(width)) {
-			emitWrapped(TINY_REASON);
+			emitWrapped(TINY_REASON, "warn");
 		}
 		return status;
 	};
@@ -815,14 +877,17 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		const rows: string[] = [];
 		const tiny = !canMutate(width);
 		for (const [index, action] of list.entries()) {
-			const marker = focus === "actions" && (actionCursor[view] ?? 0) === index ? ">" : " ";
+			const focused = focus === "actions" && (actionCursor[view] ?? 0) === index;
+			const marker = focused ? ">" : " ";
 			const reason = action.disabledReason ?? TINY_REASON;
 			const state = action.enabled ? "" : tiny && reason === TINY_REASON ? " (Unavailable)" : ` (Unavailable: ${reason})`;
-			for (const line of wrapRow(`${marker} ${action.label}${state}`, width, "")) rows.push(fitRow(line, width));
+			for (const line of wrapRow(`${marker} ${action.label}${state}`, width, "")) {
+				const fitted = fitRow(line, width);
+				rows.push(!action.enabled && state !== "" ? styleRow("warn", fitted) : focused ? dashboardPaint.fg("accent", fitted) : fitted);
+			}
 		}
 		return rows;
 	};
-
 	/**
 	 * Every non-content row, built exactly as emitted: status, action strip,
 	 * and help. Sizing the content window against this tail keeps header,
@@ -831,7 +896,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	const buildTail = (width: number, list: DashboardAction[]): string[] => [
 		...statusRows(width),
 		...actionRows(width, list),
-		fitRow(helpLine(), width),
+		styleRow("meta", fitRow(helpLine(), width)),
 	];
 
 	/** The affirmative may fire only when its full identity/effect text fits the actual content window. */
@@ -840,14 +905,9 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		if (body.length === 0) return false;
 		const tail = buildTail(width, list);
 		const budget = Math.max(0, viewportHeight() - HEAD_ROWS - tail.length);
-		return wrappedRows(body, width).length <= budget;
+		return body.flatMap((line) => wrapRow(line.text, width, "")).length <= budget;
 	};
 
-	/**
-	 * actions() plus the viewport-fit gate: never silently clip an identity and
-	 * still offer the mutation. Tiny and clipped-preview gates live in actions();
-	 * this layer only refuses an affirmative whose text cannot be reviewed.
-	 */
 	const visibleActions = (width: number): DashboardAction[] => {
 		const list = actions(width);
 		if (view !== "confirm-candidate" && view !== "confirm-install") return list;
@@ -864,11 +924,11 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	 * viewport: it names the withheld action and the resize path explicitly, so
 	 * nothing is silently clipped and no affirmative is offered on unseen text.
 	 */
-	const confirmRefusalLines = (): string[] => {
+	const confirmRefusalLines = (): RichLine[] => {
 		const label = view === "confirm-install" ? "Install into Omp" : "Confirm candidate";
 		return [
-			`${label} is withheld: the full identity and effect do not fit this viewport.`,
-			"Resize to review the complete text; browsing and Escape remain available. No action was taken.",
+			{ text: `${label} is withheld: the full identity and effect do not fit this viewport.`, tone: "warn" },
+			{ text: "Resize to review the complete text; browsing and Escape remain available. No action was taken.", tone: "warn" },
 		];
 	};
 
@@ -884,13 +944,14 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	/**
 	 * The single physical-window budget shared by render, scroll/page steps,
 	 * and clamps: header plus the exact tail (status, strip, help) are
-	 * reserved first, so every consumer windows the same remainder.
+	 * reserved first, so every consumer windows the same remainder. Unknown
+	 * host height falls back to the bounded 12-row content window.
 	 */
 	const layoutFor = (width: number): DashboardLayout => {
 		const list = visibleActions(width);
 		const status = statusRows(width);
 		const strip = actionRows(width, list);
-		const help = fitRow(helpLine(), width);
+		const help = styleRow("meta", fitRow(helpLine(), width));
 		const tail = [...status, ...strip, help];
 		return {
 			list,
@@ -898,7 +959,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			strip,
 			help,
 			tail,
-			budget: (reserved: number): number => Math.max(0, viewportHeight() - HEAD_ROWS - tail.length - reserved),
+			budget: (reserved: number): number =>
+				rawHeight() !== undefined
+					? Math.max(0, viewportHeight() - HEAD_ROWS - tail.length - reserved)
+					: Math.max(0, FALLBACK_CONTENT_ROWS - reserved),
 		};
 	};
 
@@ -915,41 +979,106 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		return windowRows;
 	};
 
-	const panelEmptyCopy = (panel: InsightPanel): string[] => {
+	/**
+	 * Cell-safe hard wrap that preserves every source space: leading and
+	 * repeated internal spaces survive reflow, and over-wide rows break on
+	 * grapheme boundaries without splitting cells. Used for in-bound draft and
+	 * lesson body text; shell labels keep the folding word wrap instead.
+	 */
+	const wrapPreserving = (text: string, width: number): string[] => {
+		const room = Math.max(1, width);
+		if (visibleWidth(text) <= room) return [text];
+		const rows: string[] = [];
+		let current = "";
+		for (const { segment } of GRAPHEMES.segment(text)) {
+			const next = `${current}${segment}`;
+			if (visibleWidth(next) > room && current !== "") {
+				rows.push(current);
+				current = segment;
+				if (visibleWidth(current) > room) {
+					rows.push(current);
+					current = "";
+				}
+			} else {
+				current = next;
+			}
+		}
+		rows.push(current);
+		return rows;
+	};
+
+	/** Wrap one logical line and style each physical row after wrapping. */
+	const wrapRich = (line: RichLine, width: number): string[] => {
+		const room = Math.max(1, width);
+		const rows = line.tone === "body" ? wrapPreserving(line.text, room) : wrapRow(line.text, room, "");
+		return rows.map((row) => styleRow(line.tone === "body" ? "plain" : line.tone, fitRow(row, room)));
+	};
+
+	/**
+	 * Bounded per-panel partial/read-error qualifier: the partial banner plus
+	 * at most two limitation lines, so affected tabs and details stay truthful
+	 * without consuming narrow body space. Complete snapshots show nothing.
+	 */
+	const partialBanner = (): RichLine[] => {
+		if (!snapshot.partial) return [];
+		const banner: RichLine[] = [{ text: PARTIAL_COPY, tone: "warn" }];
+		for (const item of snapshot.limitations.map((entry) => cleanInline(entry, 160)).filter(Boolean).slice(0, 2)) {
+			banner.push({ text: `Limitation: ${item}`, tone: "warn" });
+		}
+		return banner;
+	};
+
+	const panelEmptyCopy = (panel: InsightPanel): RichLine[] => {
 		switch (panel) {
 			case "jev":
-				return ["No saved Jev decisions for this session", "This view reads the latest saved plan, not a complete history. Refresh after a plan is saved; opening this view never evaluates Jev."];
+				return [
+					{ text: "No saved Jev decisions for this session", tone: "head" },
+					{ text: "This view reads the latest saved plan, not a complete history. Refresh after a plan is saved; opening this view never evaluates Jev.", tone: "plain" },
+				];
 			case "moments":
-				return ["No lessons recorded for this project", "Use the existing teaching workflow to capture a lesson, then refresh. This view does not create the store or capture lessons."];
+				return [
+					{ text: "No lessons recorded for this project", tone: "head" },
+					{ text: "Use the existing teaching workflow to capture a lesson, then refresh. This view does not create the store or capture lessons.", tone: "plain" },
+				];
 			case "skills":
-				return ["No lessons meet the promotion rules", "Eligible lessons are confirmed and unpromoted, with the configured occurrence count or playbook exception. Refresh after lesson state changes."];
+				// Both collections are labeled independently even though they
+				// share one stacked list: an empty list means both are absent.
+				return [
+					{ text: "No lessons meet the promotion rules", tone: "head" },
+					{ text: "Eligible lessons are confirmed and unpromoted, with the configured occurrence count or playbook exception. Refresh after lesson state changes.", tone: "plain" },
+					{ text: "No promotions recorded for this project", tone: "head" },
+					{ text: "Preview an eligible lesson before choosing Install into Omp. This list contains promotion records, not an installed-skill inventory.", tone: "plain" },
+				];
 			default:
 				return [];
 		}
 	};
 
-	const overviewLines = (): string[] => {
+	const overviewLines = (): RichLine[] => {
 		const decisionList = decisions();
 		const lessonList = lessons();
-		const lines = [snapshotLabel(), `Snapshot: ${snapshotTime()}`];
+		const lines: RichLine[] = [
+			{ text: snapshotLabel(), tone: "meta" },
+			{ text: `Snapshot: ${snapshotTime()}`, tone: "meta" },
+		];
 		if (decisionList.length === 0) {
-			lines.push("No saved Jev decisions for this session");
-			lines.push("This view reads the latest saved plan, not a complete history. Refresh after a plan is saved; opening this view never evaluates Jev.");
+			lines.push({ text: "No saved Jev decisions for this session", tone: "head" });
+			lines.push({ text: "This view reads the latest saved plan, not a complete history. Refresh after a plan is saved; opening this view never evaluates Jev.", tone: "plain" });
 		} else {
 			const latest = decisionList[0];
 			if (latest) {
-				lines.push(`Latest decision: ${truncateGraphemes(latest.point, 60)} · ${latest.action} · P ${latest.pText}`);
+				lines.push({ text: `Latest decision: ${truncateGraphemes(latest.point, 60)} · ${latest.action} · P ${latest.pText}`, tone: "head" });
 			}
 		}
 		const parts = Object.entries(snapshot.counts)
 			.slice(0, 8)
 			.map(([status, value]) => `${cleanInline(status, 20)}: ${asFiniteNumber(value) ?? 0}`);
-		lines.push(`Moments: ${parts.join(" · ") || `${lessonList.length} shown`}`);
-		lines.push(`Skills: ${snapshot.eligible} eligible · ${snapshot.promoted} promoted`);
+		lines.push({ text: `Moments: ${parts.join(" · ") || `${lessonList.length} shown`}`, tone: "plain" });
+		lines.push({ text: `Skills: ${snapshot.eligible} eligible · ${snapshot.promoted} promoted`, tone: "plain" });
 		lines.push(...policyLines());
 		const limitations = snapshot.limitations.map((item) => cleanInline(item, 160)).filter(Boolean).slice(0, 4);
-		for (const limitation of limitations) lines.push(`Limitation: ${limitation}`);
-		if (snapshot.partial) lines.push("Partial snapshot — some local data could not be read. Available records remain visible; press r to refresh.");
+		for (const limitation of limitations) lines.push({ text: `Limitation: ${limitation}`, tone: "warn" });
+		if (snapshot.partial) lines.push({ text: PARTIAL_COPY, tone: "warn" });
 		return lines;
 	};
 
@@ -999,21 +1128,25 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 
 	/** DETAIL_WINDOW caps content rows; layoutFor owns the actual budget. */
 
-	/** Physical rows each logical line occupies at the given width; scroll positions index these wrapped rows. */
-	const wrappedRows = (lines: readonly string[], width: number): string[] => {
-		const room = Math.max(1, width);
+	/** The detail surface: eligibility facts lead the scrolled lesson body rows. */
+	const detailSurface = (width: number): string[] => {
 		const rows: string[] = [];
-		for (const line of lines) rows.push(...wrapRow(line, room, ""));
+		for (const line of [...detailFactRows(), ...detailLines()]) rows.push(...wrapRich(line, width));
 		return rows;
 	};
 
-	/** The detail surface: eligibility facts lead the scrolled lesson body rows. */
-	const detailSurface = (width: number): string[] => [...detailFactRows(width), ...wrappedRows(detailLines(), width)];
+	/** Preview surface: header and warnings fold as shell labels while draft source keeps its spaces. */
+	const previewSurface = (width: number): string[] => {
+		const { lines } = previewLines();
+		const rows: string[] = [];
+		for (const line of lines) rows.push(...wrapRich(line, width));
+		return rows;
+	};
 
 	/** Overview body reflowed to physical rows; scroll positions index these rows. */
 	const overviewSurface = (width: number): string[] => {
 		const rows: string[] = [];
-		for (const line of overviewLines()) for (const row of wrapRow(line, width, "")) rows.push(fitRow(row, width));
+		for (const line of overviewLines()) rows.push(...wrapRich(line, width));
 		return rows;
 	};
 
@@ -1026,12 +1159,29 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
 		if (safeWidth <= 0) return [];
 		const height = viewportHeight();
-		const head: string[] = [`Ultrathink · ${snapshotLabel()} · Snapshot: ${snapshotTime()}`].map((text) => fitRow(text, safeWidth));
+		// Transient layout guidance never outlives the viewport that caused it:
+		// a cleared fit refusal recomputes against the grown viewport while
+		// durable receipts in `notice` are untouched.
+		if (notice === FIT_REASON && (view === "confirm-candidate" || view === "confirm-install")) {
+			const savedKind = noticeKind;
+			setNotice("");
+			const list = actions(safeWidth);
+			const affirmative = view === "confirm-candidate" ? "confirm-yes" : "install-yes";
+			if (!(list.some((action) => action.id === affirmative && action.enabled) && confirmScreenFits(safeWidth, list))) {
+				setNotice(FIT_REASON, savedKind);
+			}
+		}
+		if (notice === TINY_REASON && canMutate(safeWidth)) setNotice("");
+		const head: string[] = [`Ultrathink · ${snapshotLabel()} · Snapshot: ${snapshotTime()}`].map((text) => styleRow("meta", fitRow(text, safeWidth)));
 		if (safeWidth < MIN_TAB_STRIP_COLS) {
 			const index = PANELS.indexOf(tab) + 1;
-			head.push(fitRow(`[${TAB_LABELS[tab]}] ${index}/${PANELS.length}`, safeWidth));
+			head.push(styleRow("head", fitRow(`[${TAB_LABELS[tab]}] ${index}/${PANELS.length}`, safeWidth)));
 		} else {
-			const strip = PANELS.map((panel) => (panel === tab ? `[${TAB_LABELS[panel]}]` : TAB_LABELS[panel])).join("  ");
+			const strip = PANELS.map((panel) =>
+				panel === tab
+					? dashboardPaint.bold(dashboardPaint.fg("accent", `[${TAB_LABELS[panel]}]`))
+					: dashboardPaint.fg("muted", TAB_LABELS[panel]),
+			).join("  ");
 			head.push(fitRow(strip, safeWidth));
 		}
 
@@ -1041,38 +1191,38 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		// off screen. Render, scroll/page steps, and clamps share layoutFor.
 		const layout = layoutFor(safeWidth);
 		let body: string[] = [];
-		const emitBody = (text: string): void => {
-			body.push(fitRow(text, safeWidth));
+		const emitBody = (text: string, tone: Tone = "plain"): void => {
+			body.push(styleRow(tone, fitRow(text, safeWidth)));
 		};
-		const emitBodyWrapped = (text: string, indent = ""): void => {
-			for (const line of wrapRow(text, safeWidth, indent)) emitBody(line);
+		const emitRich = (line: RichLine): void => {
+			for (const row of wrapRich(line, safeWidth)) body.push(row);
 		};
 
 		if (view === "confirm-candidate" || view === "confirm-install") {
 			// A refused identity is never silently clipped into an enabled
 			// affirmative and never relies on terminal scrollback: it either
 			// fits complete or is replaced by an explicit bounded refusal.
-			const full = view === "confirm-candidate"
+			const full: RichLine[] = view === "confirm-candidate"
 				? (confirmTarget ? candidateConfirmLines(confirmTarget) : [])
-				: pendingPreview ? installConfirmLines() : ["Preview unavailable. Go back and preview again."];
-			if (wrappedRows(full, safeWidth).length <= layout.budget(0) && full.length > 0) {
-				for (const line of full) emitBodyWrapped(line);
+				: pendingPreview ? installConfirmLines() : [{ text: "Preview unavailable. Go back and preview again.", tone: "plain" }];
+			if (full.length > 0 && full.flatMap((line) => wrapRow(line.text, safeWidth, "")).length <= layout.budget(0)) {
+				for (const line of full) emitRich(line);
 			} else if (full.length > 0) {
-				const refusal = wrappedRows(confirmRefusalLines(), safeWidth);
-				body = refusal.slice(0, layout.budget(0));
+				for (const line of confirmRefusalLines()) emitRich(line);
+				body = body.slice(0, layout.budget(0));
 			}
 		} else if (view === "preview") {
-			const { lines: logical, clipped } = previewLines();
+			const { clipped } = previewLines();
 			// Reflow before windowing, then draw and scroll the same wrapped rows,
 			// so the complete in-bound tail/ownership marker stays reachable.
-			const lines = wrappedRows(logical, safeWidth);
+			const lines = previewSurface(safeWidth);
 			const windowRows = previewWindow(layout);
 			previewScroll = clampScroll(previewScroll, lines.length, windowRows);
 			if (windowRows > 0) {
 				const start = previewScroll;
 				const end = Math.min(lines.length, start + windowRows);
-				emitBody(`Preview lines ${lines.length === 0 ? 0 : start + 1}–${end} of ${lines.length}${clipped ? " · draft withheld at 60KB bound" : ""}`);
-				for (const line of lines.slice(start, end)) emitBody(line);
+				emitBody(`Preview lines ${lines.length === 0 ? 0 : start + 1}–${end} of ${lines.length}${clipped ? " · draft withheld at 60KB bound" : ""}`, "meta");
+				for (const line of lines.slice(start, end)) body.push(line);
 			}
 		} else if (view === "detail") {
 			// Eligibility facts lead the lesson body as one scrolled surface:
@@ -1083,8 +1233,8 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			detailScroll = clampScroll(detailScroll, lines.length, windowRows);
 			if (windowRows > 0) {
 				const start = detailScroll;
-				for (const line of lines.slice(start, start + windowRows)) emitBody(line);
-				if (lines.length > windowRows) emitBody(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
+				for (const line of lines.slice(start, start + windowRows)) body.push(line);
+				if (lines.length > windowRows) emitBody(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`, "meta");
 			}
 		} else if (tab === "overview") {
 			// The overview body scrolls like detail/preview content: lesson
@@ -1095,38 +1245,65 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			overviewScroll = clampScroll(overviewScroll, lines.length, windowRows);
 			if (windowRows > 0) {
 				const start = overviewScroll;
-				for (const row of lines.slice(start, start + windowRows)) emitBody(row);
-				if (lines.length > windowRows) emitBody(`Overview ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
+				for (const row of lines.slice(start, start + windowRows)) body.push(row);
+				if (lines.length > windowRows) emitBody(`Overview ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`, "meta");
 			}
 		} else {
-			// Skills root keeps Main's effective-policy prefix: live policy plus
-			// the saved-rules caveat, never a fresh Jev or installation claim.
-			const prefix: string[] = [];
+			// Browse prefixes keep live policy plus the saved-rules caveat (never
+			// a fresh Jev or installation claim), the Jev latest-plan label, and
+			// the bounded partial qualifier beside the affected collection.
+			const prefix: RichLine[] = [...partialBanner()];
+			if (tab === "jev") prefix.unshift({ text: LATEST_PLAN_NOTE, tone: "meta" });
 			if (tab === "skills") {
-				for (const line of [...policyLines(), "Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading."])
-					for (const row of wrapRow(line, safeWidth, "")) prefix.push(fitRow(row, safeWidth));
+				prefix.unshift(
+					...policyLines(),
+					{ text: "Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading.", tone: "plain" },
+				);
 			}
+			const wrappedPrefix: string[] = [];
+			for (const line of prefix) wrappedPrefix.push(...wrapRich(line, safeWidth));
 			const rows_list = listRows(tab);
 			if (rows_list.length === 0) {
 				const wrapped: string[] = [];
-				for (const line of panelEmptyCopy(tab)) for (const row of wrapRow(line, safeWidth, "")) wrapped.push(fitRow(row, safeWidth));
+				for (const line of panelEmptyCopy(tab)) wrapped.push(...wrapRich(line, safeWidth));
 				if (tab === "skills") {
 					// Shared budget: the why-empty copy stays complete and
 					// reachable; the policy prefix fills whatever rows remain
 					// above it instead of clipping the message away.
 					const surface = Math.max(1, layout.budget(0));
 					const copy = wrapped.slice(0, surface);
-					body = [...prefix.slice(0, Math.max(0, surface - copy.length)), ...copy];
+					body = [...wrappedPrefix.slice(0, Math.max(0, surface - copy.length)), ...copy];
 				} else {
-					body = [...prefix, ...wrapped].slice(0, layout.budget(0));
+					body = [...wrappedPrefix, ...wrapped].slice(0, layout.budget(0));
 				}
 			} else {
 				const total = rows_list.length;
 				// Resize clamps the stored selection; lesson data is untouched.
 				cursors[tab] = Math.min(Math.max(0, cursors[tab]), total - 1);
 				const cursor = cursors[tab];
-				const count: string[] = [fitRow(total === 1 ? "1 record shown" : `item ${cursor + 1} of ${total} shown`, safeWidth)];
-				if (total >= COLLECTION_CAP) count.push(fitRow("Showing up to 100 local records; this is not a complete inventory.", safeWidth));
+				const core: RichLine[] = [{ text: `${total === 1 ? "1 record shown" : `item ${cursor + 1} of ${total} shown`}${snapshot.partial ? " · partial" : ""}`, tone: "meta" }];
+				if (total >= COLLECTION_CAP) core.push({ text: "Showing up to 100 local records; this is not a complete inventory.", tone: "warn" });
+				const extras: RichLine[] = [];
+				if (tab === "skills") {
+					// One stacked list, two independently labeled collections:
+					// subset counts plus the full empty copy of any absent side.
+					const all = lessons();
+					const eligibleCount = all.filter((row) => row.eligible).length;
+					const promotedCount = all.filter((row) => row.promoted).length;
+					extras.push({ text: `Eligible: ${eligibleCount} shown · Promoted: ${promotedCount} shown`, tone: "meta" });
+					if (eligibleCount === 0) {
+						extras.push({ text: "No lessons meet the promotion rules", tone: "head" });
+						extras.push({ text: "Eligible lessons are confirmed and unpromoted, with the configured occurrence count or playbook exception. Refresh after lesson state changes.", tone: "plain" });
+					}
+					if (promotedCount === 0) {
+						extras.push({ text: "No promotions recorded for this project", tone: "head" });
+						extras.push({ text: "Preview an eligible lesson before choosing Install into Omp. This list contains promotion records, not an installed-skill inventory.", tone: "plain" });
+					}
+				}
+				const wrappedCore: string[] = [];
+				for (const line of core) wrappedCore.push(...wrapRich(line, safeWidth));
+				const wrappedExtras: string[] = [];
+				for (const line of extras) wrappedExtras.push(...wrapRich(line, safeWidth));
 				// Skills shares one row budget across the policy prefix and the
 				// list: the prefix renders first, the list keeps at least one
 				// row, and the combined surface scrolls as one when it exceeds
@@ -1134,23 +1311,26 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				// while the prefix scrolls away above them.
 				const skillsBudget = Math.max(1, layout.budget(0));
 				const windowRows = tab === "skills"
-					? Math.max(1, Math.min(LIST_WINDOW, skillsBudget - prefix.length - count.length))
-					: Math.min(LIST_WINDOW, layout.budget(prefix.length + count.length));
+					? Math.max(1, Math.min(LIST_WINDOW, skillsBudget - wrappedPrefix.length - wrappedCore.length - wrappedExtras.length))
+					: Math.min(LIST_WINDOW, layout.budget(wrappedPrefix.length + wrappedCore.length));
 				const start = clampScroll(cursor - Math.floor(windowRows / 2), total, windowRows);
 				const shown = rows_list.slice(start, Math.min(total, start + windowRows));
 				const rows: string[] = [];
 				shown.forEach((row, offset) => {
-					const marker = start + offset === cursor && focus === "list" ? ">" : " ";
-					rows.push(fitRow(`${marker} ${row.label}`, safeWidth));
+					const focusedRow = start + offset === cursor && focus === "list";
+					const fitted = fitRow(`${focusedRow ? ">" : " "} ${row.label}`, safeWidth);
+					rows.push(focusedRow ? dashboardPaint.fg("accent", fitted) : fitted);
 				});
 				if (tab === "skills") {
-					const combined = [...prefix, ...rows, ...count];
-					// Never smaller than the lesson window plus the count line,
+					// Subset notes sit above the list so the tail slice always
+					// keeps the lesson window and the core count on screen.
+					const combined = [...wrappedPrefix, ...wrappedExtras, ...rows, ...wrappedCore];
+					// Never smaller than the lesson window plus the core count,
 					// so a scrolled surface keeps the selection on screen.
-					const surface = Math.min(combined.length, Math.max(skillsBudget, windowRows + count.length));
+					const surface = Math.min(combined.length, Math.max(skillsBudget, windowRows + wrappedCore.length));
 					body = combined.slice(Math.max(0, combined.length - surface));
 				} else {
-					body = [...prefix, ...rows, ...count];
+					body = [...wrappedPrefix, ...rows, ...wrappedCore];
 				}
 			}
 		}
@@ -1210,7 +1390,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			previewScroll,
 			overviewScroll,
 			actionCursor[view] ?? 0,
-			notice,
+			`${notice}:${noticeKind}`,
 			snapshotError,
 			busy ? `${busy.kind}:${busyCancelled}:${actionRefresh ? "action" : "manual"}` : "",
 			pendingPreview ? "preview" : "",
@@ -1220,7 +1400,8 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 	const finishRefresh = (run: number, next: InsightSnapshot | undefined, failure: string): void => {
 		if (disposed || run !== epoch || busy?.kind !== "refresh") return;
 		const wasAction = actionRefresh;
-		const receipt = wasAction ? notice : "";
+	const receipt = wasAction ? notice : "";
+	const receiptKind: NoticeKind = wasAction ? noticeKind : "info";
 		busy = undefined;
 		busyCancelled = false;
 		actionRefresh = false;
@@ -1232,7 +1413,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				// The confirm/install already settled: its receipt stands. The
 				// refresh only re-reads; disappearance or preview drift is
 				// appended as read state, never as a rollback claim.
-				notice = receipt;
+				setNotice(receipt, receiptKind);
 				let disappeared = false;
 				for (const panel of PANELS) {
 					const retained = previous[panel];
@@ -1241,19 +1422,19 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				}
 				if (disappeared) {
 					if (view === "detail" || view === "preview") closeToBrowseSilent();
-					notice = `${receipt ? `${receipt} ` : ""}Selected record is no longer in this snapshot. Choose another record. No rollback is claimed; the action result above stands.`;
+					setNotice(`${receipt ? `${receipt} ` : ""}Selected record is no longer in this snapshot. Choose another record. No rollback is claimed; the action result above stands.`, "warn");
 				}
 				if (pendingPreview) {
 					pendingPreview = undefined;
 					if (view === "preview" || view === "confirm-install") {
 						view = "detail";
-						notice = `${notice ? `${notice} ` : ""}Lesson or preview changed. No new action was started; refresh and preview again.`;
+						setNotice(`${notice ? `${notice} ` : ""}Lesson or preview changed. No new action was started; refresh and preview again.`, "warn");
 					}
 				}
 			} else {
 				// Explicit manual refresh: prior receipts are obsolete once the
 				// new snapshot lands.
-				notice = "";
+				setNotice("");
 				let disappeared = false;
 				for (const panel of PANELS) {
 					const retained = previous[panel];
@@ -1263,13 +1444,13 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				if (disappeared) {
 					// A retained identity disappeared: clear details/preview rather than reusing an index.
 					if (view === "detail" || view === "preview") closeToBrowseSilent();
-					notice = "Selected record is no longer in this snapshot. Choose another record.";
+					setNotice("Selected record is no longer in this snapshot. Choose another record.", "warn");
 				}
 				if (pendingPreview) {
 					pendingPreview = undefined;
 					if (view === "preview" || view === "confirm-install") {
 						view = "detail";
-						notice = `${notice ? `${notice} ` : ""}Lesson or preview changed. No new action was started; refresh and preview again.`;
+						setNotice(`${notice ? `${notice} ` : ""}Lesson or preview changed. No new action was started; refresh and preview again.`, "warn");
 					}
 				}
 			}
@@ -1278,10 +1459,10 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			// report the read failure beside it, never as a rollback.
 			snapshotError = failure || "refresh failed";
 			const followUp = `Follow-up refresh failed: ${snapshotError}. No rollback is claimed; the action result above stands. Press r to refresh actual state.`;
-			notice = receipt ? `${receipt} ${followUp}` : followUp;
+			setNotice(receipt ? `${receipt} ${followUp}` : followUp, "error");
 		} else {
 			snapshotError = failure || "refresh failed";
-			notice = "";
+			setNotice("");
 		}
 		touch();
 	};
@@ -1306,18 +1487,28 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			.then(() => callbacks.refresh())
 			.then(
 				(next) => {
+					// Detached run (Escape during any busy wait) or disposed
+					// dashboard: skip result application entirely.
+					if (disposed || run !== epoch || busy?.kind !== "refresh") return;
 					finishRefresh(run, next, "");
 				},
 				(error) => {
+					if (disposed || run !== epoch || busy?.kind !== "refresh") return;
 					const reason = cleanInline(error instanceof Error ? error.message : String(error), 160) || "refresh failed";
 					finishRefresh(run, undefined, reason);
 				},
 			);
 	};
 
-	const failResult = (result: InsightActionResult | undefined): string => {
-		if (!result || typeof result !== "object") return "action failed";
-		return cleanInline(result.message, 200) || "action failed";
+	/**
+	 * Canonical safe adapter results already carry their own prefix and
+	 * recovery instruction: display them once. Fallback wrapping is only for
+	 * thrown or otherwise unreadable responses.
+	 */
+	const canonicalMessage = (result: InsightActionResult | undefined): string | undefined => {
+		if (!result || typeof result !== "object") return undefined;
+		const message = cleanInline(result.message, 400);
+		return message === "" ? undefined : message;
 	};
 
 	const startPreview = (row: LessonRow): void => {
@@ -1341,9 +1532,9 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 						// the next Enter opens the separate installation confirmation;
 						// that confirmation still starts on Keep preview.
 						actionCursor.preview = 1;
-						notice = "";
+						setNotice("");
 					} else {
-						notice = `Preview unavailable: ${failResult(result)}. Refresh the lesson before trying again.`;
+						setNotice(canonicalMessage(result) ?? "Preview unavailable: the command did not return a readable result. Refresh the lesson before trying again.", "error");
 						touch();
 					}
 				},
@@ -1351,7 +1542,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					if (disposed || run !== epoch || busy?.kind !== "preview") return;
 					busy = undefined;
 					busyCancelled = false;
-					notice = `Preview unavailable: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh the lesson before trying again.`;
+					setNotice(`Preview unavailable: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh the lesson before trying again.`, "error");
 					touch();
 				},
 			);
@@ -1375,13 +1566,13 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 						const receipt = cleanInline(result.message, 200) || "Candidate confirmed.";
 						const retention = result.retention ? ` Retention: ${cleanInline(result.retention, 40)}.` : "";
 						const lifecycle = result.lifecycle ? ` Lifecycle: ${cleanInline(result.lifecycle, 40)}.` : "";
-						notice = `${receipt}${retention}${lifecycle}`;
+						setNotice(`${receipt}${retention}${lifecycle}`, "success");
 						closeToBrowseSilent();
 						focus = "list";
 						touch();
 						startRefresh(true);
 					} else {
-						notice = `Candidate was not confirmed: ${failResult(result)}. Refresh the lesson before trying again.`;
+						setNotice(canonicalMessage(result) ?? "Candidate was not confirmed: the command did not return a readable result. Refresh the lesson before trying again.", "error");
 						openView("detail", "details");
 					}
 				},
@@ -1389,7 +1580,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					if (disposed || run !== epoch || busy?.kind !== "confirm") return;
 					busy = undefined;
 					busyCancelled = false;
-					notice = `Candidate was not confirmed: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh the lesson before trying again.`;
+					setNotice(`Candidate was not confirmed: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh the lesson before trying again.`, "error");
 					openView("detail", "details");
 				},
 			);
@@ -1414,16 +1605,16 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 						const receipt = cleanInline(result.message, 200) || "Omp install returned success.";
 						const install = result.install;
 						const recorded = install ? ` Recorded action: ${cleanInline(install.action, 40)}${install.skill ? ` · Skill: ${cleanInline(install.skill, 80)}` : ""}${install.path ? ` · Path: ${cleanInline(install.path, 120)}` : ""}.` : "";
-						notice = `${receipt}${recorded}`;
+						setNotice(`${receipt}${recorded}`, "success");
 						closeToBrowseSilent();
 						focus = "list";
 						touch();
 						startRefresh(true);
 					} else if (result && result.status === "refused") {
-						notice = failResult(result);
+						setNotice(canonicalMessage(result) ?? "Installation refused: the command did not return a readable result. Existing files were not replaced by this refused install; review the lesson/slot outside this dashboard, then preview again.", "error");
 						openView("preview", "details");
 					} else {
-						notice = `Installation did not return a successful Omp result: ${failResult(result)}. Refresh actual lesson state before trying again; no rollback is claimed.`;
+						setNotice(canonicalMessage(result) ?? "Installation did not return a successful Omp result: the command did not return a readable result. Refresh actual lesson state before trying again; no rollback is claimed.", "error");
 						openView("preview", "details");
 					}
 				},
@@ -1431,7 +1622,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					if (disposed || run !== epoch || busy?.kind !== "install") return;
 					busy = undefined;
 					busyCancelled = false;
-					notice = `Installation did not return a successful Omp result: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh actual lesson state before trying again; no rollback is claimed.`;
+					setNotice(`Installation did not return a successful Omp result: ${cleanInline(error instanceof Error ? error.message : String(error), 200)}. Refresh actual lesson state before trying again; no rollback is claimed.`, "error");
 					openView("preview", "details");
 				},
 			);
@@ -1475,7 +1666,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 
 	const activateAction = (action: DashboardAction | undefined, width: number): void => {
 		if (!action || !action.enabled) {
-			if (action && !action.enabled && action.disabledReason) notice = action.disabledReason;
+			if (action && !action.enabled && action.disabledReason) setNotice(action.disabledReason, "warn");
 			touch();
 			return;
 		}
@@ -1495,15 +1686,23 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 				openDetail();
 				return;
 			case "back":
+				// Preview's Back returns to the exact selected lesson details
+				// with cursor and selection preserved, consistently with Escape.
+				if (view === "preview") {
+					openView("detail", "details");
+					pendingPreview = undefined;
+					setNotice("");
+					return;
+				}
 				closeToBrowse();
 				return;
 			case "keep":
 				if (view === "confirm-install") {
 					openView("preview", "actions");
-					notice = "";
+					setNotice("");
 				} else {
 					openView("detail", "details");
-					notice = "";
+					setNotice("");
 				}
 				return;
 			case "refresh":
@@ -1513,7 +1712,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					// dead install action.
 					pendingPreview = undefined;
 					openView("detail", "details");
-					notice = "Lesson or preview changed. No new action was started; refresh and preview again.";
+					setNotice("Lesson or preview changed. No new action was started; refresh and preview again.", "warn");
 					startRefresh();
 					return;
 				}
@@ -1523,7 +1722,12 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		case "open-confirm": {
 			const row = currentLesson();
 			if (!row || !canMutate(width)) {
-				notice = TINY_REASON;
+				setNotice(TINY_REASON, "warn");
+				touch();
+				return;
+			}
+			if (isPolicyOff()) {
+				setNotice(POLICY_OFF_REASON, "warn");
 				touch();
 				return;
 			}
@@ -1535,6 +1739,11 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 		case "open-preview": {
 			const row = currentLesson();
 			if (!row) return;
+			if (isPolicyOff()) {
+				setNotice(POLICY_OFF_REASON, "warn");
+				touch();
+				return;
+			}
 			startPreview(row);
 			return;
 		}
@@ -1542,7 +1751,12 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			// A clipped preview has no reviewable tail: opening install consent
 			// over it would ask approval for unseen content, so refuse here.
 			if (!pendingPreview || previewLines().clipped || !canMutate(width)) {
-				notice = pendingPreview && previewLines().clipped ? CLIPPED_PREVIEW_REASON : TINY_REASON;
+				setNotice(pendingPreview && previewLines().clipped ? CLIPPED_PREVIEW_REASON : TINY_REASON, "warn");
+				touch();
+				return;
+			}
+			if (isPolicyOff()) {
+				setNotice(POLICY_OFF_REASON, "warn");
 				touch();
 				return;
 			}
@@ -1554,7 +1768,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			// The Enter that opened this confirmation advanced `seq`; require a
 			// strictly later input before the affirmative can fire so the
 			// triggering keypress never activates the mutating choice.
-			if (seq <= viewOpenedAtSeq || !confirmTarget || !canMutate(width)) return;
+			if (seq <= viewOpenedAtSeq || !confirmTarget || !canMutate(width) || isPolicyOff()) return;
 			if (!confirmScreenFits(width, actions(width))) return;
 			const row = confirmTarget;
 			confirmTarget = undefined;
@@ -1562,7 +1776,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 			return;
 		}
 		case "install-yes": {
-			if (seq <= viewOpenedAtSeq || !pendingPreview || !canMutate(width)) return;
+			if (seq <= viewOpenedAtSeq || !pendingPreview || !canMutate(width) || isPolicyOff()) return;
 			if (previewLines().clipped || !confirmScreenFits(width, actions(width))) return;
 			startInstall();
 			return;
@@ -1619,6 +1833,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					const kind = busy.kind;
 					const wasAction = kind === "refresh" && actionRefresh;
 					const receipt = wasAction ? notice : "";
+					const receiptKind: NoticeKind = wasAction ? noticeKind : "info";
 					// Cancellation is a request to stop owned UI work, never a
 					// claim of rollback: detach the run so late completions are
 					// ignored, keep the snapshot that is already on screen.
@@ -1626,43 +1841,43 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					busy = undefined;
 					busyCancelled = false;
 					actionRefresh = false;
-					notice = "Closing dashboard. An already-started action is not claimed to be rolled back; inspect actual state when reopening.";
+					setNotice("Closing dashboard. An already-started action is not claimed to be rolled back; inspect actual state when reopening.", "warn");
 					if (kind === "confirm" || kind === "install") {
 						// The mutating callback was dispatched before this Escape:
 						// it is in flight and cannot be stopped, so the
 						// before-it-started copy would be false. Report the
 						// unobserved outcome honestly instead.
 						openView("detail", "details");
-						notice = kind === "confirm"
+						setNotice(kind === "confirm"
 							? "Escape dismissed the wait, but candidate confirmation had already started and cannot be stopped. Its result is not reported here; press r to refresh actual state. No rollback is claimed."
-							: "Escape dismissed the wait, but installation had already started and cannot be stopped. Its result is not reported here; press r to refresh actual state. No rollback is claimed.";
+							: "Escape dismissed the wait, but installation had already started and cannot be stopped. Its result is not reported here; press r to refresh actual state. No rollback is claimed.", "warn");
 					} else if (kind === "preview") {
 						// The preview build was dispatched too; it only reads local data.
 						openView("detail", "details");
-						notice = "Escape dismissed the wait. The preview build had already started; it reads local data only and makes no changes. Preview again to see its result.";
+						setNotice("Escape dismissed the wait. The preview build had already started; it reads local data only and makes no changes. Preview again to see its result.", "warn");
 					} else if (wasAction && receipt) {
 						// The confirm/install settled before this read was cancelled:
 						// the receipt stands, the cancelled re-read claims nothing.
-						notice = `${receipt} Follow-up refresh cancelled before it finished; no rollback is claimed. Press r to refresh actual state.`;
+						setNotice(`${receipt} Follow-up refresh cancelled before it finished; no rollback is claimed. Press r to refresh actual state.`, receiptKind === "success" ? "warn" : receiptKind);
 					}
 					touch();
 					return;
 				}
 				if (view === "confirm-candidate") {
 					openView("detail", "details");
-					notice = "";
+					setNotice("");
 					confirmTarget = undefined;
 					return;
 				}
 				if (view === "confirm-install") {
 					openView("preview", "details");
-					notice = "";
+					setNotice("");
 					return;
 				}
 				if (view === "preview") {
 					openView("detail", "details");
 					pendingPreview = undefined;
-					notice = "";
+					setNotice("");
 					return;
 				}
 				if (view === "detail") {
@@ -1684,7 +1899,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					// leaves the preview view so the refresh cannot strand it.
 					pendingPreview = undefined;
 					openView("detail", "details");
-					notice = "Lesson or preview changed. No new action was started; refresh and preview again.";
+					setNotice("Lesson or preview changed. No new action was started; refresh and preview again.", "warn");
 				}
 				startRefresh();
 				return;
@@ -1734,7 +1949,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 						const total = detailSurface(lastWidth).length;
 						detailScroll = clampScroll(detailScroll + delta, total, contentWindow(layout, total));
 					} else {
-						const total = wrappedRows(previewLines().lines, lastWidth).length;
+						const total = previewSurface(lastWidth).length;
 						previewScroll = clampScroll(previewScroll + delta, total, previewWindow(layout));
 					}
 					touch();
@@ -1759,7 +1974,7 @@ const eligibilityLine = (row: LessonRow): string | undefined => {
 					return;
 				}
 				const detailTotal = detailSurface(lastWidth).length;
-				const previewTotal = wrappedRows(previewLines().lines, lastWidth).length;
+				const previewTotal = previewSurface(lastWidth).length;
 				const step = view === "preview" ? previewWindow(layout) : contentWindow(layout, detailTotal);
 				const delta = key === "pagedown" ? step : -step;
 				if (focus === "details" && view === "detail") {

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { createInsightDashboard, type InsightDashboard, type InsightDashboardCallbacks } from "./omp-dashboard.ts";
-import type { InsightLesson, InsightSnapshot } from "./omp-insights.ts";
+import type { InsightActionResult, InsightLesson, InsightSnapshot } from "./omp-insights.ts";
 
 function mkLesson(id: string, name: string, overrides: Partial<InsightLesson> = {}): InsightLesson {
 	return {
@@ -269,8 +269,8 @@ describe("dashboard bounds and viewports", () => {
 });
 
 describe("dashboard guarded confirmations", () => {
-	async function openCandidateConfirm(): Promise<{ ui: InsightDashboard; cb: RecordingCallbacks }> {
-		const cb = stubs();
+	async function openCandidateConfirm(overrides: Partial<InsightDashboardCallbacks> = {}): Promise<{ ui: InsightDashboard; cb: RecordingCallbacks }> {
+		const cb = stubs(overrides);
 		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments" });
 		ui.handleInput("tab");
 		ui.handleInput("enter");
@@ -331,6 +331,128 @@ describe("dashboard guarded confirmations", () => {
 		ui.handleInput("escape");
 		expect(cb.calls).not.toContain("install");
 		ui.dispose();
+	});
+
+	test("escape during an in-flight confirmation detaches its late completion", async () => {
+		const gate = Promise.withResolvers<InsightActionResult>();
+		const { ui, cb } = await openCandidateConfirm({
+			confirmCandidate: async () => {
+				cb.calls.push("confirm");
+				return gate.promise;
+			},
+		});
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		expect(cb.calls).toContain("confirm");
+		// Escape detaches the run while the dispatched confirmation waits.
+		ui.handleInput("escape");
+		const detached = plain(ui.render(80)).join("\n");
+		expect(detached).toContain("Escape dismissed the wait");
+		// The late completion lands nowhere: no receipt, no auto-refresh.
+		gate.resolve({ status: "ok", message: "LATE-CONFIRM-RECEIPT", retention: "retained" as const });
+		await flush();
+		await flush();
+		const after = plain(ui.render(80)).join("\n");
+		expect(after).toContain("Escape dismissed the wait");
+		expect(after).not.toContain("LATE-CONFIRM-RECEIPT");
+		expect(cb.calls).not.toContain("refresh");
+		ui.dispose();
+	});
+
+	test("escape during an in-flight install detaches its late completion", async () => {
+		const gate = Promise.withResolvers<InsightActionResult>();
+		const cb = stubs({
+			installPreview: async () => {
+				cb.calls.push("install");
+				return gate.promise;
+			},
+		});
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments" });
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		expect(cb.calls).toContain("install");
+		ui.handleInput("escape");
+		const detached = plain(ui.render(80)).join("\n");
+		expect(detached).toContain("Escape dismissed the wait");
+		// The late completion lands nowhere: no receipt, no auto-refresh.
+		gate.resolve({ status: "ok", message: "LATE-INSTALL-RECEIPT", install: { action: "created", skill: "second-lesson" } });
+		await flush();
+		await flush();
+		const after = plain(ui.render(80)).join("\n");
+		expect(after).toContain("Escape dismissed the wait");
+		expect(after).not.toContain("LATE-INSTALL-RECEIPT");
+		expect(cb.calls).not.toContain("refresh");
+		ui.dispose();
+	});
+
+	test("escape during a settled confirmation's follow-up refresh detaches the re-read", async () => {
+		const gate = Promise.withResolvers<InsightSnapshot>();
+		let refreshes = 0;
+		const { ui, cb } = await openCandidateConfirm({
+			confirmCandidate: async () => {
+				cb.calls.push("confirm");
+				return { status: "ok", message: "RECEIPT-KEEP", retention: "retained" as const };
+			},
+			refresh: async () => {
+				refreshes += 1;
+				if (refreshes === 1) return gate.promise;
+				cb.calls.push("refresh");
+				return snapshot();
+			},
+		});
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		expect(cb.calls).toContain("confirm");
+		expect(refreshes).toBe(1);
+		// Escape cancels the owned follow-up refresh while it waits.
+		ui.handleInput("escape");
+		const detached = plain(ui.render(80)).join("\n");
+		expect(detached).toContain("RECEIPT-KEEP");
+		expect(detached).toContain("Follow-up refresh cancelled");
+		// The late snapshot lands nowhere: no disappearance claim, no swap.
+		gate.resolve(snapshot({ lessons: [], counts: { candidate: 0, confirmed: 0, promoted: 0, superseded: 0 }, eligible: 0 }));
+		await flush();
+		await flush();
+		const after = plain(ui.render(80)).join("\n");
+		expect(after).toContain("RECEIPT-KEEP");
+		expect(after).toContain("Follow-up refresh cancelled");
+		expect(after).not.toContain("no longer in this snapshot");
+		ui.dispose();
+	});
+
+	test("late confirmation completion after dispose changes nothing", async () => {
+		const gate = Promise.withResolvers<InsightActionResult>();
+		const { ui, cb } = await openCandidateConfirm({
+			confirmCandidate: async () => {
+				cb.calls.push("confirm");
+				return gate.promise;
+			},
+		});
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		expect(cb.calls).toContain("confirm");
+		ui.dispose();
+		gate.resolve({ status: "ok", message: "LATE-DISPOSE-RECEIPT", retention: "retained" as const });
+		await flush();
+		await flush();
+		expect(cb.calls).not.toContain("refresh");
+		expect(ui.render(80).length).toBe(0);
 	});
 
 	test("only one preview request runs while pending", async () => {
@@ -971,6 +1093,339 @@ describe("dashboard physical viewport boundaries", () => {
 		rows = plain(ui.render(80));
 		expect(rows.length).toBeLessThanOrEqual(height);
 		expect(rows.join("\n")).toContain(RECEIPT);
+		ui.dispose();
+	});
+});
+
+describe("dashboard source fidelity and partial truth", () => {
+	function openFirstDetail(ui: InsightDashboard): void {
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+	}
+
+	test("lesson body keeps indentation and repeated spaces through reflow and scrolling", () => {
+		const tail = "whitespace-tail-marker";
+		const lesson = mkLesson("ws", "Whitespace lesson", {
+			status: "confirmed",
+			kind: "pattern",
+			occurrences: 5,
+			eligible: true,
+			body: ["def check():", '    return "a  b"', "", "      nested: true", `${"filler ".repeat(120)}`, tail].join("\n"),
+			selection: { id: "ws", revision: "rws" },
+		});
+		const ui = createInsightDashboard(snapshot({ lessons: [lesson] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => 40 });
+		openFirstDetail(ui);
+		let text = plain(ui.render(40)).join("\n");
+		expect(text).toContain('    return "a  b"');
+		expect(text).toContain("      nested: true");
+		ui.dispose();
+		// Narrow reflow preserves leading spaces instead of folding them away.
+		const narrow = createInsightDashboard(snapshot({ lessons: [lesson] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => 40 });
+		openFirstDetail(narrow);
+		text = plain(narrow.render(24)).join("\n");
+		expect(text).toContain("      nested: true");
+		narrow.dispose();
+		// The in-bound tail stays reachable by scrolling within bounds.
+		const height = 12;
+		const scrolled = createInsightDashboard(snapshot({ lessons: [lesson] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => height });
+		openFirstDetail(scrolled);
+		let rendered = plain(scrolled.render(40)).join("\n");
+		for (let i = 0; i < 200 && !rendered.includes(tail); i += 1) {
+			scrolled.handleInput("down");
+			rendered = plain(scrolled.render(40)).join("\n");
+		}
+		expect(rendered).toContain(tail);
+		const tailRows = plain(scrolled.render(40));
+		expect(tailRows.length).toBeLessThanOrEqual(height);
+		for (const row of tailRows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(40);
+		scrolled.dispose();
+	});
+
+	test("preview draft keeps source indentation instead of folding lines into labels", async () => {
+		const content = ["---", "name: indented-draft", '  setting: "a  b"', "    deeper: true", "ownership: generated-by-ultrathink"].join("\n");
+		const cb = stubs({
+			previewSkill: async () => {
+				cb.calls.push("preview");
+				return { status: "ok", message: "ready", preview: { selection: { id: "l2", revision: "r2" }, fingerprint: "f", name: "draft", description: "d", content, warnings: [] } };
+			},
+		});
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		const text = plain(ui.render(80)).join("\n");
+		expect(text).toMatch(/Preview only/);
+		expect(text).toContain('  setting: "a  b"');
+		expect(text).toContain("    deeper: true");
+		ui.dispose();
+	});
+
+	test("partial snapshots qualify every panel list, count, and selected details", () => {
+		const partial = snapshot({ partial: true, limitations: ["scan capped at 500 files"] });
+		for (const panel of ["jev", "moments", "skills"] as const) {
+			const ui = createInsightDashboard(partial, stubs(), { theme: {}, initialPanel: panel, rows: () => 40 });
+			const browse = plain(ui.render(80)).join("\n");
+			expect(browse).toMatch(/Partial snapshot/);
+			expect(browse).toMatch(/partial/);
+			ui.handleInput("tab");
+			ui.handleInput("enter");
+			const detail = plain(ui.render(80)).join("\n");
+			// Empty-or-not, the directly opened record carries the qualifier.
+			if (!detail.includes("No saved Jev decisions") && !detail.includes("No lessons")) {
+				expect(detail).toMatch(/Partial snapshot/);
+			}
+			ui.dispose();
+		}
+	});
+
+	test("long bounded provenance wraps complete instead of a narrower recap", () => {
+		const phase = "p".repeat(300);
+		const artifact = "a".repeat(200);
+		const related = "r".repeat(80);
+		const dest = "s".repeat(300);
+		const lesson = mkLesson("lp", "Long provenance lesson", {
+			status: "promoted",
+			sourcePhase: phase,
+			sourceArtifacts: [artifact],
+			relatedIds: [related],
+			promoted: { at: "2026-01-05T00:00:00Z", skill: "long-lesson", target: "omp", path: dest },
+			selection: { id: "lp", revision: "rlp" },
+		});
+		const ui = createInsightDashboard(snapshot({ lessons: [lesson] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		const views = [plain(ui.render(80)).join("")];
+		for (let page = 0; page < 3; page += 1) {
+			ui.handleInput("pagedown");
+			views.push(plain(ui.render(80)).join(""));
+		}
+		for (const value of [phase, artifact, related, dest]) {
+			expect(views.some((text) => text.includes(value))).toBe(true);
+		}
+		ui.dispose();
+	});
+});
+
+describe("dashboard policy-off and layout guidance", () => {
+	test("known teaching-off disables confirm, preview, and install without dispatching", async () => {
+		const off = snapshot({ policy: { ...snapshot().policy, enabled: false } });
+		const cb = stubs();
+		const ui = createInsightDashboard(off, cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		let text = plain(ui.render(80)).join("\n");
+		expect(text).toMatch(/Teaching is off/);
+		// The candidate strip offers confirmation only as unavailable; firing
+		// it explains instead of dispatching.
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		expect(cb.calls).not.toContain("confirm");
+		expect(plain(ui.render(80)).join("\n")).toMatch(/Teaching is off/);
+		ui.dispose();
+		// The eligible lesson offers preview only as unavailable; firing it
+		// explains instead of dispatching.
+		const previewUi = createInsightDashboard(off, cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		previewUi.render(80);
+		previewUi.handleInput("tab");
+		previewUi.handleInput("down");
+		previewUi.handleInput("enter");
+		expect(plain(previewUi.render(80)).join("\n")).toMatch(/Teaching is off/);
+		previewUi.handleInput("tab");
+		previewUi.handleInput("tab");
+		previewUi.handleInput("enter");
+		await flush();
+		await flush();
+		expect(cb.calls).not.toContain("preview");
+		previewUi.dispose();
+	});
+
+	test("growing the viewport clears stale fit guidance but keeps durable receipts", async () => {
+		const longId = `l-${"x".repeat(300)}`;
+		let height = 12;
+		const cb = stubs();
+		const ui = createInsightDashboard(
+			snapshot({ lessons: [mkLesson(longId, "A very long candidate title that wraps across many terminal rows", { selection: { id: longId, revision: "r" } })] }),
+			cb,
+			{ theme: {}, initialPanel: "moments", rows: () => height },
+		);
+		ui.render(40);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("right");
+		ui.handleInput("enter");
+		expect(plain(ui.render(40)).join("\n")).toMatch(/does not fit/);
+		// Firing the withheld affirmative records only transient guidance.
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		expect(cb.calls).not.toContain("confirm");
+		expect(plain(ui.render(40)).join("\n")).toMatch(/does not fit/);
+		// Growing restores the complete identity and clears the stale refusal.
+		height = 40;
+		const grown = plain(ui.render(40)).join("\n");
+		expect(grown).toContain("Confirm this candidate?");
+		expect(grown).not.toMatch(/does not fit/);
+		ui.dispose();
+		// A durable settled receipt survives the same growth.
+		const RECEIPT = "Candidate confirmed receipt-growth.";
+		let currentHeight = 12;
+		const receiptCb = stubs({
+			confirmCandidate: async () => {
+				receiptCb.calls.push("confirm");
+				return { status: "ok", message: RECEIPT, retention: "retained" as const };
+			},
+		});
+		const receiptUi = createInsightDashboard(snapshot(), receiptCb, { theme: {}, initialPanel: "moments", rows: () => currentHeight });
+		receiptUi.render(80);
+		receiptUi.handleInput("tab");
+		receiptUi.handleInput("enter");
+		receiptUi.handleInput("tab");
+		receiptUi.handleInput("tab");
+		receiptUi.handleInput("enter");
+		await flush();
+		receiptUi.handleInput("down");
+		receiptUi.handleInput("enter");
+		await flush();
+		await flush();
+		expect(plain(receiptUi.render(80)).join("\n")).toContain(RECEIPT);
+		currentHeight = 40;
+		expect(plain(receiptUi.render(80)).join("\n")).toContain(RECEIPT);
+		receiptUi.dispose();
+	});
+
+	test("unknown height uses the bounded content fallback with a width-based mutation guard", () => {
+		const ui = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "moments" });
+		const rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(2 + 12 + 8);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		// Mutation stays available by width: the confirmation opens complete.
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		expect(plain(ui.render(80)).join("\n")).toContain("Confirm this candidate?");
+		ui.dispose();
+		// Missing, invalid, and throwing heights fall back the same way.
+		const fallbacks: Array<() => number | undefined> = [() => undefined, () => Number.NaN, () => { throw new Error("rows unavailable"); }];
+		for (const rowsOf of fallbacks) {
+			const fallback = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "moments", rows: rowsOf });
+			const fallbackRows = plain(fallback.render(80));
+			expect(fallbackRows.length).toBeLessThanOrEqual(2 + 12 + 8);
+			fallback.dispose();
+		}
+	});
+});
+
+describe("dashboard skills collections and preview navigation", () => {
+	test("skills labels eligible-empty and promoted-empty independently, including mixed collections", () => {
+		// Fully empty: both absence states are labeled.
+		const empty = createInsightDashboard(snapshot({ lessons: [], eligible: 0, promoted: 0 }), stubs(), { theme: {}, initialPanel: "skills", rows: () => 40 });
+		const emptyText = plain(empty.render(80)).join("\n");
+		expect(emptyText).toContain("No lessons meet the promotion rules");
+		expect(emptyText).toContain("No promotions recorded for this project");
+		empty.dispose();
+		// Eligible-only: subset counts plus the promoted-empty state.
+		const eligibleOnly = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "skills", rows: () => 40 });
+		const eligibleText = plain(eligibleOnly.render(80)).join("\n");
+		expect(eligibleText).toContain("Eligible: 1 shown");
+		expect(eligibleText).toContain("Promoted: 0 shown");
+		expect(eligibleText).toContain("No promotions recorded for this project");
+		eligibleOnly.dispose();
+		// Promoted-only: subset counts plus the eligible-empty state.
+		const promoted = mkLesson("sp", "Promoted lesson", {
+			status: "promoted",
+			promoted: { at: "2026-01-05T00:00:00Z", skill: "promoted-lesson", target: "omp" },
+			selection: { id: "sp", revision: "rsp" },
+		});
+		const promotedOnly = createInsightDashboard(snapshot({ lessons: [promoted], eligible: 0, promoted: 1 }), stubs(), { theme: {}, initialPanel: "skills", rows: () => 40 });
+		const promotedText = plain(promotedOnly.render(80)).join("\n");
+		expect(promotedText).toContain("Eligible: 0 shown");
+		expect(promotedText).toContain("Promoted: 1 shown");
+		expect(promotedText).toContain("No lessons meet the promotion rules");
+		promotedOnly.dispose();
+	});
+
+	test("canonical refused results display once without added wrapping", async () => {
+		const reason = "z".repeat(300);
+		const message = `Installation refused: ${reason}. Existing files were not replaced by this refused install; review the lesson/slot outside this dashboard, then preview again.`;
+		const cb = stubs({
+			installPreview: async () => {
+				cb.calls.push("install");
+				return { status: "refused", message };
+			},
+		});
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		const text = plain(ui.render(80)).join("\n");
+		expect(cb.calls).toContain("install");
+		// The complete canonical reason survives (never re-capped) and the
+		// prefix appears exactly once (never wrapped again).
+		expect(text.replaceAll("\n", "")).toContain(reason);
+		expect(text.split("Installation refused").length - 1).toBe(1);
+		ui.dispose();
+	});
+
+	test("preview Back returns to lesson details and Tab stays in viewport and actions", async () => {
+		const cb = stubs();
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		expect(plain(ui.render(80)).join("\n")).toMatch(/Preview only/);
+		// Arrow keys never leave the preview for unrelated tabs.
+		for (let i = 0; i < 6; i += 1) {
+			ui.handleInput("tab");
+			ui.handleInput("left");
+			ui.handleInput("right");
+		}
+		let text = plain(ui.render(80)).join("\n");
+		expect(text).toMatch(/Preview only/);
+		expect(text).toContain("[Moments]");
+		expect(text).toMatch(/back to lesson/);
+		// Back returns to the exact selected lesson details, not the browse list.
+		ui.handleInput("tab");
+		ui.handleInput("left");
+		ui.handleInput("enter");
+		await flush();
+		text = plain(ui.render(80)).join("\n");
+		expect(text).not.toMatch(/Preview only/);
+		expect(text).toContain("Second lesson");
+		expect(text).toContain("l2");
 		ui.dispose();
 	});
 });
