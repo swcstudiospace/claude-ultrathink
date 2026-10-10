@@ -2,6 +2,9 @@
 // Copyright (C) 2026 SWC Studio
 import type { Api, ApiKeyResolver, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { join } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { defaultConfig } from "../config.ts";
 import type { UltrathinkConfig } from "../config.ts";
 import { createOmpExtension } from "./omp.ts";
@@ -50,6 +53,8 @@ export function setup(
 	extra: Omit<OmpOptions, "plan" | "raceMs" | "mcp"> & Partial<Pick<OmpOptions, "mcp">> = {},
 	ctxExtra: Record<string, unknown> = {},
 	apiExtra: Pick<ExtensionAPI, "getThinkingLevel"> = {},
+	/** Test-only omission seam: a true value leaves raceMs absent at createOmpExtension, proving the real default. */
+	omitRaceMs = false,
 ): OmpTestHarness {
 	const handlers = new Map<string, AnyHandler[]>();
 	const sent: { message: unknown; options: unknown }[] = [];
@@ -78,7 +83,8 @@ export function setup(
 		...apiExtra,
 	} as unknown as ExtensionAPI;
 	// Every flight captures config; a quiet one keeps the suite off the developer's own config files.
-	createOmpExtension({ ...(plan ? { plan: wrap(plan) } : {}), raceMs, mcp: MCP, config: () => quietConfig(), ...extra })(pi);
+	// With omitRaceMs the race property stays absent so the flight proves the real factory default.
+	createOmpExtension({ ...(plan ? { plan: wrap(plan) } : {}), ...(omitRaceMs ? {} : { raceMs }), mcp: MCP, config: () => quietConfig(), ...extra })(pi);
 	const ctx = { cwd: "/repo", sessionManager: { getSessionId: () => "s1" }, ...ctxExtra };
 	const emit = (event: string, payload: Record<string, unknown> = {}, context: Record<string, unknown> = ctx) => {
 		let result: unknown;
@@ -250,4 +256,400 @@ export function stageAnswer(user: string): { stage: string; text: string } {
 		depends_on: i === 0 ? [] : [`n${i}`],
 	}));
 	return { stage: "graph", text: JSON.stringify({ goal: "Ship it", nodes }) };
+}
+
+/**
+ * Elapsed-lifetime proof in a spawned child: the child imports the real extension and the real
+ * native pipeline, replaces only its own setTimeout/clearTimeout with a due-time/insertion-order
+ * queue, fires queued callbacks through 600001 ms, then releases the provider gate and requires
+ * exactly one real plan aside. The parent suite process keeps its real clock; a watchdog kills a
+ * hung child and disposable roots are removed in finally on both sides.
+ */
+export async function runChildLifetimeScenario(scenario: {
+	maxRunMs?: number;
+	cancelHung: boolean;
+}): Promise<{ planAsides: number; nativeCalls: number }> {
+	const root = mkdtempSync(join(tmpdir(), "ut-omp-life-"));
+	try {
+		const hostDir = fileURLToPath(new URL("./", import.meta.url));
+		const script = join(root, "lifetime-scenario.ts");
+		writeFileSync(script, childLifetimeSource(hostDir, scenario));
+		const proc = Bun.spawn([process.execPath, script], {
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
+		let timedOut = false;
+		const watchdog = setTimeout(() => {
+			timedOut = true;
+			try {
+				proc.kill("SIGKILL");
+			} catch {}
+		}, 90_000);
+		let exited = false;
+		try {
+			// Drain both pipes while the child runs: awaiting exit first can deadlock once a pipe fills.
+			const outText = new Response(proc.stdout).text();
+			const errText = new Response(proc.stderr).text();
+			const code = await proc.exited;
+			exited = true;
+			const [out, err] = await Promise.all([outText, errText]);
+			if (timedOut) throw new Error("child lifetime scenario timed out after 90 s: " + err.slice(-2000));
+			if (code !== 0) throw new Error("child lifetime scenario exited " + code + ": " + err.slice(-2000));
+			const line = out.split("\n").find((entry) => entry.startsWith("SCENARIO-RESULT "));
+			if (!line) throw new Error("child lifetime scenario printed no result: " + err.slice(-2000));
+			const result = JSON.parse(line.slice("SCENARIO-RESULT ".length)) as { planAsides: number; nativeCalls: number };
+			if (typeof result.planAsides !== "number" || typeof result.nativeCalls !== "number") {
+				throw new Error("child lifetime scenario result malformed: " + line);
+			}
+			return result;
+		} finally {
+			clearTimeout(watchdog);
+			// A throw above must not leave the child running or the watchdog armed.
+			if (!exited) {
+				try {
+					proc.kill("SIGKILL");
+				} catch {}
+			}
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+/**
+ * The child program behind runChildLifetimeScenario, built from static author-time imports of the
+ * real extension, the real native pipeline, and the shared test recorders. Its only fixture is a
+ * child-local timer queue with due-time/insertion-order firing, clear support, unref handles, and
+ * microtask drains between callbacks; I/O and delivery use real started/completed/delivered
+ * barriers, never the parent process clock. No paid provider, no live auth, disposable roots only.
+ */
+function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; cancelHung: boolean }): string {
+	const ompPath = JSON.stringify(join(hostDir, "omp.ts"));
+	const helpersPath = JSON.stringify(join(hostDir, "omp-test.helpers.ts"));
+	const planPath = JSON.stringify(join(hostDir, "plan.ts"));
+	const configPath = JSON.stringify(join(hostDir, "..", "config.ts"));
+	const progressPath = JSON.stringify(join(hostDir, "progress.ts"));
+	const maxRunMs = JSON.stringify(scenario.maxRunMs);
+	const cancelHung = JSON.stringify(scenario.cancelHung);
+	return [
+		"import { createNativeEngineSelector } from " + ompPath + ";",
+		"import { fakeModel, fakeRuntime, isolatedPlanEnv, quietConfig, recorder, reply, setup, stageAnswer, userText } from " + helpersPath + ";",
+		"import { planPrompt } from " + planPath + ";",
+		"import type { UltrathinkConfig } from " + configPath + ";",
+		"import type { OmpPlanner } from " + ompPath + ";",
+		"import type { PlanResponse } from " + planPath + ";",
+		"import type { ProgressEvent } from " + progressPath + ";",
+		"import { existsSync, mkdtempSync, rmSync } from 'node:fs';",
+		"import { tmpdir } from 'node:os';",
+		"import { join } from 'node:path';",
+		"",
+		"const SCENARIO_MAX_RUN_MS: number | undefined = " + maxRunMs + ";",
+		"const SCENARIO_CANCEL_HUNG: boolean = " + cancelHung + ";",
+		"",
+		"const realSetTimeout: typeof setTimeout = globalThis.setTimeout;",
+		"const realClearTimeout: typeof clearTimeout = globalThis.clearTimeout;",
+		"",
+		"interface QueueEntry {",
+		"	due: number;",
+		"	seq: number;",
+		"	callback: (...args: unknown[]) => void;",
+		"	args: unknown[];",
+		"	cleared: boolean;",
+		"	handle: unknown;",
+		"}",
+		"",
+		"let virtualNow = 0;",
+		"let insertion = 0;",
+		"const queue: QueueEntry[] = [];",
+		"const handleToEntry = new Map<unknown, QueueEntry>();",
+		"",
+		"function virtualSetTimeout(callback: (...args: unknown[]) => void, delay?: unknown, ...args: unknown[]): unknown {",
+		"	const ms = typeof delay === 'number' && Number.isFinite(delay) && delay > 0 ? delay : 0;",
+		"	const entry: QueueEntry = { due: virtualNow + ms, seq: insertion++, callback, args, cleared: false, handle: undefined };",
+		"	const handle = {",
+		"		unref(): unknown { return handle; },",
+		"		ref(): unknown { return handle; },",
+		"		hasRef(): boolean { return false; },",
+		"	};",
+		"	entry.handle = handle;",
+		"	queue.push(entry);",
+		"	handleToEntry.set(handle, entry);",
+		"	return handle;",
+		"}",
+		"",
+		"function virtualClearTimeout(handle: unknown): void {",
+		"	const entry = handleToEntry.get(handle);",
+		"	if (entry !== undefined) {",
+		"		entry.cleared = true;",
+		"		handleToEntry.delete(handle);",
+		"	}",
+		"}",
+		"",
+		"async function tick(rounds: number): Promise<void> {",
+		"	for (let i = 0; i < rounds; i++) await Promise.resolve();",
+		"}",
+		"",
+		"async function fireThrough(limit: number): Promise<void> {",
+		"	for (;;) {",
+		"		let pick: QueueEntry | undefined = undefined;",
+		"		for (const entry of queue) {",
+		"			if (entry.cleared || entry.due > limit) continue;",
+		"			if (pick === undefined || entry.due < pick.due || (entry.due === pick.due && entry.seq < pick.seq)) pick = entry;",
+		"		}",
+		"		if (pick === undefined) break;",
+		"		pick.cleared = true;",
+		"		queue.splice(queue.indexOf(pick), 1);",
+		"		handleToEntry.delete(pick.handle);",
+		"		virtualNow = pick.due;",
+		"		pick.callback(...pick.args);",
+		"		await tick(25);",
+		"	}",
+		"	virtualNow = Math.max(virtualNow, limit);",
+		"	await tick(25);",
+		"}",
+		"",
+		"function fail(message: string): never {",
+		"	throw new Error(message);",
+		"}",
+		"",
+		"function check(cond: unknown, message: string): void {",
+		"	if (!cond) fail(message);",
+		"}",
+		"",
+		"function isObject(value: unknown): value is Record<string, unknown> {",
+		"	return typeof value === 'object' && value !== null;",
+		"}",
+		"",
+		"function messageOf(value: unknown): Record<string, unknown> | undefined {",
+		"	if (!isObject(value)) return undefined;",
+		"	const message = value.message;",
+		"	return isObject(message) ? message : undefined;",
+		"}",
+		"",
+		"function customTypeOf(value: unknown): string | undefined {",
+		"	const message = messageOf(value);",
+		"	if (message === undefined) return undefined;",
+		"	return typeof message.customType === 'string' ? message.customType : undefined;",
+		"}",
+		"",
+		"function contentOf(value: unknown): unknown {",
+		"	return messageOf(value)?.content;",
+		"}",
+		"",
+		"function deliverAsOf(value: unknown): unknown {",
+		"	if (!isObject(value)) return undefined;",
+		"	const options = value.options;",
+		"	return isObject(options) ? options.deliverAs : undefined;",
+		"}",
+		"",
+		"async function runScenario(root: string): Promise<{ planAsides: number; nativeCalls: number }> {",
+		"	const live = fakeModel('acme', 'sol-1');",
+		"	const holder = fakeRuntime([live], { current: () => live });",
+		"	const runtime = holder.runtime;",
+		"	const log = holder.log;",
+		"	const config = quietConfig((value: UltrathinkConfig) => {",
+		"		value.track.enabled = true;",
+		"		value.linear.team = 'Team';",
+		"	});",
+		"	const stateDir = join(root, 'state');",
+		"	let nativeCalls = 0;",
+		"	const stages: string[] = [];",
+		"	const events: ProgressEvent[] = [];",
+		"	let tracks = 0;",
+		"	let providerStarted = false;",
+		"	let startResolve: () => void = () => {};",
+		"	const startedGate = new Promise<void>((resolve) => { startResolve = resolve; });",
+		"	let gateReleased = false;",
+		"	let releaseProvider: () => void = () => {};",
+		"	const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });",
+		"	let planResolve: (value: PlanResponse) => void = () => {};",
+		"	const planDone = new Promise<PlanResponse>((resolve) => { planResolve = resolve; });",
+		"	let successorResolve: () => void = () => {};",
+		"	const successorStarted = new Promise<void>((resolve) => { successorResolve = resolve; });",
+		"	let successorDoneResolve: (value: unknown) => void = () => {};",
+		"	const successorDone = new Promise<unknown>((resolve) => { successorDoneResolve = resolve; });",
+		"	let releaseSuccessor: () => void = () => {};",
+		"	const successorGate = new Promise<void>((resolve) => { releaseSuccessor = resolve; });",
+		"	let successorIsCurrent: (() => boolean) | undefined = undefined;",
+		"	let successorSignal: AbortSignal | undefined = undefined;",
+		"	let capturedIsCurrent: (() => boolean) | undefined = undefined;",
+		"	let capturedSignal: AbortSignal | undefined = undefined;",
+		"	const rec = recorder((call) => {",
+		"		nativeCalls++;",
+		"		if (nativeCalls === 1 && !providerStarted) {",
+		"			providerStarted = true;",
+		"			startResolve();",
+		"		}",
+		"		const figured = stageAnswer(userText(call));",
+		"		stages.push(figured.stage);",
+		"		const answer = () => reply([{ type: 'thinking', thinking: 'SECRET-THOUGHT' }, { type: 'text', text: figured.text }]);",
+		"		if (nativeCalls === 1 && !gateReleased) return providerGate.then(answer);",
+		"		return answer();",
+		"	});",
+		"	const emptyGround = { status: 'none', chunks: [], chars: 0, ms: 0, datasets: 0 };",
+		"	const planner: OmpPlanner = async (request, signal, onEvent) => {",
+		"		if (request.prompt === 'add a different widget') {",
+		"			successorIsCurrent = request.isCurrent;",
+		"			successorSignal = signal;",
+		"			successorResolve();",
+		"			await successorGate;",
+		"			const inline = { context: 'PLAN B' };",
+		"			successorDoneResolve(inline);",
+		"			return inline;",
+		"		}",
+		"		capturedIsCurrent = request.isCurrent;",
+		"		capturedSignal = signal;",
+		"		const response = await planPrompt(",
+		"			{ host: 'omp', session_id: request.sessionId, prompt: request.prompt, cwd: request.cwd },",
+		"			isolatedPlanEnv(root),",
+		"			{",
+		"				config: request.config,",
+		"				control: request.control,",
+		"				stateDir,",
+		"				signal,",
+		"				native: createNativeEngineSelector(request, signal, { completeSimple: rec.complete, providerDefaults: {}, isCurrent: request.isCurrent }),",
+		"				ground: () => Promise.resolve(emptyGround),",
+		"				createTracker: () => async () => { tracks++; return undefined; },",
+		"				progress: (entry: ProgressEvent) => {",
+		"					events.push(entry);",
+		"					if (onEvent) onEvent(entry);",
+		"				},",
+		"			},",
+		"		);",
+		"		planResolve(response);",
+		"		return response;",
+		"	};",
+		"	const extra: Record<string, unknown> = { stateDir, config: () => config };",
+		"	if (SCENARIO_MAX_RUN_MS !== undefined) extra['maxRunMs'] = SCENARIO_MAX_RUN_MS;",
+		"	// The session thinking level every native stage must keep across the cutoff; never the unset default.",
+		"	const h = setup(planner, 1000, extra, { cwd: root, model: live, ...runtime }, { getThinkingLevel: () => 'low' }, true);",
+		"	let sentinel = false;",
+		"	const childSetTimeout = globalThis.setTimeout as unknown as (callback: () => void, ms: number) => unknown; // child-local virtual timer handle is opaque to the host clock",
+		"	childSetTimeout(() => { sentinel = true; }, 600000);",
+		"	const pendingPromise: unknown = h.run('add a widget');",
+		"	await startedGate;",
+		"	await tick(25);",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'flight aborted before the race');",
+		"	check(capturedIsCurrent !== undefined && capturedIsCurrent(), 'flight not current before the race');",
+		"	await fireThrough(25000);",
+		"	const pending: unknown = await pendingPromise;",
+		"	check(customTypeOf(pending) === 'ultrathink-pending', 'expected the real pending handoff at 25000ms');",
+		"	check(nativeCalls === 1, 'expected one pending native call at handoff, saw ' + nativeCalls);",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'flight aborted at the handoff');",
+		"	await fireThrough(600001);",
+		"	check(sentinel, 'cutoff sentinel never fired: virtual clock did not cross 600000ms');",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'unbounded flight aborted beyond the former cutoff');",
+		"	check(capturedIsCurrent !== undefined && capturedIsCurrent(), 'unbounded flight lost currentness beyond the former cutoff');",
+		"	check(h.sent.length === 0, 'unexpected delivery beyond the cutoff');",
+		"	check(nativeCalls === 1, 'pipeline retried beyond the cutoff: ' + nativeCalls + ' native calls');",
+		"	check(log.resolvers.length === 1, 'resolver rebound beyond the cutoff');",
+		"	if (SCENARIO_CANCEL_HUNG) {",
+		"		h.emit('turn_start');",
+		"		const inlinePromise: unknown = h.run('add a different widget');",
+		"		// The successor resolves in microtasks: prove it started before reading the race, never by firing the clock first.",
+		"		await successorStarted;",
+		"		await tick(25);",
+		"		check(!gateReleased, 'provider gate released before the successor admitted');",
+		"		check(nativeCalls === 1, 'provider advanced while the successor was pending: ' + nativeCalls + ' native calls');",
+		"		check(capturedSignal !== undefined && capturedSignal.aborted, 'cancelled flight lifetime still running');",
+		"		check(capturedIsCurrent !== undefined && !capturedIsCurrent(), 'cancelled flight still current');",
+		"		check(successorSignal !== undefined && !successorSignal.aborted, 'successor aborted while pending');",
+		"		check(successorIsCurrent !== undefined && successorIsCurrent(), 'successor not current while pending');",
+		"		releaseSuccessor();",
+		"		const inline: unknown = await inlinePromise;",
+		"		const inlineDelivered = customTypeOf(inline) !== 'ultrathink-pending';",
+		"		if (inlineDelivered) {",
+		"			check(contentOf(inline) === 'PLAN B', 'successor did not deliver its inline plan');",
+		"		} else {",
+		"			await successorDone;",
+		"			for (let round = 0; round < 200 && h.sent.length === 0; round++) await Promise.resolve();",
+		"			check(h.sent.length === 1, 'successor pending never delivered its aside');",
+		"			check(contentOf(h.sent[0]) === 'PLAN B', 'successor aside lost its plan content');",
+		"		}",
+		"		check(h.sent.length === (inlineDelivered ? 0 : 1), 'unexpected aside before the hung provider released');",
+		"		check(capturedSignal !== undefined && capturedSignal.aborted, 'cancelled flight lifetime still running');",
+		"		check(successorSignal !== undefined && !successorSignal.aborted, 'successor aborted at delivery');",
+		"		check(successorIsCurrent !== undefined && !successorIsCurrent(), 'successor still current after settlement');",
+		"		check(rec.calls.every((call) => call.options !== undefined && call.options.reasoning === 'low'), 'a native call left the captured thinking effort');",
+		"		globalThis.setTimeout = realSetTimeout;",
+		"		globalThis.clearTimeout = realClearTimeout;",
+		"		gateReleased = true;",
+		"		releaseProvider();",
+		"		await planDone;",
+		"		await new Promise<void>((resolve) => realSetTimeout(resolve, 50));",
+		"		check(h.sent.length === (inlineDelivered ? 0 : 1), 'cancelled flight delivered late');",
+		"		check(tracks === 0, 'cancelled flight admitted tracker rows');",
+		"		for (const path of ['sessions/s1.json', 'sessions/s1.xml', 'last.json', 'last-plan.json']) {",
+		"			check(!existsSync(join(stateDir, path)), 'cancelled flight wrote ' + path);",
+		"		}",
+		"		return { planAsides: inlineDelivered ? 0 : 1, nativeCalls };",
+		"	}",
+		"	globalThis.setTimeout = realSetTimeout;",
+		"	globalThis.clearTimeout = realClearTimeout;",
+		"	gateReleased = true;",
+		"	releaseProvider();",
+		"	const response: PlanResponse = await planDone;",
+		"	for (let round = 0; round < 200 && h.sent.length === 0; round++) await Promise.resolve();",
+		"	check(h.sent.length === 1, 'expected exactly one plan aside, saw ' + h.sent.length);",
+		"	const aside: unknown = h.sent[0];",
+		"	check(deliverAsOf(aside) === 'aside', 'aside missing deliverAs');",
+		"	check(customTypeOf(aside) === 'ultrathink-plan', 'aside missing plan customType');",
+		"	const asideContent: unknown = contentOf(aside);",
+		"	check(typeof asideContent === 'string' && asideContent.indexOf('<BUILD_PROMPT>') !== -1, 'aside missing real plan content');",
+		"	check(asideContent === response.context, 'aside content differs from the pipeline response');",
+		"	check(JSON.stringify(stages) === JSON.stringify(['uplift', 'graph', 'fill', 'fill', 'fill', 'fill', 'fill', 'clarify']), 'unexpected stage sequence ' + JSON.stringify(stages));",
+		"	check(response.modelResolution && response.modelResolution.state === 'detected', 'model resolution not detected');",
+		"	check(response.modelResolution.source === 'ctx.model', 'model resolution lost its source');",
+		"	check(response.modelResolution.label === 'omp-native:acme/sol-1 [detected]', 'unexpected resolution label');",
+		"	check(nativeCalls === 8, 'expected eight native completions, saw ' + nativeCalls);",
+		"	check(log.resolvers.length === 1, 'resolver rebound across the cutoff');",
+		"	const snapshot = log.resolvers[0]?.model;",
+		"	check(rec.calls.every((call) => call.model === snapshot), 'a native call left the captured Model snapshot');",
+		"	check(rec.calls.every((call) => call.options && call.options.sessionId === 's1'), 'a native call left the captured session');",
+		"	check(rec.calls.every((call) => call.options && call.options.apiKey === log.resolvers[0]?.key), 'a native call left the captured auth route');",
+		"	check(rec.calls.every((call) => call.options !== undefined && call.options.reasoning === 'low'), 'a native call left the captured thinking effort');",
+		"	check(rec.calls.every((call) => call.options === undefined || call.options.disableReasoning !== true), 'a native call disabled the captured thinking effort');",
+		"	check(JSON.stringify(response).indexOf('SECRET') === -1, 'secret material escaped into the plan response');",
+		"	check(JSON.stringify(events).indexOf('SECRET') === -1, 'secret material escaped into progress events');",
+		"	check(tracks === 1, 'expected one tracker admission, saw ' + tracks);",
+		"	for (const path of ['sessions/s1.json', 'sessions/s1.xml', 'last.json', 'last-plan.json']) {",
+		"		check(existsSync(join(stateDir, path)), 'successful pipeline missing ' + path);",
+		"	}",
+		"	const again: unknown = await h.run('add a widget');",
+		"	check(again === undefined, 'settled reentry planned again');",
+		"	check(nativeCalls === 8, 'reentry issued a second pipeline');",
+		"	check(h.sent.length === 1, 'reentry duplicated the aside');",
+		"	await new Promise<void>((resolve) => realSetTimeout(resolve, 25));",
+		"	check(capturedSignal !== undefined && !capturedSignal.aborted, 'successful flight aborted late');",
+		"	check(h.sent.length === 1, 'late duplicate aside');",
+		"	check(capturedIsCurrent !== undefined && !capturedIsCurrent(), 'settled flight still current');",
+		"	return { planAsides: 1, nativeCalls };",
+		"}",
+		"",
+		"async function main(): Promise<void> {",
+		"	const stashSetTimeout = globalThis.setTimeout;",
+		"	const stashClearTimeout = globalThis.clearTimeout;",
+		"	globalThis.setTimeout = virtualSetTimeout as typeof setTimeout;",
+		"	globalThis.clearTimeout = virtualClearTimeout as typeof clearTimeout;",
+		"	const root = mkdtempSync(join(tmpdir(), 'ut-omp-life-child-'));",
+		"	try {",
+		"		const result = await runScenario(root);",
+		"		console.log('SCENARIO-RESULT ' + JSON.stringify(result));",
+		"		process.exitCode = 0;",
+		"	} finally {",
+		"		globalThis.setTimeout = stashSetTimeout;",
+		"		globalThis.clearTimeout = stashClearTimeout;",
+		"		rmSync(root, { recursive: true, force: true });",
+		"	}",
+		"}",
+		"",
+		"main().then(",
+		"	() => {},",
+		"	(error: unknown) => {",
+		"		console.error('SCENARIO-FAIL ' + (error instanceof Error ? error.stack || error.message : String(error)));",
+		"		realSetTimeout(() => process.exit(1), 100);",
+		"	},",
+		");",
+	].join("\n");
 }
