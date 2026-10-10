@@ -469,10 +469,10 @@ export interface SwarmSpawnCardSnapshot {
 	lanes: SwarmLaneCard[];
 }
 
-/** One status card lane: the lane's own summary line and counts, or the probe error in their place. */
+/** One status card lane: the lane's own summary line and counts, or the probe error in their place; both carry the run log path. */
 export type SwarmStatusLane =
-	| { laneId: string; summary: string; done: number; total: number }
-	| { laneId: string; summary: string; error: string };
+	| { laneId: string; summary: string; logPath: string; done: number; total: number }
+	| { laneId: string; summary: string; logPath: string; error: string };
 
 /** The status reply as a card snapshot, plus how many discovered lanes the recency bound hid. */
 export interface SwarmStatusCardSnapshot {
@@ -502,14 +502,15 @@ export function toSwarmSpawnCard(handles: readonly LaneHandle[], plans: readonly
 
 /**
  * Project status rows into a card snapshot: a probed lane keeps its own summary and counts; a failed probe
- * becomes a bare error lane with empty counts; the discovery bound's omitted count passes through untouched.
+ * becomes a bare error lane with empty counts; every lane carries its run log path, and the discovery
+ * bound's omitted count passes through untouched.
  */
 export function toSwarmStatusCard(rows: readonly LaneStatusRow[], omitted: number): SwarmStatusCardSnapshot {
 	return {
 		lanes: rows.map((row) =>
 			"error" in row
-				? { laneId: row.laneId, summary: "", error: row.error }
-				: { laneId: row.laneId, summary: row.summary, done: row.done, total: row.total },
+				? { laneId: row.laneId, summary: "", logPath: row.logPath, error: row.error }
+				: { laneId: row.laneId, summary: row.summary, logPath: row.logPath, done: row.done, total: row.total },
 		),
 		omitted,
 	};

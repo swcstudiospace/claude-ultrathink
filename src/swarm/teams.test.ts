@@ -576,7 +576,7 @@ describe("toSwarmSpawnCard", () => {
 });
 
 describe("toSwarmStatusCard", () => {
-	test("maps success rows to counts and error rows to bare error lanes", () => {
+	test("maps success rows to counts and error rows to bare error lanes, both with the run log path", () => {
 		const rows: LaneStatusRow[] = [
 			{
 				laneId: "aa11bb22-1-x1",
@@ -591,8 +591,8 @@ describe("toSwarmStatusCard", () => {
 		const card = toSwarmStatusCard(rows, 2);
 		expect(card.omitted).toBe(2);
 		expect(card.lanes).toEqual([
-			{ laneId: "aa11bb22-1-x1", summary: "aa11bb22-1-x1: 3 tasks — 2 done", done: 2, total: 3 },
-			{ laneId: "cc33dd44-2-x2", summary: "", error: "probe timed out" },
+			{ laneId: "aa11bb22-1-x1", summary: "aa11bb22-1-x1: 3 tasks — 2 done", logPath: "/s/aa11bb22-1-x1/run.log", done: 2, total: 3 },
+			{ laneId: "cc33dd44-2-x2", summary: "", logPath: "/s/cc33dd44-2-x2/run.log", error: "probe timed out" },
 		]);
 		// A probed lane carries no error key; a failed probe lane carries none of the counts.
 		expect("error" in card.lanes[0]!).toBe(false);

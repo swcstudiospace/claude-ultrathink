@@ -725,16 +725,16 @@ describe("swarm card", () => {
 	const statusDetails = {
 		omitted: 0,
 		lanes: [
-			{ laneId: "lane-a", summary: "auth flow implemented", done: 4, total: 4 },
-			{ laneId: "lane-b", summary: "half the tables migrated", done: 2, total: 5 },
-			{ laneId: "lane-c", summary: "", done: 0, total: 0, error: "task store locked" },
+			{ laneId: "lane-a", summary: "auth flow implemented", logPath: "/tmp/swarm/aa11-1-x/run.log", done: 4, total: 4 },
+			{ laneId: "lane-b", summary: "half the tables migrated", logPath: "/tmp/swarm/bb22-2-x/run.log", done: 2, total: 5 },
+			{ laneId: "lane-c", summary: "", logPath: "/tmp/swarm/cc33-3-x/run.log", done: 0, total: 0, error: "task store locked" },
 		],
 	};
 	const omittedDetails = {
 		omitted: 2,
 		lanes: [
-			{ laneId: "lane-1", summary: "finished already", done: 1, total: 1 },
-			{ laneId: "lane-2", summary: "still going", done: 0, total: 3 },
+			{ laneId: "lane-1", summary: "finished already", logPath: "/tmp/swarm/lane-1/run.log", done: 1, total: 1 },
+			{ laneId: "lane-2", summary: "still going", logPath: "/tmp/swarm/lane-2/run.log", done: 0, total: 3 },
 		],
 	};
 
@@ -770,7 +770,7 @@ describe("swarm card", () => {
 		expect(plain.join("\n")).toContain("no pty");
 		const status = swarmCard(statusDetails, false, 80);
 		const countsRow = status.plain.find((row) => row.includes("1 done")) ?? "";
-		expect(countsRow).toContain("1 running");
+		expect(countsRow).toContain("1 incomplete");
 		expect(countsRow).toContain("1 failed");
 		expect(status.plain.join("\n")).toContain("4/4 done");
 		expect(status.plain.join("\n")).toContain("task store locked");
@@ -787,7 +787,7 @@ describe("swarm card", () => {
 	test("expanded card stays within twenty-four content rows with an omission notice when capped", () => {
 		const { rows, plain } = swarmCard(manyLanes(40), true, 80);
 		expect(rows.length).toBeLessThanOrEqual(24 + 4);
-		expect(plain.join("\n")).toMatch(/more lanes — open \/ultrathink-ui/);
+		expect(plain.join("\n")).toMatch(/of 40 lanes shown — run \/ultrathink-swarm status for the full list/);
 	});
 
 	test("expanded card shows full state dirs and log paths", () => {
@@ -795,6 +795,116 @@ describe("swarm card", () => {
 		const text = plain.join("\n");
 		expect(text).toContain("/tmp/swarm/aa11-1-x/run.log");
 		expect(text).toContain("/tmp/swarm/bb22-2-x");
+	});
+
+	test("expanded spawn heading names each lane's pid", () => {
+		const { plain } = swarmCard(spawnDetails, true, 160);
+		const heading = plain.find((row) => row.includes("lane-a")) ?? "";
+		expect(heading).toContain("pid 101");
+		const failedHeading = plain.find((row) => row.includes("lane-c")) ?? "";
+		expect(failedHeading).not.toContain("pid");
+	});
+
+	test("expanded status card renders each lane's log path", () => {
+		const { plain } = swarmCard(statusDetails, true, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("log /tmp/swarm/aa11-1-x/run.log");
+		expect(text).toContain("log /tmp/swarm/cc33-3-x/run.log");
+	});
+
+	test("path fields stay copy-pasteable — no ~/ collapse, no redaction marker", () => {
+		// under the runner's real HOME, so the old full-sanitizer path (redactText collapsing $HOME to ~/)
+		// would fail this; the light path sanitizer must keep every segment intact
+		const home = process.env.HOME ?? "/home/alex";
+		const stateDir = `${home}/.opensessions/swarm/ab12cd34-1-x`;
+		const snapshot = {
+			spawned: 1,
+			total: 1,
+			lanes: [
+				{
+					laneId: "lane-h",
+					brief: "b",
+					stateDir,
+					logPath: `${stateDir}/run.log`,
+					pid: 5,
+				},
+			],
+		};
+		const text = swarmCard(snapshot, true, 160).plain.join("\n");
+		expect(text).toContain(stateDir);
+		expect(text).toContain(`log ${stateDir}/run.log`);
+		expect(text).not.toContain("~/");
+		expect(text).not.toContain("[redacted]");
+	});
+
+	test("expanded card wraps lane fields across rows instead of cutting them at the frame border", () => {
+		const wide = {
+			spawned: 1,
+			total: 1,
+			lanes: [
+				{
+					laneId: "lane-w",
+					brief: `detailed ${"brief ".repeat(40)}`,
+					stateDir: "/tmp/swarm/ww11-1-x",
+					logPath: "/tmp/swarm/ww11-1-x/run.log",
+					pid: 9,
+				},
+			],
+		};
+		const { rows, plain } = swarmCard(wide, true, 40);
+		expect(rows.length).toBeLessThanOrEqual(24 + 4);
+		// the long brief wrapped into many rows (it cannot fit one 36-column row), and every field is reachable
+		expect(rows.length).toBeGreaterThan(10);
+		const text = plain.join("\n");
+		expect(text).toContain("pid 9");
+		expect(text).toContain("/tmp/swarm/ww11-1-x/run.log");
+	});
+
+	test("compact card counts lanes dropped by the row budget in a notice", () => {
+		const { rows, plain } = swarmCard(manyLanes(10), false, 160);
+		expect(rows.length).toBeLessThanOrEqual(6 + 2);
+		const text = plain.join("\n");
+		expect(text).toContain("6 more lanes not shown — run /ultrathink-swarm status for the full list");
+		expect(text).toContain("Brief 3");
+		expect(text).not.toContain("Brief 4");
+	});
+
+	test("zero-task lanes get their own empty bucket in the counts row", () => {
+		const empty = {
+			omitted: 0,
+			lanes: [
+				{ laneId: "lane-a", summary: "auth flow implemented", logPath: "/s/a/run.log", done: 4, total: 4 },
+				{ laneId: "lane-z", summary: "", logPath: "/s/z/run.log", done: 0, total: 0 },
+			],
+		};
+		const countsRow = swarmCard(empty, false, 160).plain.find((row) => row.includes("done")) ?? "";
+		expect(countsRow).toContain("1 done");
+		expect(countsRow).toContain("1 empty");
+		expect(countsRow).not.toContain("incomplete");
+	});
+
+	test("status lanes without the recorded log path are dropped, mirroring the frozen DTO", () => {
+		const missing = { omitted: 0, lanes: [{ laneId: "lane-a", summary: "s", done: 1, total: 1 }] };
+		expect(swarmCard(missing, false, 80).plain.join("\n")).toContain("No swarm lanes");
+	});
+
+	test("oversize input stays bounded: 500 lanes with 10k-char fields render within budget", () => {
+		const brief = "x".repeat(10_000);
+		const lanes = Array.from({ length: 500 }, (_, i) => ({
+			laneId: `lane-${i + 1}`,
+			brief,
+			stateDir: `/tmp/swarm/lane-${i + 1}`,
+			logPath: `/tmp/swarm/lane-${i + 1}/run.log`,
+			pid: i + 1,
+		}));
+		const oversized = { spawned: 500, total: 500, lanes };
+		const compact = swarmCard(oversized, false, 80);
+		expect(compact.rows.length).toBeLessThanOrEqual(6 + 2);
+		// only the first 64 lanes are considered at all; the rest are counted, never drawn
+		expect(compact.plain.join("\n")).toContain("60 more lanes not shown — run /ultrathink-swarm status for the full list");
+		const expanded = swarmCard(oversized, true, 80);
+		expect(expanded.rows.length).toBeLessThanOrEqual(24 + 4);
+		expect(expanded.plain.join("\n")).toMatch(/of 64 lanes shown — run \/ultrathink-swarm status for the full list/);
 	});
 
 	test("compact card never shows full paths, only state dir basenames", () => {

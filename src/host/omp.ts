@@ -1418,7 +1418,8 @@ export function createOmpExtension(
 							if (parsed.kind === "status") {
 								const discovery = laneDirs(dir);
 								const rows = await laneStatus(discovery.lanes, orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
-								if (uiEnabled && ctx?.hasUI) sendSwarmCard(sessionId, ctx, `Swarm lanes — ${rows.filter((row) => !("error" in row)).length}/${rows.length} reported${discovery.omitted > 0 ? ` · ${discovery.omitted} older not shown` : ""}`, toSwarmStatusCard(rows, discovery.omitted));
+								// The card is only sent when a renderer can actually draw it; otherwise the full text reply keeps log paths and errors visible.
+								if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${rows.filter((row) => !("error" in row)).length}/${rows.length} reported${discovery.omitted > 0 ? ` · ${discovery.omitted} older not shown` : ""}`, toSwarmStatusCard(rows, discovery.omitted));
 								else return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
 								return;
 							}
@@ -1426,7 +1427,7 @@ export function createOmpExtension(
 							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
 							const handles = spawnLanes(plan);
 							const started = handles.filter((handle) => handle.pid !== undefined).length;
-							if (uiEnabled && ctx?.hasUI) sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned`, toSwarmSpawnCard(handles, plan));
+							if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned`, toSwarmSpawnCard(handles, plan));
 							else sendSessionText(sessionId, ctx, formatLaneHandles(handles));
 						} catch {}
 					},
