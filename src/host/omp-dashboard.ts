@@ -1,4 +1,5 @@
 import { formatP as formatDecisionP } from "../decisions/types.ts";
+import { MAX_BODY_CHARS } from "../teach/types.ts";
 import { sanitizeInsightText } from "./omp-insights.ts";
 import { truncateToWidth, visibleWidth } from "./omp-paint.ts";
 import type {
@@ -45,6 +46,15 @@ const PREVIEW_MAX_CHARS = 200_000;
 const MIN_MUTATE_COLS = 24;
 const MIN_MUTATE_ROWS = 8;
 const MIN_TAB_STRIP_COLS = 32;
+// Header is always the title row plus the tab-strip/position row.
+const HEAD_ROWS = 2;
+// Lesson bodies arrive sanitized and bounded by the read model at the imported
+// MAX_BODY_CHARS. Re-sanitizing at that same authoritative bound strips hostile
+// controls from untrusted fixtures without narrowing in-bound text; line
+// completeness comes from never slicing lines here.
+const TINY_REASON = "Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.";
+const CLIPPED_PREVIEW_REASON = "Preview exceeds the supported 60KB bound; the complete draft cannot be reviewed here, so install is unavailable.";
+const FIT_REASON = "Action identity does not fit the current viewport. Resize to review the full identity and effect; browsing and Escape remain available.";
 const TAB_LABELS: Record<InsightPanel, string> = {
 	overview: "Overview",
 	jev: "Jev",
@@ -80,19 +90,6 @@ function utf8Bytes(text: string): number {
 	}
 }
 
-/** Grapheme-safe byte cap for draft preview text. */
-function capBytes(text: string, maxBytes: number): { text: string; clipped: boolean } {
-	if (utf8Bytes(text) <= maxBytes) return { text, clipped: false };
-	let kept = "";
-	let used = 0;
-	for (const segment of GRAPHEMES.segment(text)) {
-		const size = utf8Bytes(segment.segment);
-		if (used + size > maxBytes) break;
-		kept += segment.segment;
-		used += size;
-	}
-	return { text: kept, clipped: true };
-}
 
 /** Guarded dashboard probability wrapper: non-finite intake stays unrecorded; finite values reuse the canonical domain helper. */
 function formatP(value: unknown): string | undefined {
@@ -320,6 +317,9 @@ export function createInsightDashboard(
 	};
 	let detailScroll = 0;
 	let previewScroll = 0;
+	// previewLines() is width-independent; memoize on preview identity so action
+	// gates and scroll handlers reuse the render's computation.
+	let previewMemo: { preview: SkillPreview; result: { lines: string[]; clipped: boolean } } | undefined;
 	let notice = "";
 	// True while the follow-up refresh owned by a settled confirm/install is in
 	// flight. The receipt in `notice` survives that refresh (busy render,
@@ -433,9 +433,14 @@ export function createInsightDashboard(
 
 	const actions = (width: number): DashboardAction[] => {
 		const tiny = !canMutate(width);
-		const tinyReason = "Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.";
 		const gate = (action: DashboardAction): DashboardAction =>
-			action.mutating && tiny ? { ...action, enabled: false, disabledReason: tinyReason } : action;
+			action.mutating && tiny ? { ...action, enabled: false, disabledReason: TINY_REASON } : action;
+		// A clipped preview exceeded the 60KB producer bound: its tail/ownership
+		// marker cannot be reviewed, so every install path stays disabled.
+		const previewClipped = pendingPreview !== undefined && previewLines().clipped;
+		const installBlocked: DashboardAction | undefined = previewClipped
+			? { id: "open-install", label: "Install into Omp", mutating: true, enabled: false, disabledReason: CLIPPED_PREVIEW_REASON }
+			: undefined;
 		if (view === "confirm-candidate") {
 			return [
 				{ id: "keep", label: "Keep candidate", mutating: false, enabled: true },
@@ -445,13 +450,15 @@ export function createInsightDashboard(
 		if (view === "confirm-install") {
 			return [
 				{ id: "keep", label: "Keep preview", mutating: false, enabled: true },
-				gate({ id: "install-yes", label: "Install into Omp", mutating: true, enabled: !busy }),
+				previewClipped
+					? { id: "install-yes", label: "Install into Omp", mutating: true, enabled: false, disabledReason: CLIPPED_PREVIEW_REASON }
+					: gate({ id: "install-yes", label: "Install into Omp", mutating: true, enabled: !busy }),
 			];
 		}
 		if (view === "preview") {
 			return [
 				{ id: "back", label: "Back to lesson", mutating: false, enabled: true },
-				gate({ id: "open-install", label: "Install into Omp", mutating: true, enabled: !busy }),
+				installBlocked ?? gate({ id: "open-install", label: "Install into Omp", mutating: true, enabled: !busy }),
 			];
 		}
 		if (view === "detail") {
@@ -520,7 +527,7 @@ export function createInsightDashboard(
 			regions.push("list");
 		}
 		if (view === "detail" || view === "preview") regions.push("details");
-		if (actions(lastWidth).length > 0) regions.push("actions");
+		if (visibleActions(lastWidth).length > 0) regions.push("actions");
 		return regions;
 	};
 
@@ -628,11 +635,13 @@ export function createInsightDashboard(
 			`Lifecycle: ${row.status} · Kind: ${row.kind}${row.occurrences !== undefined ? ` · Occurrences: ${row.occurrences}` : ""}`,
 			`Description: ${cleanInline(source.description, 400) || "Not recorded"}`,
 		];
-		const body = cleanText(source.body, 4000);
-		if (body) {
-			lines.push("Body:");
-			for (const chunk of body.split("\n").slice(0, 64)) lines.push(`  ${cleanInline(chunk, 200)}`);
-		}
+	// The body arrives sanitized and bounded from the read model; every in-bound
+	// line stays complete here and the viewport wraps/scrolls it into cells.
+	const body = cleanText(source.body, MAX_BODY_CHARS);
+	if (body) {
+		lines.push("Body:");
+		for (const chunk of body.split("\n")) lines.push(`  ${chunk}`);
+	}
 		const origin = cleanInline(source.origin, 60);
 			const host = cleanInline(source.host, 60);
 		if (origin || host) lines.push(`Provenance: ${[origin, host ? `host ${host}` : ""].filter(Boolean).join(" · ") || "Not recorded"}`);
@@ -656,21 +665,60 @@ export function createInsightDashboard(
 					`Related: ${related.map((item) => cleanInline(item, 48)).filter(Boolean).join(", ") || "none"} · Supersedes: ${supersedes.map((item) => cleanInline(item, 48)).filter(Boolean).join(", ") || "none"}`,
 				);
 			}
-		const promotion = source.promoted;
-		if (promotion) {
-			lines.push(
-				`Promotion recorded — current installation not verified · Skill: ${cleanInline(promotion.skill, 80) || "Not recorded"} · Target: ${cleanInline(promotion.target, 24) || "Not recorded"} · At: ${formatTime(promotion.at)}${promotion.path ? ` · Path: ${cleanInline(promotion.path, 100)}` : ""}`,
-			);
-		} else if (row.eligible) {
-			lines.push("Eligible by saved lesson rules — not a new Jev verdict");
-		}
+	const promotion = source.promoted;
+	if (promotion) {
+		lines.push(
+			`Promotion recorded — current installation not verified · Skill: ${cleanInline(promotion.skill, 80) || "Not recorded"} · Target: ${cleanInline(promotion.target, 24) || "Not recorded"} · At: ${formatTime(promotion.at)}${promotion.path ? ` · Path: ${cleanInline(promotion.path, 100)}` : ""}`,
+		);
+	}
 		return lines;
 	};
 
-	const previewLines = (): { lines: string[]; total: number; clipped: boolean } => {
+/**
+ * Deterministic eligibility reasoning from saved lesson rules only: confirmed
+ * plus unpromoted plus occurrences meeting the effective threshold, or the
+ * playbook-kind exception. Never a fresh Jev verdict or installation proof.
+ */
+const eligibilityLine = (row: LessonRow): string | undefined => {
+	const source = row.source;
+	const policy = snapshot.policy;
+	const threshold = policy ? policy.promoteAfter : undefined;
+	const thresholdText = typeof threshold === "number" && Number.isFinite(threshold) ? String(threshold) : "unavailable";
+	const occ = row.occurrences;
+	const occText = typeof occ === "number" && Number.isFinite(occ) ? String(occ) : "unrecorded";
+	if (row.eligible) {
+		const basis =
+			source.kind === "playbook" && typeof occ === "number" && typeof threshold === "number" && occ < threshold
+				? `playbook exception (occurrences ${occText} below threshold ${thresholdText})`
+				: `occurrences ${occText} meet threshold ${thresholdText}`;
+		return `Eligible: confirmed · unpromoted · ${basis} — not a new Jev verdict`;
+	}
+	if (source.status !== "confirmed") return `Not eligible: status ${row.status} (needs confirmed) — not a new Jev verdict`;
+	if (typeof occ === "number" && typeof threshold === "number" && occ < threshold && source.kind !== "playbook")
+		return `Not eligible: occurrences ${occText} below threshold ${thresholdText} — not a new Jev verdict`;
+	if (occ === undefined || threshold === undefined) return "Not eligible: occurrence count or threshold unrecorded — not a new Jev verdict";
+	return undefined;
+};
+
+	/**
+	 * Saved eligibility facts for the selected lesson as pinned physical rows:
+	 * they sit above the scrolled detail window and share its budget, so
+	 * scrolling, reflow, and resize never move them out of view — they are the
+	 * consent context for the strip's confirm/preview actions.
+	 */
+	const detailFactRows = (width: number): string[] => {
+		if (tab === "jev") return [];
+		const row = currentLesson();
+		if (!row) return [];
+		const reason = eligibilityLine(row);
+		return reason ? wrappedRows([reason], width) : [];
+	};
+
+	const previewLines = (): { lines: string[]; clipped: boolean } => {
 		if (!pendingPreview) {
-			return { lines: ["Preview unavailable. Go back and preview again."], total: 1, clipped: false };
+			return { lines: ["Preview unavailable. Go back and preview again."], clipped: false };
 		}
+		if (previewMemo?.preview === pendingPreview) return previewMemo.result;
 		const preview: SkillPreview = pendingPreview;
 		const name = cleanInline(preview.name, 100) || "Not recorded";
 		const description = cleanInline(preview.description, 300) || "Not recorded";
@@ -679,7 +727,11 @@ export function createInsightDashboard(
 			.filter(Boolean)
 			.slice(0, 8);
 		const sourceId = cleanInline(preview.selection.id, 120);
-		const { text, clipped } = capBytes(cleanText(preview.content, PREVIEW_MAX_CHARS), PREVIEW_MAX_BYTES);
+		// Unsupported payloads are withheld before text processing, just as
+		// oversized persisted records are refused before reading their bodies.
+		const overBound = preview.content.length > PREVIEW_MAX_BYTES || utf8Bytes(preview.content) > PREVIEW_MAX_BYTES;
+		const text = overBound ? "" : cleanText(preview.content, PREVIEW_MAX_CHARS);
+		const clipped = overBound || utf8Bytes(text) > PREVIEW_MAX_BYTES;
 		const contentLines = text.split("\n");
 		const header = [
 			"Preview only — not installed. Deterministic content from the selected lesson.",
@@ -688,14 +740,178 @@ export function createInsightDashboard(
 			"Terminal controls are removed from this display; existing draft redaction warnings are shown below.",
 		];
 		const warningLines = warnings.map((warning) => `Warning: ${warning}`);
-		if (clipped) warningLines.push("Preview clipped at the 60KB bound; install reviews the complete regenerated draft.");
-		return {
-			// Keep each sanitized line whole: the viewport wraps and scrolls, so
-			// cutting here would hide draft content the installer still writes.
-			lines: [...header, ...warningLines, "---", ...contentLines.map((line) => cleanInline(line, PREVIEW_MAX_CHARS))],
-			total: contentLines.length,
+		// A clipped preview exceeded the producer bound: the tail/ownership marker
+		// cannot be reviewed, so install stays disabled and nothing claims review
+		// of regenerated content under this consent.
+		if (clipped) warningLines.push("Preview exceeds the 60KB bound; draft content is withheld and install is unavailable.");
+		const result = {
+			// In-bound lines stay whole and scrollable. An over-bound draft is
+			// withheld, not expensively wrapped into an unreviewable fragment.
+			lines: [...header, ...warningLines, ...(clipped ? [] : ["---", ...contentLines.map((line) => cleanInline(line, PREVIEW_MAX_CHARS))])],
 			clipped,
 		};
+		previewMemo = { preview, result };
+		return result;
+	};
+
+	const candidateConfirmLines = (row: LessonRow): string[] => [
+		"Confirm this candidate?",
+		`Confirm lesson ${row.title} (${row.id}) for the current project. Existing retention may run or queue; this action does not install a skill.`,
+	];
+
+	const installConfirmLines = (): string[] => {
+		const name = pendingPreview ? cleanInline(pendingPreview.name, 80) || "the preview" : "the preview";
+		return [
+			"Install this preview into Omp?",
+			`Source lesson: ${pendingPreview ? cleanInline(pendingPreview.selection.id, 120) : "Not recorded"}`,
+			`Install ${name} into Omp managed skills. Only an owned generated slot may be updated; authored, foreign, symlinked, or conflicting slots are refused.`,
+		];
+	};
+
+	const confirmBodyLines = (): string[] => {
+		if (view === "confirm-install") return installConfirmLines();
+		if (view === "confirm-candidate" && confirmTarget) return candidateConfirmLines(confirmTarget);
+		return [];
+	};
+
+	/**
+	 * Status rows: snapshot error, busy or receipt notice, tiny-viewport
+	 * guidance. Never trimmed silently by callers without keeping help.
+	 */
+	const statusRows = (width: number): string[] => {
+		const status: string[] = [];
+		const emit = (text: string): void => {
+			status.push(fitRow(text, width));
+		};
+		const emitWrapped = (text: string, indent = ""): void => {
+			for (const line of wrapRow(text, width, indent)) emit(line);
+		};
+		if (snapshotError) {
+			emitWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`);
+		}
+		if (busy) {
+			emit(`${busy.label}${busyCancelled ? " · cancelling…" : "…"}`);
+			// The settled confirm/install receipt stays on screen while its
+			// owned follow-up refresh re-reads; every other busy run keeps the
+			// existing behavior of showing only the busy label.
+			if (busy.kind === "refresh" && actionRefresh && notice) emitWrapped(notice);
+		} else if (notice) {
+			emitWrapped(notice);
+		}
+		if (!canMutate(width)) {
+			emitWrapped(TINY_REASON);
+		}
+		return status;
+	};
+
+	/**
+	 * Action-strip rows. Below the mutation floor every mutating entry already
+	 * carries the full guidance in the status rows above, so the strip compacts
+	 * to a short marker instead of repeating the whole reason per action.
+	 */
+	const actionRows = (width: number, list: DashboardAction[]): string[] => {
+		const rows: string[] = [];
+		const tiny = !canMutate(width);
+		for (const [index, action] of list.entries()) {
+			const marker = focus === "actions" && (actionCursor[view] ?? 0) === index ? ">" : " ";
+			const reason = action.disabledReason ?? TINY_REASON;
+			const state = action.enabled ? "" : tiny && reason === TINY_REASON ? " (Unavailable)" : ` (Unavailable: ${reason})`;
+			for (const line of wrapRow(`${marker} ${action.label}${state}`, width, "")) rows.push(fitRow(line, width));
+		}
+		return rows;
+	};
+
+	/**
+	 * Every non-content row, built exactly as emitted: status, action strip,
+	 * and help. Sizing the content window against this tail keeps header,
+	 * actions, status, and help on screen at any height.
+	 */
+	const buildTail = (width: number, list: DashboardAction[]): string[] => [
+		...statusRows(width),
+		...actionRows(width, list),
+		fitRow(helpLine(), width),
+	];
+
+	/** The affirmative may fire only when its full identity/effect text fits the actual content window. */
+	const confirmScreenFits = (width: number, list: DashboardAction[]): boolean => {
+		const body = confirmBodyLines();
+		if (body.length === 0) return false;
+		const tail = buildTail(width, list);
+		const budget = Math.max(0, viewportHeight() - HEAD_ROWS - tail.length);
+		return wrappedRows(body, width).length <= budget;
+	};
+
+	/**
+	 * actions() plus the viewport-fit gate: never silently clip an identity and
+	 * still offer the mutation. Tiny and clipped-preview gates live in actions();
+	 * this layer only refuses an affirmative whose text cannot be reviewed.
+	 */
+	const visibleActions = (width: number): DashboardAction[] => {
+		const list = actions(width);
+		if (view !== "confirm-candidate" && view !== "confirm-install") return list;
+		const affirmative = view === "confirm-candidate" ? "confirm-yes" : "install-yes";
+		if (!list.some((action) => action.id === affirmative && action.enabled)) return list;
+		if (confirmScreenFits(width, list)) return list;
+		return list.map((action) =>
+			action.id === affirmative && action.enabled ? { ...action, enabled: false, disabledReason: FIT_REASON } : action,
+		);
+	};
+
+	/**
+	 * Bounded refusal shown when a confirmation identity/effect cannot fit the
+	 * viewport: it names the withheld action and the resize path explicitly, so
+	 * nothing is silently clipped and no affirmative is offered on unseen text.
+	 */
+	const confirmRefusalLines = (): string[] => {
+		const label = view === "confirm-install" ? "Install into Omp" : "Confirm candidate";
+		return [
+			`${label} is withheld: the full identity and effect do not fit this viewport.`,
+			"Resize to review the complete text; browsing and Escape remain available. No action was taken.",
+		];
+	};
+
+	interface DashboardLayout {
+		list: DashboardAction[];
+		status: string[];
+		strip: string[];
+		help: string;
+		tail: string[];
+		budget: (reserved: number) => number;
+	}
+
+	/**
+	 * The single physical-window budget shared by render, scroll/page steps,
+	 * and clamps: header plus the exact tail (status, strip, help) are
+	 * reserved first, so every consumer windows the same remainder.
+	 */
+	const layoutFor = (width: number): DashboardLayout => {
+		const list = visibleActions(width);
+		const status = statusRows(width);
+		const strip = actionRows(width, list);
+		const help = fitRow(helpLine(), width);
+		const tail = [...status, ...strip, help];
+		return {
+			list,
+			status,
+			strip,
+			help,
+			tail,
+			budget: (reserved: number): number => Math.max(0, viewportHeight() - HEAD_ROWS - tail.length - reserved),
+		};
+	};
+
+	/** Preview content rows: the position header keeps one reserved row. */
+	const previewWindow = (layout: DashboardLayout): number => Math.min(DETAIL_WINDOW, layout.budget(1));
+
+	/**
+	 * Detail content rows: the position footer keeps one reserved row only when
+	 * the content actually overflows the windowless budget, and callers reserve
+	 * the pinned fact rows from the same shared budget.
+	 */
+	const detailWindow = (layout: DashboardLayout, totalWrapped: number, reservedRows = 0): number => {
+		let windowRows = Math.min(DETAIL_WINDOW, layout.budget(reservedRows));
+		if (totalWrapped > windowRows && windowRows > 0) windowRows = Math.min(DETAIL_WINDOW, layout.budget(reservedRows + 1));
+		return windowRows;
 	};
 
 	const panelEmptyCopy = (panel: InsightPanel): string[] => {
@@ -780,8 +996,7 @@ export function createInsightDashboard(
 		return kept;
 	}
 
-	/** The actual on-screen detail/preview window; DETAIL_WINDOW is only an upper bound, never the scroll limit. */
-	const detailViewportRows = (): number => Math.min(DETAIL_WINDOW, Math.max(1, viewportHeight() - 6));
+	/** DETAIL_WINDOW caps content rows; layoutFor owns the actual budget. */
 
 	/** Physical rows each logical line occupies at the given width; scroll positions index these wrapped rows. */
 	const wrappedRows = (lines: readonly string[], width: number): string[] => {
@@ -799,118 +1014,163 @@ export function createInsightDashboard(
 	const renderInto = (width: number): string[] => {
 		const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
 		if (safeWidth <= 0) return [];
-		const rows: string[] = [];
-		const push = (text: string): void => {
-			rows.push(fitRow(text, safeWidth));
-		};
-		const pushWrapped = (text: string, indent = ""): void => {
-			for (const line of wrapRow(text, safeWidth, indent)) push(line);
-		};
-
-		push(`Ultrathink · ${snapshotLabel()} · Snapshot: ${snapshotTime()}`);
+		const height = viewportHeight();
+		const head: string[] = [`Ultrathink · ${snapshotLabel()} · Snapshot: ${snapshotTime()}`].map((text) => fitRow(text, safeWidth));
 		if (safeWidth < MIN_TAB_STRIP_COLS) {
 			const index = PANELS.indexOf(tab) + 1;
-			push(`[${TAB_LABELS[tab]}] ${index}/${PANELS.length}`);
+			head.push(fitRow(`[${TAB_LABELS[tab]}] ${index}/${PANELS.length}`, safeWidth));
 		} else {
 			const strip = PANELS.map((panel) => (panel === tab ? `[${TAB_LABELS[panel]}]` : TAB_LABELS[panel])).join("  ");
-			push(strip);
+			head.push(fitRow(strip, safeWidth));
 		}
 
-		const tiny = !canMutate(safeWidth);
-		let available = Math.max(0, viewportHeight() - 6);
+		// Tail first: status, strip, and help are all known before the content
+		// window is sized, so header, actions, status, and help stay
+		// discoverable at any height and scrollable content never pushes them
+		// off screen. Render, scroll/page steps, and clamps share layoutFor.
+		const layout = layoutFor(safeWidth);
+		let body: string[] = [];
+		const emitBody = (text: string): void => {
+			body.push(fitRow(text, safeWidth));
+		};
+		const emitBodyWrapped = (text: string, indent = ""): void => {
+			for (const line of wrapRow(text, safeWidth, indent)) emitBody(line);
+		};
 
-		if (snapshotError) {
-			pushWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`);
-		}
-		if (view === "confirm-candidate" && confirmTarget) {
-			push("Confirm this candidate?");
-			pushWrapped(`Confirm lesson ${confirmTarget.title} (${confirmTarget.id}) for the current project. Existing retention may run or queue; this action does not install a skill.`);
-		} else if (view === "confirm-install") {
-			push("Install this preview into Omp?");
-			const name = pendingPreview ? cleanInline(pendingPreview.name, 80) || "the preview" : "the preview";
-			pushWrapped(`Install ${name} into Omp managed skills. Only an owned generated slot may be updated; authored, foreign, symlinked, or conflicting slots are refused.`);
+		if (view === "confirm-candidate" || view === "confirm-install") {
+			// A refused identity is never silently clipped into an enabled
+			// affirmative and never relies on terminal scrollback: it either
+			// fits complete or is replaced by an explicit bounded refusal.
+			const full = view === "confirm-candidate"
+				? (confirmTarget ? candidateConfirmLines(confirmTarget) : [])
+				: pendingPreview ? installConfirmLines() : ["Preview unavailable. Go back and preview again."];
+			if (wrappedRows(full, safeWidth).length <= layout.budget(0) && full.length > 0) {
+				for (const line of full) emitBodyWrapped(line);
+			} else if (full.length > 0) {
+				const refusal = wrappedRows(confirmRefusalLines(), safeWidth);
+				body = refusal.slice(0, layout.budget(0));
+			}
 		} else if (view === "preview") {
-			const { lines: logical, total, clipped } = previewLines();
-			// Wrap first, then draw and scroll over the same wrapped rows and
-			// the same actual window, so every drawn line stays reachable.
+			const { lines: logical, clipped } = previewLines();
+			// Reflow before windowing, then draw and scroll the same wrapped rows,
+			// so the complete in-bound tail/ownership marker stays reachable.
 			const lines = wrappedRows(logical, safeWidth);
-			const windowRows = detailViewportRows();
-			const start = clampScroll(previewScroll, lines.length, windowRows);
-			const end = Math.min(lines.length, start + windowRows);
-			push(`Preview lines ${lines.length === 0 ? 0 : start + 1}–${end} of ${lines.length}${clipped ? ` · source truncated at 60KB, ${total} draft lines` : ""}`);
-			for (const line of lines.slice(start, end)) push(line);
+			const windowRows = previewWindow(layout);
+			previewScroll = clampScroll(previewScroll, lines.length, windowRows);
+			if (windowRows > 0) {
+				const start = previewScroll;
+				const end = Math.min(lines.length, start + windowRows);
+				emitBody(`Preview lines ${lines.length === 0 ? 0 : start + 1}–${end} of ${lines.length}${clipped ? " · draft withheld at 60KB bound" : ""}`);
+				for (const line of lines.slice(start, end)) emitBody(line);
+			}
 		} else if (view === "detail") {
 			const lines = wrappedRows(detailLines(), safeWidth);
-			const windowRows = detailViewportRows();
-			const start = clampScroll(detailScroll, lines.length, windowRows);
-			for (const line of lines.slice(start, start + windowRows)) push(line);
-			if (lines.length > windowRows) push(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
+			// Pinned saved-fact rows draw above the scrolled window and are
+			// reserved from the same shared budget, so the facts stay visible at
+			// every scroll offset without pushing header, status, strip, or help
+			// off screen.
+			const factRows = detailFactRows(safeWidth);
+			const windowRows = detailWindow(layout, lines.length, factRows.length);
+			detailScroll = clampScroll(detailScroll, lines.length, windowRows);
+			if (windowRows > 0) {
+				for (const row of factRows) emitBody(row);
+				const start = detailScroll;
+				for (const line of lines.slice(start, start + windowRows)) emitBody(line);
+				if (lines.length > windowRows) emitBody(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
+			}
 		} else if (tab === "overview") {
-			for (const line of overviewLines().slice(0, Math.max(4, available))) pushWrapped(line);
+			const wrapped: string[] = [];
+			for (const line of overviewLines()) for (const row of wrapRow(line, safeWidth, "")) wrapped.push(fitRow(row, safeWidth));
+			body = wrapped.slice(0, layout.budget(0));
 		} else {
+			// Skills root keeps Main's effective-policy prefix: live policy plus
+			// the saved-rules caveat, never a fresh Jev or installation claim.
+			const prefix: string[] = [];
 			if (tab === "skills") {
-				const policyStart = rows.length;
-				for (const line of policyLines()) pushWrapped(line);
-				pushWrapped("Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading.");
-				available = Math.max(0, available - (rows.length - policyStart));
+				for (const line of [...policyLines(), "Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading."])
+					for (const row of wrapRow(line, safeWidth, "")) prefix.push(fitRow(row, safeWidth));
 			}
 			const rows_list = listRows(tab);
 			if (rows_list.length === 0) {
-				for (const line of panelEmptyCopy(tab)) pushWrapped(line);
+				const wrapped: string[] = [];
+				for (const line of panelEmptyCopy(tab)) for (const row of wrapRow(line, safeWidth, "")) wrapped.push(fitRow(row, safeWidth));
+				if (tab === "skills") {
+					// Shared budget: the why-empty copy stays complete and
+					// reachable; the policy prefix fills whatever rows remain
+					// above it instead of clipping the message away.
+					const surface = Math.max(1, layout.budget(0));
+					const copy = wrapped.slice(0, surface);
+					body = [...prefix.slice(0, Math.max(0, surface - copy.length)), ...copy];
+				} else {
+					body = [...prefix, ...wrapped].slice(0, layout.budget(0));
+				}
 			} else {
 				const total = rows_list.length;
-				const windowRows = Math.min(LIST_WINDOW, Math.max(1, available));
-				const cursor = Math.min(Math.max(0, cursors[tab]), total - 1);
+				// Resize clamps the stored selection; lesson data is untouched.
+				cursors[tab] = Math.min(Math.max(0, cursors[tab]), total - 1);
+				const cursor = cursors[tab];
+				const count: string[] = [fitRow(total === 1 ? "1 record shown" : `item ${cursor + 1} of ${total} shown`, safeWidth)];
+				if (total >= COLLECTION_CAP) count.push(fitRow("Showing up to 100 local records; this is not a complete inventory.", safeWidth));
+				// Skills shares one row budget across the policy prefix and the
+				// list: the prefix renders first, the list keeps at least one
+				// row, and the combined surface scrolls as one when it exceeds
+				// the budget — the lesson window and count line stay reachable
+				// while the prefix scrolls away above them.
+				const skillsBudget = Math.max(1, layout.budget(0));
+				const windowRows = tab === "skills"
+					? Math.max(1, Math.min(LIST_WINDOW, skillsBudget - prefix.length - count.length))
+					: Math.min(LIST_WINDOW, layout.budget(prefix.length + count.length));
 				const start = clampScroll(cursor - Math.floor(windowRows / 2), total, windowRows);
-				const shown = rows_list.slice(start, start + windowRows);
+				const shown = rows_list.slice(start, Math.min(total, start + windowRows));
+				const rows: string[] = [];
 				shown.forEach((row, offset) => {
 					const marker = start + offset === cursor && focus === "list" ? ">" : " ";
-					push(`${marker} ${row.label}`);
+					rows.push(fitRow(`${marker} ${row.label}`, safeWidth));
 				});
-				const one = total === 1;
-				push(one ? "1 record shown" : `item ${cursor + 1} of ${total} shown`);
-				if (total >= COLLECTION_CAP) push("Showing up to 100 local records; this is not a complete inventory.");
+				if (tab === "skills") {
+					const combined = [...prefix, ...rows, ...count];
+					// Never smaller than the lesson window plus the count line,
+					// so a scrolled surface keeps the selection on screen.
+					const surface = Math.min(combined.length, Math.max(skillsBudget, windowRows + count.length));
+					body = combined.slice(Math.max(0, combined.length - surface));
+				} else {
+					body = [...prefix, ...rows, ...count];
+				}
 			}
 		}
 
-		if (busy) {
-			push(`${busy.label}${busyCancelled ? " · cancelling…" : "…"}`);
-			// The settled confirm/install receipt stays on screen while its
-			// owned follow-up refresh re-reads; every other busy run keeps the
-			// existing behavior of showing only the busy label.
-			if (busy.kind === "refresh" && actionRefresh && notice) pushWrapped(notice);
-		} else if (notice) {
-			pushWrapped(notice);
+		// The segments above already bound body to the exact remainder, but a
+		// status-heavy tail can itself exceed a tiny viewport: trim without
+		// ever losing the header, the close/help row, or the leading status.
+		const help = layout.help;
+		const status = layout.status;
+		const strip = layout.strip;
+		let rows = [...head, ...body, ...status, ...strip, help];
+		if (rows.length > height) {
+			rows = [...head, ...status, ...strip, help];
 		}
-		if (tiny) {
-			pushWrapped("Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.");
+		if (rows.length > height) {
+			const keepStrip = Math.max(0, height - head.length - status.length - 1);
+			rows = [...head, ...status, ...strip.slice(0, keepStrip), help];
 		}
-
-		const list = actions(safeWidth);
-		if (list.length > 0) {
-			const parts = list.map((action, index) => {
-				const marker = focus === "actions" && (actionCursor[view] ?? 0) === index ? ">" : " ";
-				const state = action.enabled ? "" : " (Unavailable: Terminal too small to review an action.)";
-				return `${marker} ${action.label}${state}`;
-			});
-			for (const part of parts) pushWrapped(part);
+		if (rows.length > height) {
+			const keepStatus = Math.max(0, height - head.length - 1);
+			rows = [...head, ...status.slice(0, keepStatus), help].slice(0, height);
 		}
-
-		push(helpLine());
 		return rows;
 	};
 
 	const helpLine = (): string => {
-		if (view === "confirm-candidate") return "Tab change focus · ↑/↓ choose · Enter confirm candidate · Esc keep candidate";
-		if (view === "confirm-install") return "Tab change focus · ↑/↓ choose · Enter install · Esc keep preview";
+		if (view === "confirm-candidate") return "Esc keep candidate · ↑/↓ choose · Enter select · Tab change focus";
+		if (view === "confirm-install") return "Esc keep preview · ↑/↓ choose · Enter select · Tab change focus";
 		if (focus === "actions") {
 			const back = view === "preview" ? "Esc back to lesson" : view === "detail" ? "Esc back to list" : "Esc close dashboard";
-			return `Tab change focus · ←/→ choose action · Enter select action · ${back}`;
+			return `${back} · ←/→ choose action · Enter select action · Tab change focus`;
 		}
-		if (view === "preview") return "Tab change focus · ↑/↓ scroll preview · Enter install into Omp · Esc back to lesson";
-		if (view === "detail") return "Tab change focus · ↑/↓ scroll details · Enter actions · r refresh snapshot · Esc back to list";
-		if (focus === "tabs") return "Tab change focus · ←/→ choose panel · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Esc close dashboard";
-		return "Tab change focus · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Esc close dashboard";
+		if (view === "preview") return "Esc back to lesson · ↑/↓ scroll preview · Enter actions · Tab change focus";
+		if (view === "detail") return "Esc back to list · ↑/↓ scroll details · Enter actions · r refresh snapshot · Tab change focus";
+		if (focus === "tabs") return "Esc close dashboard · ←/→ choose panel · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Tab change focus";
+		return "Esc close dashboard · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Tab change focus";
 	};
 
 	const stateKey = (width: number): string =>
@@ -1138,7 +1398,7 @@ export function createInsightDashboard(
 						touch();
 						startRefresh(true);
 					} else if (result && result.status === "refused") {
-						notice = `Installation refused: ${failResult(result)}. Existing files were not replaced by this refused install; review the lesson/slot outside this dashboard, then preview again.`;
+						notice = failResult(result);
 						openView("preview", "details");
 					} else {
 						notice = `Installation did not return a successful Omp result: ${failResult(result)}. Refresh actual lesson state before trying again; no rollback is claimed.`;
@@ -1182,7 +1442,7 @@ export function createInsightDashboard(
 	};
 
 	const moveAction = (delta: 1 | -1): void => {
-		const list = actions(lastWidth);
+		const list = visibleActions(lastWidth);
 		if (list.length === 0) return;
 		const current = actionCursor[view] ?? 0;
 		const next = current + delta;
@@ -1238,56 +1498,60 @@ export function createInsightDashboard(
 				if (view === "confirm-candidate" || view === "confirm-install" || busy) return;
 				startRefresh();
 				return;
-			case "open-confirm": {
-				const row = currentLesson();
-				if (!row || !canMutate(width)) {
-					notice = "Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.";
-					touch();
-					return;
-				}
-				confirmTarget = row;
-				actionCursor["confirm-candidate"] = 0;
-				openView("confirm-candidate", "actions");
+		case "open-confirm": {
+			const row = currentLesson();
+			if (!row || !canMutate(width)) {
+				notice = TINY_REASON;
+				touch();
 				return;
 			}
-			case "open-preview": {
-				const row = currentLesson();
-				if (!row) return;
-				startPreview(row);
+			confirmTarget = row;
+			actionCursor["confirm-candidate"] = 0;
+			openView("confirm-candidate", "actions");
+			return;
+		}
+		case "open-preview": {
+			const row = currentLesson();
+			if (!row) return;
+			startPreview(row);
+			return;
+		}
+		case "open-install": {
+			// A clipped preview has no reviewable tail: opening install consent
+			// over it would ask approval for unseen content, so refuse here.
+			if (!pendingPreview || previewLines().clipped || !canMutate(width)) {
+				notice = pendingPreview && previewLines().clipped ? CLIPPED_PREVIEW_REASON : TINY_REASON;
+				touch();
 				return;
 			}
-			case "open-install": {
-				if (!pendingPreview || !canMutate(width)) {
-					notice = "Terminal too small to review an action. Resize to at least 24 columns and 8 rows; browsing and Escape remain available.";
-					touch();
-					return;
-				}
-				actionCursor["confirm-install"] = 0;
-				openView("confirm-install", "actions");
-				return;
-			}
-			case "confirm-yes": {
-				// The Enter that opened this confirmation advanced `seq`; require a
-				// strictly later input before the affirmative can fire so the
-				// triggering keypress never activates the mutating choice.
-				if (seq <= viewOpenedAtSeq || !confirmTarget || !canMutate(width)) return;
-				const row = confirmTarget;
-				confirmTarget = undefined;
-				startConfirm(row);
-				return;
-			}
-			case "install-yes": {
-				if (seq <= viewOpenedAtSeq || !pendingPreview || !canMutate(width)) return;
-				startInstall();
-				return;
-			}
+			actionCursor["confirm-install"] = 0;
+			openView("confirm-install", "actions");
+			return;
+		}
+		case "confirm-yes": {
+			// The Enter that opened this confirmation advanced `seq`; require a
+			// strictly later input before the affirmative can fire so the
+			// triggering keypress never activates the mutating choice.
+			if (seq <= viewOpenedAtSeq || !confirmTarget || !canMutate(width)) return;
+			if (!confirmScreenFits(width, actions(width))) return;
+			const row = confirmTarget;
+			confirmTarget = undefined;
+			startConfirm(row);
+			return;
+		}
+		case "install-yes": {
+			if (seq <= viewOpenedAtSeq || !pendingPreview || !canMutate(width)) return;
+			if (previewLines().clipped || !confirmScreenFits(width, actions(width))) return;
+			startInstall();
+			return;
+		}
 			default:
 				return;
 		}
 	};
 
 	const focusedAction = (width: number): DashboardAction | undefined => {
-		const list = actions(width);
+		const list = visibleActions(width);
 		if (list.length === 0) return undefined;
 		return list[Math.min(Math.max(0, actionCursor[view] ?? 0), list.length - 1)];
 	};
@@ -1430,33 +1694,41 @@ export function createInsightDashboard(
 					return;
 				}
 				if (focus === "details" && (view === "detail" || view === "preview")) {
-					// Scroll over wrapped rows with the same actual window the
-					// renderer draws, so no drawn line is unreachable.
-					const windowRows = detailViewportRows();
+					// Steps share layoutFor with the renderer, so a step can stop
+					// exactly on the displayed tail and never past it.
+					const layout = layoutFor(lastWidth);
 					if (view === "detail") {
-						detailScroll = clampScroll(detailScroll + delta, wrappedRows(detailLines(), lastWidth).length, windowRows);
+						const total = wrappedRows(detailLines(), lastWidth).length;
+						detailScroll = clampScroll(detailScroll + delta, total, detailWindow(layout, total, detailFactRows(lastWidth).length));
 					} else {
-						previewScroll = clampScroll(previewScroll + delta, wrappedRows(previewLines().lines, lastWidth).length, windowRows);
+						const total = wrappedRows(previewLines().lines, lastWidth).length;
+						previewScroll = clampScroll(previewScroll + delta, total, previewWindow(layout));
 					}
 					touch();
 					return;
 				}
-				if (focus === "actions" && (view === "confirm-candidate" || view === "confirm-install")) {
+				if (focus === "actions") {
+					// A focused strip chooses with ↑/↓ exactly as with ←/→ in every
+					// view, so Enter fires precisely the labeled action under the
+					// cursor instead of the stale first entry.
 					moveAction(delta as 1 | -1);
 					return;
 				}
 				return;
 			}
 			if (key === "pageup" || key === "pagedown") {
-				const windowRows = detailViewportRows();
-				const delta = key === "pagedown" ? windowRows : -windowRows;
+				const layout = layoutFor(lastWidth);
+				const detailTotal = wrappedRows(detailLines(), lastWidth).length;
+				const previewTotal = wrappedRows(previewLines().lines, lastWidth).length;
+				const step = view === "preview" ? previewWindow(layout) : detailWindow(layout, detailTotal, detailFactRows(lastWidth).length);
+				const delta = key === "pagedown" ? step : -step;
 				if (focus === "details" && view === "detail") {
-					detailScroll = clampScroll(detailScroll + delta, wrappedRows(detailLines(), lastWidth).length, windowRows);
+					detailScroll = clampScroll(detailScroll + delta, detailTotal, detailWindow(layout, detailTotal, detailFactRows(lastWidth).length));
 					touch();
 					return;
 				}
 				if (view === "preview") {
-					previewScroll = clampScroll(previewScroll + delta, wrappedRows(previewLines().lines, lastWidth).length, windowRows);
+					previewScroll = clampScroll(previewScroll + delta, previewTotal, previewWindow(layout));
 					touch();
 				}
 				return;

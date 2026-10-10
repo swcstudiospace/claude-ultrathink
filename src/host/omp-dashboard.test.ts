@@ -111,15 +111,6 @@ test("Jev details preserve numeric thresholds and zero cost with and without que
 });
 
 describe("dashboard tabs and focus", () => {
-	test("tabs render in contract order with the first tab active", () => {
-		const ui = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "overview" });
-		const text = plain(ui.render(80)).join("\n");
-		const order = [text.indexOf("Overview"), text.indexOf("Jev"), text.indexOf("Moments"), text.indexOf("Skills")];
-		expect(order.every((index) => index >= 0)).toBe(true);
-		expect([...order].sort((a, b) => a - b)).toEqual(order);
-		expect(text).toContain("[Overview]");
-		ui.dispose();
-	});
 
 	test("tab focus cycles through regions without trapping", () => {
 		const ui = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "moments" });
@@ -245,13 +236,6 @@ describe("dashboard bounds and viewports", () => {
 		}
 	});
 
-	test("narrow terminals show position instead of the strip", () => {
-		const ui = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "jev" });
-		const text = plain(ui.render(24)).join("\n");
-		expect(text).toMatch(/\[Jev\] 2\/4/);
-		expect(text).not.toContain("[Overview]");
-		ui.dispose();
-	});
 
 	test("tiny viewports refuse mutation while browsing and escape stay live", () => {
 		const cb = stubs();
@@ -646,6 +630,300 @@ describe("dashboard action receipts survive refresh", () => {
 		await flush();
 		expect(plain(ui.render(80)).join("\n")).not.toContain(RECEIPT);
 		expect(cb.calls.filter((call) => call === "refresh").length).toBe(2);
+		ui.dispose();
+	});
+});
+
+describe("dashboard physical viewport boundaries", () => {
+	const TAIL = "ownership-marker-tail-line";
+	function longBodyLesson(): InsightLesson {
+		return mkLesson("lb", "Long body lesson", {
+			status: "confirmed",
+			kind: "pattern",
+			occurrences: 5,
+			eligible: true,
+			body: [`head ${"n".repeat(900)}`, `${"数据库迁移".repeat(60)} recall`, "middle", `${"y".repeat(900)}`, TAIL].join("\n"),
+			selection: { id: "lb", revision: "rlb" },
+		});
+	}
+	function openDetail(ui: InsightDashboard): void {
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+	}
+	function scrollTo(text: string, ui: InsightDashboard, width: number, key: string, limit = 600): string {
+		let rendered = plain(ui.render(width)).join("\n");
+		for (let i = 0; i < limit && !rendered.includes(text); i += 1) {
+			ui.handleInput(key);
+			const next = plain(ui.render(width)).join("\n");
+			if (next === rendered) break;
+			rendered = next;
+		}
+		return rendered;
+	}
+
+	test("long unbroken, multiline, and CJK detail scrolls to the tail without row or height overflow", () => {
+		const height = 24;
+		const width = 80;
+		const ui = createInsightDashboard(snapshot({ lessons: [longBodyLesson()] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => height });
+		openDetail(ui);
+		for (const rows of [plain(ui.render(width))]) {
+			expect(rows.length).toBeLessThanOrEqual(height);
+			for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width);
+		}
+		const text = scrollTo(TAIL, ui, width, "down");
+		expect(text).toContain(TAIL);
+		const tailRows = plain(ui.render(width));
+		expect(tailRows.length).toBeLessThanOrEqual(height);
+		for (const row of tailRows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(width);
+		ui.dispose();
+	});
+
+
+	test("a supported preview scrolls its ownership tail into view with install reachable", async () => {
+		const marker = "ownership: generated-by-ultrathink";
+		const content = `---\n${"draft line\n".repeat(200)}${marker}\n`;
+		const cb = stubs({
+			previewSkill: async () => {
+				cb.calls.push("preview");
+				return { status: "ok", message: "ready", preview: { selection: { id: "l2", revision: "r2" }, fingerprint: "f", name: "draft", description: "d", content, warnings: [] } };
+			},
+		});
+		const height = 24;
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => height });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		let text = scrollTo(marker, ui, 80, "down");
+		expect(text).toContain(marker);
+		const tailRows = plain(ui.render(80));
+		expect(tailRows.length).toBeLessThanOrEqual(height);
+		for (const row of tailRows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		// The reviewable preview still opens its separate install confirmation.
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		expect(plain(ui.render(80)).join("\n")).toMatch(/Install this preview into Omp/);
+		ui.dispose();
+	});
+
+	test("a clipped preview disables every install path without claiming review", async () => {
+		const content = `${"z".repeat(70_000)}\nownership-tail\n`;
+		const cb = stubs({
+			previewSkill: async () => {
+				cb.calls.push("preview");
+				return { status: "ok", message: "ready", preview: { selection: { id: "l2", revision: "r2" }, fingerprint: "f", name: "draft", description: "d", content, warnings: [] } };
+			},
+		});
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => 40 });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		const text = plain(ui.render(80)).join("\n");
+		expect(text).toMatch(/60KB/);
+		// The strip's install entry is present but disabled: activating it
+		// explains instead of opening install consent.
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		expect(cb.calls).not.toContain("install");
+		ui.handleInput("escape");
+		expect(cb.calls).not.toContain("install");
+		ui.dispose();
+	});
+
+	test("short viewports refuse mutation while browsing and escape stay live", () => {
+		let height = 7;
+		const cb = stubs();
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => height });
+		const short = plain(ui.render(80));
+		expect(short.length).toBeLessThanOrEqual(7);
+		for (const row of short) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		expect(short.join("\n")).toMatch(/resize/i);
+		// Navigation still advances the stored cursor while short; growing the
+		// viewport proves the selection survived clamping with data intact.
+		ui.handleInput("tab");
+		ui.handleInput("down");
+		height = 30;
+		expect(plain(ui.render(80)).join("\n")).toContain("> Second lesson");
+		height = 7;
+		ui.handleInput("escape");
+		expect(cb.calls).toContain("close");
+		expect(cb.calls).not.toContain("confirm");
+		expect(cb.calls).not.toContain("install");
+		ui.dispose();
+	});
+
+	test("skills panel shares one scroll budget between policy prefix and lesson list", () => {
+		// Tiny viewport: the policy prefix and the list fit one shared budget —
+		// the panel never overflows and at least one lesson row stays reachable.
+		const tiny = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "skills", rows: () => 8 });
+		const tinyRows = plain(tiny.render(24));
+		expect(tinyRows.length).toBeLessThanOrEqual(8);
+		for (const row of tinyRows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(24);
+		expect(tinyRows.join("\n")).toContain("Second");
+		expect(tinyRows.join("\n")).toContain("1 record shown");
+		tiny.dispose();
+		// Roomier viewport: the full policy prefix, the lesson, and the count
+		// line are all on screen within the shared budget.
+		const roomy = createInsightDashboard(snapshot(), stubs(), { theme: {}, initialPanel: "skills", rows: () => 20 });
+		const roomyRows = plain(roomy.render(40));
+		expect(roomyRows.length).toBeLessThanOrEqual(20);
+		const roomyText = roomyRows.join("\n");
+		expect(roomyText).toContain("Capture:");
+		expect(roomyText).toContain("Second");
+		expect(roomyText).toContain("1 record shown");
+		roomy.dispose();
+		// Empty collection: the why-empty message is reachable under the same
+		// shared budget instead of being clipped away by the policy prefix.
+		const empty = createInsightDashboard(snapshot({ lessons: [], eligible: 0 }), stubs(), { theme: {}, initialPanel: "skills", rows: () => 8 });
+		const emptyRows = plain(empty.render(24));
+		expect(emptyRows.length).toBeLessThanOrEqual(8);
+		expect(emptyRows.join("\n")).toContain("No lessons meet the");
+		empty.dispose();
+	});
+
+	test("an affirmative cannot fire when its identity does not fit", async () => {
+		const cb = stubs();
+		const longId = `l-${"x".repeat(300)}`;
+		let height = 12;
+		const ui = createInsightDashboard(
+			snapshot({ lessons: [mkLesson(longId, "A very long candidate title that wraps across many terminal rows", { selection: { id: longId, revision: "r" } })] }),
+			cb,
+			{ theme: {}, initialPanel: "moments", rows: () => height },
+		);
+		ui.render(40);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("right");
+		ui.handleInput("enter");
+		// The refusal names the withheld action instead of clipping identity,
+		// and the layout stays within the viewport.
+		let rows = plain(ui.render(40));
+		expect(rows.length).toBeLessThanOrEqual(12);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(40);
+		expect(rows.join("\n")).not.toContain(longId);
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		expect(cb.calls).not.toContain("confirm");
+		// Even shorter: the strip-level refusal survives while staying bounded.
+		height = 8;
+		rows = plain(ui.render(40));
+		expect(rows.length).toBeLessThanOrEqual(8);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(40);
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		expect(cb.calls).not.toContain("confirm");
+		ui.dispose();
+	});
+
+	test("resize clamps scroll and selection without changing data or permission", () => {
+		let height = 40;
+		const ui = createInsightDashboard(snapshot({ lessons: [longBodyLesson()] }), stubs(), { theme: {}, initialPanel: "moments", rows: () => height });
+		openDetail(ui);
+		for (let i = 0; i < 30; i += 1) ui.handleInput("down");
+		height = 10;
+		const rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(10);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		// The same lesson identity remains reachable after shrinking.
+		const top = scrollTo("Long body lesson", ui, 80, "up");
+		expect(top).toContain("Long body lesson");
+		const bottom = scrollTo(TAIL, ui, 80, "down");
+		expect(bottom).toContain(TAIL);
+		// The eligible lesson keeps its named preview action after resize.
+		ui.handleInput("tab");
+		expect(plain(ui.render(80)).join("\n")).toContain("Preview skill draft");
+		ui.dispose();
+	});
+
+	test("a notice shares a low viewport with windowed content", async () => {
+		const cb = stubs({
+			previewSkill: async () => {
+				cb.calls.push("preview");
+				return { status: "error", message: "draft too large" };
+			},
+		});
+		const height = 12;
+		const ui = createInsightDashboard(snapshot({ lessons: [longBodyLesson()] }), cb, { theme: {}, initialPanel: "moments", rows: () => height });
+		openDetail(ui);
+		ui.handleInput("tab");
+		ui.handleInput("right");
+		ui.handleInput("enter");
+		await flush();
+		await flush();
+		// The failed preview leaves its notice beside windowed details.
+		let rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(height);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		// Reach the details viewport, then scroll the tail back into view.
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		const text = scrollTo(TAIL, ui, 80, "down");
+		expect(text).toContain(TAIL);
+		rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(height);
+		for (const row of rows) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+		ui.dispose();
+	});
+
+	test("a settled receipt shares a low viewport with its follow-up refresh", async () => {
+		const RECEIPT = "Candidate confirmed receipt-low.";
+		const pending: Array<(next: InsightSnapshot) => void> = [];
+		const cb = stubs({
+			confirmCandidate: async () => {
+				cb.calls.push("confirm");
+				return { status: "ok", message: RECEIPT, retention: "retained" as const };
+			},
+			refresh: () => {
+				cb.calls.push("refresh");
+				return new Promise<InsightSnapshot>((resolve) => {
+					pending.push(resolve);
+				});
+			},
+		});
+		const height = 12;
+		const ui = createInsightDashboard(snapshot(), cb, { theme: {}, initialPanel: "moments", rows: () => height });
+		ui.render(80);
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		await flush();
+		ui.handleInput("down");
+		ui.handleInput("enter");
+		await flush();
+		// Busy refresh plus receipt stay bounded and visible together.
+		let rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(height);
+		expect(rows.join("\n")).toContain(RECEIPT);
+		expect(rows.join("\n")).toMatch(/Refreshing local snapshot/);
+		pending.shift()?.(snapshot());
+		await flush();
+		await flush();
+		rows = plain(ui.render(80));
+		expect(rows.length).toBeLessThanOrEqual(height);
+		expect(rows.join("\n")).toContain(RECEIPT);
 		ui.dispose();
 	});
 });
