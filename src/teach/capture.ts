@@ -164,7 +164,13 @@ async function retainOne(moment: TeachableMoment, client: HindsightClient, store
 		return { ok: false, message: `retain failed: ${redactLine(error instanceof Error ? error.message : String(error))}` };
 	}
 	if (!result.ok) return { ok: false, kind: result.error.kind, message: `retain failed (${result.error.kind}): ${redactLine(result.error.message)}` };
-	const retained: TeachableMoment = { ...moment, retained: { at: new Date(nowOf(ctx)).toISOString(), bank: client.bank, documentId } };
+	// The remote write already happened and cannot be unsent; a cancelled lifetime still gets no
+	// local put, acknowledgment or success claim from this completion.
+	if (ctx.signal?.aborted) return { ok: false, message: "retain cancelled after dispatch; the local copy was left unchanged" };
+	// Reread before spreading retention metadata so a deferred completion cannot overwrite newer
+	// lesson state (a worker confirm, a merged capture) with the stale pre-await object.
+	const current = store.get(moment.id) ?? moment;
+	const retained: TeachableMoment = { ...current, retained: { at: new Date(nowOf(ctx)).toISOString(), bank: client.bank, documentId } };
 	try {
 		store.put(retained);
 		dropRetainOps(store, moment.id);
@@ -183,6 +189,8 @@ async function settle(moment: TeachableMoment, ctx: TeachContext, store: TeachSt
 	if (!client) return { moment, retain: "local-only", reason };
 	const result = await retainOne(moment, client, store, ctx);
 	if (result.ok) return { moment: result.moment, retain: "retained" };
+	// A cancelled lifetime never turns a failed retain into a queued outbox write.
+	if (ctx.signal?.aborted) return { moment, retain: "local-only", reason: "action cancelled before the failed retain could be queued; the local lesson is unchanged" };
 	try {
 		store.enqueue({ op: "retain", momentId: moment.id }, nowOf(ctx));
 	} catch {
@@ -257,7 +265,11 @@ export async function confirmMoment(id: string, ctx: TeachContext): Promise<Capt
 	if (!teachEnabled(ctx)) return { moment, created: false, retain: "off", reason: "teach is off" };
 	try {
 		const confirmed: TeachableMoment = moment.status === "candidate" ? { ...moment, status: "confirmed" } : moment;
-		if (confirmed !== moment) store.put(confirmed);
+		if (confirmed !== moment) {
+			// Cancellation before dispatch mutates nothing: no local confirmation commit.
+			if (ctx.signal?.aborted) return { moment, created: false, retain: "off", reason: "confirmation cancelled before it was stored" };
+			store.put(confirmed);
+		}
 		return { ...(await settle(confirmed, ctx, store, false)), created: false };
 	} catch (error) {
 		return { moment, created: false, retain: "off", reason: `teach store write failed: ${redactLine(error instanceof Error ? error.message : String(error))}` };

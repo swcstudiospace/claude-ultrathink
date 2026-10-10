@@ -2,8 +2,9 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
-import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
+import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightSnapshot } from "./omp-insights.ts";
 import type { PlanView } from "./view.ts";
 
 const FG = ["accent", "muted", "dim", "success", "warning", "error", "borderMuted", "borderAccent", "customMessageLabel", "customMessageText"];
@@ -293,5 +294,298 @@ describe("plan card model row (§9 path 5)", () => {
 				expect({ name, width, widths: rows.map(visibleWidth) }).toEqual({ name, width, widths: rows.map(() => width) });
 			}
 		}
+	});
+});
+
+describe("insight card", () => {
+	const renderInsight = renderers[INSIGHT_TYPE] as Renderer;
+
+	// fixture matches the frozen card DTO (asInsightCard); body/content ride along as leak bait the renderer must drop
+	const cardDetails = {
+		project: "demo",
+		session: "s1",
+		at: 1_700_000_000_000,
+		policy: { enabled: true, capture: "explicit" },
+		decisions: [
+			{ point: "teachable", outcome: "ok", action: "keep", model: "m1" },
+			{ point: "skillworthy", outcome: "error", action: "skip", model: "m1" },
+		],
+		lessons: [
+			{ id: "l-1", name: "First", status: "candidate", kind: "pattern", occurrences: 1, eligible: false, body: "must never appear in compact rows", content: "draft leak" },
+			{ id: "l-2", name: "Second", status: "confirmed", kind: "pattern", occurrences: 2, eligible: true },
+			{ id: "l-3", name: "Third", status: "promoted", kind: "playbook", occurrences: 1, eligible: false, promoted: { target: "omp", skill: "" } },
+			{ id: "l-4", name: "Fourth", status: "candidate", kind: "pitfall", occurrences: 1, eligible: false },
+		],
+		counts: { candidate: 2, confirmed: 1, promoted: 1, superseded: 0 },
+		eligible: 1,
+		promoted: 1,
+		partial: true,
+		limitations: ["partial read"],
+	};
+
+	function insightCard(details: unknown, expanded: boolean, width: number, cardTheme: unknown = theme) {
+		const rows = renderInsight({ content: "card", details }, { expanded }, cardTheme)?.render(width) ?? [];
+		return { rows, plain: rows.map((row) => Bun.stripANSI(row)) };
+	}
+
+	test("compact card stays within six content rows and never carries bodies or drafts", () => {
+		const { rows, plain } = insightCard(cardDetails, false, 80);
+		expect(rows.length).toBeLessThanOrEqual(6 + 4);
+		expect(plain.join("\n")).not.toContain("must never appear");
+		expect(plain.join("\n")).not.toContain("draft leak");
+	});
+
+	test("expanded card stays within twenty-four content rows with an omission notice when capped", () => {
+		const { rows, plain } = insightCard(cardDetails, true, 80);
+		expect(rows.length).toBeLessThanOrEqual(24 + 4);
+		expect(plain.join("\n")).toMatch(/more lessons — open \/ultrathink-ui/);
+	});
+
+	test("captured cards are labeled with time and scope, never as live state", () => {
+		const { plain } = insightCard(cardDetails, false, 80);
+		const text = plain.join("\n");
+		expect(text).toContain("demo");
+		expect(text).toMatch(/captured/);
+		expect(text).toMatch(/not live/);
+		expect(text).not.toContain("is live");
+	});
+
+	test("malformed persisted details fall back to a safe bounded card", () => {
+		for (const details of [undefined, null, "x", 42, ["array"], { project: 7, decisions: "nope" }]) {
+			const { rows } = insightCard(details, false, 80, {});
+			expect(rows.length).toBeLessThanOrEqual(6 + 4);
+			for (const row of rows) expect(row).not.toContain(String.fromCharCode(27));
+		}
+	});
+
+	test("hostile persisted text never reaches the terminal unsanitized", () => {
+		const hostile = {
+			project: "x\x1b[2Jcgi",
+			session: "s\x1b]0;pwned\x07",
+			at: 1_700_000_000_000,
+			policy: { enabled: true, capture: "observe" },
+			decisions: [{ point: "plan", outcome: "ok", action: "plan", model: "m" }],
+			lessons: [{ id: "h-1", name: "a\u202eb", status: "candidate", kind: "bug", occurrences: 1, eligible: false }],
+			counts: { candidate: 1, confirmed: 0, promoted: 0, superseded: 0 },
+			eligible: 0,
+			promoted: 0,
+			partial: false,
+			limitations: [],
+		};
+		const { rows } = insightCard(hostile, true, 80, {});
+		for (const row of rows) expect(row).not.toContain(String.fromCharCode(27));
+	});
+
+	test("every row keeps the render width", () => {
+		for (const width of [8, 40, 80, 160]) {
+			const { rows } = insightCard(cardDetails, true, width);
+			expect(rows.map(visibleWidth)).toEqual(rows.map(() => width));
+		}
+	});
+
+	// Real canonical data: the card under test is produced by the actual
+	// toInsightCardSnapshot writer, never a hand-copied DTO literal. Bodies,
+	// descriptions and selection revisions ride along as leak bait.
+	function canonicalCard(overrides: Partial<InsightSnapshot> = {}): InsightCardSnapshot {
+		const snapshot: InsightSnapshot = {
+			project: "demo",
+			session: "s1",
+			at: 1_700_000_000_000,
+			decisions: [
+				{
+					point: "teachable",
+					outcome: "ok",
+					model: "jev-test-model",
+					action: "keep",
+					threshold: 0.5,
+					latencyMs: 12,
+					attempts: 1,
+					at: 1_700_000_000_000,
+					probabilities: { capture: 0.82 },
+					questions: [{ key: "worth-keeping", p: 0.82 }],
+				},
+				{
+					point: "skillworthy",
+					outcome: "error",
+					model: "jev-test-model",
+					action: "fail-open",
+					threshold: 0.5,
+					latencyMs: 30,
+					attempts: 2,
+					at: 1_700_000_001_000,
+					probabilities: {},
+					questions: [],
+				},
+			],
+			lessons: [
+				{
+					id: "l-1",
+					name: "First lesson",
+					description: "operator notes stay out of cards",
+					body: "FULL BODY MUST NEVER RENDER",
+					status: "confirmed",
+					kind: "pattern",
+					origin: "explicit",
+					host: "omp",
+					occurrences: 4,
+					recalled: 1,
+					createdAt: "2026-01-01T00:00:00Z",
+					lastSeenAt: "2026-01-02T00:00:00Z",
+					sourcePhase: "p1",
+					sourceArtifacts: ["a"],
+					tags: ["t"],
+					relatedIds: [],
+					selection: { id: "l-1", revision: "digest-must-never-render" },
+					eligible: true,
+				},
+				{
+					id: "l-2",
+					name: "Second lesson",
+					description: "",
+					body: "",
+					status: "promoted",
+					kind: "playbook",
+					origin: "explicit",
+					host: "omp",
+					occurrences: 9,
+					recalled: 3,
+					createdAt: "2026-01-03T00:00:00Z",
+					lastSeenAt: "2026-01-04T00:00:00Z",
+					sourcePhase: "p1",
+					sourceArtifacts: [],
+					tags: [],
+					relatedIds: [],
+					selection: { id: "l-2", revision: "r2" },
+					eligible: false,
+					promoted: { at: "2026-01-04T00:00:00Z", skill: "second-skill", target: "omp" },
+				},
+				{
+					id: "l-3",
+					name: "Third lesson",
+					description: "",
+					body: "",
+					status: "candidate",
+					kind: "bug",
+					origin: "observe",
+					host: "omp",
+					occurrences: 1,
+					recalled: 0,
+					createdAt: "2026-02-01T00:00:00Z",
+					lastSeenAt: "2026-02-01T00:00:00Z",
+					sourcePhase: "p2",
+					sourceArtifacts: [],
+					tags: [],
+					relatedIds: [],
+					selection: { id: "l-3", revision: "r3" },
+					eligible: false,
+				},
+			],
+			policy: {
+				enabled: true,
+				capture: "observe",
+				recall: true,
+				recallLimit: 5,
+				recallChars: 4000,
+				autoPromote: false,
+				promoteAfter: 3,
+				jevEnabled: true,
+			},
+			counts: { candidate: 1, confirmed: 1, promoted: 1, superseded: 0 },
+			eligible: 1,
+			promoted: 1,
+			partial: false,
+			limitations: [],
+			...overrides,
+		};
+		return toInsightCardSnapshot(snapshot);
+	}
+
+	test("recorded nonzero autonomy counts render instead of zeroed lists", () => {
+		const { plain } = insightCard(canonicalCard(), false, 80);
+		const text = plain.join("\n");
+		expect(text).toMatch(/1 eligible/);
+		expect(text).toMatch(/1 promoted/);
+		expect(text).not.toMatch(/0 eligible/);
+		expect(text).not.toMatch(/0 promoted/);
+		expect(text).toMatch(/1 confirmed/);
+		expect(text).not.toContain("superseded");
+	});
+
+	test("lesson bodies, descriptions and selection revisions never reach rows", () => {
+		for (const expanded of [false, true]) {
+			const { plain } = insightCard(canonicalCard(), expanded, 160);
+			const text = plain.join("\n");
+			expect(text).not.toContain("FULL BODY MUST NEVER RENDER");
+			expect(text).not.toContain("operator notes stay out of cards");
+			expect(text).not.toContain("digest-must-never-render");
+		}
+	});
+
+	test("expanded card shows typed decision fields with the first question", () => {
+		const { plain } = insightCard(canonicalCard(), true, 160);
+		const text = plain.join("\n");
+		expect(text).toMatch(/teachable/);
+		expect(text).toMatch(/fail-open/);
+		expect(text).toMatch(/jev-test-model/);
+		expect(text).toMatch(/worth-keeping/);
+		expect(text).toMatch(/0\.82/);
+		expect(text).toMatch(/second-skill/);
+		expect(text).toMatch(/Policy: teaching on/);
+	});
+
+	test("expanded card never rounds a saved probability across its threshold", () => {
+		const snapshot = canonicalCard();
+		const first = snapshot.decisions[0];
+		if (first === undefined) throw new Error("canonical fixture must carry a decision");
+		const near = { ...first, threshold: 0.2, questions: [{ key: "edge-case", p: 0.1999 }] };
+		const { plain } = insightCard(canonicalCard({ decisions: [near, ...snapshot.decisions.slice(1)] }), true, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("edge-case (0.19)");
+		expect(text).not.toContain("0.20");
+		expect(text).not.toContain("20%");
+	});
+
+	test("expanded card keeps zero and one probabilities honest", () => {
+		const snapshot = canonicalCard();
+		const first = snapshot.decisions[0];
+		const second = snapshot.decisions[1];
+		if (first === undefined || second === undefined) throw new Error("canonical fixture must carry two decisions");
+		const zero = { ...first, questions: [{ key: "never-asked", p: 0 }] };
+		const one = { ...second, questions: [{ key: "always-asked", p: 1 }] };
+		const { plain } = insightCard(canonicalCard({ decisions: [zero, one] }), true, 160);
+		const text = plain.join("\n");
+		expect(text).toContain("never-asked (0.00)");
+		expect(text).toContain("always-asked (1.00)");
+		expect(text).not.toContain("NaN");
+	});
+
+	test("legacy list-shaped counts fall back instead of rendering zero", () => {
+		const legacy = { ...canonicalCard(), eligible: [{ id: "x" }], promoted: [{ id: "y" }] };
+		const { plain } = insightCard(legacy, false, 80, {});
+		const text = plain.join("\n");
+		expect(text).toMatch(/unavailable/);
+		expect(text).not.toMatch(/0 eligible/);
+	});
+
+	test("invented alias fields never override recorded counts", () => {
+		const aliased = { ...canonicalCard(), eligibleCount: 99, promotedCount: 99, title: "Alias bait" };
+		const { plain } = insightCard(aliased, false, 80);
+		const text = plain.join("\n");
+		expect(text).toMatch(/1 eligible/);
+		expect(text).toMatch(/1 promoted/);
+		expect(text).not.toContain("Alias bait");
+		expect(text).not.toContain("99");
+	});
+
+	test("raw message content is never rendered", () => {
+		const rows =
+			renderInsight({ content: "SECRET-CONTENT-MARKER", details: canonicalCard() }, { expanded: true }, theme)?.render(160) ?? [];
+		expect(rows.map((row) => Bun.stripANSI(row)).join("\n")).not.toContain("SECRET-CONTENT-MARKER");
+	});
+
+	test("repeated renders at the same width return the same rows", () => {
+		const component = renderInsight({ content: "card", details: canonicalCard() }, { expanded: false }, theme);
+		expect(component).toBeDefined();
+		expect(component?.render(80)).toBe(component?.render(80));
 	});
 });
