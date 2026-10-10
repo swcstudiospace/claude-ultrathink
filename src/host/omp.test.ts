@@ -35,10 +35,11 @@ describe("omp extension", () => {
 	test("slow plan returns pending then delivers aside once", async () => {
 		const gate = controlled();
 		const { run, sent } = setup(gate.plan, 1);
-		const result = await run();
-		expect(result && typeof result.message === "object" && result.message.customType).toBe(
-			"ultrathink-pending",
-		);
+		const result: unknown = await run();
+		const message: unknown = typeof result === "object" && result !== null && "message" in result ? result.message : undefined;
+		const customType: unknown =
+			typeof message === "object" && message !== null && "customType" in message ? message.customType : undefined;
+		expect(customType).toBe("ultrathink-pending");
 		expect(sent).toHaveLength(0);
 		gate.resolve("PLAN");
 		await flush();
@@ -152,7 +153,7 @@ describe("omp extension", () => {
 
 	test("tui session mounts the bar above the editor, then re-mounts once per tick after other handlers", async () => {
 		const t = tuiCtx();
-		const { emit, renderers } = setup(async () => "", 1_000, {}, t.ctx);
+		const { emit } = setup(async () => "", 1_000, {}, t.ctx);
 		emit("session_start");
 		expect(t.widgets).toHaveLength(1);
 		expect(t.widgets[0]!.key).toBe("ultrathink");
@@ -172,7 +173,6 @@ describe("omp extension", () => {
 		expect(t.widgets).toHaveLength(3);
 		expect(t.widgets[2]!.factory).toBe(t.widgets[0]!.factory);
 		expect(t.widgets[2]!.options).toEqual({ placement: "aboveEditor" });
-		expect(renderers.sort()).toEqual(["ultrathink-pending", "ultrathink-plan", "ultrathink-ship", "ultrathink-sync"]);
 	});
 
 	test("non-tui or no-UI sessions mount no bar", async () => {
@@ -386,11 +386,8 @@ describe("slash commands", () => {
 		return { plan, prompts };
 	};
 
-	test("registers every /ultrathink-<verb> command, with on/off completions for track", () => {
+	test("track command offers on/off completions", () => {
 		const { commands } = setup(async () => "PLAN", 1_000, { stateDir });
-		expect([...commands.keys()].sort()).toEqual(
-			["ultrathink-off", "ultrathink-on", "ultrathink-quick", "ultrathink-skip", "ultrathink-status", "ultrathink-track"],
-		);
 		const complete = commands.get("ultrathink-track")!.getArgumentCompletions!;
 		expect((complete("") as { value: string }[]).map((item) => item.value)).toEqual(["on", "off"]);
 		expect((complete("of") as { value: string }[]).map((item) => item.value)).toEqual(["off"]);

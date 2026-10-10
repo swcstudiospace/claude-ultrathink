@@ -701,3 +701,122 @@ describe("stored shape", () => {
 		expect(stored).toEqual(outcome.moment);
 	});
 });
+
+describe("aborted lifetimes leave no late writes", () => {
+	function deferred() {
+		const { client: base } = fakeClient();
+		const seen: RetainItem[] = [];
+		let release!: (value: HindsightResult<RetainOutcome>) => void;
+		const gate = new Promise<HindsightResult<RetainOutcome>>((resolve) => {
+			release = resolve;
+		});
+		let retainCalled!: () => void;
+		const called = new Promise<void>((resolve) => {
+			retainCalled = resolve;
+		});
+		const client: HindsightClient = {
+			...base,
+			retain: async (item) => {
+				seen.push(item);
+				retainCalled();
+				return gate;
+			},
+		};
+		return { client, seen, release, called };
+	}
+
+	test("an abort during retain keeps the committed confirmation but writes no retention state and queues nothing", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const controller = new AbortController();
+		ctx.signal = controller.signal;
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		expect(gated.seen).toHaveLength(1);
+		controller.abort();
+		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("local-only");
+		expect(outcome?.reason).toContain("cancelled");
+		const stored = store.get(created.moment.id);
+		expect(stored?.status).toBe("confirmed");
+		expect(stored?.retained).toBeUndefined();
+		expect(store.outbox()).toEqual([]);
+	});
+
+	test("an abort during a failing retain queues nothing", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const controller = new AbortController();
+		ctx.signal = controller.signal;
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		controller.abort();
+		gated.release(err("network"));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("local-only");
+		expect(outcome?.reason).toContain("cancelled");
+		expect(store.get(created.moment.id)?.status).toBe("confirmed");
+		expect(store.outbox()).toEqual([]);
+	});
+
+	test("without an abort a deferred retain still commits retention metadata", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("retained");
+		expect(store.get(created.moment.id)?.retained?.documentId).toBe(documentIdFor(created.moment.id));
+		expect(store.outbox()).toEqual([]);
+	});
+
+	test("a deferred retain rereads fresh state instead of overwriting newer fields", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		const current = store.get(created.moment.id);
+		if (!current) throw new Error("confirmation seeding failed");
+		store.put({ ...current, occurrences: 42 });
+		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("retained");
+		expect(outcome?.moment.occurrences).toBe(42);
+		const stored = store.get(created.moment.id);
+		expect(stored?.occurrences).toBe(42);
+		expect(stored?.body).toBe(current.body);
+		expect(stored?.retained?.documentId).toBe(documentIdFor(created.moment.id));
+	});
+
+	test("a deferred retain that lost a race to a newer capture leaves the newer text queued", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		const current = store.get(created.moment.id);
+		if (!current) throw new Error("confirmation seeding failed");
+		store.put({ ...current, body: "Newer body wins." });
+		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("queued");
+		expect(outcome?.reason).toContain("older revision");
+		const stored = store.get(created.moment.id);
+		expect(stored?.body).toBe("Newer body wins.");
+		expect(stored?.retained).toBeUndefined();
+		expect(store.outbox().map((entry) => entry.op.op)).toEqual(["retain"]);
+		// The queued retry syncs the newer text on a later pass.
+		const healthy = fakeClient();
+		ctx.hindsight = healthy.client;
+		expect(await syncOutbox(ctx)).toEqual({ done: 1, pending: 0 });
+		expect(store.get(created.moment.id)?.retained?.documentId).toBe(documentIdFor(created.moment.id));
+		expect(healthy.calls.retain).toHaveLength(1);
+		expect(healthy.calls.retain[0]?.content).toContain("Newer body wins.");
+	});
+});

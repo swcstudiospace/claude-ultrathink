@@ -62,6 +62,8 @@ With Teachable Moments on, the Hermes plugin registers the tools `ultrathink_les
 
 Every plan records which model planned it and why, in one of four states: `detected` (Omp's live session model), `default` (a built-in or provider default), `override` (a model you set) or `unresolved` (none could be used; the prompt goes through unplanned with the reason). See [Planning model states](docs/how-to/choose-engine.md#planning-model-states).
 
+On Omp, `/ultrathink-ui [overview|jev|moments|skills|card]` opens a native keyboard-driven dashboard (no browser, no extra runtime) over saved Jev decisions, project lessons and skill autonomy, or publishes a captured summary card. See [docs/commands.md](docs/commands.md#omp).
+
 ### Cross-agent discovery
 
 claude-ultrathink is a cross-agent reasoning plugin for prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications, with optional Linear/Notion tracking and Greptile-gated shipping. Existing adapters serve Claude Code, Grok Build, Hermes Agent, Muse, Omp and Prime Agent. Loader name: ultrathink. Grok Bot is a native host (`bin/ultrathink-grokbot` plus skills; no prompt hook); its compatibility is not verified. The GPT Dot protocol is pending; its compatibility is unverified. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
@@ -188,6 +190,7 @@ The same commands work on every host (on Prime Agent the agent runs them through
 | `/ultrathink-off`, `/ultrathink-on` | Planning off or on for this host until you change it |
 | `/ultrathink-track off`, `/ultrathink-track on` | Keep planning, but stop or start creating Linear/Notion rows |
 | `/ultrathink-status` | Show the planning, tracking and engine state |
+| `/ultrathink-ui [overview\|jev\|moments\|skills\|card]` (Omp only) | Open the native dashboard, or publish a captured summary card with `card` |
 
 Start a message with `raw:` to send it without planning, or with `uplift:` to plan it even while planning is off. From a shell, `<clone>/bin/ultrathink status`, `off`, `on`, `skip` and `track off|on` do the same. Per-host behavior, Claude Code's plugin-qualified names and environment variables: [docs/commands.md](docs/commands.md).
 

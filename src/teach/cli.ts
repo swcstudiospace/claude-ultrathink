@@ -39,7 +39,7 @@ import type {
 import type { HindsightClient } from "../hindsight/types.ts";
 import { resolveStateDir } from "../host/paths.ts";
 
-/** `config`, `hindsight` and `complete` are test seams on top of the shared CommandDeps shape. */
+/** `config`, `hindsight`, `complete` and `signal` are test seams on top of the shared CommandDeps shape. */
 export interface CommandDeps {
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
@@ -51,6 +51,8 @@ export interface CommandDeps {
 	now?: () => number;
 	hindsight?: HindsightClient;
 	complete?: TeachContext["complete"];
+	/** Forwarded into TeachContext so a host lifetime can cancel in-flight work; omitted keeps legacy behavior. */
+	signal?: AbortSignal;
 }
 
 const USAGE = `usage:
@@ -341,6 +343,7 @@ function buildContext(deps: CommandDeps): TeachContext {
 	if (deps.config) options.config = deps.config;
 	if (deps.hindsight) options.hindsight = deps.hindsight;
 	if (deps.complete) options.complete = deps.complete;
+	if (deps.signal) options.signal = deps.signal;
 	return teachContext(options);
 }
 

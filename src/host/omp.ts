@@ -36,6 +36,14 @@ import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_T
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
+import { confirmInsightLesson, installInsightSkill, previewInsightSkill, type InsightActionRuntime } from "./omp-insight-actions.ts";
+import { createInsightDashboard, type InsightDashboardCallbacks, type InsightPanel } from "./omp-dashboard.ts";
+import type { InsightActionResult, InsightScope, InsightSnapshot, LessonSelection, SkillPreview } from "./omp-insights.ts";
+import { formatInsightText, readInsightSnapshot, toInsightCardSnapshot } from "./omp-insights.ts";
+import { paint, truncateToWidth } from "./omp-paint.ts";
+import { INSIGHT_TYPE } from "./omp-render.ts";
+import { projectOf } from "../teach/mapping.ts";
+import type { TeachContext } from "../teach/types.ts";
 import { type PlanView, projectResolution } from "./view.ts";
 
 interface BeforeAgentStartEvent {
@@ -64,6 +72,39 @@ type WidgetFactory = (tui: TuiLike, theme: unknown) => { render(width: number): 
 interface ExtensionUI {
 	setWidget?(key: string, content: WidgetFactory | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
 	notify?(message: string, type?: "info" | "warning" | "error"): void;
+	/**
+	 * Structural `ui.custom`: public factory order tui/theme/keybindings/done with optional signal.
+	 * Absent on non-TUI/RPC hosts. No host runtime import: the dashboard component shape is structural.
+	 */
+	custom?<T>(
+		factory: (
+			tui: InsightTui,
+			theme: unknown,
+			keybindings: unknown,
+			done: (result: T) => void,
+		) => InsightComponent | Promise<InsightComponent>,
+		options?: InsightCustomOptions,
+	): Promise<T>;
+}
+
+/** Structural `TUI` subset the insight dashboard needs: redraw requests plus optional viewport size. */
+interface InsightTui {
+	requestRender(): void;
+	terminal?: { rows?: number; columns?: number };
+}
+
+/** Structural custom component matching the frozen dashboard return; terminal input stays opaque bytes. */
+interface InsightComponent {
+	render(width: number): readonly string[];
+	invalidate(): void;
+	handleInput(data: unknown): void;
+	dispose(): void;
+}
+
+/** Structural subset of Omp's public `ExtensionCustomOptions`: abort the custom UI and reject its promise. */
+interface InsightCustomOptions {
+	overlay?: boolean;
+	signal?: AbortSignal;
 }
 
 /**
@@ -133,7 +174,10 @@ export interface ExtensionAPI {
 	on(event: "input", handler: (event: unknown, ctx: ExtensionContext) => undefined): void;
 	/** Returning undefined keeps the tool result unchanged. */
 	on(event: "tool_result", handler: (event: ToolResultEvent, ctx: ExtensionContext) => undefined): void;
-	sendMessage(message: CustomMessage, options: { deliverAs: "aside" }): void;
+	sendMessage(
+		message: CustomMessage,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
+	): void;
 	/** Starts a turn when idle; the message runs through `before_agent_start` like typed input. */
 	sendUserMessage?(content: string): void;
 	/** Optional for older hosts; a native flight snapshots this session setting once (AD-5). */
@@ -799,6 +843,11 @@ export function createOmpExtension(
 		const observeFlights = (ctx: ExtensionContext): void => {
 			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
 			const cwd = ctx?.cwd || process.cwd();
+			// A prompt observed in another session/cwd orphans the dashboard: drop it silently here
+			// (the switch handler explains); planner-flight handling below is unchanged.
+			if (activeInsight && (activeInsight.sessionId !== sessionId || activeInsight.cwd !== cwd)) {
+				teardownInsight(activeInsight);
+			}
 			for (const flight of flights.values()) {
 				if (flight.sessionId !== sessionId || flight.cwd !== cwd) {
 					cancel(flight, SESSION_ENDED);
@@ -815,6 +864,289 @@ export function createOmpExtension(
 		const endFlights = (): void => {
 			for (const flight of [...flights.values()]) cancel(flight, SESSION_ENDED);
 			quick = undefined;
+		};
+		// `/ultrathink-ui` native dashboard lifetimes (Phase 26). One owned lifetime at a time, separate from
+		// planner flights: its own AbortController plus a monotonic epoch covering session/cwd/stateDir/project.
+		// Session switch/shutdown, explicit close and replacement open abort the old lifetime, dispose its
+		// component once, clear ephemeral state and suppress its late callbacks. Teardown never touches planner
+		// flights, the bar store, tracking, quick handoff or auth. No dashboard opens per turn: only this command.
+		const UI_PANELS = ["overview", "jev", "moments", "skills", "card"] as const;
+		type UiPanel = (typeof UI_PANELS)[number];
+
+		const UI_OFF_COPY =
+			"Ultrathink native UI is disabled by the extension option. No dashboard or custom card was opened.";
+		const UI_CHILD_COPY = "Dashboard is available only in the top-level Omp session.";
+		const UI_UNSUPPORTED_COPY =
+			"Native dashboard unavailable in this host. Showing a local read-only snapshot; use Omp TUI for guarded actions.";
+		const UI_SCOPE_COPY =
+			"Scope unavailable. Cross-project/session inspection and actions are disabled; reopen from a top-level Omp session.";
+		const UI_STALE_COPY = "Session changed. Dashboard closed; no further action was started for the old selection.";
+		const UI_LOADING_COPY = "Loading local snapshot… No model calls or lesson changes.";
+
+		/** Plain-text fallback budget (UI-SPEC): at most 24 rows of 120 visible columns. */
+		const UI_FALLBACK_ROWS = 24;
+		const UI_FALLBACK_COLS = 120;
+
+		/** Strip untrusted terminal controls from a short label; the read model owns body sanitization. */
+		const uiOneLine = (text: string): string =>
+			text.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+
+		/** Clamp fallback text to the row/column budget, keeping the trailing explanation always visible. */
+		const clampUiFallback = (text: string, tail: string): string => {
+			const rows = text.replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "").split("\n").slice(0, UI_FALLBACK_ROWS - 1);
+			return [...rows, tail]
+				.slice(0, UI_FALLBACK_ROWS)
+				.map((row) => truncateToWidth(row, UI_FALLBACK_COLS))
+				.join("\n");
+		};
+
+		interface InsightLifetime {
+			epoch: number;
+			sessionId: string;
+			cwd: string;
+			stateDir: string;
+			project: string;
+			controller: AbortController;
+			dashboard?: InsightComponent;
+			disposed: boolean;
+			refreshSeq: number;
+			lastSnapshot?: InsightSnapshot;
+			loadingUi?: ExtensionUI;
+		}
+
+		let insightEpoch = 0;
+		let activeInsight: InsightLifetime | undefined;
+
+		/** The lifetime still owns the dashboard: active, undisposed, unaborted. Planner flights are never consulted. */
+		const insightCurrent = (lifetime: InsightLifetime): boolean =>
+			activeInsight === lifetime && !lifetime.disposed && !lifetime.controller.signal.aborted;
+
+		/** Abort the lifetime, dispose its component once, drop ephemeral state. Never touches flights/bar/tracking/quick. */
+		const teardownInsight = (lifetime: InsightLifetime): void => {
+			if (lifetime.disposed) return;
+			lifetime.disposed = true;
+			const loadingUi = lifetime.loadingUi;
+			lifetime.loadingUi = undefined;
+			if (loadingUi) guard(() => loadingUi.setWidget?.(INSIGHT_TYPE, undefined));
+			if (activeInsight === lifetime) activeInsight = undefined;
+			guard(() => lifetime.controller.abort());
+			const dashboard = lifetime.dashboard;
+			lifetime.dashboard = undefined;
+			if (dashboard) guard(() => dashboard.dispose());
+		};
+
+		/**
+		 * The TeachContext snapshot and preview work runs in: the same layered config authority flights capture,
+		 * passed explicitly so inspection never invokes Hindsight readiness, credential resolution, recall or sync.
+		 * No network, model, or store mutation happens here; the read model and action adapter own their boundaries.
+		 */
+		const insightTeachContext = (lifetime: InsightLifetime): TeachContext => {
+			const env = { ...process.env, ULTRATHINK_HOST: "omp" };
+			let config: TeachContext["config"] | undefined;
+			try {
+				const full = flightConfig(lifetime.cwd);
+				config = { teach: full.teach, hindsight: full.hindsight, decisions: full.decisions, gateway: full.gateway };
+			} catch {
+				config = undefined;
+			}
+			return (options.teachContext ?? teachContext)({
+				host: "omp",
+				cwd: lifetime.cwd,
+				env,
+				sessionId: lifetime.sessionId,
+				stateDir: lifetime.stateDir,
+				...(config ? { config } : {}),
+				signal: lifetime.controller.signal,
+			});
+		};
+
+		/**
+		 * Display-only delivery for UI text: default delivery with `triggerTurn: false` renders in the transcript
+		 * without starting a turn. Never `deliverAs: "aside"` (starts a turn when idle) or `sendUserMessage`
+		 * (starts a model prompt and skips slash expansion) on UI/teaching paths. Existing planner `aside`
+		 * deliveries are unchanged.
+		 */
+		const sendInsightText = (content: string): void => {
+			guard(() => pi.sendMessage({ content, display: true }, { triggerTurn: false }));
+		};
+
+		/** Publish a captured summary card without a model turn. A stale lifetime sends nothing. */
+		const publishInsightCard = (lifetime: InsightLifetime, snapshot: InsightSnapshot): InsightActionResult => {
+			if (!insightCurrent(lifetime)) return { status: "cancelled", message: UI_STALE_COPY };
+			let details: unknown;
+			try {
+				details = toInsightCardSnapshot(snapshot);
+			} catch {
+				details = undefined;
+			}
+			const label = uiOneLine(`Ultrathink insight — ${snapshot.project} · session ${snapshot.session}`);
+			guard(() =>
+				pi.sendMessage(
+					{
+						customType: INSIGHT_TYPE,
+						content: truncateToWidth(label, UI_FALLBACK_COLS),
+						display: true,
+						...(details !== undefined ? { details } : {}),
+					},
+					{ triggerTurn: false },
+				),
+			);
+			return { status: "ok", message: label };
+		};
+
+		/** Bounded read-only snapshot for unsupported hosts and mount failures, with the TUI-only explanation. */
+		const sendSnapshotFallback = (snapshot: InsightSnapshot | undefined, lifetime: InsightLifetime): void => {
+			if (!insightCurrent(lifetime)) return;
+			let text = "";
+			try {
+				if (snapshot) text = formatInsightText(snapshot);
+			} catch {
+				text = "";
+			}
+			sendInsightText(text ? clampUiFallback(text, UI_UNSUPPORTED_COPY) : UI_UNSUPPORTED_COPY);
+			teardownInsight(lifetime);
+		};
+
+		/** Session switch/shutdown ownership: the old dashboard can never publish into the new session. */
+		const closeInsightForSwitch = (ctx: ExtensionContext): void => {
+			const previous = activeInsight;
+			if (!previous) return;
+			teardownInsight(previous);
+			try {
+				ctx?.ui?.notify?.(UI_STALE_COPY, "info");
+			} catch {}
+		};
+
+		const openInsightUi = async (args: string | undefined, ctx: ExtensionContext): Promise<void> => {
+			const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const panel: UiPanel = (UI_PANELS as readonly string[]).includes(argv[0] ?? "") ? (argv[0] as UiPanel) : "overview";
+			// Guards precede everything: no component mount, no card, no model admission on refused paths.
+			if (!uiEnabled) {
+				sendInsightText(UI_OFF_COPY);
+				return;
+			}
+			if (isSubagentSession(ctx, exists)) {
+				sendInsightText(UI_CHILD_COPY);
+				return;
+			}
+			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			const cwd = ctx?.cwd || process.cwd();
+			if (!sessionId) {
+				sendInsightText(UI_SCOPE_COPY);
+				return;
+			}
+			const dir = stateDir(cwd);
+			const previous = activeInsight;
+			const lifetime: InsightLifetime = {
+				epoch: ++insightEpoch,
+				sessionId,
+				cwd,
+				stateDir: dir,
+				project: projectOf(cwd),
+				controller: new AbortController(),
+				disposed: false,
+				refreshSeq: 0,
+			};
+			if (previous) teardownInsight(previous);
+			activeInsight = lifetime;
+			const isCurrent = (): boolean => insightCurrent(lifetime);
+			const scope: InsightScope = { sessionId, cwd, stateDir: dir, epoch: lifetime.epoch };
+			const hostUi =
+				ctx?.hasUI && ctx.mode === "tui" && ctx.ui && typeof ctx.ui.custom === "function" ? ctx.ui : undefined;
+			if (hostUi?.setWidget) {
+				lifetime.loadingUi = hostUi;
+				guard(() => hostUi.setWidget?.(INSIGHT_TYPE, (_tui, theme) => {
+					const p = paint(theme);
+					return { render: (width) => [truncateToWidth(p.fg("muted", UI_LOADING_COPY), width)] };
+				}, { placement: "aboveEditor" }));
+			} else if (hostUi) {
+				guard(() => hostUi.notify?.(UI_LOADING_COPY, "info"));
+			}
+			let snapshot: InsightSnapshot;
+			try {
+				snapshot = await readInsightSnapshot(scope, insightTeachContext(lifetime), lifetime.controller.signal);
+			} catch (error) {
+				if (!isCurrent()) return;
+				teardownInsight(lifetime);
+				const reason = uiOneLine(error instanceof Error ? error.message : String(error)).slice(0, 200) || "unknown error";
+				sendInsightText(`Could not read local snapshot: ${reason}. No lesson changes were made by this read.`);
+				return;
+			}
+			if (!isCurrent()) return;
+			const loadingUi = lifetime.loadingUi;
+			lifetime.loadingUi = undefined;
+			if (loadingUi) guard(() => loadingUi.setWidget?.(INSIGHT_TYPE, undefined));
+			lifetime.lastSnapshot = snapshot;
+			if (panel === "card") {
+				publishInsightCard(lifetime, snapshot);
+				teardownInsight(lifetime);
+				return;
+			}
+			if (!hostUi?.custom) {
+				sendSnapshotFallback(snapshot, lifetime);
+				return;
+			}
+			const runtime = (): InsightActionRuntime => ({
+				scope,
+				getContext: () => insightTeachContext(lifetime),
+				isCurrent,
+				signal: lifetime.controller.signal,
+			});
+			const staleResult = (): InsightActionResult => ({ status: "cancelled", message: UI_STALE_COPY });
+			let finish: ((result: void) => void) | undefined;
+			const callbacks: InsightDashboardCallbacks = {
+				refresh: async (): Promise<InsightSnapshot> => {
+					const seq = ++lifetime.refreshSeq;
+					const fresh = await readInsightSnapshot(scope, insightTeachContext(lifetime), lifetime.controller.signal);
+					// Latest request alone publishes: a late previous refresh keeps the current snapshot.
+					if (!isCurrent() || seq !== lifetime.refreshSeq) return lifetime.lastSnapshot ?? fresh;
+					lifetime.lastSnapshot = fresh;
+					return fresh;
+				},
+				confirmCandidate: (selection: LessonSelection): Promise<InsightActionResult> =>
+					isCurrent() ? confirmInsightLesson(selection, runtime()) : Promise.resolve(staleResult()),
+				previewSkill: (selection: LessonSelection): Promise<InsightActionResult> =>
+					isCurrent() ? previewInsightSkill(selection, runtime()) : Promise.resolve(staleResult()),
+				installPreview: (preview: SkillPreview, confirmed: boolean): Promise<InsightActionResult> =>
+					isCurrent() ? installInsightSkill(preview, confirmed, runtime()) : Promise.resolve(staleResult()),
+				publishCard: (next: InsightSnapshot): Promise<InsightActionResult> =>
+					Promise.resolve(publishInsightCard(lifetime, next)),
+				close: (): void => {
+					teardownInsight(lifetime);
+					guard(() => finish?.(undefined));
+				},
+			};
+			try {
+				const initialPanel: InsightPanel = panel;
+				await hostUi.custom<void>(
+					(tui, theme, _keybindings, done) => {
+						finish = done;
+						const dashboard = createInsightDashboard(snapshot, callbacks, {
+							theme,
+							requestRender: () => {
+								try {
+									tui.requestRender();
+								} catch {}
+							},
+							rows: () => {
+								try {
+									return tui.terminal?.rows;
+								} catch {
+									return undefined;
+								}
+							},
+							initialPanel,
+						});
+						lifetime.dashboard = dashboard;
+						return dashboard;
+					},
+					{ signal: lifetime.controller.signal },
+				);
+			} catch {
+				// Host abort/close rejects the custom promise; teardown below is idempotent.
+			} finally {
+				teardownInsight(lifetime);
+			}
 		};
 
 		const attach = (ctx: ExtensionContext) =>
@@ -841,11 +1173,16 @@ export function createOmpExtension(
 		pi.on("session_switch", (_event, ctx) => {
 			// The old session's flights would deliver into the new one: cancel and suppress them.
 			guard(endFlights);
+			// The old dashboard would publish into the new session: abort it first, then explain the closure.
+			guard(() => closeInsightForSwitch(ctx));
 			attach(ctx);
 			scheduleMount();
 		});
 		pi.on("session_shutdown", () => {
 			guard(endFlights);
+			guard(() => {
+				if (activeInsight) teardownInsight(activeInsight);
+			});
 		});
 		for (const event of ["agent_start", "agent_end", "turn_end", "tool_execution_start", "tool_execution_end"] as const) {
 			pi.on(event, (_event, ctx) => {
@@ -996,6 +1333,26 @@ export function createOmpExtension(
 					}),
 				);
 			}
+			// `/ultrathink-ui [overview|jev|moments|skills|card]`: the native insight dashboard. Default opens
+			// Overview; `card` publishes a captured summary card without a model turn. Never per-turn spam:
+			// this registration is the only entry point. Child sessions get an explicit refusal, never
+			// model forwarding: unlike the verbs above, this path must not `sendUserMessage` anything.
+			guard(() =>
+				pi.registerCommand?.("ultrathink-ui", {
+					description: "Open the native Ultrathink dashboard (overview, jev, moments, skills) or publish a summary card",
+					getArgumentCompletions: (prefix: string) =>
+						UI_PANELS.filter((panel) => panel.startsWith(prefix.trim())).map((value) => ({
+							value,
+							label: value,
+							description: `Ultrathink dashboard view: ${value}`,
+						})),
+					handler: async (args, ctx) => {
+						try {
+							await openInsightUi(args, ctx);
+						} catch {}
+					},
+				}),
+			);
 		}
 
 		/** Delivery once the plan settles: only a still-current flight on an unchanged live model shows or sends anything. */

@@ -29,13 +29,28 @@ const wrap =
 
 type OmpOptions = NonNullable<Parameters<typeof createOmpExtension>[0]>;
 
+/** The recorded host surface `setup` returns; consumers import this contract instead of `ReturnType`. */
+export interface OmpTestHarness {
+	run: (prompt?: string) => unknown;
+	sent: { message: unknown; options: unknown }[];
+	emit: (event: string, payload?: Record<string, unknown>, context?: Record<string, unknown>) => unknown;
+	renderers: string[];
+	commands: Map<
+		string,
+		{ description?: string; getArgumentCompletions?: (prefix: string) => unknown; handler: (event: unknown, ctx: unknown) => unknown }
+	>;
+	command: (name: string, args?: string) => unknown;
+	userMessages: string[];
+	notices: string[];
+}
+
 export function setup(
 	plan: ((...args: Parameters<OmpPlanner>) => Promise<string | OmpPlan>) | undefined,
 	raceMs = 1_000,
-	extra: Omit<OmpOptions, "plan" | "raceMs" | "mcp"> = {},
+	extra: Omit<OmpOptions, "plan" | "raceMs" | "mcp"> & Partial<Pick<OmpOptions, "mcp">> = {},
 	ctxExtra: Record<string, unknown> = {},
 	apiExtra: Pick<ExtensionAPI, "getThinkingLevel"> = {},
-) {
+): OmpTestHarness {
 	const handlers = new Map<string, AnyHandler[]>();
 	const sent: { message: unknown; options: unknown }[] = [];
 	const renderers: string[] = [];
@@ -73,7 +88,13 @@ export function setup(
 	const run = (prompt = "do it") =>
 		(handlers.get("before_agent_start")?.[0] as Handler)({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx as never);
 	const command = (name: string, args = "") =>
-		commands.get(name)?.handler(args, { ...ctx, ui: { notify: (text: string) => void notices.push(text) } });
+		commands
+			.get(name)
+			?.handler(args, {
+				...ctx,
+				// Keep harness-provided host UI (e.g. a `custom` recorder) while still recording notifications.
+				ui: { notify: (text: string) => void notices.push(text), ...((ctx as Record<string, unknown>).ui as Record<string, unknown> | undefined ?? {}) },
+			});
 	return { run, sent, emit, renderers, commands, command, userMessages, notices };
 }
 
