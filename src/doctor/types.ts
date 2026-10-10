@@ -10,7 +10,7 @@ export const DOCTOR_LEVELS = ["ok", "info", "warn", "error"] as const;
 export type DoctorLevel = (typeof DOCTOR_LEVELS)[number];
 
 /** Report order of the sections. */
-export const DOCTOR_SECTIONS = ["runtime", "config", "credentials", "state"] as const;
+export const DOCTOR_SECTIONS = ["runtime", "config", "credentials", "state", "pstack"] as const;
 export type DoctorSection = (typeof DOCTOR_SECTIONS)[number];
 
 export interface Finding {

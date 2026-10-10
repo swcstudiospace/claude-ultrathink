@@ -751,6 +751,58 @@ describe("state config", () => {
 	});
 });
 
+describe("pstack config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("defaults to off with a 2000-char context cap and no cursor dir or mapping", () => {
+		expect(base.pstack).toEqual({ enabled: false, contextCapChars: 2000 });
+		expect(loadLayerFiles(roots, undefined).pstack).toEqual({ enabled: false, contextCapChars: 2000 });
+	});
+
+	test("a user file enables the bridge", () => {
+		expect(mergeConfig({ pstack: { enabled: true } }, base).pstack.enabled).toBe(true);
+		expect(loadLayerFiles(roots, { pstack: { enabled: true } }).pstack.enabled).toBe(true);
+	});
+
+	test("a project file cannot enable it, even over a user file that did", () => {
+		expect(loadLayerFiles(roots, undefined, undefined, { pstack: { enabled: true } }).pstack.enabled).toBe(false);
+		expect(loadLayerFiles(roots, { pstack: { enabled: true } }, undefined, { pstack: { enabled: true } }).pstack.enabled).toBe(true);
+	});
+
+	test("a user mapping override reaches the merged result", () => {
+		const config = loadLayerFiles(roots, { pstack: { enabled: true, mapping: { plan: ["architect", "arena"], review: ["how"] } } });
+		expect(config.pstack.mapping).toEqual({ plan: ["architect", "arena"], review: ["how"] });
+	});
+
+	test("mapping drops unknown stages, wrong-typed stages and non-string entries", () => {
+		const merged = mergeConfig({ pstack: { mapping: { plan: ["architect", 7, null, "arena"], bogus: ["x"], review: "nope" } } }, base);
+		expect(merged.pstack.mapping).toEqual({ plan: ["architect", "arena"] });
+	});
+
+	test("invalid contextCapChars values keep the lower layer's cap", () => {
+		for (const value of [0, -1, "x"]) {
+			expect(mergeConfig({ pstack: { contextCapChars: value } }, base).pstack.contextCapChars).toBe(2000);
+		}
+		const raised = mergeConfig({ pstack: { contextCapChars: 4000 } }, base);
+		expect(raised.pstack.contextCapChars).toBe(4000);
+		expect(mergeConfig({ pstack: { contextCapChars: 0 } }, raised).pstack.contextCapChars).toBe(4000);
+	});
+
+	test("a user file sets cursorDir; a project file cannot, and a relative path is ignored", () => {
+		expect(mergeConfig({ pstack: { cursorDir: "/opt/cursor" } }, base).pstack.cursorDir).toBe("/opt/cursor");
+		expect(mergeConfig({ pstack: { cursorDir: "relative/cursor" } }, base).pstack.cursorDir).toBeUndefined();
+		expect(loadLayerFiles(roots, { pstack: { cursorDir: "/opt/cursor" } }).pstack.cursorDir).toBe("/opt/cursor");
+		expect(loadLayerFiles(roots, undefined, undefined, { pstack: { cursorDir: "/evil/cursor", enabled: true } }).pstack).toEqual({
+			enabled: false,
+			contextCapChars: 2000,
+		});
+	});
+});
+
 describe("ragflow config", () => {
 	const base = defaultConfig();
 	const roots: string[] = [];

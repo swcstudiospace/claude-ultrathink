@@ -37,6 +37,7 @@ This page explains how the pieces fit together. To install it, start with [Getti
 - [MCP gateway](#mcp-gateway)
 - [Ship state machine](#ship-state-machine)
 - [Decisions (Jev)](#decisions-jev)
+- [Cursor pstack bridge](#cursor-pstack-bridge)
 - [Fail-open principles](#fail-open-principles)
 - [Source tree](#source-tree)
 
@@ -544,8 +545,17 @@ Setup and threshold tuning: [Use Jev decisions](how-to/use-jev-decisions.md). Wh
 
 Resolved details: a plan skip's `DecisionRecord` is not written to the session record (that file holds the session's latest plan, which the Stop hook, kickoff and sync read; writing it on a skip would replace or alter that plan), so it is visible only in the notice, the debug line and the returned result. A knowledge claim Jev rejects never takes the place of one of the clarifier's questions: it is appended as an open question (with its own options, or "As stated" and "Something else" when it has fewer than two) after all of the clarifier's own questions, only while fewer than `hitl.maxQuestions` are open, and it never displaces or changes them. An appended claim is then checked by the `blocking` point too, in a second round that runs only when a claim was rejected; with no slot left, the claim is dropped (neither settled nor asked) and gets no blocking check. A project file, which whoever wrote the repository controls, can only tighten consent (`decisions.zdr` only to `true`, `decisions.points` only narrowed; `decisions.enabled` is ignored in every file), so opening a repository sends nothing anywhere unless you stored or set a key. With several points in one prompt the summary shows one bit, for example `Decisions · plan 0.97 · knowledge 1/2 kept · blocking 1/3 promoted · error (timeout)`. Probabilities are printed with two decimals, truncated rather than rounded, so a printed value never crosses its threshold.
 
+## Cursor pstack bridge
+
+Cursor can run pstack skills (`how`, `architect`, `arena`, `tdd`, `interrogate`, `no-comments`) next to a GSD command. Those skills are marked so Cursor will not invoke them on its own. ultrathink's bridge does not call them either. A `beforeSubmitPrompt` hook reads the prompt, and when it sees a `/gsd-*` command it adds an instruction block that names each mapped skill and the absolute path of its `SKILL.md`. The agent reads that file and keeps going with the GSD step. The block is local context for that submission. Nothing in it is sent anywhere by ultrathink.
+
+The hook is plain Node, staged at `<cursor dir>/hooks/ultrathink-cursor-pstack.js`, and registered as one `beforeSubmitPrompt` command carrying `ultrathink-managed: true`. `bun scripts/cursor-hooks.ts install` adds that entry and `remove` deletes it. Entries marked `gsd-managed` or `substrate-managed`, and any entry the installer does not own, are left as they are. `hooks.json` is rewritten by a temp file renamed into place, mode `0600`. The hook itself writes nothing.
+
+It is off until `pstack.enabled` is `true` in the user config the hook reads. A project file cannot turn it on. `ULTRATHINK_PSTACK=0` turns it off for one process. A missing plugin, a missing skill, a bad payload or any throw prints `{}` and exits 0, so Cursor still submits the prompt. The plugin directory is the newest completed `pstack` cache under `<cursor dir>/plugins/cache/cursor-public/pstack`. Setup is in [Run pstack skills beside GSD in Cursor](how-to/use-pstack-with-cursor.md). `ultrathink doctor` reports the deciding config file, the resolved plugin, each stage's skills and whether the hook is installed.
+
 ## Fail-open principles
 
+- **The Cursor pstack hook never blocks a prompt.** A disabled bridge, `ULTRATHINK_PSTACK=0`, a missing plugin or skill, bad stdin or any throw prints `{}` and exits 0. The hook writes no file.
 - **Hooks never block a prompt.** `hooks/uplift.ts`, `hooks/engine.ts`, the Muse launchers and `bin/run-bun` in hook mode exit 0 even when Bun is missing, the engine throws, or stdin is garbage. The Hermes and Omp adapters catch everything and return no context. Only the CLIs you run by hand report a missing Bun (exit 127).
 - **Each stage degrades separately.** When the spec call fails, a conservative fallback spec is used and the graph and clarification stages still run. When the graph call fails or returns too few nodes, a generic 5-node fallback graph is used. A failed clarification or tracking stage drops only that stage. A failed or empty knowledge-base read leaves the clarification stage exactly as with the feature off. The substrate brief and the carrier file are optional. Progress events are display-only.
 - **Decisions fail open.** A missing key, any HTTP error, a timeout or an invalid answer from Jev leaves its point exactly as with the feature off: the prompt is planned, the knowledge claim stays settled, the question keeps its flag, the ship verdict is the LLM's or the rules', a candidate is still stored, and a due moment is still listed. The failure is still recorded: `Decisions · error (<kind>)` in the summary, `decision.error` in the assess JSON, `- Jev: error (<kind>)` in the PR body. Only a caller's abort is re-thrown.
@@ -575,13 +585,14 @@ Resolved details: a plan skip's `DecisionRecord` is not written to the session r
 | `src/ragflow/` | Optional RAGFlow client and planner grounding (`ground.ts`). Excerpts are untrusted evidence. Never calls `/system/healthz`. |
 | `src/teach/` | Teachable Moments: schema v2 (`types.ts`), one JSON file per moment (`store.ts`), redaction, Hindsight mapping, capture, recall, detached observe, promotion. |
 | `src/substrate/` | Optional Agent Substrate client: the brief, and the plan event. |
+| `src/cursor/` | Cursor pstack bridge: plugin resolution, `/gsd-*` stage detection, the default stage-to-skill mapping and the instruction block. The staged hook re-embeds the same table. |
 | `src/config.ts` | Config defaults and the merge of the config files, including `models`. See [Configuration](configuration.md). |
 | `src/route-defaults.ts` | `ROUTE_DEFAULT_MODELS`, the built-in model of each CLI route (`claude`, `grok`, `muse`). |
 | `hooks/` | `uplift.ts` (`UserPromptSubmit`), `answers.ts`, `pr-sync.ts`, `stop.ts`, `engine.ts` (host-neutral JSON entry, used by Hermes and Prime Agent), `hooks.json`, and the Muse launchers `muse-prompt`, `muse-post-tool`, `muse-stop`. |
-| `hosts/` | `grok/ultrathink.md` (the Grok rule) and `hermes/` (the Hermes plugin and its bridge). |
+| `hosts/` | `grok/ultrathink.md` (the Grok rule), `hermes/` (the Hermes plugin and its bridge) and `cursor/ultrathink-cursor-pstack.js` (the staged Cursor hook). |
 | `skills/` | `ultrathink-plan`, `ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-ship`, `ultrathink-teach`. |
 | `commands/` | The six `/ultrathink-*` command files used by Claude Code, Grok and Muse. |
 | `bin/` | `run-bun` (finds Bun without `PATH`), `ultrathink`, `ultrathink-mcp`, `ultrathink-ship`. |
-| `scripts/` | `setup.ts` (`apply`, `status`, `rollback`) and `mcp-register.ts`. |
+| `scripts/` | `setup.ts` (`apply`, `status`, `rollback`), `mcp-register.ts` and `cursor-hooks.ts` (install or remove the Cursor pstack hook). |
 | `.claude-plugin/`, `.muse-plugin/`, `.omp-plugin/` | Host manifests. |
 | `ultrathink.discovery.json`, `ultrathink.discovery.schema.json` | Static cross-agent discovery descriptor and its schema. See [Cross-agent discovery](../README.md#cross-agent-discovery). |

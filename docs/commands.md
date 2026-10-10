@@ -396,7 +396,7 @@ A static diagnosis that sends nothing anywhere: no network request, no `gh` and 
 Usage: ultrathink doctor [--json]
 ```
 
-Any other argument prints that line and exits 2. The report has four sections, `runtime`, `config`, `credentials` and `state`, with one line per finding marked `✓` (ok), `i` (info), `!` (warning) or `✗` (error), and ends with `<n> errors, <n> warnings`. `--json` prints one object, `{"ok","summary","findings"}`, instead.
+Any other argument prints that line and exits 2. The report has five sections, `runtime`, `config`, `credentials`, `state` and `pstack`, with one line per finding marked `✓` (ok), `i` (info), `!` (warning) or `✗` (error), and ends with `<n> errors, <n> warnings`. `--json` prints one object, `{"ok","summary","findings"}`, instead.
 
 | What it reports | Findings |
 |---|---|
@@ -404,6 +404,7 @@ Any other argument prints that line and exits 2. The report has four sections, `
 | `config` | Per file: not found (info), invalid JSON or not an object (error), unknown section or key with a `Did you mean …?`, a wrong type, a value the merge ignores or adjusts with the effective value, and a key a project file may not set (info, by design). |
 | `credentials` | Present or missing, by provider name only, for the features that are switched on, with the command that stores a missing one. |
 | `state` | Missing or unwritable directory, session count, size and oldest age (a warning above 500 sessions or 100 MB, with the hint `ultrathink prune --older-than 30 --dry-run`), session and carrier files that group or others can read, and `*.tmp` and `*.lock` files in `sessions/` older than one hour. |
+| `pstack` | Enabled or disabled, with the user file that decided it (a project file cannot enable it); the resolved plugin path and version; each stage's skills, with a warning for a mapped name that has no `SKILL.md`; whether the Cursor `beforeSubmitPrompt` hook is installed. Warnings only matter once the bridge is enabled. See [Run pstack skills beside GSD in Cursor](how-to/use-pstack-with-cursor.md). |
 
 Exit 0 means no error finding; warnings still exit 0. Exit 1 means at least one error finding. A credential value, a prefix of one and its length are never printed, and session records are never read.
 
