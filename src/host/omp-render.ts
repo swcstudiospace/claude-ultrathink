@@ -365,9 +365,10 @@ function insightRows(details: unknown, expanded: boolean, p: Paint): string[] {
 		"Autonomy: " + card.eligible + " eligible · " + card.promoted + " promoted" + (card.partial ? " · partial snapshot" : "");
 	if (!expanded) {
 		const rows = [`${label}`, scopeLine, latestLine, lessonLine, autonomyLine];
-		if (card.limitations[0] !== undefined) rows.push("Limitation: " + card.limitations[0]);
-		else if (card.counts.length === 0) rows.push("Counts: none recorded");
-		else rows.push("Counts: " + card.counts.map((entry) => entry.total + " " + entry.status).join(" · "));
+		// Counts lead on the final row so they survive truncation: real snapshots always carry
+		// limitation notes, so a separate counts row never fits the compact budget.
+		const counts = card.counts.length === 0 ? "none recorded" : card.counts.map((entry) => entry.total + " " + entry.status).join(" · ");
+		rows.push("Counts: " + counts + (card.limitations[0] === undefined ? "" : " · " + card.limitations[0]));
 		return rows.slice(0, INSIGHT_COMPACT_ROWS);
 	}
 	const rows = [`${label}`, scopeLine, latestLine];

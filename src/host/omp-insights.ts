@@ -19,6 +19,7 @@ import {
 	type DecisionAction,
 	type DecisionPoint,
 	type DecisionsErrorKind,
+	formatP,
 } from "../decisions/types.ts";
 import { teachEnabled } from "../teach/context.ts";
 import { projectOf } from "../teach/mapping.ts";
@@ -501,8 +502,15 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 			try {
 				const files = await readdir(`${dir}/moments`);
 				candidates = files.filter((file) => file.endsWith(".json") && isValidId(file.slice(0, -".json".length))).length;
-			} catch {
+			} catch (error) {
 				candidates = 0;
+				// A missing moments directory is an honestly empty store; any other read
+				// failure is disclosed instead of passing as an empty store.
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					markPartial(
+						"Could not read local snapshot: the lesson directory could not be read. Press r to refresh or Esc to close; no lesson changes were made by this read.",
+					);
+				}
 			}
 			const scanned = await listRecentMoments(dir, { max: INSIGHT_SCAN_WINDOW, maxBytes: INSIGHT_MOMENT_BYTES, signal });
 			if (cancelled()) markPartial(CANCEL_NOTE);
@@ -611,7 +619,7 @@ export function formatInsightText(snapshot: InsightSnapshot): string {
 	rows.push(`Ultrathink snapshot — Project: ${snapshot.project} | Session: ${snapshot.session}`);
 	const latest = snapshot.decisions[0];
 	if (latest) {
-		const p = latest.p === undefined ? "Not recorded" : latest.p.toFixed(2).replace(/0$/, "");
+		const p = latest.p === undefined ? "Not recorded" : formatP(latest.p);
 		rows.push(`Latest Jev: ${latest.point} ${latest.action} (P ${p})${latest.error ? ` [${latest.error}]` : ""}`);
 	} else {
 		rows.push("No saved Jev decisions for this session");

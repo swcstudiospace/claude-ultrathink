@@ -147,14 +147,16 @@ function dropRetainOps(store: TeachStore, momentId: string): void {
 	}
 }
 
-/** One retain of one moment; on success the moment records `retained` and its pending retain ops are dropped. */
+/** One retain of one moment; on success the moment records `retained` and its pending retain ops are dropped. Success means
+ *  the stored lesson still is the text the request carried; a concurrent capture leaves the newer text queued instead. */
 async function retainOne(moment: TeachableMoment, client: HindsightClient, store: TeachStore, ctx: TeachContext): Promise<Failure | { ok: true; moment: TeachableMoment }> {
 	const documentId = documentIdFor(moment.id);
+	const sentContent = contentFor(moment);
 	let result;
 	try {
 		result = await client.retain({
 			documentId,
-			content: contentFor(moment),
+			content: sentContent,
 			context: RETAIN_CONTEXT,
 			tags: tagsFor(moment),
 			metadata: metadataFor(moment),
@@ -170,6 +172,12 @@ async function retainOne(moment: TeachableMoment, client: HindsightClient, store
 	// Reread before spreading retention metadata so a deferred completion cannot overwrite newer
 	// lesson state (a worker confirm, a merged capture) with the stale pre-await object.
 	const current = store.get(moment.id) ?? moment;
+	// Acknowledge only the revision the request carried: if a capture changed the lesson while this
+	// retain was pending, the remote holds the older text, so the newer text must stay unretained —
+	// with any queued retry intact — and reach Hindsight on a later sync.
+	if (contentFor(current) !== sentContent) {
+		return { ok: false, message: "retain succeeded for an older revision; the newer lesson text stays queued to sync" };
+	}
 	const retained: TeachableMoment = { ...current, retained: { at: new Date(nowOf(ctx)).toISOString(), bank: client.bank, documentId } };
 	try {
 		store.put(retained);

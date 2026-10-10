@@ -333,6 +333,11 @@ describe("insight card", () => {
 		expect(rows.length).toBeLessThanOrEqual(6 + 4);
 		expect(plain.join("\n")).not.toContain("must never appear");
 		expect(plain.join("\n")).not.toContain("draft leak");
+		// lifecycle counts share the limitation row: real snapshots always carry limitation
+		// notes, so a dedicated counts row would never fit the six-row budget
+		const countsRow = plain.find((row) => row.includes("2 candidate"));
+		expect(countsRow).toBeDefined();
+		expect(countsRow).toContain("partial read");
 	});
 
 	test("expanded card stays within twenty-four content rows with an omission notice when capped", () => {

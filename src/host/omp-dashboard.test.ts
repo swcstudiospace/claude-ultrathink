@@ -259,10 +259,14 @@ describe("dashboard bounds and viewports", () => {
 		const text = plain(ui.render(20)).join("\n");
 		expect(text).toMatch(/resize/i);
 		ui.handleInput("tab");
+		// Below the mutation floor the list stays navigable: Tab focuses it and
+		// ↑/↓ select records; only data-changing actions stay gated.
+		expect(plain(ui.render(20)).join("\n")).toContain("> First lesson");
 		ui.handleInput("down");
+		expect(plain(ui.render(20)).join("\n")).toContain("> Second lesson");
 		ui.handleInput("enter");
 		const detail = plain(ui.render(20)).join("\n");
-		expect(detail).toContain("l1");
+		expect(detail).toContain("l2");
 		ui.handleInput("escape");
 		ui.handleInput("escape");
 		expect(cb.calls).toContain("close");
@@ -300,6 +304,11 @@ describe("dashboard guarded confirmations", () => {
 		ui.handleInput("enter");
 		await flush();
 		expect(cb.calls).not.toContain("confirm");
+		ui.handleInput("tab");
+		ui.handleInput("tab");
+		ui.handleInput("enter");
+		ui.handleInput("tab");
+		ui.handleInput("shift-tab");
 		ui.handleInput("left");
 		ui.handleInput("right");
 		ui.handleInput("up");
@@ -464,7 +473,6 @@ describe("dashboard action receipts survive refresh", () => {
 	}
 
 	async function fireConfirmYes(ui: InsightDashboard): Promise<void> {
-		ui.handleInput("enter");
 		ui.handleInput("down");
 		ui.handleInput("enter");
 		await flush();
@@ -541,7 +549,6 @@ describe("dashboard action receipts survive refresh", () => {
 		ui.handleInput("enter");
 		await flush();
 		expect(plain(ui.render(80)).join("\n")).toMatch(/Install this preview into Omp/);
-		ui.handleInput("enter");
 		ui.handleInput("down");
 		ui.handleInput("enter");
 		await flush();

@@ -39,6 +39,9 @@ const LIST_WINDOW = 12;
 const DETAIL_WINDOW = 16;
 const COLLECTION_CAP = 100;
 const PREVIEW_MAX_BYTES = 60_000;
+// Whole-draft character bound shared by intake sanitation and per-line display;
+// per-line use never truncates because the whole draft is already capped.
+const PREVIEW_MAX_CHARS = 200_000;
 const MIN_MUTATE_COLS = 24;
 const MIN_MUTATE_ROWS = 8;
 const MIN_TAB_STRIP_COLS = 32;
@@ -508,10 +511,12 @@ export function createInsightDashboard(
 	};
 
 	const focusable = (): FocusRegion[] => {
+		if (view === "confirm-candidate" || view === "confirm-install") return ["actions"];
 		const regions: FocusRegion[] = ["tabs"];
-		// Below the mutation floor, rows are too truncated to act on as identity:
-		// the list is not a focus stop; browsing continues through the action strip.
-		if (view === "browse" && (tab === "jev" || tab === "moments" || tab === "skills") && listRows(tab).length > 0 && canMutate(lastWidth)) {
+		// The size guard only gates data-changing actions. List navigation
+		// (Tab focus and ↑/↓ selection) stays available below the mutation
+		// floor so records remain browsable and selectable when narrow.
+		if (view === "browse" && (tab === "jev" || tab === "moments" || tab === "skills") && listRows(tab).length > 0) {
 			regions.push("list");
 		}
 		if (view === "detail" || view === "preview") regions.push("details");
@@ -550,7 +555,7 @@ export function createInsightDashboard(
 		detailScroll = 0;
 		previewScroll = 0;
 		syncSelection(tab);
-		focus = listRows(tab).length > 0 && tab !== "overview" && canMutate(lastWidth) ? "list" : "tabs";
+		focus = listRows(tab).length > 0 && tab !== "overview" ? "list" : "tabs";
 		touch();
 	};
 
@@ -564,11 +569,12 @@ export function createInsightDashboard(
 
 	const policyLines = (): string[] => {
 		const policy = snapshot.policy;
-		if (!policy || !policy.enabled) return ["Teaching is off. Saved lessons remain readable; confirmation, preview, and installation are unavailable."];
+		if (!policy) return ["Autonomy policy is unavailable. Saved lessons remain readable; no current policy can be inferred."];
 		const lines: string[] = [];
+		if (!policy.enabled) lines.push("Teaching is off. Saved lessons remain readable; confirmation, preview, and installation are unavailable.");
 		const capture = cleanInline(policy.capture, 24);
 		lines.push(
-			`Capture: ${capture || "Not recorded"} · Recall: ${policy.recall ? `enabled (limit ${policy.recallLimit})` : "disabled"} · Auto-promotion: ${policy.autoPromote ? "enabled" : "disabled"} · Threshold: ${policy.promoteAfter}`,
+			`Capture: ${capture || "Not recorded"} · Recall: ${policy.recall ? `enabled (limit ${policy.recallLimit}, ${policy.recallChars} chars)` : "disabled"} · Auto-promotion: ${policy.autoPromote ? "enabled" : "disabled"} · Threshold: ${policy.promoteAfter}`,
 		);
 		if (!policy.jevEnabled) {
 			lines.push("Jev is off for current policy. Recorded past decisions remain readable; this view performs no evaluation.");
@@ -673,7 +679,7 @@ export function createInsightDashboard(
 			.filter(Boolean)
 			.slice(0, 8);
 		const sourceId = cleanInline(preview.selection.id, 120);
-		const { text, clipped } = capBytes(cleanText(preview.content, 200_000), PREVIEW_MAX_BYTES);
+		const { text, clipped } = capBytes(cleanText(preview.content, PREVIEW_MAX_CHARS), PREVIEW_MAX_BYTES);
 		const contentLines = text.split("\n");
 		const header = [
 			"Preview only — not installed. Deterministic content from the selected lesson.",
@@ -684,7 +690,9 @@ export function createInsightDashboard(
 		const warningLines = warnings.map((warning) => `Warning: ${warning}`);
 		if (clipped) warningLines.push("Preview clipped at the 60KB bound; install reviews the complete regenerated draft.");
 		return {
-			lines: [...header, ...warningLines, "---", ...contentLines.map((line) => cleanInline(line, 400))],
+			// Keep each sanitized line whole: the viewport wraps and scrolls, so
+			// cutting here would hide draft content the installer still writes.
+			lines: [...header, ...warningLines, "---", ...contentLines.map((line) => cleanInline(line, PREVIEW_MAX_CHARS))],
 			total: contentLines.length,
 			clipped,
 		};
@@ -772,6 +780,17 @@ export function createInsightDashboard(
 		return kept;
 	}
 
+	/** The actual on-screen detail/preview window; DETAIL_WINDOW is only an upper bound, never the scroll limit. */
+	const detailViewportRows = (): number => Math.min(DETAIL_WINDOW, Math.max(1, viewportHeight() - 6));
+
+	/** Physical rows each logical line occupies at the given width; scroll positions index these wrapped rows. */
+	const wrappedRows = (lines: readonly string[], width: number): string[] => {
+		const room = Math.max(1, width);
+		const rows: string[] = [];
+		for (const line of lines) rows.push(...wrapRow(line, room, ""));
+		return rows;
+	};
+
 	const fitRow = (text: string, width: number): string => {
 		if (width <= 0) return "";
 		return truncateToWidth(text, width);
@@ -798,7 +817,7 @@ export function createInsightDashboard(
 		}
 
 		const tiny = !canMutate(safeWidth);
-		const available = Math.max(0, viewportHeight() - 6);
+		let available = Math.max(0, viewportHeight() - 6);
 
 		if (snapshotError) {
 			pushWrapped(`Could not read local snapshot: ${snapshotError}. Press r to refresh or Esc to close; no lesson changes were made by this read.`);
@@ -811,21 +830,30 @@ export function createInsightDashboard(
 			const name = pendingPreview ? cleanInline(pendingPreview.name, 80) || "the preview" : "the preview";
 			pushWrapped(`Install ${name} into Omp managed skills. Only an owned generated slot may be updated; authored, foreign, symlinked, or conflicting slots are refused.`);
 		} else if (view === "preview") {
-			const { lines, total, clipped } = previewLines();
-			const windowRows = Math.min(DETAIL_WINDOW, Math.max(1, available));
+			const { lines: logical, total, clipped } = previewLines();
+			// Wrap first, then draw and scroll over the same wrapped rows and
+			// the same actual window, so every drawn line stays reachable.
+			const lines = wrappedRows(logical, safeWidth);
+			const windowRows = detailViewportRows();
 			const start = clampScroll(previewScroll, lines.length, windowRows);
 			const end = Math.min(lines.length, start + windowRows);
 			push(`Preview lines ${lines.length === 0 ? 0 : start + 1}–${end} of ${lines.length}${clipped ? ` · source truncated at 60KB, ${total} draft lines` : ""}`);
-			for (const line of lines.slice(start, end)) pushWrapped(line);
+			for (const line of lines.slice(start, end)) push(line);
 		} else if (view === "detail") {
-			const lines = detailLines();
-			const windowRows = Math.min(DETAIL_WINDOW, Math.max(1, available));
+			const lines = wrappedRows(detailLines(), safeWidth);
+			const windowRows = detailViewportRows();
 			const start = clampScroll(detailScroll, lines.length, windowRows);
-			for (const line of lines.slice(start, start + windowRows)) pushWrapped(line);
+			for (const line of lines.slice(start, start + windowRows)) push(line);
 			if (lines.length > windowRows) push(`Details ${start + 1}–${Math.min(lines.length, start + windowRows)} of ${lines.length} shown`);
 		} else if (tab === "overview") {
 			for (const line of overviewLines().slice(0, Math.max(4, available))) pushWrapped(line);
 		} else {
+			if (tab === "skills") {
+				const policyStart = rows.length;
+				for (const line of policyLines()) pushWrapped(line);
+				pushWrapped("Eligibility uses saved lesson rules, not a fresh Jev verdict. Recorded promotion is not proof of current installation or loading.");
+				available = Math.max(0, available - (rows.length - policyStart));
+			}
 			const rows_list = listRows(tab);
 			if (rows_list.length === 0) {
 				for (const line of panelEmptyCopy(tab)) pushWrapped(line);
@@ -875,6 +903,10 @@ export function createInsightDashboard(
 	const helpLine = (): string => {
 		if (view === "confirm-candidate") return "Tab change focus · ↑/↓ choose · Enter confirm candidate · Esc keep candidate";
 		if (view === "confirm-install") return "Tab change focus · ↑/↓ choose · Enter install · Esc keep preview";
+		if (focus === "actions") {
+			const back = view === "preview" ? "Esc back to lesson" : view === "detail" ? "Esc back to list" : "Esc close dashboard";
+			return `Tab change focus · ←/→ choose action · Enter select action · ${back}`;
+		}
 		if (view === "preview") return "Tab change focus · ↑/↓ scroll preview · Enter install into Omp · Esc back to lesson";
 		if (view === "detail") return "Tab change focus · ↑/↓ scroll details · Enter actions · r refresh snapshot · Esc back to list";
 		if (focus === "tabs") return "Tab change focus · ←/→ choose panel · ↑/↓ choose lesson · Enter view details · r refresh snapshot · Esc close dashboard";
@@ -1124,6 +1156,13 @@ export function createInsightDashboard(
 	};
 
 	const cycleFocus = (direction: 1 | -1): void => {
+		if (view === "confirm-candidate" || view === "confirm-install") {
+			const count = actions(lastWidth).length;
+			if (count > 0) actionCursor[view] = ((actionCursor[view] ?? 0) + direction + count) % count;
+			focus = "actions";
+			touch();
+			return;
+		}
 		const regions = focusable();
 		if (regions.length === 0) return;
 		let index = regions.indexOf(focus);
@@ -1187,7 +1226,11 @@ export function createInsightDashboard(
 				return;
 			case "refresh":
 				if (view === "preview") {
+					// Discarding the preview must also leave the preview view;
+					// otherwise the refresh lands on an empty preview with a
+					// dead install action.
 					pendingPreview = undefined;
+					openView("detail", "details");
 					notice = "Lesson or preview changed. No new action was started; refresh and preview again.";
 					startRefresh();
 					return;
@@ -1203,10 +1246,8 @@ export function createInsightDashboard(
 					return;
 				}
 				confirmTarget = row;
-				// Focus starts on the question region: the next Enter only moves to
-				// the two choices, so the opening keypress can never confirm.
-				openView("confirm-candidate", "details");
 				actionCursor["confirm-candidate"] = 0;
+				openView("confirm-candidate", "actions");
 				return;
 			}
 			case "open-preview": {
@@ -1221,8 +1262,8 @@ export function createInsightDashboard(
 					touch();
 					return;
 				}
-				openView("confirm-install", "details");
 				actionCursor["confirm-install"] = 0;
+				openView("confirm-install", "actions");
 				return;
 			}
 			case "confirm-yes": {
@@ -1289,7 +1330,8 @@ export function createInsightDashboard(
 			}
 			if (key === "escape") {
 				if (busy) {
-					const wasAction = busy.kind === "refresh" && actionRefresh;
+					const kind = busy.kind;
+					const wasAction = kind === "refresh" && actionRefresh;
 					const receipt = wasAction ? notice : "";
 					// Cancellation is a request to stop owned UI work, never a
 					// claim of rollback: detach the run so late completions are
@@ -1299,9 +1341,19 @@ export function createInsightDashboard(
 					busyCancelled = false;
 					actionRefresh = false;
 					notice = "Closing dashboard. An already-started action is not claimed to be rolled back; inspect actual state when reopening.";
-					if (view === "confirm-candidate" || view === "confirm-install" || view === "preview") {
+					if (kind === "confirm" || kind === "install") {
+						// The mutating callback was dispatched before this Escape:
+						// it is in flight and cannot be stopped, so the
+						// before-it-started copy would be false. Report the
+						// unobserved outcome honestly instead.
 						openView("detail", "details");
-						notice = "Action cancelled before it started. No lesson change or installation was requested.";
+						notice = kind === "confirm"
+							? "Escape dismissed the wait, but candidate confirmation had already started and cannot be stopped. Its result is not reported here; press r to refresh actual state. No rollback is claimed."
+							: "Escape dismissed the wait, but installation had already started and cannot be stopped. Its result is not reported here; press r to refresh actual state. No rollback is claimed.";
+					} else if (kind === "preview") {
+						// The preview build was dispatched too; it only reads local data.
+						openView("detail", "details");
+						notice = "Escape dismissed the wait. The preview build had already started; it reads local data only and makes no changes. Preview again to see its result.";
 					} else if (wasAction && receipt) {
 						// The confirm/install settled before this read was cancelled:
 						// the receipt stands, the cancelled re-read claims nothing.
@@ -1342,7 +1394,10 @@ export function createInsightDashboard(
 			if (key === "r") {
 				if (view === "confirm-candidate" || view === "confirm-install") return;
 				if (view === "preview") {
+					// Same as the refresh action: discarding the preview also
+					// leaves the preview view so the refresh cannot strand it.
 					pendingPreview = undefined;
+					openView("detail", "details");
 					notice = "Lesson or preview changed. No new action was started; refresh and preview again.";
 				}
 				startRefresh();
@@ -1375,10 +1430,13 @@ export function createInsightDashboard(
 					return;
 				}
 				if (focus === "details" && (view === "detail" || view === "preview")) {
+					// Scroll over wrapped rows with the same actual window the
+					// renderer draws, so no drawn line is unreachable.
+					const windowRows = detailViewportRows();
 					if (view === "detail") {
-						detailScroll = clampScroll(detailScroll + delta, detailLines().length, DETAIL_WINDOW);
+						detailScroll = clampScroll(detailScroll + delta, wrappedRows(detailLines(), lastWidth).length, windowRows);
 					} else {
-						previewScroll = clampScroll(previewScroll + delta, previewLines().lines.length, DETAIL_WINDOW);
+						previewScroll = clampScroll(previewScroll + delta, wrappedRows(previewLines().lines, lastWidth).length, windowRows);
 					}
 					touch();
 					return;
@@ -1390,14 +1448,15 @@ export function createInsightDashboard(
 				return;
 			}
 			if (key === "pageup" || key === "pagedown") {
-				const delta = key === "pagedown" ? DETAIL_WINDOW : -DETAIL_WINDOW;
+				const windowRows = detailViewportRows();
+				const delta = key === "pagedown" ? windowRows : -windowRows;
 				if (focus === "details" && view === "detail") {
-					detailScroll = clampScroll(detailScroll + delta, detailLines().length, DETAIL_WINDOW);
+					detailScroll = clampScroll(detailScroll + delta, wrappedRows(detailLines(), lastWidth).length, windowRows);
 					touch();
 					return;
 				}
 				if (view === "preview") {
-					previewScroll = clampScroll(previewScroll + delta, previewLines().lines.length, DETAIL_WINDOW);
+					previewScroll = clampScroll(previewScroll + delta, wrappedRows(previewLines().lines, lastWidth).length, windowRows);
 					touch();
 				}
 				return;
@@ -1414,7 +1473,7 @@ export function createInsightDashboard(
 							return;
 						}
 					}
-					focus = view === "browse" && listRows(tab).length > 0 && tab !== "overview" && canMutate(lastWidth) ? "list" : "actions";
+					focus = view === "browse" && listRows(tab).length > 0 && tab !== "overview" ? "list" : "actions";
 					touch();
 					return;
 				}

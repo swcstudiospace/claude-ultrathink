@@ -783,13 +783,40 @@ describe("aborted lifetimes leave no late writes", () => {
 		await gated.called;
 		const current = store.get(created.moment.id);
 		if (!current) throw new Error("confirmation seeding failed");
-		store.put({ ...current, occurrences: 42, body: "Newer body wins." });
+		store.put({ ...current, occurrences: 42 });
 		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
 		const outcome = await pending;
+		expect(outcome?.retain).toBe("retained");
 		expect(outcome?.moment.occurrences).toBe(42);
 		const stored = store.get(created.moment.id);
 		expect(stored?.occurrences).toBe(42);
-		expect(stored?.body).toBe("Newer body wins.");
+		expect(stored?.body).toBe(current.body);
 		expect(stored?.retained?.documentId).toBe(documentIdFor(created.moment.id));
+	});
+
+	test("a deferred retain that lost a race to a newer capture leaves the newer text queued", async () => {
+		const gated = deferred();
+		const { ctx, store } = setup({ hindsight: gated.client });
+		const created = await captureMoment({ ...lesson(), status: "candidate" }, ctx);
+		const pending = confirmMoment(created.moment.id, ctx);
+		await gated.called;
+		const current = store.get(created.moment.id);
+		if (!current) throw new Error("confirmation seeding failed");
+		store.put({ ...current, body: "Newer body wins." });
+		gated.release(ok({ bankId: "ultrathink", documentId: documentIdFor(created.moment.id), itemsCount: 1 }));
+		const outcome = await pending;
+		expect(outcome?.retain).toBe("queued");
+		expect(outcome?.reason).toContain("older revision");
+		const stored = store.get(created.moment.id);
+		expect(stored?.body).toBe("Newer body wins.");
+		expect(stored?.retained).toBeUndefined();
+		expect(store.outbox().map((entry) => entry.op.op)).toEqual(["retain"]);
+		// The queued retry syncs the newer text on a later pass.
+		const healthy = fakeClient();
+		ctx.hindsight = healthy.client;
+		expect(await syncOutbox(ctx)).toEqual({ done: 1, pending: 0 });
+		expect(store.get(created.moment.id)?.retained?.documentId).toBe(documentIdFor(created.moment.id));
+		expect(healthy.calls.retain).toHaveLength(1);
+		expect(healthy.calls.retain[0]?.content).toContain("Newer body wins.");
 	});
 });

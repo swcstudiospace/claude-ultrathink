@@ -371,6 +371,21 @@ describe("readInsightSnapshot lessons", () => {
 		})();
 	});
 
+	test("an unreadable moments directory is disclosed as partial; a missing one stays honestly empty", () => {
+		return (async () => {
+			mkdirSync(join(stateDir, "teach"), { recursive: true });
+			writeFileSync(join(stateDir, "teach", "moments"), "not a directory");
+			const unreadable = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+			expect(unreadable.lessons).toEqual([]);
+			expect(unreadable.partial).toBe(true);
+			expect(unreadable.limitations.some((note) => note.includes("lesson directory could not be read"))).toBe(true);
+			rmSync(join(stateDir, "teach", "moments"), { force: true });
+			const missing = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+			expect(missing.lessons).toEqual([]);
+			expect(missing.partial).toBe(false);
+		})();
+	});
+
 	test("similar project names never leak across scopes", () => {
 		return (async () => {
 			const dirA = join(root, "shop");
@@ -584,6 +599,16 @@ describe("formatInsightText", () => {
 			const text = formatInsightText(snap);
 			expect(text).toContain("0 shown");
 			expect(text.split("\n").length).toBeLessThanOrEqual(24);
+		})();
+	});
+
+	test("saved probabilities never round across their threshold in the fallback", () => {
+		return (async () => {
+			writeSessionRecord("sess-a", [decision({ p: 0.199, threshold: 0.2 })]);
+			const snap = await readInsightSnapshot(scopeFor("sess-a"), makeCtx());
+			const text = formatInsightText(snap);
+			expect(text).toContain("(P 0.19)");
+			expect(text).not.toContain("(P 0.2)");
 		})();
 	});
 });
