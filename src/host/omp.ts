@@ -795,6 +795,9 @@ export function createOmpExtension(
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;
 		let timerStarted = false;
+		// Set on session_shutdown and cleared on session_start/session_switch: a reply computed across an
+		// await must not be delivered into a host that no longer has a live session to receive it.
+		let shutDown = false;
 
 		const guard = (fn: () => void): void => {
 			try {
@@ -983,6 +986,16 @@ export function createOmpExtension(
 		 */
 		const sendInsightText = (content: string): void => {
 			guard(() => pi.sendMessage({ content, display: true }, { triggerTurn: false }));
+		};
+
+		/**
+		 * Delivery for command replies computed across an await: the session the command started in is
+		 * captured at entry, and a reply is suppressed when the extension shut down or the live session id
+		 * changed meanwhile — otherwise a switch during the wait delivers the reply into the NEW session.
+		 */
+		const sendSessionText = (sessionId: string, ctx: ExtensionContext | undefined, content: string): void => {
+			if (shutDown || (ctx?.sessionManager?.getSessionId?.() ?? "") !== sessionId) return;
+			sendInsightText(content);
 		};
 
 		/** Publish a captured summary card without a model turn. A stale lifetime sends nothing. */
@@ -1183,6 +1196,7 @@ export function createOmpExtension(
 				}, 80);
 			});
 		pi.on("session_start", (_event, ctx) => {
+			shutDown = false;
 			attach(ctx);
 			scheduleMount();
 		});
@@ -1191,10 +1205,12 @@ export function createOmpExtension(
 			guard(endFlights);
 			// The old dashboard would publish into the new session: abort it first, then explain the closure.
 			guard(() => closeInsightForSwitch(ctx));
+			shutDown = false;
 			attach(ctx);
 			scheduleMount();
 		});
 		pi.on("session_shutdown", () => {
+			shutDown = true;
 			guard(endFlights);
 			guard(() => {
 				if (activeInsight) teardownInsight(activeInsight);
@@ -1378,6 +1394,8 @@ export function createOmpExtension(
 					description: "Fan out AgentSwarm lanes from `|`-separated briefs, or show lane status",
 					handler: async (args, ctx) => {
 						try {
+							// The session this command belongs to; replies computed across an await are dropped if it changed.
+							const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
 							const cwd = ctx?.cwd || process.cwd();
 							const dir = stateDir(cwd);
 							const parsed = parseLaneArgs(args ?? "", { maxLanes: maxLanes(process.env) });
@@ -1385,12 +1403,13 @@ export function createOmpExtension(
 							const root = resolveSwarmRoot(process.env);
 							if ("reason" in root) return sendInsightText(`AgentSwarm lanes unavailable: ${root.reason}`);
 							if (parsed.kind === "status") {
-								const rows = await laneStatus(laneDirs(dir), orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
-								return sendInsightText(formatLaneStatusText(rows));
+								const discovery = laneDirs(dir);
+								const rows = await laneStatus(discovery.lanes, orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
+								return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
 							}
 							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
 							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
-							sendInsightText(formatLaneHandles(spawnLanes(plan)));
+							sendSessionText(sessionId, ctx, formatLaneHandles(spawnLanes(plan)));
 						} catch {}
 					},
 				}),

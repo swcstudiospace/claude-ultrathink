@@ -375,11 +375,11 @@ describe("laneDirs", () => {
 		mkdirSync(join(stateDir, "swarm", "abcd1234-1"), { recursive: true });
 		mkdirSync(join(stateDir, "swarm", "zzzzzzzz-3-m0c"), { recursive: true });
 		writeFileSync(join(stateDir, "swarm", "stray.txt"), "x");
-		const lanes = laneDirs(stateDir, realFs);
+		const lanes = laneDirs(stateDir, realFs).lanes;
 		expect(lanes.map((entry) => entry.laneId)).toEqual([`${sha8("a")}-1-m0a`, `${sha8("b")}-2-m0b`]);
 		expect(lanes[0]!.stateDir).toBe(join(stateDir, "swarm", `${sha8("a")}-1-m0a`));
 		// A state directory without swarm lanes discovers nothing.
-		expect(laneDirs(join(stateDir, "empty"), realFs)).toEqual([]);
+		expect(laneDirs(join(stateDir, "empty"), realFs)).toEqual({ lanes: [], omitted: 0 });
 		rmSync(stateDir, { recursive: true, force: true });
 	});
 
@@ -400,8 +400,11 @@ describe("laneDirs", () => {
 				return entry;
 			},
 		};
-		const lanes = laneDirs("/state", fakeFs);
+		const discovery = laneDirs("/state", fakeFs);
+		const lanes = discovery.lanes;
 		expect(lanes.length).toBe(MAX_DISCOVERED_LANES);
+		// 31 matching lanes minus the kept 24: the hidden older lanes are counted, never silent.
+		expect(discovery.omitted).toBe(7);
 		const ids = lanes.map((entry) => entry.laneId);
 		expect(ids).not.toContain("abcd1234-1-m1"); // oldest dropped
 		expect(ids).not.toContain("abcd1234-7-m7");
@@ -451,6 +454,28 @@ describe("display formatting", () => {
 		expect(text).toContain("ef567890-2-m9y: timed out");
 		expect(text).toContain("log /s/ef567890-2-m9y/run.log");
 		expect(formatLaneStatusText([])).toContain("No swarm lanes");
+	});
+
+	test("formatLaneStatusText ends with the omitted count when discovery hid older lanes", () => {
+		const rows: LaneStatusRow[] = [
+			{
+				laneId: "abcd1234-1-m9x",
+				logPath: "/s/abcd1234-1-m9x/run.log",
+				total: 1,
+				byState: { RUNNING: 1 },
+				done: 0,
+				summary: "abcd1234-1-m9x: 1 task — 1 RUNNING · 0 done",
+			},
+		];
+		const text = formatLaneStatusText(rows, 3);
+		expect(text).toContain("abcd1234-1-m9x: 1 task — 1 RUNNING · 0 done");
+		// The omitted count is a final line, after every probed lane.
+		expect(text.split("\n").at(-1)).toMatch(/^3 older lanes not shown — raise .* prune <stateDir>\/swarm$/);
+		// Singular lanes read naturally, and no bound means no trailing line.
+		expect(formatLaneStatusText(rows, 1)).toContain("1 older lane not shown");
+		expect(formatLaneStatusText(rows)).not.toContain("not shown");
+		// A hidden count is still reported even with zero probed rows.
+		expect(formatLaneStatusText([], 2)).toContain("2 older lanes not shown");
 	});
 
 	test("TEAMS_USAGE documents the command surface", () => {

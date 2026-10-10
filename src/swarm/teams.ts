@@ -89,6 +89,14 @@ export interface LaneRef {
 	stateDir: string;
 }
 
+/** What discovery found under one state directory, plus what its recency bound hid. */
+export interface LaneDiscovery {
+	/** The bounded lanes, ordered by lane index (then nonce). */
+	lanes: LaneRef[];
+	/** Older matching lanes beyond the {@link MAX_DISCOVERED_LANES} bound; they may still be running. */
+	omitted: number;
+}
+
 /** Per-lane task counts, or why the probe failed. `logPath` always names the lane's run log. */
 export type LaneStatusRow =
 	| { laneId: string; logPath: string; total: number; byState: Record<string, number>; done: number; summary: string }
@@ -275,15 +283,16 @@ const LANE_DIR_PATTERN = /^([0-9a-f]{8})-(\d+)-([0-9a-z]+)$/;
  * Discover recently spawned lanes under a host state directory: every `swarm/<sha8>-<i>-<nonce>`
  * subdirectory becomes a lane labelled by its full basename, ordered by lane index (then nonce). Discovery
  * is bounded to the {@link MAX_DISCOVERED_LANES} most recent directories by mtime, so history never floods
- * a status reply; anything else is ignored.
+ * a status reply; the count of older lanes it hid is returned as `omitted`, because those lanes may still
+ * be running and must not disappear silently.
  */
-export function laneDirs(stateDir: string, fs: TeamsFs = defaultFs): LaneRef[] {
+export function laneDirs(stateDir: string, fs: TeamsFs = defaultFs): LaneDiscovery {
 	const swarmDir = join(stateDir, "swarm");
 	let names: string[] = [];
 	try {
 		names = fs.readdirSync(swarmDir);
 	} catch {
-		return [];
+		return { lanes: [], omitted: 0 };
 	}
 	const lanes: Array<{ laneId: string; stateDir: string; index: number; nonce: string; mtimeMs: number }> = [];
 	for (const name of names) {
@@ -299,10 +308,13 @@ export function laneDirs(stateDir: string, fs: TeamsFs = defaultFs): LaneRef[] {
 		lanes.push({ laneId: name, stateDir: full, index: Number.parseInt(match[2]!, 10), nonce: match[3]!, mtimeMs });
 	}
 	lanes.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	return lanes
-		.slice(0, MAX_DISCOVERED_LANES)
-		.sort((a, b) => a.index - b.index || a.nonce.localeCompare(b.nonce))
-		.map(({ laneId, stateDir }) => ({ laneId, stateDir }));
+	const kept = lanes.slice(0, MAX_DISCOVERED_LANES);
+	return {
+		lanes: kept
+			.sort((a, b) => a.index - b.index || a.nonce.localeCompare(b.nonce))
+			.map(({ laneId, stateDir }) => ({ laneId, stateDir })),
+		omitted: lanes.length - kept.length,
+	};
 }
 
 /**
@@ -423,10 +435,19 @@ export function formatLaneHandles(handles: readonly LaneHandle[]): string {
 	return [`Swarm lanes: ${started}/${handles.length} spawned`, ...lines].join("\n");
 }
 
-/** The status reply: one summary per lane labelled by its state directory, with the log path; errors in place of counts. */
-export function formatLaneStatusText(rows: readonly LaneStatusRow[]): string {
-	if (rows.length === 0) return "No swarm lanes found under this state directory yet.";
-	return rows
-		.map((row) => `${"error" in row ? `${row.laneId}: ${row.error}` : row.summary}\n    log ${row.logPath}`)
-		.join("\n");
+/**
+ * The status reply: one summary per lane labelled by its state directory, with the log path; errors in
+ * place of counts. When discovery hid older lanes behind its recency bound, a trailing line names the
+ * omitted count instead of letting running lanes vanish from the report.
+ */
+export function formatLaneStatusText(rows: readonly LaneStatusRow[], omitted = 0): string {
+	if (rows.length === 0 && omitted === 0) return "No swarm lanes found under this state directory yet.";
+	const lines = rows.map(
+		(row) => `${"error" in row ? `${row.laneId}: ${row.error}` : row.summary}\n    log ${row.logPath}`,
+	);
+	if (omitted > 0)
+		lines.push(
+			`${omitted} older lane${omitted === 1 ? "" : "s"} not shown — raise ULTRATHINK_SWARM_MAX_LANES-scoped discovery or prune <stateDir>/swarm`,
+		);
+	return lines.join("\n");
 }
