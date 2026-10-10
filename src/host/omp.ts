@@ -10,9 +10,11 @@
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
 import { existsSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, AssistantMessage, Context, Effort, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { resolvePstack } from "../cursor/pstack.ts";
 import type { ClaudeCompleter } from "../claude/complete.ts";
 import { type ControlState, readControl, readSession, type SessionRecord, sessionPath } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
@@ -28,6 +30,19 @@ import { digestFromAgentMessages } from "../teach/digest.ts";
 import { spawnObserveDetached } from "../teach/spawn.ts";
 import { status as authStatus } from "../mcp/oauth.ts";
 import { storePath } from "../mcp/store.ts";
+import {
+	formatLaneHandles,
+	formatLaneStatusText,
+	laneDirs,
+	laneStatus,
+	maxLanes,
+	orchStatusRunner,
+	parseLaneArgs,
+	planLanes,
+	resolveSwarmRoot,
+	spawnLanes,
+	TEAMS_USAGE,
+} from "../swarm/teams.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
@@ -780,6 +795,9 @@ export function createOmpExtension(
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;
 		let timerStarted = false;
+		// Set on session_shutdown and cleared on session_start/session_switch: a reply computed across an
+		// await must not be delivered into a host that no longer has a live session to receive it.
+		let shutDown = false;
 
 		const guard = (fn: () => void): void => {
 			try {
@@ -970,6 +988,16 @@ export function createOmpExtension(
 			guard(() => pi.sendMessage({ content, display: true }, { triggerTurn: false }));
 		};
 
+		/**
+		 * Delivery for command replies computed across an await: the session the command started in is
+		 * captured at entry, and a reply is suppressed when the extension shut down or the live session id
+		 * changed meanwhile — otherwise a switch during the wait delivers the reply into the NEW session.
+		 */
+		const sendSessionText = (sessionId: string, ctx: ExtensionContext | undefined, content: string): void => {
+			if (shutDown || (ctx?.sessionManager?.getSessionId?.() ?? "") !== sessionId) return;
+			sendInsightText(content);
+		};
+
 		/** Publish a captured summary card without a model turn. A stale lifetime sends nothing. */
 		const publishInsightCard = (lifetime: InsightLifetime, snapshot: InsightSnapshot): InsightActionResult => {
 			if (!insightCurrent(lifetime)) return { status: "cancelled", message: UI_STALE_COPY };
@@ -1143,7 +1171,8 @@ export function createOmpExtension(
 					{ signal: lifetime.controller.signal },
 				);
 			} catch {
-				// Host abort/close rejects the custom promise; teardown below is idempotent.
+				// Live host failures degrade to text; stale/aborted closes stay silent.
+				if (isCurrent()) sendSnapshotFallback(lifetime.lastSnapshot ?? snapshot, lifetime);
 			} finally {
 				teardownInsight(lifetime);
 			}
@@ -1167,6 +1196,7 @@ export function createOmpExtension(
 				}, 80);
 			});
 		pi.on("session_start", (_event, ctx) => {
+			shutDown = false;
 			attach(ctx);
 			scheduleMount();
 		});
@@ -1175,10 +1205,12 @@ export function createOmpExtension(
 			guard(endFlights);
 			// The old dashboard would publish into the new session: abort it first, then explain the closure.
 			guard(() => closeInsightForSwitch(ctx));
+			shutDown = false;
 			attach(ctx);
 			scheduleMount();
 		});
 		pi.on("session_shutdown", () => {
+			shutDown = true;
 			guard(endFlights);
 			guard(() => {
 				if (activeInsight) teardownInsight(activeInsight);
@@ -1349,6 +1381,35 @@ export function createOmpExtension(
 					handler: async (args, ctx) => {
 						try {
 							await openInsightUi(args, ctx);
+						} catch {}
+					},
+				}),
+			);
+			// `/ultrathink-swarm brief|brief|…` fans out one detached AgentSwarm orchestrator lane per brief; each
+			// lane runs `hooks/autonomous_run.py` with its own SWARM_DIR, so Task Stores and logs never contend.
+			// `/ultrathink-swarm status` probes every lane's Task Store through orch_status.py. Replies are
+			// display-only text (never a model turn); child sessions may use it like the verbs above.
+			guard(() =>
+				pi.registerCommand?.("ultrathink-swarm", {
+					description: "Fan out AgentSwarm lanes from `|`-separated briefs, or show lane status",
+					handler: async (args, ctx) => {
+						try {
+							// The session this command belongs to; replies computed across an await are dropped if it changed.
+							const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+							const cwd = ctx?.cwd || process.cwd();
+							const dir = stateDir(cwd);
+							const parsed = parseLaneArgs(args ?? "", { maxLanes: maxLanes(process.env) });
+							if (parsed.kind === "usage") return sendInsightText(`${parsed.reason}. ${TEAMS_USAGE}`);
+							const root = resolveSwarmRoot(process.env);
+							if ("reason" in root) return sendInsightText(`AgentSwarm lanes unavailable: ${root.reason}`);
+							if (parsed.kind === "status") {
+								const discovery = laneDirs(dir);
+								const rows = await laneStatus(discovery.lanes, orchStatusRunner({ swarmRoot: root.root, cwd, env: process.env }));
+								return sendSessionText(sessionId, ctx, formatLaneStatusText(rows, discovery.omitted));
+							}
+							const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
+							const plan = planLanes(parsed.briefs, { cwd, stateDir: dir, swarmRoot: root.root, env: process.env, pstack });
+							sendSessionText(sessionId, ctx, formatLaneHandles(spawnLanes(plan)));
 						} catch {}
 					},
 				}),

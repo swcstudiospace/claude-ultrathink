@@ -70,10 +70,21 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 
 ### Omp
 
-- The extension (`src/host/omp.ts`) registers `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` (with `on`/`off` completions), `/ultrathink-status` and `/ultrathink-ui` (with `overview`/`jev`/`moments`/`skills`/`card` completions).
+- The extension (`src/host/omp.ts`) registers `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` (with `on`/`off` completions), `/ultrathink-status`, `/ultrathink-ui` (with `overview`/`jev`/`moments`/`skills`/`card` completions) and `/ultrathink-swarm`.
 - Control commands reply with an Omp notification. No model turn runs. `omp -p` shows no notifications and exits before a quick message runs, so use the interactive UI for these commands.
 - `/ultrathink-quick <message>` sends the message to the agent as a normal user message and skips planning, tracking and the status bar for exactly that message. Without a message it shows a usage notification.
 - In a task-subagent session the commands do nothing special: the typed text goes to the agent unchanged.
+
+#### `/ultrathink-swarm` swarm teams
+
+`/ultrathink-swarm <brief>|<brief>|…` fans out one AgentSwarm orchestrator lane per brief from a single command, and `/ultrathink-swarm status` reports every lane's task counts. Each lane is a detached `python3 <swarm root>/hooks/autonomous_run.py --runtime omp --cwd <repo> --brief <brief>` process, so lanes keep running when the session ends.
+
+- **Lanes and limits.** Briefs are separated by `|` and trimmed; empty segments are dropped. The default limit is 3 lanes per command; `ULTRATHINK_SWARM_MAX_LANES` raises it, capped at 6. More briefs than the limit is a usage reply, never a partial spawn.
+- **Isolation.** Each lane runs with its own `SWARM_DIR` (`<state dir>/swarm/<sha8 of brief>-<lane index>`), so the per-lane Task Store (SQLite plus `kickoffs/` locks) and the runner's own logs never contend across concurrent lanes. `status` finds lanes by scanning those directories, and works in child sessions like the other commands.
+- **Logs.** A lane's `stdout` and `stderr` are appended to `<lane state dir>/run.log`; the spawn reply lists every lane's state directory and log path, and `N/M spawned` counts lanes that actually started (a lane that fails to start is one error line, never a failed command).
+- **Status.** `status` probes each lane's Task Store with `orch_status.py --json --repo <repo>` (10s cap per lane) and prints one line per lane: total tasks, per-state counts, and how many are done (`DONE`, `APPROVED` or `CANCELLED`).
+- **Environment.** `ULTRATHINK_SWARM_ROOT` must point at an absolute agent-swarm checkout containing `hooks/autonomous_run.py`; without it the command refuses with the reason. `SWARM_AUTONOMOUS_RUN_CAP_S` is passed through to each lane's runner when set.
+- **pstack.** When a pstack plugin cache resolves for the user, the mapped `orchestrate` skills block is appended to each lane's brief; if it does not resolve, the block is dropped silently and the lanes still run.
 
 #### `/ultrathink-ui` native dashboard
 
@@ -87,6 +98,7 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - **Guarded actions.** A `candidate` lesson offers `Confirm candidate` (explicit confirmation through the existing teaching command; existing retention may retain remotely, queue, stay local-only or report an error). An eligible confirmed lesson offers `Preview skill draft`: a complete deterministic draft shown `Preview only — not installed`. `Install into Omp` opens a separate confirmation and, on a fresh affirmative Enter, revalidates session, project, lesson revision, eligibility and draft fingerprint before running the existing installer for the Omp target only. The installer stays authoritative: authored, foreign, symlinked or conflicting slots are refused, and a stale preview (lesson, content, config or session changed) refuses and requires a new preview. Cancellation stops owned UI work before dispatch; it never rolls back a write already begun.
 - **Limits.** Browsing, refresh, detail views and preview are passive and local: no store creation, recall-count bump, credential lookup, network, model or Jev call. Below 24 columns or 8 rows, mutation is unavailable (resize guidance is shown; browsing and `Esc` still work). In a task-subagent session, with `createOmpExtension({ ui: false })`, or outside the TUI (`omp -p`, RPC, headless), the command answers with bounded read-only text instead of the interactive dashboard; guarded actions need the Omp TUI. Switching session or shutting down closes the dashboard and suppresses stale refresh/action completions for the old selection.
 - **Headless summaries.** Plain-text fallback reports displayed versus snapshot lesson counts and explicitly identifies lessons omitted by its 24-row budget. Those snapshot counts are not a complete project inventory when the read model reports a partial scan.
+- **Host failures and Jev off.** A current native custom-UI mounting failure degrades to the same bounded read-only snapshot without starting a model turn; a stale or aborted mount emits nothing. `ULTRATHINK_DECISIONS=0` marks current Jev policy off in the dashboard and expanded captured card, but does not hide saved decisions or resolve credentials.
 - **Cards.** Compact cards show scope, latest-decision, lesson-lifecycle and autonomy summaries plus a limitation line (at most 6 content rows), including capture omissions when lesson summaries exceed the 24-per-collection card bound. Expanded cards reflow recorded Jev metadata to terminal cell width, add up to 3 lesson and 3 eligible/promoted summaries, and reserve space for effective policy, counts and actionable limitations (at most 24 physical content rows). Additional detail lines are explicitly omitted with an `N more — open /ultrathink-ui` notice. Every card is labeled `captured — not live` with its snapshot time: expanding an old card never re-reads state or proves current installation.
 
 ### Prime Agent

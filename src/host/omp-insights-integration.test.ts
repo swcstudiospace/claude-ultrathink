@@ -389,6 +389,37 @@ describe("unsupported host fallback", () => {
 		expect(firstTeachInput.signal?.aborted).toBe(true);
 	});
 
+	test("a live custom UI failure degrades to the real bounded snapshot without starting a turn", async () => {
+		for (const rejectsAsync of [false, true]) {
+			const suite = buildSuite();
+			seedMoment(suite.fixture, { id: "mount-failure", name: "Visible after failed native mount" });
+			const before = fingerprint(suite.fixture.stateDir);
+			const { ctx } = sessionCtx({
+				cwd: suite.fixture.cwd,
+				ui: { custom: () => {
+					if (rejectsAsync) return Promise.reject(new Error("native mount rejected"));
+					throw new Error("native mount threw");
+				} },
+			});
+			await uiCommand(suite)("", ctx);
+			expect(suite.harness.sent).toHaveLength(1);
+			const entry = suite.harness.sent[0]!;
+			const body = textOf(entry.message);
+			expect(body).toContain("Visible after failed native mount");
+			expect(body).toContain("candidate");
+			expect(body).toMatch(/dashboard unavailable/i);
+			expect(entry.options).toEqual({ triggerTurn: false });
+			expect(suite.harness.userMessages).toEqual([]);
+			expect(fingerprint(suite.fixture.stateDir)).toBe(before);
+			expect(suite.teachInputs[0]?.signal?.aborted).toBe(true);
+			expect(body.split("\n").length).toBeLessThanOrEqual(24);
+			for (const row of body.split("\n")) {
+				expect(hasControls(row)).toBe(false);
+				expect(Bun.stringWidth(row)).toBeLessThanOrEqual(120);
+			}
+		}
+	});
+
 	test("RPC host (hasUI, non-tui mode) gets the same bounded fallback with no model admission", async () => {
 		const suite = buildSuite();
 		const { ctx } = sessionCtx({ cwd: suite.fixture.cwd, sessionId: "s1", mode: "rpc" });

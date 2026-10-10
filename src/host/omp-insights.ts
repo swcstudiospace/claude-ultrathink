@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { readSession, sessionPath } from "../claude/state.ts";
+import { decisionsKilled } from "../decisions/gate.ts";
 import {
 	DECISION_POINTS,
 	DECISIONS_ERROR_KINDS,
@@ -549,7 +550,7 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 		recallChars: ctx.config.teach.recallChars,
 		autoPromote: ctx.config.teach.autoPromote,
 		promoteAfter: ctx.config.teach.promoteAfter,
-		jevEnabled: ctx.config.decisions !== undefined,
+		jevEnabled: ctx.config.decisions !== undefined && !decisionsKilled(ctx.env),
 	};
 	return { project, session, at: Date.now(), decisions, lessons, policy, counts, eligible, promoted, partial, limitations };
 }
