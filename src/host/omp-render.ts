@@ -147,6 +147,10 @@ const INSIGHT_COMPACT_ROWS = 6;
 const INSIGHT_EXPANDED_ROWS = 24;
 /** Summaries per section in the expanded card. */
 const INSIGHT_SUMMARY_CAP = 3;
+/** Footer rows (teaching state + limitations) always kept reachable in the expanded budget. */
+const INSIGHT_FOOTER_FLOOR = 4;
+/** Short leading marker for snapshots whose local reads partly failed; it must survive row truncation. */
+const PARTIAL_READ_WARNING = "Partial snapshot — some reads failed";
 
 /** Closed vocabularies of the frozen card DTO; anything outside them is untrusted persisted data. */
 const INSIGHT_POINTS = ["plan", "ship", "knowledge", "blocking", "teachable", "skillworthy"] as const;
@@ -530,20 +534,19 @@ function insightRows(details: unknown, expanded: boolean, p: Paint, room: number
 		first === undefined
 			? "No lessons recorded for this project"
 			: "Moments: " + card.lessons.length + " shown" + (omittedLessons > 0 ? " · " + omittedLessons + " omitted from card" : "") + " · " + first.name + " · " + first.status;
-	const autonomyLine =
-		"Autonomy: " +
-		card.eligible +
-		" eligible · " +
-		card.promoted +
-		" promoted · capture " +
+	const autonomyCounts = "Autonomy: " + card.eligible + " eligible · " + card.promoted + " promoted";
+	const autonomySettings =
+		" · capture " +
 		card.policy.capture +
 		" · recall " +
 		(card.policy.recall ? "on (" + card.policy.recallLimit + "/" + card.policy.recallChars + ")" : "off") +
 		" · auto-promote " +
 		(card.policy.autoPromote ? "on" : "off") +
 		" after " +
-		card.policy.promoteAfter +
-		(card.partial ? " · partial snapshot" : "");
+		card.policy.promoteAfter;
+	// a failed read must never read as ordinary missing history: the short warning leads the row so
+	// it survives truncation, while the settings trail as optional text that narrow rows may clip
+	const autonomyLine = (card.partial ? PARTIAL_READ_WARNING + " · " : "") + autonomyCounts + autonomySettings;
 	const countsLine =
 		card.counts.length === 0
 			? "Counts (shown): none recorded"
@@ -575,7 +578,10 @@ function insightRows(details: unknown, expanded: boolean, p: Paint, room: number
 	if (flagged.length > skillsShown.length) {
 		rows.push("  " + (flagged.length - skillsShown.length) + " more skills omitted — open /ultrathink-ui");
 	}
-	const footer = [autonomyLine, countsLine];
+	// the footer autonomy row keeps the recorded counts and the partial-read warning but drops the
+	// settings: the "Effective policy" row below already states them, and fewer fixed rows keep the
+	// footer (teaching state + limitations) inside the expanded budget at narrow widths
+	const footer = [(card.partial ? PARTIAL_READ_WARNING + " · " : "") + autonomyCounts, countsLine];
 	footer.push(
 		"Effective policy: teaching " +
 			(card.policy.teaching ? "on" : "off") +
@@ -594,13 +600,31 @@ function insightRows(details: unknown, expanded: boolean, p: Paint, room: number
 	const identity = [rows[0]!, ...wrapInsightLines(rows.slice(1, 4), room)];
 	const detailsRows = wrapInsightLines(rows.slice(4), room);
 	const footerRows = wrapInsightLines(footer, room);
-	const available = Math.max(0, INSIGHT_EXPANDED_ROWS - identity.length - footerRows.length);
-	if (detailsRows.length > available) {
-		const shown = Math.max(0, available - 1);
-		const notice = (detailsRows.length - shown) + " more detail lines — open /ultrathink-ui";
-		return [...identity, ...detailsRows.slice(0, shown), truncateToWidth(notice, room), ...footerRows].slice(0, INSIGHT_EXPANDED_ROWS);
+	// Records keep their rows; the footer (teaching state + limitations) takes bounded leftover
+	// space but always stays reachable: both bookends are capped so their sum can never overflow
+	// the 24-row budget and push the footer out of the slice, and any overflow hides behind a
+	// one-line notice pointing at the dashboard.
+	let shownIdentity = identity;
+	const identityCap = INSIGHT_EXPANDED_ROWS - INSIGHT_FOOTER_FLOOR;
+	if (shownIdentity.length > identityCap) {
+		const hidden = shownIdentity.length - identityCap + 1;
+		shownIdentity = [...shownIdentity.slice(0, identityCap - 1), truncateToWidth(hidden + " more record lines — open /ultrathink-ui", room)];
 	}
-	return [...identity, ...detailsRows, ...footerRows].slice(0, INSIGHT_EXPANDED_ROWS);
+	let shownFooter = footerRows;
+	const footerBudget = Math.max(INSIGHT_FOOTER_FLOOR, INSIGHT_EXPANDED_ROWS - shownIdentity.length);
+	if (shownFooter.length > footerBudget) {
+		const hidden = shownFooter.length - footerBudget + 1;
+		shownFooter = [...shownFooter.slice(0, footerBudget - 1), truncateToWidth(hidden + " more policy and limitation lines — open /ultrathink-ui", room)];
+	}
+	const available = Math.max(0, INSIGHT_EXPANDED_ROWS - shownIdentity.length - shownFooter.length);
+	if (detailsRows.length > available) {
+		// with zero detail room there is no row for the omission notice; the dashboard carries the rest
+		if (available === 0) return [...shownIdentity, ...shownFooter];
+		const shown = available - 1;
+		const notice = (detailsRows.length - shown) + " more detail lines — open /ultrathink-ui";
+		return [...shownIdentity, ...detailsRows.slice(0, shown), truncateToWidth(notice, room), ...shownFooter];
+	}
+	return [...shownIdentity, ...detailsRows, ...shownFooter];
 }
 
 export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: string, renderer: Renderer): void }): void {
