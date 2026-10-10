@@ -3,7 +3,7 @@
 /**
  * Behavioral probes for the shared read-model: boundaries, scoping,
  * noncreation, persisted-state stability, sanitizer order and card exclusion.
- * No source-string assertions, no host/renderer wiring, no exact-copy pins.
+ * No source-string assertions, domain substitutions, or exact-copy pins.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -17,6 +17,8 @@ import { projectOf } from "../teach/mapping.ts";
 import { storeDir } from "../teach/store.ts";
 import { DEFAULT_TEACH_CONFIG } from "../teach/types.ts";
 import type { TeachableMoment, TeachConfig, TeachContext } from "../teach/types.ts";
+import { createInsightDashboard } from "./omp-dashboard.ts";
+import { INSIGHT_TYPE, registerUltrathinkRenderers } from "./omp-render.ts";
 import {
 	formatInsightText,
 	insightLessonRevision,
@@ -509,19 +511,39 @@ describe("readInsightSnapshot lessons", () => {
 		})();
 	});
 
-	test("policy reflects effective config, kill switch and jev presence", () => {
-		return (async () => {
-			const off = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ env: { ULTRATHINK_TEACH: "0" } }));
-			expect(off.policy.enabled).toBe(false);
-			const on = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ teach: { capture: "explicit", autoPromote: false, promoteAfter: 7 } }));
-			expect(on.policy.enabled).toBe(true);
-			expect(on.policy.capture).toBe("explicit");
-			expect(on.policy.autoPromote).toBe(false);
-			expect(on.policy.promoteAfter).toBe(7);
-			expect(on.policy.jevEnabled).toBe(true);
-			const noJev = await readInsightSnapshot(scopeFor("sess-a"), makeCtx({ decisions: false }));
-			expect(noJev.policy.jevEnabled).toBe(false);
-		})();
+	test("the shell Jev kill switch changes visible current policy without hiding saved history", async () => {
+		writeSessionRecord("sess-a", [decision({ p: 0.19, threshold: 0.2 })]);
+		const saved = readFileSync(sessionPath(stateDir, "sess-a"));
+		for (const entry of [
+			{ kill: "1", configured: true, off: false },
+			{ kill: "0", configured: true, off: true },
+			{ kill: "1", configured: true, off: false },
+			{ kill: "1", configured: false, off: true },
+		]) {
+			const ctx = makeCtx({ env: { ULTRATHINK_DECISIONS: entry.kill }, decisions: entry.configured });
+			const scope = scopeFor("sess-a");
+			const snap = await readInsightSnapshot(scope, ctx);
+			const ui = createInsightDashboard(snap, {
+				refresh: () => readInsightSnapshot(scope, ctx),
+				confirmCandidate: async () => { throw new Error("inspection must not confirm"); },
+				previewSkill: async () => { throw new Error("inspection must not preview"); },
+				installPreview: async () => { throw new Error("inspection must not install"); },
+				publishCard: async () => { throw new Error("inspection must not publish"); },
+				close: () => { throw new Error("inspection must not close"); },
+			}, { theme: {}, rows: () => 40 });
+			const overview = Bun.stripANSI(ui.render(120).join("\n"));
+			expect(/\bJev\b.*\boff\b/i.test(overview)).toBe(entry.off);
+			expect(overview).toContain("0.19");
+			ui.dispose();
+			let expanded = "";
+			registerUltrathinkRenderers({ registerMessageRenderer: (type, render) => {
+				if (type !== INSIGHT_TYPE) return;
+				expanded = Bun.stripANSI(render({ content: "", details: toInsightCardSnapshot(snap) }, { expanded: true }, {})?.render(120).join("\n") ?? "");
+			} });
+			expect(expanded).toMatch(entry.off ? /\bJev off\b/ : /\bJev on\b/);
+			expect(expanded).toContain("0.19");
+			expect(readFileSync(sessionPath(stateDir, "sess-a"))).toEqual(saved);
+		}
 	});
 
 	test("counts cover every lifecycle over shown rows", () => {

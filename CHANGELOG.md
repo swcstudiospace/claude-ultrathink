@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native Omp insights honor `ULTRATHINK_DECISIONS=0` in current-policy labels while keeping saved decisions readable. A live native UI mounting failure now degrades to the existing bounded read-only snapshot; stale or aborted lifetimes remain silent.
 - Native Grok Bot skill tests fold `>-` descriptions in process, so CI no longer needs PyYAML. The label-safety cwd check compares canonical paths, which is what macOS `getcwd` returns for `/var`.
 - Grok Bot tracking commands load configuration from the supplied environment, so isolated callers honor their tracking settings instead of the operator's configuration.
 - Doctor recognizes optional service backends, diagnoses the effective value from preceding config layers, checks the selected gateway credential without requiring unused direct credentials, and reports loose control files and stale state-root remnants.

@@ -1143,7 +1143,8 @@ export function createOmpExtension(
 					{ signal: lifetime.controller.signal },
 				);
 			} catch {
-				// Host abort/close rejects the custom promise; teardown below is idempotent.
+				// Live host failures degrade to text; stale/aborted closes stay silent.
+				if (isCurrent()) sendSnapshotFallback(lifetime.lastSnapshot ?? snapshot, lifetime);
 			} finally {
 				teardownInsight(lifetime);
 			}
