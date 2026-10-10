@@ -5,21 +5,33 @@
 import {
 	accessSync,
 	chmodSync,
+	closeSync,
 	constants,
 	copyFileSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { withLockMutation } from "../src/claude/atomic.ts";
 
 /** The staged hook file name inside <cursorDir>/hooks. */
 export const HOOK_FILE = "ultrathink-cursor-pstack.js";
+/** Exclusive lock covering staging and hooks.json registration. A dead holder's pid is reclaimed; a fresh empty file is not. */
+export const HOOK_LOCK_FILE = ".ultrathink-cursor-hooks.lock";
+/** How long install and remove wait for the other one to finish the update. */
+export const HOOK_LOCK_WAIT_MS = 10_000;
+/** An empty lock younger than this is still being written and is left alone. */
+export const HOOK_LOCK_EMPTY_GRACE_MS = 1_000;
 /** The hooks.json event ultrathink registers the staged hook under. */
 export const EVENT = "beforeSubmitPrompt";
 /** Marker that makes a hooks.json entry ultrathink's; gsd-managed, substrate-managed and markerless entries never match. */
@@ -213,6 +225,144 @@ function ensureDir(dir: string, mode: number): boolean {
 	return true;
 }
 
+function sleepMs(ms: number): void {
+	if (ms <= 0) return;
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** `ESRCH` is the only signal that the pid is gone. `EPERM` means it is alive and owned by someone else. */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+/** First field of the lock file. A bare pid (`123\n`) and `pid token` both count; anything else is unidentified. */
+function lockPid(raw: string): number | undefined {
+	const text = raw.trim().split(/\s+/)[0] ?? "";
+	if (!text) return undefined;
+	const pid = Number(text);
+	return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/**
+ * Called only while holding the lock-mutation guard. A live pid stays. A dead pid, or an unidentified
+ * file older than the empty-lock grace, is removed. The guard is what stops this unlink from catching
+ * a successor created by another installer.
+ */
+function lockIsFree(file: string): boolean {
+	if (!existsSync(file)) return true;
+	let raw: string;
+	let mtimeMs: number;
+	try {
+		raw = readFileSync(file, "utf8");
+		mtimeMs = statSync(file).mtimeMs;
+	} catch (error) {
+		return errorCode(error) === "ENOENT";
+	}
+	const pid = lockPid(raw);
+	const dead = pid !== undefined ? !processAlive(pid) : Date.now() - mtimeMs >= HOOK_LOCK_EMPTY_GRACE_MS;
+	if (!dead) return false;
+	try {
+		if (readFileSync(file, "utf8") !== raw) return false;
+		rmSync(file, { force: true });
+		return true;
+	} catch (error) {
+		return errorCode(error) === "ENOENT";
+	}
+}
+
+function releaseHookLock(file: string, payload: string): void {
+	const deadline = Date.now() + HOOK_LOCK_WAIT_MS;
+	for (;;) {
+		try {
+			const released = withLockMutation(file, () => {
+				try {
+					if (readFileSync(file, "utf8") === payload) rmSync(file, { force: true });
+				} catch {
+					// Already gone, or no longer ours.
+				}
+				return true;
+			});
+			if (released) return;
+		} catch {
+			return;
+		}
+		if (Date.now() >= deadline) return;
+		sleepMs(15);
+	}
+}
+
+/**
+ * Exclusive `<cursorDir>/${HOOK_LOCK_FILE}` around the staged-file snapshot, the copy, hooks.json
+ * registration, and restore. A second install or remove waits. On timeout this returns a reason and
+ * does not touch the hook: `withFileLock` would run the update unlocked, which is the rollback race.
+ * Creation and reclamation go through `withLockMutation`, so a delayed reclaim cannot unlink a successor.
+ */
+export function acquireHookLock(
+	cursorDir: string,
+	waitMs = HOOK_LOCK_WAIT_MS,
+): { release: () => void } | { reason: string } {
+	ensureDir(cursorDir, 0o700);
+	const file = join(cursorDir, HOOK_LOCK_FILE);
+	const payload = `${process.pid} ${randomBytes(16).toString("hex")}`;
+	const deadline = Date.now() + Math.max(0, waitMs);
+	for (;;) {
+		let outcome: "acquired" | "busy" | undefined;
+		try {
+			outcome = withLockMutation(file, () => {
+				if (!lockIsFree(file)) return "busy" as const;
+				try {
+					const fd = openSync(file, "wx", 0o600);
+					try {
+						writeSync(fd, payload);
+						chmodSync(file, 0o600);
+					} catch (error) {
+						rmSync(file, { force: true });
+						throw error;
+					} finally {
+						closeSync(fd);
+					}
+					return "acquired" as const;
+				} catch (error) {
+					if (errorCode(error) === "EEXIST") return "busy" as const;
+					throw error;
+				}
+			});
+		} catch (error) {
+			return { reason: `could not lock the Cursor hook update: ${error instanceof Error ? error.message : String(error)}` };
+		}
+		if (outcome === "acquired") return { release: () => releaseHookLock(file, payload) };
+		if (Date.now() >= deadline) {
+			return { reason: "another install or remove is updating the Cursor hook; re-run the command" };
+		}
+		sleepMs(Math.min(50, Math.max(1, deadline - Date.now())));
+	}
+}
+
+/** Runs `body` while this process holds the hook lock. The lock is released on success, failure, and throw. */
+function withHookLock(
+	cursorDir: string,
+	waitMs: number | undefined,
+	log: (line: string) => void,
+	body: () => number,
+): number {
+	const locked = acquireHookLock(cursorDir, waitMs ?? HOOK_LOCK_WAIT_MS);
+	if ("reason" in locked) return fail(log, locked.reason);
+	try {
+		return body();
+	} finally {
+		locked.release();
+	}
+}
+
 export interface MainDeps {
 	env: Record<string, string | undefined>;
 	/** Repository root whose hosts/cursor hook gets staged. */
@@ -222,6 +372,8 @@ export interface MainDeps {
 	nodeCandidates: string[];
 	/** Test seam: runs after a merge is computed and before the compare-and-swap write. */
 	beforeCommit?: () => void;
+	/** How long to wait for the staging lock. `0` tries once. Defaults to {@link HOOK_LOCK_WAIT_MS}. */
+	lockWaitMs?: number;
 }
 
 function usage(log: (line: string) => void, reason: string): number {
@@ -274,42 +426,57 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		// {"hooks":[]} is valid JSON and would otherwise replace a staged hook that never gets registered.
 		const preview = upsertHook(initial.config, wanted);
 		if (preview.reason) return fail(log, preview.reason);
-		const previous = existsSync(staged) ? readFileSync(staged) : undefined;
-		ensureDir(cursorDir, 0o700);
-		ensureDir(dirname(staged), 0o755);
-		try {
-			copyFileSync(source, staged);
-			chmodSync(staged, 0o644);
-		} catch (error) {
-			restoreStaged(staged, previous);
-			throw error;
-		}
-		log(`staged ${staged}`);
-		const committed = commitHooks(file, (current) => upsertHook(current, wanted), log, deps.beforeCommit);
-		if (committed.code !== 0) {
-			restoreStaged(staged, previous);
-			return committed.code;
-		}
-		log(
-			committed.action === "unchanged"
-				? `hooks.json: ${EVENT} entry already current`
-				: `hooks.json: ${EVENT} entry ${committed.action}`,
-		);
-		return 0;
+		// Snapshot, copy, registration and restore share one lock. A second install waits, so its
+		// rollback cannot delete a hook this attempt has already registered.
+		return withHookLock(cursorDir, deps.lockWaitMs, log, () => {
+			const again = readHooksFile(file);
+			if ("reason" in again) return fail(log, again.reason);
+			const currentPreview = upsertHook(again.config, wanted);
+			if (currentPreview.reason) return fail(log, currentPreview.reason);
+			const previous = existsSync(staged) ? readFileSync(staged) : undefined;
+			ensureDir(cursorDir, 0o700);
+			ensureDir(dirname(staged), 0o755);
+			try {
+				copyFileSync(source, staged);
+				chmodSync(staged, 0o644);
+			} catch (error) {
+				restoreStaged(staged, previous);
+				throw error;
+			}
+			log(`staged ${staged}`);
+			const committed = commitHooks(file, (current) => upsertHook(current, wanted), log, deps.beforeCommit);
+			if (committed.code !== 0) {
+				restoreStaged(staged, previous);
+				return committed.code;
+			}
+			log(
+				committed.action === "unchanged"
+					? `hooks.json: ${EVENT} entry already current`
+					: `hooks.json: ${EVENT} entry ${committed.action}`,
+			);
+			return 0;
+		});
 	}
 
-	const committed = commitHooks(file, (current) => removeHook(current), log, deps.beforeCommit);
-	if (committed.code !== 0) return committed.code;
-	if (existsSync(staged)) {
-		rmSync(staged);
-		log(`unstaged ${staged}`);
+	// Nothing of ours is installed: do not create the Cursor directory just to take the lock.
+	if (removeHook(initial.config).action === "not present" && !existsSync(staged)) {
+		log(`hooks.json: no ${OUR_MARKER} ${EVENT} entry present`);
+		return 0;
 	}
-	log(
-		committed.action === "not present"
-			? `hooks.json: no ${OUR_MARKER} ${EVENT} entry present`
-			: `hooks.json: ${EVENT} entry removed`,
-	);
-	return 0;
+	return withHookLock(cursorDir, deps.lockWaitMs, log, () => {
+		const committed = commitHooks(file, (current) => removeHook(current), log, deps.beforeCommit);
+		if (committed.code !== 0) return committed.code;
+		if (existsSync(staged)) {
+			rmSync(staged);
+			log(`unstaged ${staged}`);
+		}
+		log(
+			committed.action === "not present"
+				? `hooks.json: no ${OUR_MARKER} ${EVENT} entry present`
+				: `hooks.json: ${EVENT} entry removed`,
+		);
+		return 0;
+	});
 }
 
 if (import.meta.main) {

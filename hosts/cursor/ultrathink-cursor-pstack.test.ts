@@ -128,6 +128,17 @@ describe("ultrathink-cursor-pstack hook (spawned with node)", () => {
 		});
 	});
 
+	test("an inch mark does not swallow a command that sits before a later quote", () => {
+		withHarness(({ run, skillRoot }) => {
+			const prompt = 'The panel is 12" wide.\n/gsd-plan-phase 24\nUse the label "Continue".';
+			const { status, stdout } = run(JSON.stringify({ prompt }));
+			expect(status).toBe(0);
+			const parsed = JSON.parse(stdout) as { additional_context?: string };
+			expect(parsed.additional_context).toContain(join(skillRoot, "skills", "architect", "SKILL.md"));
+			expect(parsed.additional_context).toContain(join(skillRoot, "skills", "arena", "SKILL.md"));
+		});
+	});
+
 	test("a command at the start of a later line still injects", () => {
 		withHarness(({ run, skillRoot }) => {
 			const { status, stdout } = run(JSON.stringify({ prompt: "notes\n/gsd-plan-phase 24" }));

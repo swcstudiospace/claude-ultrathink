@@ -148,6 +148,20 @@ function isOpeningQuote(prompt: string, index: number): boolean {
 	return prev === "" || /[\s([{"-]/.test(prev);
 }
 
+/** A `"` after a digit is an inch mark (`12"`), not the start of a quotation. */
+function isInchMark(prompt: string, index: number): boolean {
+	if (prompt[index] !== '"') return false;
+	if (index === 0) return false;
+	return /[0-9]/.test(prompt[index - 1] ?? "");
+}
+
+/** `"` and `“` open a quote. An inch mark does not, so it cannot swallow a later command. */
+function isOpeningDoubleQuote(prompt: string, index: number): boolean {
+	const ch = prompt[index];
+	if (ch === "\u201c") return true;
+	return ch === '"' && !isInchMark(prompt, index);
+}
+
 /** Closing delimiter for a quote opener. Curly quotes close on their matching twin. */
 function quoteCloser(opener: string): string {
 	if (opener === "\u201c") return "\u201d";
@@ -159,6 +173,7 @@ function quoteCloser(opener: string): string {
  * Blank fenced code, backtick spans, and quoted spans that mention a slash command.
  * A quote may span lines: `"\n/gsd-ship\n"` is an example, not an invocation.
  * Apostrophes in contractions are not quotes, so `don't\n/gsd-plan-phase` still counts.
+ * An inch mark is not an opening quote, so `12"\n/gsd-plan-phase` still counts.
  */
 function withoutQuotedCommands(prompt: string): string {
 	let out = "";
@@ -175,7 +190,7 @@ function withoutQuotedCommands(prompt: string): string {
 			continue;
 		}
 		const ch = prompt[i] ?? "";
-		const quoted = ch === '"' || ch === "\u201c" || isOpeningQuote(prompt, i);
+		const quoted = isOpeningDoubleQuote(prompt, i) || isOpeningQuote(prompt, i);
 		if (ch === "`" || quoted) {
 			const closer = ch === "`" ? "`" : quoteCloser(ch);
 			const end = prompt.indexOf(closer, i + 1);

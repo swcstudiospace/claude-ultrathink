@@ -14,7 +14,8 @@
 //
 // Behaviour:
 //   - Detects a /gsd-* command invoked at the start of a line (not a quoted
-//     example, including one that spans lines, or a mention later in a sentence) and, when the
+//     example, including one that spans lines, an inch mark such as 12", or a
+//     mention later in a sentence) and, when the
 //     user-level ultrathink config enables pstack, injects additional_context
 //     telling the agent to run the matching pstack skills alongside the GSD
 //     step, then continue the GSD workflow unchanged.
@@ -126,6 +127,20 @@ const isOpeningQuote = (prompt, index) => {
   return prev === '' || /[\s([{"-]/.test(prev);
 };
 
+// A " after a digit is an inch mark (12"), not the start of a quotation.
+const isInchMark = (prompt, index) => {
+  if (prompt[index] !== '"') return false;
+  if (index === 0) return false;
+  return /[0-9]/.test(prompt[index - 1] ?? '');
+};
+
+// " and “ open a quote. An inch mark does not, so it cannot swallow a later command.
+const isOpeningDoubleQuote = (prompt, index) => {
+  const ch = prompt[index];
+  if (ch === '\u201c') return true;
+  return ch === '"' && !isInchMark(prompt, index);
+};
+
 const quoteCloser = (opener) => {
   if (opener === '\u201c') return '\u201d';
   if (opener === '\u2018') return '\u2019';
@@ -134,6 +149,7 @@ const quoteCloser = (opener) => {
 
 // Blank fenced code, backtick spans, and quoted spans that mention a slash command.
 // A quote may span lines. Apostrophes in contractions are not quotes.
+// An inch mark is not an opening quote, so 12"\n/gsd-plan-phase still counts.
 const withoutQuotedCommands = (prompt) => {
   let out = '';
   let i = 0;
@@ -149,7 +165,7 @@ const withoutQuotedCommands = (prompt) => {
       continue;
     }
     const ch = prompt[i] ?? '';
-    const quoted = ch === '"' || ch === '\u201c' || isOpeningQuote(prompt, i);
+    const quoted = isOpeningDoubleQuote(prompt, i) || isOpeningQuote(prompt, i);
     if (ch === '`' || quoted) {
       const closer = ch === '`' ? '`' : quoteCloser(ch);
       const end = prompt.indexOf(closer, i + 1);

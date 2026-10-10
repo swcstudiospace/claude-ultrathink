@@ -2,12 +2,14 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import {
 	EVENT,
 	HOOK_FILE,
+	HOOK_LOCK_EMPTY_GRACE_MS,
+	HOOK_LOCK_FILE,
 	hookCommand,
 	isOwned,
 	main,
@@ -178,7 +180,7 @@ interface Sandbox {
 	node: string;
 	lines: string[];
 	/** Runs main with hermetic env/root; `over` swaps the repo root, node candidates, or the pre-write seam. */
-	run: (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void }) => number;
+	run: (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void; lockWaitMs?: number }) => number;
 	hooksJson: () => unknown;
 	list: () => unknown[];
 }
@@ -195,7 +197,7 @@ function sandbox(fn: (box: Sandbox) => void): void {
 	writeFileSync(node, "#!/bin/sh\n", { mode: 0o755 });
 	const lines: string[] = [];
 	const cursor = join(home, ".cursor");
-	const run = (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void }) =>
+	const run = (args: string[], over?: { root?: string; candidates?: string[]; beforeCommit?: () => void; lockWaitMs?: number }) =>
 		main(args, {
 			env: { HOME: home },
 			root: over?.root ?? repo,
@@ -203,6 +205,7 @@ function sandbox(fn: (box: Sandbox) => void): void {
 			// A missing first candidate proves the loop skips non-existent paths.
 			nodeCandidates: over?.candidates ?? [join(dir, "missing-node"), node],
 			...(over?.beforeCommit ? { beforeCommit: over.beforeCommit } : {}),
+			...(over?.lockWaitMs !== undefined ? { lockWaitMs: over.lockWaitMs } : {}),
 		});
 	try {
 		fn({
@@ -392,6 +395,74 @@ describe("main", () => {
 			writeFileSync(join(box.cursor, "hooks.json"), '{"hooks":[]}\n');
 			expect(box.run(["install"])).toBe(1);
 			expect(existsSync(box.staged)).toBe(false);
+		});
+	});
+
+	function deadPid(): number {
+		for (let pid = 1_000_000; pid < 1_010_000; pid++) {
+			try {
+				process.kill(pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return pid;
+			}
+		}
+		throw new Error("no unused pid");
+	}
+
+	test("a live lock stops install and remove from touching the other installer's hook", () => {
+		sandbox((box) => {
+			mkdirSync(dirname(box.staged), { recursive: true });
+			writeFileSync(box.staged, "winner\n");
+			const entry = { ...WANTED, command: hookCommand(box.node, box.staged) };
+			writeFileSync(join(box.cursor, "hooks.json"), `${JSON.stringify({ hooks: { [EVENT]: [entry] } })}\n`);
+			const lock = join(box.cursor, HOOK_LOCK_FILE);
+			writeFileSync(lock, `${process.pid}\n`);
+			expect(box.run(["install"], { lockWaitMs: 0 })).toBe(1);
+			expect(box.lines.join("\n")).toContain("another install or remove is updating");
+			expect(readFileSync(box.staged, "utf8")).toBe("winner\n");
+			expect(box.list()).toEqual([entry]);
+			expect(readFileSync(lock, "utf8")).toBe(`${process.pid}\n`);
+			box.lines.length = 0;
+			expect(box.run(["remove"], { lockWaitMs: 0 })).toBe(1);
+			expect(existsSync(box.staged)).toBe(true);
+			expect(readFileSync(box.staged, "utf8")).toBe("winner\n");
+			expect(box.list()).toEqual([entry]);
+		});
+	});
+
+	test("a lock left by a dead process is reclaimed and does not block install", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor, { recursive: true });
+			writeFileSync(join(box.cursor, HOOK_LOCK_FILE), `${deadPid()}\n`);
+			expect(box.run(["install"], { lockWaitMs: 0 })).toBe(0);
+			expect(existsSync(join(box.cursor, HOOK_LOCK_FILE))).toBe(false);
+			expect(readFileSync(box.staged, "utf8")).toBe(readFileSync(box.source, "utf8"));
+			expect(box.list().filter(isOwned)).toHaveLength(1);
+		});
+	});
+
+	test("a fresh empty lock is not stolen", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor, { recursive: true });
+			const lock = join(box.cursor, HOOK_LOCK_FILE);
+			writeFileSync(lock, "");
+			expect(box.run(["install"], { lockWaitMs: 0 })).toBe(1);
+			expect(readFileSync(lock, "utf8")).toBe("");
+			expect(existsSync(box.staged)).toBe(false);
+			expect(existsSync(join(box.cursor, "hooks.json"))).toBe(false);
+		});
+	});
+
+	test("an empty lock older than the grace period is reclaimed", () => {
+		sandbox((box) => {
+			mkdirSync(box.cursor, { recursive: true });
+			const lock = join(box.cursor, HOOK_LOCK_FILE);
+			writeFileSync(lock, "");
+			const old = (Date.now() - (HOOK_LOCK_EMPTY_GRACE_MS + 1_500)) / 1000;
+			utimesSync(lock, old, old);
+			expect(box.run(["install"], { lockWaitMs: 0 })).toBe(0);
+			expect(existsSync(lock)).toBe(false);
+			expect(readFileSync(box.staged, "utf8")).toBe(readFileSync(box.source, "utf8"));
 		});
 	});
 

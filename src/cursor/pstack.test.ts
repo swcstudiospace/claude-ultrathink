@@ -183,6 +183,14 @@ describe("detectStage", () => {
 		expect(detectStage('notes\n"\n/gsd-ship\n"\n/gsd-plan-phase 23').stage).toBe("plan");
 	});
 
+	test("an inch mark is not a quote, so a command between it and a later quote is still an invocation", () => {
+		const prompt = 'The panel is 12" wide.\n/gsd-plan-phase 24\nUse the label "Continue".';
+		expect(detectStage(prompt).stage).toBe("plan");
+		expect(detectStage(prompt).command).toBe("gsd-plan-phase");
+		expect(detectStage('12"\n/gsd-plan-phase 24').stage).toBe("plan");
+		expect(detectStage('"12"\n/gsd-plan-phase 24').stage).toBe("plan");
+	});
+
 	test("a command at the start of a later line is still an invocation", () => {
 		expect(detectStage("notes about the milestone\n/gsd-plan-phase 23").stage).toBe("plan");
 		expect(detectStage("/gsd-plan-phase 23\nWhat does `/gsd-ship` do?").stage).toBe("plan");
