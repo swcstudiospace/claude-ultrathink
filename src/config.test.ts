@@ -816,6 +816,37 @@ describe("pstack config", () => {
 	});
 });
 
+describe("swarm config", () => {
+	const base = defaultConfig();
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	test("defaults to off", () => {
+		expect(base.swarm).toEqual({ autoRun: false });
+		expect(loadLayerFiles(roots, undefined).swarm).toEqual({ autoRun: false });
+	});
+
+	test("a user file enables it", () => {
+		expect(mergeConfig({ swarm: { autoRun: true } }, base).swarm.autoRun).toBe(true);
+		expect(loadLayerFiles(roots, { swarm: { autoRun: true } }).swarm.autoRun).toBe(true);
+	});
+
+	test("a project file cannot enable it, even over a user file that did", () => {
+		expect(loadLayerFiles(roots, undefined, undefined, { swarm: { autoRun: true } }).swarm.autoRun).toBe(false);
+		expect(loadLayerFiles(roots, { swarm: { autoRun: true } }, undefined, { swarm: { autoRun: true } }).swarm.autoRun).toBe(true);
+	});
+
+	test("a non-boolean autoRun keeps the lower layer's value", () => {
+		const on = mergeConfig({ swarm: { autoRun: true } }, base);
+		for (const value of ["yes", 1, null]) {
+			expect(mergeConfig({ swarm: { autoRun: value } }, on).swarm.autoRun).toBe(true);
+			expect(mergeConfig({ swarm: { autoRun: value } }, base).swarm.autoRun).toBe(false);
+		}
+	});
+});
+
 describe("ragflow config", () => {
 	const base = defaultConfig();
 	const roots: string[] = [];
