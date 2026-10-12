@@ -4,7 +4,7 @@
 
 ## Hosts affected
 
-<!-- Tick every host whose behavior changes. The list matches the Hosts table in the README plus the Grok Bot adapter. A change to the shared engine affects the six hosts that run it (Grok Bot does not); a docs- or CI-only change affects none. -->
+<!-- Tick every host whose behavior changes. The list matches the Hosts table in the README plus the Grok Bot adapter. A change to the shared engine affects the seven hosts that run it (Grok Bot does not); a docs- or CI-only change affects none. -->
 
 - [ ] Claude Code
 - [ ] Grok Build
@@ -12,6 +12,7 @@
 - [ ] Muse Code
 - [ ] Prime Agent
 - [ ] Omp
+- [ ] Cursor
 - [ ] Grok Bot (skill adapter)
 
 ## Checklist

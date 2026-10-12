@@ -310,6 +310,41 @@ Tracking from Prime Agent uses the shared MCP gateway through the kickoff and sy
 
 The skill is a symlink into the clone, so `git pull` updates it; start a new session afterwards. `bun <clone>/scripts/setup.ts rollback` removes the symlinks it created (only links that point into the clone), and leaves the state directory. A Python environment the kernel created inside `hosts/prime-agent` (`.venv`, `uv.lock`) is ignored by git.
 
+## Cursor
+
+Cursor loads skills from `.cursor-plugin/plugin.json`. Planning is a `beforeSubmitPrompt` hook, separate from the pstack bridge. The hook runs `hooks/engine.ts` with host `cursor` and puts the plan in `additional_context`. It fails open: a missing Bun, a planner error, a child or swarm session, or a wait past `ULTRATHINK_CURSOR_BUDGET_MS` (default 180000) leaves the prompt unchanged. Plans use the Claude CLI, the same default as Hermes and Prime Agent. State is `~/.cursor/ultrathink`. Run status with `ULTRATHINK_HOST=cursor`; host detection does not treat `CURSOR_AGENT` as this host, because that variable is set for other work on the same machine.
+
+The hook does not start Agent Swarm. When `.cursor/agents/a01-orchestrator.md` is installed, the `ultrathink-cursor` skill tells the agent to spawn `a01-orchestrator` once with the Graph ID. Questions, short replies, and `/ultrathink-quick` stay in the current session.
+
+### Install
+
+```sh
+bun <clone>/scripts/cursor-plugin.ts install
+```
+
+Optional checkouts, both skipped when unset. A missing script is logged and does not undo the hook:
+
+```sh
+SUBSTRATE_ROOT=<substrate-clone> SWARM_ROOT=<agent-swarm-clone> \
+  bun <clone>/scripts/cursor-plugin.ts install --target <workspace>
+```
+
+`SUBSTRATE_ROOT` runs the substrate Cursor hook projector and its MCP projector. `SWARM_ROOT` with `--target` runs `scripts/_install_cursor.py`, which copies agents and the swarm rule only. The installer never writes a token and never runs `swarm_run.py` or `hooks/autonomous_run.py`.
+
+`install` again refreshes the planner entry and leaves `ultrathink-managed` (pstack) and `substrate-managed` entries in place. `remove` deletes only the planner entry and the staged hook:
+
+```sh
+bun <clone>/scripts/cursor-plugin.ts remove
+```
+
+### Verify
+
+1. `~/.cursor/hooks.json` has one `beforeSubmitPrompt` command whose entry is `ultrathink-cursor-managed`, and the pstack entry is still there if you installed it.
+2. `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink status` prints the Cursor state directory.
+3. Send a non-trivial prompt. The agent receives the plan, including a Cursor swarm note and the Graph ID when one was minted. A prompt that is a question, or `/ultrathink-quick`, is not handed to `a01-orchestrator`.
+
+This adapter is source-present. It has not been verified in a live Cursor session.
+
 ## `scripts/setup.ts` reference
 
 `bun <clone>/scripts/setup.ts <apply|status|rollback>` works on the clone that contains the script, whatever directory you run it from. With no argument it runs `status`. Grok Build and Prime Agent need `apply`. The other hosts do not, but `apply` also sets up Claude Code when the `claude` CLI is installed.

@@ -84,6 +84,10 @@ const HOST_MAPPING: Record<HostId, { entrypoints: string[]; delivery: string }> 
 		entrypoints: ["hosts/prime-agent/SKILL.md", "hosts/prime-agent/pyproject.toml", "hosts/prime-agent/src/ultrathink/__init__.py", "hooks/engine.ts"],
 		delivery: "kernel-skill-return",
 	},
+	cursor: {
+		entrypoints: [".cursor-plugin/plugin.json", "hosts/cursor/ultrathink-cursor-plan.js", "scripts/cursor-plugin.ts", "hooks/engine.ts"],
+		delivery: "hook-additional-context",
+	},
 };
 const HOST_IDS = Object.keys(HOST_MAPPING) as HostId[];
 const JSON_PLANNER = { transport: "json-stdin-stdout", launcher: "bin/run-bun", entrypoint: "hooks/engine.ts", responseType: "PlanResponse" };

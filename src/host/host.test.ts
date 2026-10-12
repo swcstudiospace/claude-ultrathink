@@ -152,6 +152,10 @@ describe("resolveStateDir", () => {
 		expect(resolveStateDir({ ULTRATHINK_HOST: "omp", PI_CODING_AGENT_DIR: "/omp" })).toBe(join("/omp", "ultrathink"));
 	});
 
+	test("Cursor state goes under ~/.cursor/ultrathink, never the Claude directory", () => {
+		expect(resolveStateDir({ ULTRATHINK_HOST: "cursor", CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join(homedir(), ".cursor", "ultrathink"));
+	});
+
 	test("Prime Agent state goes under PRIME_AGENT_CODING_AGENT_DIR, else ~/.prime/agent, never the Claude directory", () => {
 		expect(resolveStateDir({ ULTRATHINK_HOST: "prime-agent", PRIME_AGENT_CODING_AGENT_DIR: "/prime", CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join("/prime", "ultrathink"));
 		expect(resolveStateDir({ RLM_SESSION_DIR: "/prime/session-artifacts/s1", CLAUDE_CONFIG_DIR: "/cfg" })).toBe(join(homedir(), ".prime", "agent", "ultrathink"));

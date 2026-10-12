@@ -1,0 +1,15 @@
+{
+	"name": "ultrathink",
+	"displayName": "ultrathink",
+	"version": "1.4.0",
+	"description": "Plans prompts into a spec and a Graph of Thought, remembers work through Agent Substrate, and hands SDLC work to Agent Swarm subagents.",
+	"author": {
+		"name": "SWC Studio",
+		"email": "noreply@swcstudio.space"
+	},
+	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+	"repository": "https://github.com/swcstudiospace/claude-ultrathink",
+	"license": "AGPL-3.0-or-later",
+	"keywords": ["planning", "prompt", "graph-of-thought", "substrate", "agent-swarm", "cursor"],
+	"skills": "./skills/"
+}

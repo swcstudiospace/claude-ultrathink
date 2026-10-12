@@ -4,7 +4,7 @@ This tutorial takes you from nothing to a first planned prompt, and then, if you
 
 A few terms used throughout:
 
-- **Host**: the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent). ultrathink plugs into its prompt hook (or kernel skill on Prime Agent).
+- **Host**: the coding agent you type into (Claude Code, Grok Build, Hermes Agent, Muse Code, Omp, Prime Agent or Cursor). ultrathink plugs into its prompt hook (or kernel skill on Prime Agent).
 - **Engine**: the model that writes the plan. On Claude Code, which this tutorial uses, it runs as separate headless calls through the `claude` CLI, independent of the host, and the default engine is Claude. On Omp it is the session's own model, called through Omp's own login (see [Choose the engine](how-to/choose-engine.md#omp-the-sessions-own-model)).
 - **Spec**: your message rewritten as structured XML. Your own words stay verbatim inside it.
 - **Graph of Thought**: the plan itself, 5 to 8 nodes by default with dependencies between them. It ends in a WORKFLOW: waves of work whose units can run in parallel.

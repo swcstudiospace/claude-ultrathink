@@ -101,6 +101,12 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - **Host failures and Jev off.** A current native custom-UI mounting failure degrades to the same bounded read-only snapshot without starting a model turn; a stale or aborted mount emits nothing. `ULTRATHINK_DECISIONS=0` marks current Jev policy off in the dashboard and expanded captured card, but does not hide saved decisions or resolve credentials.
 - **Cards.** Compact cards show scope, latest-decision, lesson-lifecycle and autonomy summaries plus a limitation line (at most 6 content rows), including capture omissions when lesson summaries exceed the 24-per-collection card bound. Expanded cards reflow recorded Jev metadata to terminal cell width, add up to 3 lesson and 3 eligible/promoted summaries, and reserve space for effective policy, counts and actionable limitations (at most 24 physical content rows). Additional detail lines are explicitly omitted with an `N more — open /ultrathink-ui` notice. Every card is labeled `captured — not live` with its snapshot time: expanding an old card never re-reads state or proves current installation.
 
+### Cursor
+
+- Planning is the `beforeSubmitPrompt` hook from `bun scripts/cursor-plugin.ts install`, not a slash-command dispatcher. `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` and `/ultrathink-status` are still the engine's commands: type them as the prompt. The shell form is `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink <verb>`.
+- A planned implementation prompt tells the agent to run `ultrathink-cursor` after kickoff. That skill spawns `a01-orchestrator` once when `.cursor/agents/a01-orchestrator.md` is installed, and passes the Graph ID. It does not spawn `a02`–`a15`, and it does not run `swarm_run.py`.
+- A child session (`SWARM_CHILD=1`, a non-empty `SWARM_AGENT`, or a prompt that names a parent conversation) is not planned.
+
 ### Prime Agent
 
 - Prime Agent has no command hook, so the `/ultrathink-*` names are instructions the agent carries out through the `ultrathink` kernel skill: `ultrathink.ctl("status")`, `ctl("off")`, `ctl("on")`, `ctl("skip")`, `ctl("track", "off"|"on")`, and `ctl("think", ...)`, `ctl("hitl", ...)`, `ctl("grok", "engine", ...)` for the verbs the other hosts leave to `bin/ultrathink`. Each call runs `bin/ultrathink` against the Prime Agent state directory and returns its text.

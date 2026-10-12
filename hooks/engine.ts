@@ -7,7 +7,7 @@
  * Claude Code, Grok Build and Muse use hooks/uplift.ts instead.
  * Only the string fields below cross: no Model, auth, resolver, registry or callable is ever read from the JSON.
  *
- *   { "host": "hermes" | "prime-agent", "session_id": "...", "prompt": "...", "cwd": "...", "model": "...", "provider": "..." }
+ *   { "host": "hermes" | "prime-agent" | "cursor", "session_id": "...", "prompt": "...", "cwd": "...", "model": "...", "provider": "..." }
  */
 import { planPrompt, type PlanRequest } from "../src/host/plan.ts";
 import { createFdProgressSink } from "../src/host/progress.ts";
