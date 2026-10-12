@@ -1542,34 +1542,45 @@ export function createOmpExtension(
 		 * AgentSwarm auto-run: with `swarm.autoRun` on (user files only, default off) an SDLC-sounding prompt in a
 		 * top-level session fans out one detached lane for it, published exactly like the /ultrathink-swarm spawn
 		 * branch. Explicit /commands, child sessions, unconfigured swarm roots and repeat submissions never spawn;
-		 * every skip is silent and a spawn failure never breaks prompt submission (the guard below). Fired from
-		 * `before_agent_start`, which this host delivers for every submitted prompt.
+		 * every skip is silent and a spawn failure never breaks prompt submission (the guard below). When a lane
+		 * actually started it owns the request: the quick suppression /ultrathink-quick arms makes the session's own
+		 * planning skip the submission, and the caller returns without a plan. Returns whether the lane owns it.
+		 * Fired from `before_agent_start` after its quick bypass, which this host delivers for every submitted prompt.
 		 */
-		let lastPrompt = "";
-		const maybeAutoRun = (prompt: string, ctx: ExtensionContext | undefined): void => {
+		let lastLane = "";
+		const maybeAutoRun = (prompt: string, ctx: ExtensionContext | undefined): boolean => {
+			let owned = false;
 			guard(() => {
-				if (!prompt || prompt.startsWith("/") || prompt === lastPrompt) return;
-				if (isSubagentSession(ctx, exists)) return;
+				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
 				const cwd = ctx?.cwd || process.cwd();
+				// Dedupe per session+cwd+prompt: identical resubmissions never double-spawn, while the same text in
+				// another session or repo is a fresh request. The key lands only once a lane actually started, so a
+				// failed spawn stays retryable.
+				const key = `${sessionId}:${cwd}:${prompt}`;
+				if (!prompt || prompt.startsWith("/") || prompt === lastLane) return;
+				if (isSubagentSession(ctx, exists)) return;
 				if (flightConfig(cwd).swarm?.autoRun !== true) return;
 				const root = resolveSwarmRoot(process.env);
 				if ("reason" in root) return;
 				if (!isSdlcPrompt(prompt)) return;
-				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
 				if (!sessionId) return;
-				const plan = planLanes([prompt.trim().slice(0, 200)], { cwd, stateDir: stateDir(cwd), swarmRoot: root.root, env: process.env });
+				const pstack = resolvePstack(join(process.env.HOME?.trim() || homedir(), ".cursor"));
+				const plan = planLanes([prompt.trim()], { cwd, stateDir: stateDir(cwd), swarmRoot: root.root, env: process.env, pstack });
 				const handles = spawnLanes(plan);
-				lastPrompt = prompt;
 				const started = handles.filter((handle) => handle.pid !== undefined).length;
-				if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned`, toSwarmSpawnCard(handles, plan));
+				if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned${started > 0 ? " (lane owns the request)" : ""}`, toSwarmSpawnCard(handles, plan));
 				else sendSessionText(sessionId, ctx, formatLaneHandles(handles));
+				if (started === 0) return; // Nothing started: the normal turn proceeds and a resubmission may retry.
+				lastLane = key;
+				quick = { sessionId, text: prompt.trim(), submission: turns.get(sessionId) };
+				owned = true;
 			});
+			return owned;
 		};
 
 		pi.on("before_agent_start", async (event, ctx) => {
 			scheduleMount();
 			if (isSubagentSession(ctx, exists)) return;
-			guard(() => maybeAutoRun(event?.prompt ?? "", ctx));
 			try {
 				const prompt = event?.prompt ?? "";
 				const cwd = ctx?.cwd || process.cwd();
@@ -1585,6 +1596,13 @@ export function createOmpExtension(
 					}
 					quick = undefined;
 				}
+				// After the quick bypass, so an armed quick message never spawns a lane. When one did spawn it owns
+				// this submission: return without a plan so the planner never races the lane.
+				let lane = false;
+				guard(() => {
+					lane = maybeAutoRun(prompt, ctx);
+				});
+				if (lane) return;
 				const dir = stateDir(cwd);
 				let captured: { config?: UltrathinkConfig; control?: ControlState; intent?: FlightIntent } = {};
 				try {
