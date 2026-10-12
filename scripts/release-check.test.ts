@@ -56,6 +56,7 @@ function fixture(version = VERSION): string {
 	put(root, ".claude-plugin/marketplace.json", marketplace(version));
 	put(root, ".omp-plugin/marketplace.json", marketplace(version));
 	put(root, ".muse-plugin/plugin.json", JSON.stringify({ name: "fx", version }, null, "\t"));
+	put(root, ".cursor-plugin/plugin.json", JSON.stringify({ name: "fx", version }, null, "\t"));
 	put(root, "hosts/hermes/plugin.yaml", `name: fx\nversion: ${version}\ndescription: "version: 9.9.9 appears in prose"\n`);
 	put(
 		root,
@@ -107,6 +108,7 @@ describe("collectVersions", () => {
 			".omp-plugin/marketplace.json metadata.version",
 			".omp-plugin/marketplace.json plugins[fx].version",
 			".muse-plugin/plugin.json version",
+			".cursor-plugin/plugin.json version",
 			"hosts/hermes/plugin.yaml version",
 			"hosts/prime-agent/pyproject.toml [project] version",
 		]);
@@ -136,6 +138,7 @@ describe("checkRelease", () => {
 		[".omp-plugin/marketplace.json (metadata)", (root) => bumpJson(root, ".omp-plugin/marketplace.json", "first")],
 		[".omp-plugin/marketplace.json (plugin entry)", (root) => bumpJson(root, ".omp-plugin/marketplace.json", "last")],
 		[".muse-plugin/plugin.json", (root) => bumpJson(root, ".muse-plugin/plugin.json", "first")],
+		[".cursor-plugin/plugin.json", (root) => bumpJson(root, ".cursor-plugin/plugin.json", "first")],
 		["hosts/hermes/plugin.yaml", (root) => rewrite(root, "hosts/hermes/plugin.yaml", (text) => text.replace(`version: ${VERSION}\n`, "version: 9.9.9\n"))],
 		[
 			"hosts/prime-agent/pyproject.toml",

@@ -29,6 +29,7 @@ body:
         - Muse Code
         - Prime Agent
         - Omp
+        - Cursor
         - Grok Bot (skill adapter)
   - type: textarea
     id: alternatives

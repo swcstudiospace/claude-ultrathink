@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { decideUplift } from "./detect.ts";
 import {
 	CHILD_PROMPT_SENTINEL,
 	isNestedChildPrompt,
@@ -249,6 +250,32 @@ describe("planningTarget", () => {
 			text: "fix it",
 			skill: { name: "gsd-quick", source: "slash", summary: "quick tasks" },
 		});
+	});
+
+	test("/gsd-* and /skill:gsd-* plan even when no skill file is installed", () => {
+		const phase = planningTarget("/gsd-plan-phase 24", { cwd, home });
+		expect(phase).toMatchObject({ text: "24", skill: { name: "gsd-plan-phase", source: "slash" } });
+		expect("text" in phase && decideUplift({ text: phase.text, source: "user", idle: true }, { enabled: true, skipOnce: false, skipTrivial: true }).action).toBe(
+			"uplift",
+		);
+		expect(planningTarget("/skill:gsd-fast add a route", { cwd, home })).toMatchObject({
+			text: "add a route",
+			skill: { name: "gsd-fast", source: "slash" },
+		});
+		expect(planningTarget("/plugin:gsd-execute-phase phase 3", { cwd, home })).toMatchObject({
+			text: "phase 3",
+			skill: { name: "gsd-execute-phase", source: "slash" },
+		});
+		expect(planningTarget("/gsd-autonomous", { cwd, home })).toMatchObject({
+			text: 'Run the "gsd-autonomous" skill.',
+			skill: { name: "gsd-autonomous", source: "slash" },
+		});
+		const stacked = planningTarget("/gsd-quick /notaskill do x", { cwd, home });
+		expect(stacked).toMatchObject({ skill: { name: "gsd-quick", source: "slash" } });
+		expect("text" in stacked && stacked.text.startsWith('Run the "gsd-quick" skill.')).toBe(true);
+		expect("text" in stacked && !stacked.text.startsWith("/")).toBe(true);
+		expect(planningTarget("/ultrathink-quick fix it", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/clear", { cwd, home })).toEqual({ skip: "slash-command" });
 	});
 
 	test("stacked slash skills plan the remainder after every resolvable skill", () => {

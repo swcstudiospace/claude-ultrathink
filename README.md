@@ -9,11 +9,11 @@ ultrathink is a planner plugin for coding agents. Before the agent sees a non-tr
 
 ## Why
 
-A coding agent starts on the prompt exactly as typed. For anything larger than a one-line fix, the scope, the order of the work and the questions worth settling first are left for the agent to work out as it goes, and whatever plan it forms stays inside that one session. ultrathink adds one planning pass in front of the agent: a written spec, a dependency graph whose independent parts can run in parallel, the blocking questions asked once up front, and, if you want them, tracker rows for every part of the plan. One engine and one config serve all six hosts.
+A coding agent starts on the prompt exactly as typed. For anything larger than a one-line fix, the scope, the order of the work and the questions worth settling first are left for the agent to work out as it goes, and whatever plan it forms stays inside that one session. ultrathink adds one planning pass in front of the agent: a written spec, a dependency graph whose independent parts can run in parallel, the blocking questions asked once up front, and, if you want them, tracker rows for every part of the plan. One engine and one config serve all seven hosts.
 
 ## What happens on a prompt
 
-1. **Filter.** The host's prompt hook runs before the model sees your message. It handles the `/ultrathink-*` commands and lets these through unplanned: `/ultrathink-quick` and `raw:` messages, short replies such as `ok` or `lgtm`, slash commands that are not skills, subagent sessions, and everything while planning is off. A skill invocation is planned together with the text you typed.
+1. **Filter.** The host's prompt hook runs before the model sees your message. It handles the `/ultrathink-*` commands and lets these through unplanned: `/ultrathink-quick` and `raw:` messages, short replies such as `ok` or `lgtm`, slash commands that are not skills, subagent sessions, and everything while planning is off. A skill invocation is planned together with the text you typed. A `/gsd-*` or `/skill:gsd-*` command is planned even when no skill file is installed.
 2. **Uplift.** The engine rewrites the message into an XML spec. Your own words stay verbatim in its `ORIGINAL` element.
 3. **Graph of Thought.** The engine splits the work into 5 to 8 nodes (by default) with dependencies and gives each node a rationale and a conclusion. The final node writes a WORKFLOW: waves of file-disjoint units, where the units of one wave can run in parallel.
 4. **Clarify.** It drafts up to 4 HITL questions. The agent first tries to answer them from the repository; blocking questions that remain are asked once, before any code is written, and the rest go ahead with their recommended default.
@@ -47,7 +47,7 @@ The agent-side half is four skills, shared by every host:
 
 ## Supported hosts
 
-Each host was tested live with the version shown, including planning and the `/ultrathink-*` commands described under [Skip ultrathink for quick messages](#skip-ultrathink-for-quick-messages). On Omp, planning on the session's own model was verified live on 18.8.0 in print mode.
+Each host except Cursor was tested live with the version shown, including planning and the `/ultrathink-*` commands described under [Skip ultrathink for quick messages](#skip-ultrathink-for-quick-messages). On Omp, planning on the session's own model was verified live on 18.8.0 in print mode. The Cursor adapter is present in source; a live Cursor session has not been verified.
 
 | Host | Tested | How ultrathink loads | How the plan reaches the agent |
 |---|---|---|---|
@@ -57,6 +57,7 @@ Each host was tested live with the version shown, including planning and the `/u
 | Muse Code | 1.4.0 | `.muse-plugin/plugin.json` | `UserPromptSubmit` hook context, same entry as Claude Code |
 | Prime Agent | 0.9.8 | Python-backed kernel skill `hosts/prime-agent`, linked into `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` by `bun scripts/setup.ts apply`; the `ultrathink-*` agent skills are linked into `~/.agents/skills` | Prime Agent has no prompt hook: the agent calls `await ultrathink("<request>")` in its persistent Python kernel, the skill runs `hooks/engine.ts` and returns the plan (`context`, the spec and its path) to the kernel. The agent then runs the waves, with `ultrathink-kickoff` first when tracking is on |
 | Omp | 18.3.1 (native planning: 18.8.0) | `package.json` `omp.extensions` → `src/host/omp.ts` | `before_agent_start` plans inside Omp on the session's own model, with Omp's own provider and login (see [Choose the planning engine](docs/how-to/choose-engine.md#omp-the-sessions-own-model)); the TUI shows a live status bar and plan cards. Omp caps a handler at 30 s, so the extension waits up to 25 s and a slower plan arrives later as an aside |
+| Cursor | source only | `.cursor-plugin/plugin.json` plus `bun scripts/cursor-plugin.ts install` | `beforeSubmitPrompt` runs `hooks/engine.ts` and injects `additional_context`. SDLC work is handed to the `a01-orchestrator` subagent when Agent Swarm's Cursor agents are installed |
 
 With Teachable Moments on, the Hermes plugin registers the tools `ultrathink_lesson_save` and `ultrathink_lesson_recall` and the commands `/ultrathink-learn` and `/ultrathink-lessons`. The plan handoff stays short: the spec path, the state file and the Graph ID.
 
@@ -66,9 +67,9 @@ On Omp, `/ultrathink-ui [overview|jev|moments|skills|card]` opens a native keybo
 
 ### Cross-agent discovery
 
-claude-ultrathink is a cross-agent reasoning plugin for prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications, with optional Linear/Notion tracking and Greptile-gated shipping. Existing adapters serve Claude Code, Grok Build, Hermes Agent, Muse, Omp and Prime Agent. Loader name: ultrathink. Grok Bot is a native host (`bin/ultrathink-grokbot` plus skills; no prompt hook); its compatibility is not verified. The GPT Dot protocol is pending; its compatibility is unverified. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
+claude-ultrathink is a cross-agent reasoning plugin for prompt uplift, Graph of Thought, Chain of Thought and HITL clarifications, with optional Linear/Notion tracking and Greptile-gated shipping. Existing adapters serve Claude Code, Grok Build, Hermes Agent, Muse, Omp, Prime Agent and Cursor. Loader name: ultrathink. Grok Bot is a native host (`bin/ultrathink-grokbot` plus skills; no prompt hook); its compatibility is not verified. The GPT Dot protocol is pending; its compatibility is unverified. See [Use with Grok Bot](docs/how-to/use-with-grok-bot.md).
 
-[`ultrathink.discovery.json`](ultrathink.discovery.json), with its schema [`ultrathink.discovery.schema.json`](ultrathink.discovery.schema.json), says the same in machine-readable form: the repository identity, the five adapters with their entry files (status `source-present`: present in the source, not a promise that a given install works), the JSON planner, control and tracker-relay interfaces (only the first one plans), the Grok Bot record (`status` `native-adapter`, `adapterPresent` true, `compatibilityVerified` false, delivery `skill-protocol-cli`) and the pending GPT Dot record, whose `adapterPresent` and `compatibilityVerified` are both `false`. It is a static file read from a checkout, and no host is known to pick it up on its own. It is not a bot adapter or a planning server: it registers nothing and holds no planning-service URL, credential or model default.
+[`ultrathink.discovery.json`](ultrathink.discovery.json), with its schema [`ultrathink.discovery.schema.json`](ultrathink.discovery.schema.json), says the same in machine-readable form: the repository identity, the seven adapters with their entry files (status `source-present`: present in the source, not a promise that a given install works), the JSON planner, control and tracker-relay interfaces (only the first one plans), the Grok Bot record (`status` `native-adapter`, `adapterPresent` true, `compatibilityVerified` false, delivery `skill-protocol-cli`) and the pending GPT Dot record, whose `adapterPresent` and `compatibilityVerified` are both `false`. It is a static file read from a checkout, and no host is known to pick it up on its own. It is not a bot adapter or a planning server: it registers nothing and holds no planning-service URL, credential or model default.
 
 ### Platforms
 

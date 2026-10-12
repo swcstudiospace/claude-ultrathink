@@ -80,7 +80,7 @@ Keep every identifier/URL you created; steps 3 and 5 use them.
 
 ## 3. Optional: register the graph with an Agent Substrate server
 
-This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
+This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. On Cursor the session record's `host` is `cursor`; pass that as `surface` (the same rule as every other host: `claude-code` only when `host` is absent). Build it from the tracking refs, leaving out fields whose value is absent:
 
 | Field | Value |
 |---|---|

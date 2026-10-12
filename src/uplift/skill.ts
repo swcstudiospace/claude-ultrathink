@@ -3,7 +3,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { isTrivial } from "./detect.ts";
+import { isCommandPrompt, isTrivial } from "./detect.ts";
 
 export interface SkillInvocation {
 	/** As invoked, without a leading "/" or the Omp / Prime Agent "skill:" prefix; Claude plugin skills keep "plugin:skill". */
@@ -55,6 +55,15 @@ const OMP_USER = "\nUser: ";
 const NAME_RE = /^[A-Za-z0-9._:-]+$/;
 /** `/ultrathink:<anything>` and `/ultrathink <verb>`: ultrathink's command namespace, answered by the hooks, never planned. */
 const ULTRATHINK_COMMAND_RE = /^ultrathink(?::|$)/i;
+/** A GSD-Core command: `/gsd-*`, `/skill:gsd-*` (the `skill:` prefix is already stripped), or `plugin:gsd-*`. */
+const GSD_COMMAND_RE = /^gsd-[a-z0-9][a-z0-9-]*$/i;
+
+/** Bare `gsd-*` name, or undefined when `name` is not a GSD command. */
+export function gsdCommandBareName(name: string): string | undefined {
+	const bare = name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : name;
+	return GSD_COMMAND_RE.test(bare) ? bare.toLowerCase() : undefined;
+}
+
 /** The running copy of this plugin (Claude's `${CLAUDE_PLUGIN_ROOT}`, or the checkout Grok, Muse, Omp and Hermes load). */
 const PLUGIN_ROOT = resolve(import.meta.dir, "..", "..");
 /** Claude Code stacked slash skills (`/review /simplify fix it`) resolved per prompt, first command included. */
@@ -266,6 +275,18 @@ function targetFor(skill: SkillInvocation): { text: string; skill: SkillInvocati
 }
 
 /**
+ * A `/gsd-*` prompt with no skill file is still planning input. The task is the text after the
+ * command. When that text is itself a slash command, keep it, but do not let the planning text
+ * start with `/` — `decideUplift` would then skip it as an unknown command.
+ */
+function gsdPlanningTarget(name: string, instruction?: string): { text: string; skill: SkillInvocation } {
+	const skill: SkillInvocation = { name, ...(instruction ? { instruction } : {}), source: "slash" };
+	const planned = targetFor(skill);
+	if (!isCommandPrompt(planned.text)) return planned;
+	return { text: `Run the "${name}" skill. ${planned.text}`, skill };
+}
+
+/**
  * What ultrathink plans for a prompt: the plain prompt, the instruction inside a skill invocation
  * (or the skill's objective for a bare one), or a skip for ultrathink's own skills and commands and non-skill slash commands.
  */
@@ -293,6 +314,10 @@ export function planningTarget(
 	const own = file && ownFile(file.path, lookup);
 	if (own) return { skip: own };
 	if (!command) return { text: prompt };
+	// `/gsd-*` and `/skill:gsd-*` are planned even when no skill or command file is installed.
+	// `/ultrathink-*` was already returned above. `/model` and other unknown commands still skip.
+	const gsdName = gsdCommandBareName(command.name);
+	if (!file && gsdName) return gsdPlanningTarget(gsdName, command.args);
 	if (!file) return { skip: "slash-command" };
 	let instruction = command.args;
 	for (let count = 1; count < MAX_STACKED_SKILLS && instruction?.startsWith("/"); count++) {

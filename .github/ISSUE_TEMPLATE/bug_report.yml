@@ -21,6 +21,7 @@ body:
         - Muse Code
         - Prime Agent
         - Omp
+        - Cursor
         - Grok Bot (skill adapter)
     validations:
       required: true

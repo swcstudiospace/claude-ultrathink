@@ -5,8 +5,8 @@
  * scripts/release-check.ts — proves that every place that carries the plugin
  * version agrees before a release can be cut.
  *
- * The version lives in eight places (package.json, the Claude Code, Omp and
- * Muse manifests, the Hermes plugin.yaml and the Prime Agent pyproject.toml)
+ * The version lives in package.json, the Claude Code, Omp, Muse and Cursor
+ * manifests, the Hermes plugin.yaml and the Prime Agent pyproject.toml
  * and nothing else ties them together. package.json is the authority: every
  * other source must equal it, it must be a semver, CHANGELOG.md must carry a
  * dated section for it plus an [Unreleased] heading, and a release tag must be
@@ -117,6 +117,7 @@ export function collectVersions(root: string): VersionSource[] {
 		...marketplaceSources(root, ".claude-plugin/marketplace.json"),
 		...marketplaceSources(root, ".omp-plugin/marketplace.json"),
 		...jsonSources(root, ".muse-plugin/plugin.json"),
+		...jsonSources(root, ".cursor-plugin/plugin.json"),
 		hermesSource(root),
 		primeAgentSource(root),
 	];

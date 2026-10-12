@@ -673,6 +673,30 @@ describe("substrate plan event", () => {
 		}
 	});
 
+	test("a cursor host asks the substrate brief and the plan event for surface cursor", async () => {
+		const { emit, sent } = recorder();
+		let briefSurface: string | undefined;
+		const { deps, cleanup } = baseDeps({
+			surface: "cursor",
+			complete: smartComplete(),
+			clarify: async () => [],
+			emit,
+			brief: async (brief) => {
+				briefSurface = brief.surface;
+				return "";
+			},
+		});
+		try {
+			const result = await runPromptSubmit(input, deps);
+			expect(briefSurface).toBe("cursor");
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({ surface: "cursor", payload: { host: "cursor" } });
+			expect(result.record?.host).toBe("cursor");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("a skill run on another host names that host and the skill, and nothing of what was asked", async () => {
 		const { emit, sent } = recorder();
 		const { deps, cleanup } = baseDeps({ surface: "hermes", complete: smartComplete(), clarify: async () => [], emit });

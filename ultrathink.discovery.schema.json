@@ -52,7 +52,7 @@
     "hosts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["claude-code", "grok-build", "hermes", "muse", "omp", "prime-agent"],
+      "required": ["claude-code", "grok-build", "hermes", "muse", "omp", "prime-agent", "cursor"],
       "properties": {
         "claude-code": {
           "allOf": [
@@ -88,6 +88,12 @@
           "allOf": [
             { "$ref": "#/$defs/hostAdapter" },
             { "properties": { "delivery": { "const": "kernel-skill-return" } } }
+          ]
+        },
+        "cursor": {
+          "allOf": [
+            { "$ref": "#/$defs/hostAdapter" },
+            { "properties": { "delivery": { "const": "hook-additional-context" } } }
           ]
         }
       }

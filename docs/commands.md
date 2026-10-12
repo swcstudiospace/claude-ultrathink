@@ -102,6 +102,13 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - **Host failures and Jev off.** A current native custom-UI mounting failure degrades to the same bounded read-only snapshot without starting a model turn; a stale or aborted mount emits nothing. `ULTRATHINK_DECISIONS=0` marks current Jev policy off in the dashboard and expanded captured card, but does not hide saved decisions or resolve credentials.
 - **Cards.** Compact cards show scope, latest-decision, lesson-lifecycle and autonomy summaries plus a limitation line (at most 6 content rows), including capture omissions when lesson summaries exceed the 24-per-collection card bound. Expanded cards reflow recorded Jev metadata to terminal cell width, add up to 3 lesson and 3 eligible/promoted summaries, and reserve space for effective policy, counts and actionable limitations (at most 24 physical content rows). Additional detail lines are explicitly omitted with an `N more — open /ultrathink-ui` notice. Every card is labeled `captured — not live` with its snapshot time: expanding an old card never re-reads state or proves current installation.
 
+### Cursor
+
+- Planning is the `beforeSubmitPrompt` hook from `bun scripts/cursor-plugin.ts install`, not a slash-command dispatcher. `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` and `/ultrathink-status` are still the engine's commands: type them as the prompt. The shell form is `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink <verb>`.
+- `/gsd-*` and `/skill:gsd-*` are planned. The text after the command is the task; a bare command plans that command's objective. `install` also copies the known GSD names into `~/.cursor/commands/` so Cursor can offer them. `/ultrathink-quick` is not planned.
+- A planned implementation prompt tells the agent to run `ultrathink-cursor` after kickoff. That skill spawns `a01-orchestrator` once when `.cursor/agents/a01-orchestrator.md` is installed, and passes the Graph ID. It does not spawn `a02`–`a15`, and it does not run `swarm_run.py`.
+- A child session (`SWARM_CHILD=1`, a non-empty `SWARM_AGENT`, or a prompt that names a parent conversation) is not planned.
+
 ### Prime Agent
 
 - Prime Agent has no command hook, so the `/ultrathink-*` names are instructions the agent carries out through the `ultrathink` kernel skill: `ultrathink.ctl("status")`, `ctl("off")`, `ctl("on")`, `ctl("skip")`, `ctl("track", "off"|"on")`, and `ctl("think", ...)`, `ctl("hitl", ...)`, `ctl("grok", "engine", ...)` for the verbs the other hosts leave to `bin/ultrathink`. Each call runs `bin/ultrathink` against the Prime Agent state directory and returns its text.
@@ -130,7 +137,7 @@ The prefixes are case-insensitive. A one-shot `/ultrathink-skip` still wins over
 These prompts are skipped automatically, with no command needed:
 
 - Trivial acknowledgements: `yes`, `y`, `no`, `n`, `ok`, `okay`, `k`, `continue`, `go`, `go ahead`, `do it`, `please`, `thanks`, `thank you`, `sure`, `yep`, `nope`, `lgtm`, optionally followed by punctuation. Set `uplift.skipTrivial: false` to plan them (see [Configuration](configuration.md)).
-- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done.
+- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done. A `/gsd-*` or `/skill:gsd-*` command is planned the same way even when no skill file is installed.
 - ultrathink's own skills (`ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan`, `ultrathink-ship`) and commands, so they never re-plan.
 - Prompts that already are an uplifted spec (they start with the spec's root XML element).
 - Subagent sessions, and child processes that ultrathink itself started.
