@@ -8,7 +8,7 @@ Grok Bot native host. Grok Bot has no prompt hook and no plugin loader, so the a
   following the plugin's own system prompt, stores the answer with `answer` (validated the way the engine parses it),
   and re-runs `plan`, which replays stored answers. Jev decisions are journalled too, so a resumed plan sees the same
   verdicts. Shipping is forced off (`ULTRATHINK_SHIP=0`) on every call.
-- `skills/<name>/SKILL.md`: 21 skills the bot loads. `ultrathink-protocol` is the standing rule that replaces the
+- `skills/<name>/SKILL.md`: 22 skills the bot loads. `ultrathink-protocol` is the standing rule that replaces the
   UserPromptSubmit hook; the `ultrathink-*` commands map to `ctl`, `teach`, `decisions`, `hindsight` and `ragflow`;
   `ultrathink-kickoff` and `ultrathink-sync` write Linear/Notion rows through the bot's own connectors from the
   dry-run payloads that `track payloads` records (`track record` writes the real refs back into the spec).
