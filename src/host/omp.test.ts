@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
@@ -1238,6 +1238,61 @@ describe("status and the default planner (§9 paths 5-6)", () => {
 		} finally {
 			if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = saved;
+		}
+	});
+});
+
+describe("swarm auto-run", () => {
+	const withSwarmRoot = (): { root: string; stateDir: string } => {
+		const root = mkdtempSync(join(tmpdir(), "sw-autorun-root-"));
+		mkdirSync(join(root, "hooks"), { recursive: true });
+		writeFileSync(join(root, "hooks", "autonomous_run.py"), "import sys\nsys.exit(0)\n");
+		const stateDir = mkdtempSync(join(tmpdir(), "sw-autorun-state-"));
+		process.env.ULTRATHINK_SWARM_ROOT = root;
+		process.env.ULTRATHINK_STATE_DIR = stateDir;
+		return { root, stateDir };
+	};
+
+	test("an SDLC prompt with autoRun enabled spawns a lane and publishes the card", () => {
+		const { root, stateDir } = withSwarmRoot();
+		const cwd = mkdtempSync(join(tmpdir(), "sw-autorun-cwd-"));
+		try {
+			const { run, sent } = setup(async () => "PLAN", 1_000, {
+				config: () => quietConfig((config) => {
+					config.swarm.autoRun = true;
+				}),
+			}, { hasUI: true, cwd });
+			void run("build a health endpoint");
+			const card = sent.find((entry) => (entry.message as { customType?: string }).customType === "ultrathink-swarm");
+			expect(card).toBeDefined();
+			expect((card!.message as { content: string }).content).toContain("1/1 spawned");
+			expect(existsSync(join(stateDir, "swarm"))).toBe(true);
+		} finally {
+			delete process.env.ULTRATHINK_SWARM_ROOT;
+			delete process.env.ULTRATHINK_STATE_DIR;
+			rmSync(root, { recursive: true, force: true });
+			rmSync(stateDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a non-SDLC prompt never spawns, and the opt-in off keeps everything quiet", () => {
+		const { root } = withSwarmRoot();
+		try {
+			const on = setup(async () => "PLAN", 1_000, {
+				config: () => quietConfig((config) => {
+					config.swarm.autoRun = true;
+				}),
+			});
+			void on.run("what does this repo do");
+			expect(on.sent.some((entry) => (entry.message as { customType?: string }).customType === "ultrathink-swarm")).toBe(false);
+			const off = setup(async () => "PLAN", 1_000, { config: () => quietConfig() });
+			off.run("build a health endpoint");
+			expect(off.sent.some((entry) => (entry.message as { customType?: string }).customType === "ultrathink-swarm")).toBe(false);
+		} finally {
+			delete process.env.ULTRATHINK_SWARM_ROOT;
+			delete process.env.ULTRATHINK_STATE_DIR;
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
