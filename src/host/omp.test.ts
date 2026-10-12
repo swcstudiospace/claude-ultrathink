@@ -1270,6 +1270,28 @@ describe("swarm auto-run", () => {
 		};
 	};
 
+	/** A stub `python3` first on PATH, so `spawnLanes` reports a started lane without a real interpreter. */
+	const withSpawnablePython = (): { restore: () => void } => {
+		const previousPath = process.env.PATH;
+		const bin = mkdtempSync(join(tmpdir(), "sw-autorun-bin-"));
+		writeFileSync(join(bin, "python3"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		return {
+			restore: () => {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+				rmSync(bin, { recursive: true, force: true });
+			},
+		};
+	};
+
+	/** The `index`th swarm card's content, or "": `fields` narrows the unknown message without casting. */
+	const cardContent = (sent: { message: unknown }[], index: number): string => {
+		const card = sent.filter((entry) => fields(entry.message).customType === "ultrathink-swarm")[index];
+		const content = fields(card?.message).content;
+		return typeof content === "string" ? content : "";
+	};
+
 	test("an SDLC prompt with autoRun enabled spawns a lane and publishes the card", () => {
 		const { root, stateDir, restore } = withSwarmRoot();
 		const cwd = mkdtempSync(join(tmpdir(), "sw-autorun-cwd-"));
@@ -1311,6 +1333,95 @@ describe("swarm auto-run", () => {
 			restore();
 			rmSync(root, { recursive: true, force: true });
 			rmSync(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	test("a resubmission of the spawned text neither respawns nor plans: the lane owns it", async () => {
+		const { root, stateDir, restore } = withSwarmRoot();
+		const python = withSpawnablePython();
+		const cwd = mkdtempSync(join(tmpdir(), "sw-autorun-dedupe-"));
+		try {
+			const gate = controlled();
+			const { run, sent, emit } = setup(gate.plan, 1, {
+				config: () => quietConfig((config) => {
+					config.swarm.autoRun = true;
+				}),
+			}, { hasUI: true, cwd });
+			expect(await run("build a health endpoint")).toBeUndefined();
+			expect(cardContent(sent, 0)).toContain("Swarm lanes — 1/1 spawned");
+			expect(cardContent(sent, 0)).toContain("lane owns this request");
+			// A second submission of the same text: quick suppression answers it before any spawn or planning.
+			emit("turn_start");
+			expect(await run("build a health endpoint")).toBeUndefined();
+			expect(sent.filter((entry) => fields(entry.message).customType === "ultrathink-swarm")).toHaveLength(1);
+			expect(sent.some((entry) => fields(entry.message).customType === "ultrathink-pending")).toBe(false);
+			expect(gate.calls()).toBe(0);
+		} finally {
+			python.restore();
+			restore();
+			rmSync(root, { recursive: true, force: true });
+			rmSync(stateDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an auto-run spawn supersedes the pending plan instead of letting it settle in later", async () => {
+		const { root, stateDir, restore } = withSwarmRoot();
+		const python = withSpawnablePython();
+		const cwd = mkdtempSync(join(tmpdir(), "sw-autorun-supersede-"));
+		try {
+			const t = tuiCtx();
+			const gate = controlled();
+			const { run, sent, emit } = setup(gate.plan, 1, {
+				config: () => quietConfig((config) => {
+					config.swarm.autoRun = true;
+				}),
+			}, { ...t.ctx, cwd });
+			emit("session_start");
+			// Seed a pending plan from a non-SDLC prompt: deferred, still current, gate unresolved.
+			expect(await run("what does this repo do")).toEqual({ message: expect.objectContaining({ customType: "ultrathink-pending" }) });
+			// The spawn owns this submission: the older flight is cancelled superseded and nothing is planned.
+			expect(await run("build a health endpoint")).toBeUndefined();
+			expect(t.line()).toContain("superseded");
+			gate.resolve("PLAN 1");
+			await flush();
+			expect(gate.calls()).toBe(1);
+			expect(sent.some((entry) => fields(entry.message).customType === "ultrathink-plan")).toBe(false);
+			expect(sent.filter((entry) => fields(entry.message).customType === "ultrathink-swarm")).toHaveLength(1);
+		} finally {
+			python.restore();
+			restore();
+			rmSync(root, { recursive: true, force: true });
+			rmSync(stateDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed spawn leaves the turn to plan and never claims lane ownership", async () => {
+		const { root, stateDir, restore } = withSwarmRoot();
+		const previousPath = process.env.PATH;
+		const emptyBin = mkdtempSync(join(tmpdir(), "sw-autorun-nopy-"));
+		const cwd = mkdtempSync(join(tmpdir(), "sw-autorun-nospawn-"));
+		try {
+			// No python3 reachable: spawnLanes starts nothing, quick stays disarmed, the normal turn plans.
+			process.env.PATH = emptyBin;
+			const gate = controlled();
+			const { run, sent } = setup(gate.plan, 1, {
+				config: () => quietConfig((config) => {
+					config.swarm.autoRun = true;
+				}),
+			}, { hasUI: true, cwd });
+			expect(await run("build a health endpoint")).toEqual({ message: expect.objectContaining({ customType: "ultrathink-pending" }) });
+			expect(cardContent(sent, 0)).toBe("Swarm lanes — 0/1 spawned");
+			expect(gate.calls()).toBe(1);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			restore();
+			rmSync(emptyBin, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+			rmSync(stateDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 });

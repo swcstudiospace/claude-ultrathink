@@ -1568,9 +1568,14 @@ export function createOmpExtension(
 				const plan = planLanes([prompt.trim()], { cwd, stateDir: stateDir(cwd), swarmRoot: root.root, env: process.env, pstack });
 				const handles = spawnLanes(plan);
 				const started = handles.filter((handle) => handle.pid !== undefined).length;
-				if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned${started > 0 ? " (lane owns the request)" : ""}`, toSwarmSpawnCard(handles, plan));
+				if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned${started > 0 ? " — the AgentSwarm lane owns this request; monitor with /ultrathink-swarm status, do not implement it here" : ""}`, toSwarmSpawnCard(handles, plan));
 				else sendSessionText(sessionId, ctx, formatLaneHandles(handles));
 				if (started === 0) return; // Nothing started: the normal turn proceeds and a resubmission may retry.
+				// The lane owns this submission: the caller's early return skips launch's supersede, so cancel any
+				// pending plan here — a stale one must not settle into this submission — then arm quick so neither
+				// this turn nor a resubmission of the same text plans the request (the quick bypass's bookkeeping).
+				const older = flights.get(sessionId);
+				if (older) cancel(older, SUPERSEDED);
 				lastLane = key;
 				quick = { sessionId, text: prompt.trim(), submission: turns.get(sessionId) };
 				owned = true;
