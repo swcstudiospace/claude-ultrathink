@@ -11,5 +11,6 @@
 	"repository": "https://github.com/swcstudiospace/claude-ultrathink",
 	"license": "AGPL-3.0-or-later",
 	"keywords": ["planning", "prompt", "graph-of-thought", "substrate", "agent-swarm", "cursor"],
-	"skills": "./skills/"
+	"skills": "./skills/",
+	"commands": ["./commands", "./hosts/cursor/gsd-commands"]
 }

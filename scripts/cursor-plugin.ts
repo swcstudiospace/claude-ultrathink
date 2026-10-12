@@ -4,10 +4,11 @@
 // Install or remove the Cursor planner hook, and optionally wire substrate and swarm.
 // Usage: see USAGE below (`bun scripts/cursor-plugin.ts --help`).
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { detectStage, gsdCommandNames } from "../src/cursor/pstack.ts";
 import {
 	EVENT,
 	HOOK_LOCK_WAIT_MS,
@@ -29,11 +30,49 @@ export const PLAN_ROOT_FILE = "ultrathink-cursor-plan.root";
  */
 export const PLAN_MARKER = "ultrathink-cursor-managed";
 
+/** HTML marker in command files this installer writes. A file without it is left alone. */
+export const GSD_MARKER = "ultrathink-cursor-gsd";
+/** Plugin-relative directory of the thin GSD command files. Not `commands/` or `skills/`. */
+export const GSD_COMMAND_DIR = "hosts/cursor/gsd-commands";
+
+const GSD_STAGE_LINE: Record<string, string> = {
+	discuss: "Discuss the phase before proposing a design.",
+	plan: "Plan the phase before the plan is finalized.",
+	execute: "Carry out the phase.",
+	review: "Verify and review the completed change.",
+	orchestrate: "Run the GSD autonomous loop across discuss, plan, execute, and review.",
+};
+
+/**
+ * Thin Cursor command for one GSD name the pstack stage table already knows.
+ * The body keeps `/<name>` on its own line so the pstack hook still sees an invocation
+ * when Cursor inserts the file, and the marker is how `remove` tells our copy from a GSD plugin's.
+ */
+export function renderGsdCommand(name: string): string {
+	const stage = detectStage(`/${name}`).stage ?? "execute";
+	const line = GSD_STAGE_LINE[stage] ?? "Continue the GSD workflow for this command.";
+	return [
+		"---",
+		`name: ${name}`,
+		`description: ${name} (${stage}). Ultrathink plans /${name}, then the agent continues the GSD workflow.`,
+		"---",
+		"",
+		`<!-- ${GSD_MARKER} -->`,
+		"",
+		`/${name}`,
+		"",
+		`${line} The text typed after the command name is the phase or task. Follow the installed GSD instructions for this command when they are present. Ultrathink plans this request before the workflow continues.`,
+		"",
+	].join("\n");
+}
+
 export const USAGE = `Usage: bun scripts/cursor-plugin.ts install|remove [--cursor-dir <dir>] [--target <repo>]
 
   install             stage hosts/cursor/${PLAN_HOOK_FILE} into <cursorDir>/hooks and register it
-                      under hooks.${EVENT} with ${PLAN_MARKER}: true
-  remove              delete that entry and the staged hook; leaves pstack and substrate entries
+                      under hooks.${EVENT} with ${PLAN_MARKER}: true. Also copies the known
+                      GSD command names into <cursorDir>/commands (marker ${GSD_MARKER}).
+  remove              delete that entry, the staged hook, and command files that carry the marker.
+                      Leaves pstack, substrate, and any command file this installer did not write.
   --cursor-dir <dir>  Cursor settings directory (default: ~/.cursor)
   --target <repo>     workspace that receives Agent Swarm Cursor agents when SWARM_ROOT is set
 
@@ -183,6 +222,95 @@ function defaultRun(argv: string[]): number | null {
 	return result.error ? null : result.status;
 }
 
+function isRealFile(path: string): boolean {
+	try {
+		const stat = lstatSync(path);
+		return stat.isFile() && !stat.isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+function commandsDirIsWritable(dir: string, log: (line: string) => void): boolean {
+	if (!existsSync(dir)) return true;
+	try {
+		if (lstatSync(dir).isSymbolicLink()) {
+			log(`commands: skipped, ${dir} is a symlink`);
+			return false;
+		}
+	} catch (error) {
+		log(`commands: skipped, ${dir} could not be read (${error instanceof Error ? error.message : String(error)})`);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Copies one thin command per known GSD name into `<cursorDir>/commands`.
+ * A regular file that does not carry {@link GSD_MARKER} is left in place (an installed GSD plugin).
+ * A symlink is left in place. A write error is logged and does not undo the planner hook.
+ */
+export function installGsdCommands(cursorDir: string, log: (line: string) => void): number {
+	const dir = join(cursorDir, "commands");
+	if (!commandsDirIsWritable(dir, log)) return 0;
+	let written = 0;
+	try {
+		ensureDir(dir, 0o755);
+	} catch (error) {
+		log(`commands: skipped, ${dir} could not be created (${error instanceof Error ? error.message : String(error)})`);
+		return 0;
+	}
+	for (const name of gsdCommandNames()) {
+		const dest = join(dir, `${name}.md`);
+		const body = renderGsdCommand(name);
+		try {
+			if (existsSync(dest)) {
+				if (!isRealFile(dest)) {
+					log(`commands: left ${name}.md in place (not a regular file)`);
+					continue;
+				}
+				const current = readFileSync(dest, "utf8");
+				if (!current.includes(GSD_MARKER)) {
+					log(`commands: left ${name}.md in place (not ultrathink's)`);
+					continue;
+				}
+				if (current === body) {
+					log(`commands: ${name}.md already current`);
+					continue;
+				}
+			}
+			writeFileSync(dest, body, { mode: 0o644 });
+			chmodSync(dest, 0o644);
+			written += 1;
+			log(`commands: ${name}.md written`);
+		} catch (error) {
+			log(`commands: ${name}.md skipped (${error instanceof Error ? error.message : String(error)})`);
+		}
+	}
+	return written;
+}
+
+/** Deletes command files this installer wrote. Anything without the marker stays. */
+export function removeGsdCommands(cursorDir: string, log: (line: string) => void): number {
+	const dir = join(cursorDir, "commands");
+	if (!existsSync(dir)) return 0;
+	if (!commandsDirIsWritable(dir, log)) return 0;
+	let removed = 0;
+	for (const name of gsdCommandNames()) {
+		const dest = join(dir, `${name}.md`);
+		try {
+			if (!existsSync(dest) || !isRealFile(dest)) continue;
+			if (!readFileSync(dest, "utf8").includes(GSD_MARKER)) continue;
+			rmSync(dest);
+			removed += 1;
+			log(`commands: removed ${name}.md`);
+		} catch (error) {
+			log(`commands: ${name}.md not removed (${error instanceof Error ? error.message : String(error)})`);
+		}
+	}
+	return removed;
+}
+
 /** Runs optional substrate and swarm installers. A missing script or a non-zero status is logged and skipped. */
 export function runExternal(
 	steps: readonly ExternalStep[],
@@ -235,8 +363,13 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	if ("reason" in initial) return fail(log, initial.reason);
 
 	if (command === "remove") {
+		const removedCommands = removeGsdCommands(cursorDir, log);
 		if (removePlanHook(initial.config).action === "not present" && !existsSync(staged) && !existsSync(rootFile)) {
-			log(`hooks.json: no ${PLAN_MARKER} ${EVENT} entry present`);
+			log(
+				removedCommands === 0
+					? `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present`
+					: `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present; removed ${removedCommands} GSD command file(s)`,
+			);
 			return 0;
 		}
 		const locked = acquireHookLock(cursorDir, HOOK_LOCK_WAIT_MS);
@@ -298,6 +431,7 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 		locked.release();
 	}
 
+	installGsdCommands(cursorDir, log);
 	const run = deps.run ?? defaultRun;
 	runExternal(externalSteps(env, target), log, run);
 	return 0;

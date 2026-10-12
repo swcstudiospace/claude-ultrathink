@@ -312,36 +312,53 @@ The skill is a symlink into the clone, so `git pull` updates it; start a new ses
 
 ## Cursor
 
-Cursor loads skills from `.cursor-plugin/plugin.json`. Planning is a `beforeSubmitPrompt` hook, separate from the pstack bridge. The hook runs `hooks/engine.ts` with host `cursor` and puts the plan in `additional_context`. It fails open: a missing Bun, a planner error, a child or swarm session, or a wait past `ULTRATHINK_CURSOR_BUDGET_MS` (default 180000) leaves the prompt unchanged. Plans use the Claude CLI, the same default as Hermes and Prime Agent. State is `~/.cursor/ultrathink`. Run status with `ULTRATHINK_HOST=cursor`; host detection does not treat `CURSOR_AGENT` as this host, because that variable is set for other work on the same machine.
+Cursor loads skills from `.cursor-plugin/plugin.json` (`skills`) and commands from the `commands` paths in that file (`./commands` and `./hosts/cursor/gsd-commands`). Planning is a `beforeSubmitPrompt` hook, separate from the pstack bridge. The hook runs `hooks/engine.ts` with host `cursor` and puts the plan in `additional_context`. It fails open: a missing Bun, a planner error, a child or swarm session, or a wait past `ULTRATHINK_CURSOR_BUDGET_MS` (default 180000) leaves the prompt unchanged. Plans use the Claude CLI, the same default as Hermes and Prime Agent. State is `~/.cursor/ultrathink`. Run status with `ULTRATHINK_HOST=cursor`; host detection does not treat `CURSOR_AGENT` as this host, because that variable is set for other work on the same machine.
 
 The hook does not start Agent Swarm. When `.cursor/agents/a01-orchestrator.md` is installed, the `ultrathink-cursor` skill tells the agent to spawn `a01-orchestrator` once with the Graph ID. Questions, short replies, and `/ultrathink-quick` stay in the current session.
 
-### Install
+A prompt that is `/gsd-*` or `/skill:gsd-*` is planned even when no GSD skill file is installed. The planner uses the text after the command name. `/ultrathink-quick` and the other `/ultrathink-*` commands are still not planned, and neither is an unknown command such as `/model`. The pstack hook (`ultrathink-managed`) still adds its skill paths on a `/gsd-*` invocation when `pstack.enabled` is true. The two hooks use different markers and do not replace each other.
 
-```sh
-bun <clone>/scripts/cursor-plugin.ts install
-```
+### Connect
 
-Optional checkouts, both skipped when unset. A missing script is logged and does not undo the hook:
+1. Clone this repo, [agent-substrate](https://github.com/swcstudiospace/agent-substrate), and [agent-swarm](https://github.com/swcstudiospace/agent-swarm). Bun 1.2 or newer must be installed (`bin/run-bun` also looks in `~/.bun/bin/bun`).
+2. From a shell, with the three checkout paths:
 
 ```sh
 SUBSTRATE_ROOT=<substrate-clone> SWARM_ROOT=<agent-swarm-clone> \
-  bun <clone>/scripts/cursor-plugin.ts install --target <workspace>
+  bun <ultrathink-clone>/scripts/cursor-plugin.ts install --target <workspace>
 ```
 
-`SUBSTRATE_ROOT` runs the substrate Cursor hook projector and its MCP projector. `SWARM_ROOT` with `--target` runs `scripts/_install_cursor.py`, which copies agents and the swarm rule only. The installer never writes a token and never runs `swarm_run.py` or `hooks/autonomous_run.py`.
+`SUBSTRATE_ROOT` and `SWARM_ROOT` are optional. Leave one unset and that checkout is skipped. `--target` is the workspace that receives Agent Swarm's Cursor agents. Without it, the swarm installer does not run.
 
-`install` again refreshes the planner entry and leaves `ultrathink-managed` (pstack) and `substrate-managed` entries in place. `remove` deletes only the planner entry and the staged hook:
+3. Set these in the environment Cursor uses. The installer never writes their values:
+   - `SUBSTRATE_URL` — substrate HTTP origin. The MCP entry is the literal `${SUBSTRATE_URL}/mcp`.
+   - `SUBSTRATE_TOKEN` — bearer token. The MCP entry is the literal `Bearer ${SUBSTRATE_TOKEN}`.
+   - `SWARM_ROOT` — absolute agent-swarm checkout, the same path you passed to `install` when you want the agents copied.
+   - `ULTRATHINK_HOST` — set to `cursor` when you run `bin/ultrathink` from a shell that is not Cursor.
+
+4. What `install` writes:
+   - `~/.cursor/hooks.json`: one `beforeSubmitPrompt` command with `ultrathink-cursor-managed: true`, plus the staged script `~/.cursor/hooks/ultrathink-cursor-plan.js` and `ultrathink-cursor-plan.root`. An existing `ultrathink-managed` (pstack) or `substrate-managed` entry stays.
+   - `~/.cursor/hooks.json` substrate entries, when `SUBSTRATE_ROOT` is set and the projector is present: `sessionStart`, `postToolUse`, and `stop`, each `substrate-managed`.
+   - `~/.cursor/mcp.json`: an HTTP `substrate` server whose URL and Authorization header are the placeholders above. A different existing `substrate` entry is left untouched.
+   - `<workspace>/.cursor/agents/<slug>.md` and `<workspace>/.cursor/rules/agent-swarm.mdc`, when `SWARM_ROOT` and `--target` are set.
+   - `~/.cursor/commands/<name>.md` for each GSD command the pstack stage table already knows (`gsd-discuss-phase`, `gsd-plan-phase`, `gsd-execute-phase`, `gsd-quick`, `gsd-ship`, `gsd-autonomous`, and the rest of that table). Each file contains the marker `ultrathink-cursor-gsd`. A file that is already there without the marker, including one installed by a GSD plugin, is not replaced.
+
+5. Start a new Cursor session so the hooks load. Type `/gsd-plan-phase` (or another `/gsd-*` name) plus the phase or task. The planner runs before the agent continues the GSD workflow.
+
+`install` again refreshes the planner entry and the marked command files, and leaves `ultrathink-managed` and `substrate-managed` entries in place. `remove` deletes the planner entry, the staged hook, and command files that carry the marker:
 
 ```sh
-bun <clone>/scripts/cursor-plugin.ts remove
+bun <ultrathink-clone>/scripts/cursor-plugin.ts remove
 ```
+
+The installer never writes a token and never runs `swarm_run.py` or `hooks/autonomous_run.py`.
 
 ### Verify
 
 1. `~/.cursor/hooks.json` has one `beforeSubmitPrompt` command whose entry is `ultrathink-cursor-managed`, and the pstack entry is still there if you installed it.
-2. `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink status` prints the Cursor state directory.
-3. Send a non-trivial prompt. The agent receives the plan, including a Cursor swarm note and the Graph ID when one was minted. A prompt that is a question, or `/ultrathink-quick`, is not handed to `a01-orchestrator`.
+2. `ULTRATHINK_HOST=cursor <ultrathink-clone>/bin/ultrathink status` prints the Cursor state directory (`~/.cursor/ultrathink`).
+3. `~/.cursor/commands/gsd-plan-phase.md` exists and contains `ultrathink-cursor-gsd`. `~/.cursor/mcp.json` names `SUBSTRATE_URL` and `SUBSTRATE_TOKEN` and does not contain a token value.
+4. Send a non-trivial prompt. The agent receives the plan, including a Cursor swarm note and the Graph ID when one was minted. A prompt that is a question, or `/ultrathink-quick`, is not handed to `a01-orchestrator`. A `/gsd-*` prompt is planned. `/ultrathink-quick` is not.
 
 This adapter is source-present. It has not been verified in a live Cursor session.
 

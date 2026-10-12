@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVENT, HOOK_FILE, isOwned } from "./cursor-hooks.ts";
+import { gsdCommandNames } from "../src/cursor/pstack.ts";
 import {
+	GSD_COMMAND_DIR,
+	GSD_MARKER,
 	PLAN_HOOK_FILE,
 	PLAN_MARKER,
 	PLAN_ROOT_FILE,
@@ -13,6 +16,7 @@ import {
 	isPlanOwned,
 	main,
 	removePlanHook,
+	renderGsdCommand,
 	upsertPlanHook,
 } from "./cursor-plugin.ts";
 
@@ -172,11 +176,72 @@ describe("main", () => {
 			expect(code).toBe(0);
 			expect(ran[2]).toEqual(["python3", installer, "--target", target]);
 			expect(ran.flat().join(" ")).not.toContain("swarm_run.py");
+			const names = gsdCommandNames();
+			expect(names.length).toBeGreaterThan(0);
+			for (const name of names) {
+				expect(readFileSync(join(cursorDir, "commands", `${name}.md`), "utf8")).toBe(renderGsdCommand(name));
+			}
 		} finally {
 			rmSync(cursorDir, { recursive: true, force: true });
 			rmSync(root, { recursive: true, force: true });
 			rmSync(substrate, { recursive: true, force: true });
 			rmSync(swarm, { recursive: true, force: true });
+		}
+	});
+
+	test("install leaves a foreign GSD command and a symlink in place, and remove deletes only marked copies", () => {
+		const cursorDir = mkdtempSync(join(tmpdir(), "cursor-plugin-gsd-"));
+		const root = mkdtempSync(join(tmpdir(), "ultrathink-root-"));
+		const outside = mkdtempSync(join(tmpdir(), "gsd-foreign-"));
+		try {
+			mkdirSync(join(root, "hosts", "cursor"), { recursive: true });
+			writeFileSync(join(root, "hosts", "cursor", PLAN_HOOK_FILE), "#!/usr/bin/env node\n");
+			const commands = join(cursorDir, "commands");
+			mkdirSync(commands, { recursive: true });
+			const foreign = join(commands, "gsd-plan-phase.md");
+			writeFileSync(foreign, "# real GSD plan-phase\n");
+			const link = join(commands, "gsd-ship.md");
+			writeFileSync(join(outside, "gsd-ship.md"), "# linked\n");
+			symlinkSync(join(outside, "gsd-ship.md"), link);
+			const logs: string[] = [];
+			expect(main(["install", "--cursor-dir", cursorDir], { env: {}, root, log: (line) => logs.push(line), nodeCandidates: [process.execPath] })).toBe(0);
+			expect(readFileSync(foreign, "utf8")).toBe("# real GSD plan-phase\n");
+			expect(lstatSync(link).isSymbolicLink()).toBe(true);
+			expect(readFileSync(join(commands, "gsd-quick.md"), "utf8")).toContain(GSD_MARKER);
+			expect(logs.some((line) => line.includes("left gsd-plan-phase.md in place"))).toBe(true);
+			expect(logs.some((line) => line.includes("left gsd-ship.md in place"))).toBe(true);
+
+			expect(main(["remove", "--cursor-dir", cursorDir], { env: {}, root, log: () => {}, nodeCandidates: [process.execPath] })).toBe(0);
+			expect(existsSync(foreign)).toBe(true);
+			expect(lstatSync(link).isSymbolicLink()).toBe(true);
+			expect(existsSync(join(commands, "gsd-quick.md"))).toBe(false);
+			expect(existsSync(join(commands, "gsd-autonomous.md"))).toBe(false);
+			expect(existsSync(join(cursorDir, "hooks", PLAN_HOOK_FILE))).toBe(false);
+		} finally {
+			rmSync(cursorDir, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("shipped GSD commands", () => {
+	test("the plugin lists the command directory and each file matches the renderer", () => {
+		const root = join(import.meta.dir, "..");
+		const manifest = JSON.parse(readFileSync(join(root, ".cursor-plugin", "plugin.json"), "utf8")) as {
+			skills?: string;
+			commands?: string[];
+		};
+		expect(manifest.skills).toBe("./skills/");
+		expect(manifest.commands).toEqual(["./commands", `./${GSD_COMMAND_DIR}`]);
+		const dir = join(root, GSD_COMMAND_DIR);
+		const names = gsdCommandNames();
+		expect(readdirSync(dir).filter((name) => name.endsWith(".md")).sort()).toEqual(names.map((name) => `${name}.md`).sort());
+		for (const name of names) {
+			const text = readFileSync(join(dir, `${name}.md`), "utf8");
+			expect(text).toBe(renderGsdCommand(name));
+			expect(text).toContain(`/${name}`);
+			expect(text.startsWith("/")).toBe(false);
 		}
 	});
 });

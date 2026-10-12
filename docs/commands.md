@@ -104,6 +104,7 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 ### Cursor
 
 - Planning is the `beforeSubmitPrompt` hook from `bun scripts/cursor-plugin.ts install`, not a slash-command dispatcher. `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` and `/ultrathink-status` are still the engine's commands: type them as the prompt. The shell form is `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink <verb>`.
+- `/gsd-*` and `/skill:gsd-*` are planned. The text after the command is the task; a bare command plans that command's objective. `install` also copies the known GSD names into `~/.cursor/commands/` so Cursor can offer them. `/ultrathink-quick` is not planned.
 - A planned implementation prompt tells the agent to run `ultrathink-cursor` after kickoff. That skill spawns `a01-orchestrator` once when `.cursor/agents/a01-orchestrator.md` is installed, and passes the Graph ID. It does not spawn `a02`–`a15`, and it does not run `swarm_run.py`.
 - A child session (`SWARM_CHILD=1`, a non-empty `SWARM_AGENT`, or a prompt that names a parent conversation) is not planned.
 
@@ -135,7 +136,7 @@ The prefixes are case-insensitive. A one-shot `/ultrathink-skip` still wins over
 These prompts are skipped automatically, with no command needed:
 
 - Trivial acknowledgements: `yes`, `y`, `no`, `n`, `ok`, `okay`, `k`, `continue`, `go`, `go ahead`, `do it`, `please`, `thanks`, `thank you`, `sure`, `yep`, `nope`, `lgtm`, optionally followed by punctuation. Set `uplift.skipTrivial: false` to plan them (see [Configuration](configuration.md)).
-- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done.
+- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done. A `/gsd-*` or `/skill:gsd-*` command is planned the same way even when no skill file is installed.
 - ultrathink's own skills (`ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan`, `ultrathink-ship`) and commands, so they never re-plan.
 - Prompts that already are an uplifted spec (they start with the spec's root XML element).
 - Subagent sessions, and child processes that ultrathink itself started.

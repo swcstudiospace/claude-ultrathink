@@ -58,6 +58,24 @@ const COMMAND_STAGE: ReadonlyArray<readonly [RegExp, PstackStage]> = [
 	[/^gsd-autonomous$/, "orchestrate"],
 ];
 
+/**
+ * Command names the stage table recognizes, without a leading slash.
+ * Derived from {@link COMMAND_STAGE} so the installer and the hook cannot list different commands.
+ */
+export function gsdCommandNames(): string[] {
+	const names: string[] = [];
+	for (const [pattern] of COMMAND_STAGE) {
+		const source = pattern.source.replace(/^\^/, "").replace(/\$$/, "");
+		const grouped = /^gsd-\(([^)]+)\)$/.exec(source);
+		if (grouped?.[1]) {
+			for (const alt of grouped[1].split("|")) names.push(`gsd-${alt}`);
+			continue;
+		}
+		names.push(source);
+	}
+	return names;
+}
+
 const ALL_STAGES: readonly StageKey[] = ["discuss", "plan", "execute", "review"];
 
 const cacheComplete = (dir: string, fs: PstackFs): boolean => {
