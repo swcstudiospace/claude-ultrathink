@@ -133,6 +133,20 @@ export const DEFAULT_PSTACK_CONFIG: PstackConfig = {
 	contextCapChars: 2000,
 };
 
+/**
+ * AgentSwarm auto-run (`src/swarm/teams.ts`): plain prompts that read as SDLC work spawn swarm lanes without the
+ * explicit `/ultrathink-swarm` command. Opt-in and user-only — every key comes from user files; a project layer is
+ * ignored entirely, so a cloned repository cannot turn auto-spawning on.
+ */
+export interface SwarmConfig {
+	/** Whether SDLC-sounding prompts auto-spawn swarm lanes; only a user file can turn this on. */
+	autoRun: boolean;
+}
+
+export const DEFAULT_SWARM_CONFIG: SwarmConfig = {
+	autoRun: false,
+};
+
 /** A per-host planning model override; "" in a field means no override for it. */
 export interface HostModelOverride {
 	/** Exact credential-bearing provider id the planning target must belong to; "" = no provider constraint. */
@@ -180,6 +194,8 @@ export interface UltrathinkConfig {
 	state: StateConfig;
 	/** Cursor pstack bridge (opt-in; user files only — a project layer cannot enable or retarget it). */
 	pstack: PstackConfig;
+	/** AgentSwarm auto-run (opt-in; user files only — a project layer cannot enable it). */
+	swarm: SwarmConfig;
 	/** Planning model overrides and exact-provider default selectors; built-in `{ hosts: {}, providerDefaults: {} }`. */
 	models: ModelsConfig;
 	/**
@@ -219,6 +235,7 @@ export function defaultConfig(): UltrathinkConfig {
 		teach: { ...DEFAULT_TEACH_CONFIG },
 		state: { ...DEFAULT_STATE_CONFIG },
 		pstack: { ...DEFAULT_PSTACK_CONFIG },
+		swarm: { ...DEFAULT_SWARM_CONFIG },
 		models: { hosts: {}, providerDefaults: providerDictionary({}) },
 		modelProvenance: { claude: "route-default", grok: "route-default", muse: "route-default" },
 	};
@@ -715,6 +732,15 @@ function mergePstack(pstack: Record<string, unknown> | undefined, defaults: Psta
 	};
 }
 
+/**
+ * Swarm auto-run is opt-in and user-only: a project layer (a file a cloned repository controls) is ignored
+ * entirely, and a non-boolean `autoRun` keeps the lower layer's value.
+ */
+function mergeSwarm(swarm: Record<string, unknown> | undefined, defaults: SwarmConfig, project: boolean): SwarmConfig {
+	if (!swarm || project) return defaults;
+	return { autoRun: booleanOr(swarm.autoRun, defaults.autoRun) };
+}
+
 /** Merges one config layer onto `base`; `project` marks a repository-controlled layer (consent may only tighten, K5). */
 export function mergeConfig(
 	file: Record<string, unknown> | undefined,
@@ -744,6 +770,7 @@ export function mergeConfig(
 		teach: mergeTeach(asRecord(file.teach), base.teach, options.project === true),
 		state: mergeState(asRecord(file.state), base.state, options.project === true),
 		pstack: mergePstack(asRecord(file.pstack), base.pstack, options.project === true),
+		swarm: mergeSwarm(asRecord(file.swarm), base.swarm, options.project === true),
 		models: mergeModels(asRecord(file.models), base.models),
 		modelProvenance: {
 			claude: modelPin(claude, base.modelProvenance.claude, true),

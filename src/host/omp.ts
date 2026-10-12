@@ -33,6 +33,7 @@ import { storePath } from "../mcp/store.ts";
 import {
 	formatLaneHandles,
 	formatLaneStatusText,
+	isSdlcPrompt,
 	laneDirs,
 	laneStatus,
 	maxLanes,
@@ -1243,8 +1244,34 @@ export function createOmpExtension(
 				turns.set(sessionId, (turns.get(sessionId) ?? 0) + 1);
 			});
 		});
-		pi.on("input", () => {
+		// AgentSwarm auto-run: with `swarm.autoRun` on (user files only, default off) an SDLC-sounding prompt in a
+		// top-level session fans out one detached lane for it, published exactly like the /ultrathink-swarm spawn
+		// branch. Explicit /commands, child sessions, unconfigured swarm roots and repeat submissions never spawn;
+		// every skip is silent and a spawn failure never breaks prompt submission (the guard below).
+		let lastPrompt = "";
+		pi.on("input", (event, ctx) => {
 			scheduleMount();
+			guard(() => {
+				const submitted = event && typeof event === "object" && "text" in event ? event.text : undefined;
+				const text = typeof submitted === "string" ? submitted : "";
+				// Slash commands (including /ultrathink-swarm itself) are explicit and never auto-run; the dedupe
+				// keeps one spawn per distinct submission text, updated only once a lane actually launched.
+				if (!text || text.startsWith("/") || text === lastPrompt) return;
+				if (isSubagentSession(ctx, exists)) return;
+				const cwd = ctx?.cwd || process.cwd();
+				if (flightConfig(cwd).swarm?.autoRun !== true) return;
+				const root = resolveSwarmRoot(process.env);
+				if ("reason" in root) return;
+				if (!isSdlcPrompt(text)) return;
+				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				if (!sessionId) return;
+				const plan = planLanes([text.trim().slice(0, 200)], { cwd, stateDir: stateDir(cwd), swarmRoot: root.root, env: process.env });
+				const handles = spawnLanes(plan);
+				lastPrompt = text;
+				const started = handles.filter((handle) => handle.pid !== undefined).length;
+				if (uiEnabled && ctx?.hasUI && typeof pi.registerMessageRenderer === "function") sendSwarmCard(sessionId, ctx, `Swarm lanes — ${started}/${plan.length} spawned`, toSwarmSpawnCard(handles, plan));
+				else sendSessionText(sessionId, ctx, formatLaneHandles(handles));
+			});
 		});
 
 		// PR-sync parity with hooks/pr-sync.ts: once a planned session opens a PR, nudge the agent to run
