@@ -14,6 +14,7 @@ import {
 	type LanePlan,
 	formatLaneHandles,
 	formatLaneStatusText,
+	isSdlcPrompt,
 	laneDirs,
 	laneStatus,
 	type LaneStatusRow,
@@ -603,5 +604,25 @@ describe("toSwarmStatusCard", () => {
 	test("omitted passes through even with no rows, and lanes is always an array", () => {
 		expect(toSwarmStatusCard([], 5)).toEqual({ lanes: [], omitted: 5 });
 		expect(toSwarmStatusCard([], 0)).toEqual({ lanes: [], omitted: 0 });
+	});
+});
+
+describe("isSdlcPrompt", () => {
+	test("slash commands are explicit and never auto-run", () => {
+		expect(isSdlcPrompt("/ultrathink-swarm x")).toBe(false);
+		expect(isSdlcPrompt("/gsd-autonomous")).toBe(false);
+	});
+
+	test("SDLC-verb openers auto-run, across whitespace and politeness prefixes", () => {
+		expect(isSdlcPrompt("build a health endpoint")).toBe(true);
+		expect(isSdlcPrompt("  fix the login bug")).toBe(true);
+		expect(isSdlcPrompt("please refactor the parser")).toBe(true);
+		expect(isSdlcPrompt("hey deploy to staging")).toBe(true);
+	});
+
+	test("questions, chatter and non-verb openers never auto-run", () => {
+		expect(isSdlcPrompt("what is this file")).toBe(false);
+		expect(isSdlcPrompt("")).toBe(false);
+		expect(isSdlcPrompt("sudo rm -rf /")).toBe(false);
 	});
 });

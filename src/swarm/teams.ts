@@ -164,6 +164,46 @@ export function parseLaneArgs(input: string, opts: { maxLanes?: number } = {}): 
 	return { kind: "spawn", briefs };
 }
 
+/** SDLC verbs whose first-word match lets a plain prompt auto-run; multi-word verbs like "write tests"/"set up" match on the first word. */
+const SDLC_VERBS: Record<string, true> = {
+	build: true,
+	implement: true,
+	add: true,
+	create: true,
+	fix: true,
+	refactor: true,
+	migrate: true,
+	deploy: true,
+	release: true,
+	ship: true,
+	scaffold: true,
+	upgrade: true,
+	integrate: true,
+	write: true,
+	set: true,
+};
+
+/** Politeness prefixes stripped before first-word matching; each needs its trailing space. */
+const SDLC_PREFIXES: readonly string[] = ["sudo ", "please ", "hey "];
+
+/**
+ * Whether a plain prompt reads as SDLC work the swarm may auto-run. Slash commands are explicit and never
+ * auto-run; otherwise the first word — lower-cased, ignoring a leading "sudo ", "please " or "hey " — must be
+ * an SDLC verb. Questions and chatter never match.
+ */
+export function isSdlcPrompt(prompt: string): boolean {
+	const trimmed = prompt.trim();
+	if (trimmed.startsWith("/")) return false;
+	let rest = trimmed;
+	for (;;) {
+		const lower = rest.toLowerCase();
+		const prefix = SDLC_PREFIXES.find((candidate) => lower.startsWith(candidate));
+		if (prefix === undefined) break;
+		rest = rest.slice(prefix.length);
+	}
+	return SDLC_VERBS[rest.split(/\s+/, 1)[0]?.toLowerCase() ?? ""] === true;
+}
+
 /** sha256 of the brief, first 8 hex characters: stable per brief, short enough for a directory name. */
 const sha8 = (brief: string): string => createHash("sha256").update(brief, "utf8").digest("hex").slice(0, 8);
 
