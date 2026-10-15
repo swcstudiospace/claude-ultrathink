@@ -360,7 +360,7 @@ function planningSegments(state: BarState, p: Paint, now: number): string[] {
 	if (state.delivery === "pending") segments.push(p.fg("warning", "→ plan arrives as aside"));
 	segments.push(...rest);
 	if (state.startedAt !== undefined) segments.push(formatElapsed(now - state.startedAt));
-	// The model this planning runs on, once its own `begin` (or unresolved `end`) named it; the first segment dropped when narrow.
+	// The model this planning runs on, once its own `begin` (or unresolved `end`) named it; dropped after the substrate segment below when narrow.
 	const model = state.resolution && modelText(state);
 	if (model) segments.push(p.fg("statusLineModel", model));
 	segments.push(...substrateSegments(state, p));

@@ -798,7 +798,10 @@ export function createOmpExtension(
 		};
 		const store: BarStore = createBarStore();
 		try {
-			pi.events?.on("substrate:status", (data) => store.setSubstrate(parseSubstrateStatus(data)));
+			pi.events?.on("substrate:status", (data) => {
+				const substrate = parseSubstrateStatus(data);
+				if (substrate !== undefined) store.setSubstrate(substrate);
+			});
 			pi.events?.emit("substrate:status-request", {});
 		} catch {}
 		let ui: ExtensionUI | undefined;
