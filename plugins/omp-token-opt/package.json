@@ -1,0 +1,13 @@
+{
+  "name": "omp-token-opt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "measured token savings for omp",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
