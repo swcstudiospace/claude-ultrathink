@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
 import { paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
-import { type BarState, createBarComponent, createBarStore, LINGER_MS, renderBarLine } from "./omp-ui.ts";
+import { type BarState, createBarComponent, createBarStore, LINGER_MS, parseSubstrateStatus, renderBarLine, type SubstrateSegment } from "./omp-ui.ts";
 import type { PlanView } from "./view.ts";
 import type { ProgressEvent } from "./progress.ts";
 
@@ -545,5 +545,108 @@ describe("model resolution on the bar (§9 path 4)", () => {
 				}
 			}
 		}
+	});
+});
+
+describe("substrate segment", () => {
+	const ok: SubstrateSegment = { state: "ok", usage: "IN_USE", coverage: { observed: 6, known: 10 }, planesDown: 0, updatedAt: "10:42", reason: null };
+	const payload = { v: 1, state: "ok", usage: "IN_USE", omp: { req: 3, emit: 4, tool: 5 }, coverage: { observed: 6, known: 10 }, planesDown: 0, updatedAt: "10:42", reason: null };
+	const quiet: Omit<SubstrateSegment, "state"> = { usage: "UNKNOWN", coverage: null, planesDown: null, updatedAt: "", reason: null };
+	const render = (substrate: SubstrateSegment | undefined, width = 300) => {
+		const store = createBarStore();
+		store.setSubstrate(substrate);
+		return plain(renderBarLine(store.get(), fakeTheme(), width, 0));
+	};
+
+	test("parseSubstrateStatus accepts a valid ok payload", () => {
+		expect(parseSubstrateStatus(payload)).toEqual(ok);
+	});
+
+	test("parseSubstrateStatus rejects other versions, states, shapes and counts", () => {
+		expect(parseSubstrateStatus({ ...payload, v: 2 })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, state: "weird" })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, usage: "MAYBE" })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, coverage: { observed: 11, known: 10 } })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, coverage: { observed: 1.5, known: 10 } })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, planesDown: -1 })).toBeUndefined();
+		expect(parseSubstrateStatus({ ...payload, updatedAt: 1020 })).toBeUndefined();
+		for (const value of ["ok", 42, null, undefined, [payload]]) expect(parseSubstrateStatus(value)).toBeUndefined();
+	});
+
+	test("parseSubstrateStatus strips ESC and BEL, then caps reason at 40 and updatedAt at 8", () => {
+		const parsed = parseSubstrateStatus({ ...payload, state: "error", reason: `\x1bdown\x07 ${"x".repeat(60)}`, updatedAt: "10:42:00:99" });
+		expect(parsed?.reason).toBe(`down ${"x".repeat(35)}`);
+		expect(parsed?.updatedAt).toBe("10:42:00");
+	});
+
+	test("ok IN_USE shows usage, coverage and planes", () => {
+		const line = render(ok);
+		expect(line).toContain("substrate IN_USE");
+		expect(line).toContain("6/10 observed");
+		expect(line).toContain("planes ok");
+	});
+
+	test("every state names itself in text", () => {
+		expect(render({ ...quiet, state: "checking" })).toContain("substrate: checking");
+		expect(render({ ...quiet, state: "access-denied" })).toContain("substrate ACCESS_DENIED");
+		expect(render({ ...quiet, state: "error", reason: "timeout", updatedAt: "10:42" })).toContain("substrate ERROR (timeout) · last good 10:42");
+		expect(render({ ...quiet, state: "error", reason: null })).toContain("substrate ERROR");
+		expect(render({ ...quiet, state: "error", reason: null })).not.toContain("ERROR (");
+		expect(render({ ...ok, usage: "NOT_OBSERVED_IN_WINDOW", coverage: { observed: 0, known: 10 }, planesDown: 2 })).toContain(
+			"substrate NOT_OBSERVED_IN_WINDOW · 0/10 observed · 2 planes down",
+		);
+	});
+
+	test("the label survives a width that drops the readiness segments", () => {
+		const store = createBarStore();
+		store.setMcp({ linear: "ready", notion: "login", greptile: "none" });
+		store.delivered("inline", view, 1);
+		store.setSubstrate(ok);
+		const narrow = plain(renderBarLine(store.get(), fakeTheme(), 100, 1));
+		expect(narrow).toContain("substrate IN_USE · 6/10 observed");
+		expect(narrow).not.toContain("linear");
+	});
+
+	test("substrate follows the name when skipped and comes last while planning", () => {
+		const skipped = createBarStore();
+		skipped.setSubstrate(ok);
+		skipped.skipped("too short", 3);
+		const skippedLine = plain(renderBarLine(skipped.get(), fakeTheme(), 300, 3));
+		expect(skippedLine.indexOf("ultrathink")).toBeLessThan(skippedLine.indexOf("substrate"));
+		expect(skippedLine.indexOf("substrate")).toBeLessThan(skippedLine.indexOf("skipped ·"));
+		const planning: BarState = { ...planningState(), substrate: ok };
+		const planningLine = plain(renderBarLine(planning, fakeTheme(), 300, 35_000));
+		expect(planningLine.indexOf("0:34")).toBeLessThan(planningLine.indexOf("substrate"));
+	});
+
+	test("without a substrate status the bar renders as before", () => {
+		for (const state of Object.values(phaseStates())) {
+			for (const width of [40, 200]) {
+				expect(renderBarLine({ ...state, substrate: undefined }, fakeTheme(), width, 35_000)).toBe(renderBarLine(state, fakeTheme(), width, 35_000));
+			}
+		}
+	});
+
+	test("width holds with a substrate status in every phase and theme", () => {
+		for (const state of Object.values(phaseStates())) {
+			for (const width of [20, 40, 80, 200]) {
+				for (const theme of [fakeTheme(), fakeTheme("\x1b[49m"), throwingTheme]) {
+					expect(visibleWidth(renderBarLine({ ...state, substrate: ok }, theme, width, 35_000))).toBeLessThanOrEqual(width);
+				}
+			}
+		}
+	});
+
+	test("setSubstrate sets the state, notifies listeners and survives a new planning", () => {
+		const store = createBarStore();
+		let notified = 0;
+		store.subscribe(() => notified++);
+		store.setSubstrate(ok);
+		expect(store.get().substrate).toEqual(ok);
+		store.begin(1);
+		expect(store.get().substrate).toEqual(ok);
+		store.setSubstrate(undefined);
+		expect(store.get().substrate).toBeUndefined();
+		expect(notified).toBe(3);
 	});
 });

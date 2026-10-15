@@ -12,6 +12,17 @@ export const LINGER_MS = 2500;
 type Readiness = "ready" | "login" | "none";
 type Counts = [number, number];
 
+/** Substrate status as the bar shows it: labels and counts only, never tokens. */
+export interface SubstrateSegment {
+	state: "checking" | "ok" | "error" | "access-denied";
+	usage: "IN_USE" | "NOT_OBSERVED_IN_WINDOW" | "UNKNOWN";
+	coverage: { observed: number; known: number } | null;
+	planesDown: number | null;
+	/** "HH:MM" local time of the last good probe, or "" when none. */
+	updatedAt: string;
+	reason: string | null;
+}
+
 export interface BarState {
 	phase: "idle" | "planning" | "delivered" | "skipped" | "failed";
 	startedAt?: number;
@@ -36,6 +47,8 @@ export interface BarState {
 	 * view. Shown with its reason next to the engine; a new planning starts without it until its own `begin`.
 	 */
 	resolution?: ModelResolution;
+	/** Substrate status from the `substrate:status` bus channel; absent until one arrives. */
+	substrate?: SubstrateSegment;
 }
 
 export interface BarStore {
@@ -47,6 +60,7 @@ export interface BarStore {
 	skipped(reason: string, now: number): void;
 	failed(detail: string, now: number): void;
 	setMcp(mcp: NonNullable<BarState["mcp"]>): void;
+	setSubstrate(substrate: SubstrateSegment | undefined): void;
 	subscribe(listener: () => void): () => void;
 	/** True while the bar or graph panel needs frame-by-frame renders. */
 	animating(now: number): boolean;
@@ -93,6 +107,47 @@ function modelFromView(view: PlanView): GraphModel {
 	};
 }
 
+const SUBSTRATE_STATES = ["checking", "ok", "error", "access-denied"] as const;
+const SUBSTRATE_USAGES = ["IN_USE", "NOT_OBSERVED_IN_WINDOW", "UNKNOWN"] as const;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: bus text loses terminal control characters
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/g;
+
+function oneOf<T extends string>(values: readonly T[], value: unknown): value is T {
+	return typeof value === "string" && (values as readonly string[]).includes(value);
+}
+
+function isCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function parseCoverage(value: unknown): SubstrateSegment["coverage"] | undefined {
+	if (value === null) return null;
+	if (typeof value !== "object" || value === null) return undefined;
+	const { observed, known } = value as Record<string, unknown>;
+	if (!isCount(observed) || !isCount(known) || observed > known) return undefined;
+	return { observed, known };
+}
+
+/**
+ * The `substrate:status` payload as the bar state holds it, or undefined for anything else. Only the fields the bar
+ * shows are kept; `omp` is never read.
+ */
+export function parseSubstrateStatus(data: unknown): SubstrateSegment | undefined {
+	try {
+		if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+		const { v, state, usage, coverage, planesDown, updatedAt, reason } = data as Record<string, unknown>;
+		if (v !== 1 || !oneOf(SUBSTRATE_STATES, state) || !oneOf(SUBSTRATE_USAGES, usage)) return undefined;
+		const counts = parseCoverage(coverage);
+		const planes = planesDown === null ? null : isCount(planesDown) ? planesDown : undefined;
+		if (counts === undefined || planes === undefined || typeof updatedAt !== "string") return undefined;
+		const why = reason === null ? null : typeof reason === "string" ? Array.from(reason.replace(CONTROL_CHARS, "")).slice(0, 40).join("") : undefined;
+		if (why === undefined) return undefined;
+		return { state, usage, coverage: counts, planesDown: planes, updatedAt: Array.from(updatedAt.replace(CONTROL_CHARS, "")).slice(0, 8).join(""), reason: why };
+	} catch {
+		return undefined;
+	}
+}
+
 export function createBarStore(): BarStore {
 	let state: BarState = { phase: "idle", stages: {} };
 	const listeners = new Set<() => void>();
@@ -111,7 +166,7 @@ export function createBarStore(): BarStore {
 	return {
 		get: () => state,
 		begin(now) {
-			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last });
+			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate });
 		},
 		apply(event) {
 			switch (event.type) {
@@ -226,6 +281,9 @@ export function createBarStore(): BarStore {
 		setMcp(mcp) {
 			set({ ...state, mcp });
 		},
+		setSubstrate(substrate) {
+			set({ ...state, substrate });
+		},
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -249,6 +307,27 @@ function mcpSegment(p: Paint, mcp: BarState["mcp"]): string | undefined {
 	const mark = (value: Readiness) =>
 		value === "ready" ? p.fg("success", p.glyph("success")) : value === "login" ? p.fg("warning", p.glyph("warning")) : p.fg("dim", p.glyph("pending"));
 	return `linear ${mark(mcp.linear)} notion ${mark(mcp.notion)} greptile ${mark(mcp.greptile)}`;
+}
+
+/** The substrate segment: every state names itself in text; color only adds emphasis. */
+function substrateSegment(p: Paint, substrate: SubstrateSegment): string {
+	if (substrate.state === "checking") return p.fg("dim", "substrate: checking");
+	if (substrate.state === "access-denied") return p.fg("error", "substrate ACCESS_DENIED");
+	if (substrate.state === "error") {
+		const failed = p.fg("error", `substrate ERROR${substrate.reason ? ` (${substrate.reason})` : ""}`);
+		return substrate.updatedAt ? `${failed} · ${p.fg("dim", `last good ${substrate.updatedAt}`)}` : failed;
+	}
+	const color = substrate.usage === "IN_USE" ? "success" : substrate.usage === "NOT_OBSERVED_IN_WINDOW" ? "warning" : "dim";
+	const details: string[] = [];
+	if (substrate.coverage) details.push(`${substrate.coverage.observed}/${substrate.coverage.known} observed`);
+	if (substrate.planesDown === 0) details.push("planes ok");
+	else if (substrate.planesDown !== null) details.push(`${substrate.planesDown} planes down`);
+	return [p.fg(color, `substrate ${substrate.usage}`), ...details.map((detail) => p.fg("dim", detail))].join(" · ");
+}
+
+/** The substrate segment list: empty until a status has been published, so the bar is unchanged until then. */
+function substrateSegments(state: BarState, p: Paint): string[] {
+	return state.substrate ? [substrateSegment(p, state.substrate)] : [];
 }
 
 function planningSegments(state: BarState, p: Paint, now: number): string[] {
@@ -284,6 +363,7 @@ function planningSegments(state: BarState, p: Paint, now: number): string[] {
 	// The model this planning runs on, once its own `begin` (or unresolved `end`) named it; the first segment dropped when narrow.
 	const model = state.resolution && modelText(state);
 	if (model) segments.push(p.fg("statusLineModel", model));
+	segments.push(...substrateSegments(state, p));
 	return segments;
 }
 
@@ -325,6 +405,7 @@ function segmentsFor(state: BarState, p: Paint, now: number): string[] {
 		case "skipped":
 			return [
 				p.fg("dim", "ultrathink"),
+				...substrateSegments(state, p),
 				p.fg("dim", `skipped · ${state.note ?? ""}`),
 				...(state.last ? lastPlanSegments(state.last, p) : []),
 				...readinessSegments(state, p),
@@ -332,12 +413,13 @@ function segmentsFor(state: BarState, p: Paint, now: number): string[] {
 		case "failed":
 			return [
 				`${p.fg("error", p.glyph("error"))} ${p.fg("error", "ultrathink")}`,
+				...substrateSegments(state, p),
 				p.fg("error", `failed · ${state.note ?? ""}`),
 				...readinessSegments(state, p),
 			];
 		default: {
 			const name = state.phase === "delivered" && state.last ? `${p.fg("success", p.glyph("success"))} ${p.bold("ultrathink")}` : p.bold("ultrathink");
-			return [name, ...(state.last ? lastPlanSegments(state.last, p) : [p.fg("dim", "idle")]), ...readinessSegments(state, p)];
+			return [name, ...substrateSegments(state, p), ...(state.last ? lastPlanSegments(state.last, p) : [p.fg("dim", "idle")]), ...readinessSegments(state, p)];
 		}
 	}
 }

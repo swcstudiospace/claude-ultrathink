@@ -49,7 +49,7 @@ import {
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
-import { type BarState, type BarStore, createBarComponent, createBarStore } from "./omp-ui.ts";
+import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus } from "./omp-ui.ts";
 import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
@@ -210,6 +210,8 @@ export interface ExtensionAPI {
 		},
 	): void;
 	registerMessageRenderer?: Parameters<typeof registerUltrathinkRenderers>[0]["registerMessageRenderer"];
+	/** Omp's shared event bus, absent on older hosts; handlers run synchronously inside `emit`. */
+	events?: { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
 }
 
 export interface OmpPlanRequest {
@@ -795,6 +797,10 @@ export function createOmpExtension(
 			if (generation === latestGeneration) guard(fn);
 		};
 		const store: BarStore = createBarStore();
+		try {
+			pi.events?.on("substrate:status", (data) => store.setSubstrate(parseSubstrateStatus(data)));
+			pi.events?.emit("substrate:status-request", {});
+		} catch {}
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;
 		let timerStarted = false;
