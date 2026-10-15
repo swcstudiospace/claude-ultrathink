@@ -887,6 +887,7 @@ export function createOmpExtension(
 		/** Observe the active session before a paused planner can resume into tracking or persistence. */
 		const observeFlights = (ctx: ExtensionContext): void => {
 			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			guard(() => store.setLiveSession(sessionId));
 			const cwd = ctx?.cwd || process.cwd();
 			// A prompt observed in another session/cwd orphans the dashboard: drop it silently here
 			// (the switch handler explains); planner-flight handling below is unchanged.
@@ -1237,6 +1238,8 @@ export function createOmpExtension(
 			shutDown = false;
 			attach(ctx);
 			scheduleMount();
+			// The host already named this session. An invalid id is ignored; a throw must not block startup.
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_switch", (_event, ctx) => {
 			// The old session's flights would deliver into the new one: cancel and suppress them.
@@ -1246,6 +1249,7 @@ export function createOmpExtension(
 			shutDown = false;
 			attach(ctx);
 			scheduleMount();
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_shutdown", () => {
 			shutDown = true;
@@ -1504,6 +1508,7 @@ export function createOmpExtension(
 			// Registered before the planner runs, so a progress callback that fires at once already finds its flight.
 			flights.set(request.sessionId, flight);
 			if (previous) cancel(previous, SUPERSEDED);
+			guard(() => store.setLiveSession(request.sessionId));
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
 				guard(() => {
@@ -1614,6 +1619,7 @@ export function createOmpExtension(
 				const prompt = event?.prompt ?? "";
 				const cwd = ctx?.cwd || process.cwd();
 				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				guard(() => store.setLiveSession(sessionId));
 				const submission = turns.get(sessionId) ?? 0;
 				if (quick) {
 					if (quick.sessionId === sessionId && quick.text === prompt.trim() && (quick.submission ?? submission) === submission) {

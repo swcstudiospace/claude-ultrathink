@@ -51,6 +51,8 @@ export interface BarState {
 	substrate?: SubstrateSegment;
 	/** Measured token savings from `token-opt:savings`; absent until a valid snapshot arrives. */
 	savings?: TokenSavingsSnapshot;
+	/** Host session this bar is painting. When set, another session's savings are not shown. */
+	liveSessionId?: string;
 }
 
 export interface BarStore {
@@ -64,6 +66,7 @@ export interface BarStore {
 	setMcp(mcp: NonNullable<BarState["mcp"]>): void;
 	setSubstrate(substrate: SubstrateSegment | undefined): void;
 	setSavings(snapshot: TokenSavingsSnapshot | undefined): void;
+	setLiveSession(id: string | undefined): void;
 	subscribe(listener: () => void): () => void;
 	/** True while the bar or graph panel needs frame-by-frame renders. */
 	animating(now: number): boolean;
@@ -142,6 +145,10 @@ export interface TokenSavingsSnapshot {
 	lastPayloadChars?: number;
 	/** Time to first token on the last turn. Omitted until measured. */
 	ttftMs?: number;
+	/** Idle time since the last turn. Not included in savedTokens. Omitted until measured. */
+	lastIdleMs?: number;
+	/** Session cost in cents. Not included in savedTokens. Omitted until measured. */
+	costCents?: number;
 }
 
 function isSessionId(value: unknown): value is string {
@@ -180,7 +187,10 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		const rtkSavedTokens = optionalPerf(record, "rtkSavedTokens");
 		const lastPayloadChars = optionalPerf(record, "lastPayloadChars");
 		const ttftMs = optionalPerf(record, "ttftMs");
+		const lastIdleMs = optionalPerf(record, "lastIdleMs");
+		const costCents = optionalPerf(record, "costCents");
 		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null || rtkSavedTokens === null || lastPayloadChars === null || ttftMs === null) return undefined;
+		if (lastIdleMs === null || costCents === null) return undefined;
 		const parsed: TokenSavingsPoint[] = [];
 		for (const point of points) {
 			const next = parseSavingsPoint(point);
@@ -195,6 +205,8 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		if (rtkSavedTokens !== undefined) snapshot.rtkSavedTokens = rtkSavedTokens;
 		if (lastPayloadChars !== undefined) snapshot.lastPayloadChars = lastPayloadChars;
 		if (ttftMs !== undefined) snapshot.ttftMs = ttftMs;
+		if (lastIdleMs !== undefined) snapshot.lastIdleMs = lastIdleMs;
+		if (costCents !== undefined) snapshot.costCents = costCents;
 		return snapshot;
 	} catch {
 		return undefined;
@@ -267,7 +279,7 @@ export function createBarStore(): BarStore {
 	return {
 		get: () => state,
 		begin(now) {
-			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate, savings: state.savings });
+			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate, savings: state.savings, liveSessionId: state.liveSessionId });
 		},
 		apply(event) {
 			switch (event.type) {
@@ -390,6 +402,10 @@ export function createBarStore(): BarStore {
 			if (!savings) return;
 			set({ ...state, savings });
 		},
+		setLiveSession(id) {
+			if (!isSessionId(id) || state.liveSessionId === id) return;
+			set({ ...state, liveSessionId: id });
+		},
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -435,9 +451,17 @@ function substrateSegment(p: Paint, substrate: SubstrateSegment): string {
 function substrateSegments(state: BarState, p: Paint): string[] {
 	return state.substrate ? [substrateSegment(p, state.substrate)] : [];
 }
-/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. `before`/`now` follows the name, with cache, query, RTK delta and payload size on that segment, and never displaces planning's protected current stage. */
-function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true): string[] {
+/** Savings painted on this bar. A set live session id hides another session's snapshot so the rest of the bar is unchanged. */
+function shownSavings(state: BarState): TokenSavingsSnapshot | undefined {
 	const savings = state.savings;
+	if (!savings) return undefined;
+	if (state.liveSessionId !== undefined && savings.sessionId !== state.liveSessionId) return undefined;
+	return savings;
+}
+
+/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. `before`/`now` follows the name, with cache, query, RTK delta, payload size, idle time and cost on that segment, and never displaces planning's protected current stage. Another session's snapshot adds neither the chip nor that segment. */
+function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true): string[] {
+	const savings = shownSavings(state);
 	if (!savings || segments.length === 0) return segments;
 	const saved = `saved ${formatTokens(savings.savedTokens)}`;
 	const chipParts = [saved];
@@ -449,6 +473,8 @@ function withSavings(state: BarState, p: Paint, segments: string[], includeTurn:
 	if (savings.lastQueryMs !== undefined) detail += ` · query ${savings.lastQueryMs}ms`;
 	if (savings.rtkSavedTokens !== undefined) detail += ` · rtk +${formatTokens(savings.rtkSavedTokens)}`;
 	if (savings.lastPayloadChars !== undefined) detail += ` · payload ${savings.lastPayloadChars}c`;
+	if (savings.lastIdleMs !== undefined) detail += ` · idle ${savings.lastIdleMs}ms`;
+	if (savings.costCents !== undefined) detail += ` · cost ${savings.costCents}c`;
 	const compare = p.fg("dim", detail);
 	const rest = segments.slice(1);
 	if (state.phase === "planning" && rest.length > 0) return [named, rest[0] ?? "", compare, ...rest.slice(1)];
@@ -561,6 +587,7 @@ export function renderBarLine(state: BarState, theme: unknown, width: number, no
 	const base = segmentsFor(state, p, now);
 	let includeTurn = true;
 	let includeTtft = true;
+	const savings = shownSavings(state);
 	let segments = withSavings(state, p, base, includeTurn, includeTtft);
 	// planning keeps spinner+name and the current stage (first two); others keep the name
 	const minimum = state.phase === "planning" ? 2 : 1;
@@ -568,17 +595,17 @@ export function renderBarLine(state: BarState, theme: unknown, width: number, no
 		const band = p.band(parts);
 		return parts.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(parts.length);
 	};
-	// TTFT shares the name chip unless it pushes planning's protected pair over the width. RTK and payload stay on before/now, never the name, so they cannot displace the stage.
-	if (state.phase === "planning" && state.savings?.ttftMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+	// TTFT shares the name chip unless it pushes planning's protected pair over the width. RTK, payload, idle and cost stay on before/now, never the name, so they cannot displace the stage.
+	if (state.phase === "planning" && savings?.ttftMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		includeTtft = false;
 		segments = withSavings(state, p, base, includeTurn, includeTtft);
 	}
 	// Turn milliseconds share the saved chip unless they push planning's protected pair over the width.
-	if (state.phase === "planning" && state.savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+	if (state.phase === "planning" && savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		includeTurn = false;
 		segments = withSavings(state, p, base, includeTurn, includeTtft);
 	}
-	if (state.phase === "planning" && state.savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+	if (state.phase === "planning" && savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		segments = [dropLeadingToken(segments[0] ?? ""), ...segments.slice(1)];
 	}
 	for (;;) {

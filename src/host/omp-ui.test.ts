@@ -845,4 +845,111 @@ describe("token savings", () => {
 		expect(line).toContain("graph 3/5");
 		expect(line).toContain("saved");
 	});
+
+	test("a matching live session still shows saved", () => {
+		const store = createBarStore();
+		store.setLiveSession(snapshot.sessionId);
+		store.setSavings(snapshot);
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+	});
+
+	test("a mismatched live session hides saved and before", () => {
+		const bare = { phase: "idle" as const, stages: {} };
+		const mismatched: BarState = { ...bare, liveSessionId: "other-session", savings: snapshot };
+		const line = plain(renderBarLine(mismatched, fakeTheme(), 300, 0));
+		expect(line).not.toContain("saved");
+		expect(line).not.toContain("before");
+		expect(line).toBe(plain(renderBarLine(bare, fakeTheme(), 300, 0)));
+		const store = createBarStore();
+		store.setLiveSession("other-session");
+		store.setSavings(snapshot);
+		const wide = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(wide).not.toContain("saved");
+		expect(wide).not.toContain("before");
+	});
+
+	test("setLiveSession stores a safe id and ignores anything else", () => {
+		const store = createBarStore();
+		store.setLiveSession("sess-1");
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.begin(1);
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.setLiveSession(undefined);
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.setLiveSession("");
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.setLiveSession("a/b");
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.setLiveSession("x".repeat(129));
+		expect(store.get().liveSessionId).toBe("sess-1");
+		store.setLiveSession("x".repeat(128));
+		expect(store.get().liveSessionId).toBe("x".repeat(128));
+	});
+
+	test("a wide line shows idle milliseconds and cost cents", () => {
+		const store = createBarStore();
+		store.setLiveSession(snapshot.sessionId);
+		store.setSavings({ ...snapshot, lastIdleMs: 40, costCents: 3 });
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("idle 40ms");
+		expect(line).toContain("cost 3c");
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(store.get().savings?.savedTokens).toBe(snapshot.savedTokens);
+		const beforeAt = line.indexOf("before 1.2M");
+		expect(line.indexOf("idle 40ms")).toBeGreaterThan(beforeAt);
+		expect(line.indexOf("cost 3c")).toBeGreaterThan(line.indexOf("idle 40ms"));
+	});
+
+	test("lastIdleMs -1 rejects the snapshot", () => {
+		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		expect(parseTokenSavings({ ...minimal, lastIdleMs: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, costCents: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastIdleMs: 1.5 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, costCents: "3" })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastIdleMs: Number.MAX_SAFE_INTEGER + 1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, costCents: Number.MAX_SAFE_INTEGER + 1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastIdleMs: -1, costCents: 3 })).toBeUndefined();
+		const copied = parseTokenSavings({ ...minimal, lastIdleMs: 40, costCents: 3 });
+		expect(copied).toEqual({ ...minimal, lastIdleMs: 40, costCents: 3 });
+		expect(copied?.savedTokens).toBe(0);
+		expect(Object.hasOwn(copied ?? {}, "lastIdleMs")).toBe(true);
+		expect(parseTokenSavings({ ...minimal, lastIdleMs: 0, costCents: 0 })).toEqual({
+			...minimal,
+			lastIdleMs: 0,
+			costCents: 0,
+		});
+		const absent = parseTokenSavings(minimal);
+		expect(absent).toEqual(minimal);
+		expect(absent !== undefined && Object.hasOwn(absent, "lastIdleMs")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "costCents")).toBe(false);
+		const store = createBarStore();
+		store.setSavings(snapshot);
+		store.setSavings({ ...snapshot, lastIdleMs: -1 });
+		expect(store.get().savings).toEqual(snapshot);
+		store.setSavings({ ...snapshot, costCents: -1 });
+		expect(store.get().savings).toEqual(snapshot);
+	});
+
+	test("width 50 matching session still contains graph 3/5 and saved", () => {
+		const state: BarState = {
+			...planningState(),
+			liveSessionId: snapshot.sessionId,
+			savings: {
+				...snapshot,
+				baselineTokens: 20,
+				currentTokens: 8,
+				savedTokens: 12,
+				points: [],
+				lastIdleMs: 999_999,
+				costCents: 999_999,
+			},
+		};
+		const line = plain(renderBarLine(state, fakeTheme(), 50, 35_000));
+		expect(line).toContain("graph 3/5");
+		expect(line).toContain("saved");
+	});
 });
