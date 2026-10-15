@@ -9,7 +9,7 @@
  * each flight owns its own cancellation and outer time limit. A tool result that opens a PR for a planned session gets
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,7 +49,7 @@ import {
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
-import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus } from "./omp-ui.ts";
+import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
 import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
@@ -803,6 +803,21 @@ export function createOmpExtension(
 				if (substrate !== undefined) store.setSubstrate(substrate);
 			});
 			pi.events?.emit("substrate:status-request", {});
+		} catch {}
+		try {
+			const live = join(homedir(), ".omp", "agent", "token-opt", "live.json");
+			if (existsSync(live)) {
+				const savings = parseTokenSavings(JSON.parse(readFileSync(live, "utf8")));
+				if (savings !== undefined) store.setSavings(savings);
+			}
+		} catch {
+			// a missing or unreadable snapshot must not block planning
+		}
+		try {
+			pi.events?.on("token-opt:savings", (data) => {
+				const savings = parseTokenSavings(data);
+				if (savings !== undefined) store.setSavings(savings);
+			});
 		} catch {}
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;

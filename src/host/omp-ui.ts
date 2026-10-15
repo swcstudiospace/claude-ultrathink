@@ -49,6 +49,8 @@ export interface BarState {
 	resolution?: ModelResolution;
 	/** Substrate status from the `substrate:status` bus channel; absent until one arrives. */
 	substrate?: SubstrateSegment;
+	/** Measured token savings from `token-opt:savings`; absent until a valid snapshot arrives. */
+	savings?: TokenSavingsSnapshot;
 }
 
 export interface BarStore {
@@ -61,6 +63,7 @@ export interface BarStore {
 	failed(detail: string, now: number): void;
 	setMcp(mcp: NonNullable<BarState["mcp"]>): void;
 	setSubstrate(substrate: SubstrateSegment | undefined): void;
+	setSavings(snapshot: TokenSavingsSnapshot | undefined): void;
 	subscribe(listener: () => void): () => void;
 	/** True while the bar or graph panel needs frame-by-frame renders. */
 	animating(now: number): boolean;
@@ -108,6 +111,91 @@ function modelFromView(view: PlanView): GraphModel {
 }
 
 const SUBSTRATE_STATES = ["checking", "ok", "error", "access-denied"] as const;
+const SAVINGS_SOURCES = ["provider", "compress", "graph"] as const;
+
+export interface TokenSavingsPoint {
+	at: number;
+	source: "provider" | "compress" | "graph";
+	baseline: number;
+	current: number;
+	saved: number;
+}
+
+/** Measured session savings. `saved` is always `baseline - current`; never an estimate. */
+export interface TokenSavingsSnapshot {
+	v: 1;
+	sessionId: string;
+	updatedAt: number;
+	baselineTokens: number;
+	currentTokens: number;
+	savedTokens: number;
+	points: TokenSavingsPoint[];
+	/** Wall time of the last completed assistant turn. Omitted until measured. */
+	lastTurnMs?: number;
+	/** Session cache-hit percent, 0-100. Omitted until a provider turn exists. */
+	cacheHitPct?: number;
+	/** Last graphify spawn or cache-hit latency. Omitted until measured. */
+	lastQueryMs?: number;
+}
+
+function isSessionId(value: unknown): value is string {
+	return typeof value === "string" && value.length >= 1 && value.length <= 128 && !value.includes("/");
+}
+
+function parseSavingsPoint(value: unknown): TokenSavingsPoint | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const { at, source, baseline, current, saved } = value as Record<string, unknown>;
+	if (!isCount(at) || !oneOf(SAVINGS_SOURCES, source) || !isCount(baseline) || !isCount(current) || !isCount(saved)) return undefined;
+	if (saved !== baseline - current) return undefined;
+	return { at, source, baseline, current, saved };
+}
+
+/** Absent → undefined. Present but not a safe integer in `0..max` → null, which rejects the snapshot. */
+function optionalPerf(data: Record<string, unknown>, key: string, max = Number.MAX_SAFE_INTEGER): number | undefined | null {
+	if (!Object.hasOwn(data, key)) return undefined;
+	const value = data[key];
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > max) return null;
+	return value;
+}
+
+/** `token-opt:savings` v1, or undefined when any required check fails. A present optional perf field outside its range rejects the snapshot. */
+export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefined {
+	try {
+		if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+		const record = data as Record<string, unknown>;
+		const { v, sessionId, updatedAt, baselineTokens, currentTokens, savedTokens, points } = record;
+		if (v !== 1 || !isSessionId(sessionId) || !isCount(updatedAt)) return undefined;
+		if (!isCount(baselineTokens) || !isCount(currentTokens) || !isCount(savedTokens)) return undefined;
+		if (savedTokens !== baselineTokens - currentTokens) return undefined;
+		if (!Array.isArray(points) || points.length > 200) return undefined;
+		const lastTurnMs = optionalPerf(record, "lastTurnMs");
+		const cacheHitPct = optionalPerf(record, "cacheHitPct", 100);
+		const lastQueryMs = optionalPerf(record, "lastQueryMs");
+		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null) return undefined;
+		const parsed: TokenSavingsPoint[] = [];
+		for (const point of points) {
+			const next = parseSavingsPoint(point);
+			if (!next) return undefined;
+			parsed.push(next);
+		}
+		const snapshot: TokenSavingsSnapshot = { v: 1, sessionId, updatedAt, baselineTokens, currentTokens, savedTokens, points: parsed };
+		if (lastTurnMs !== undefined) snapshot.lastTurnMs = lastTurnMs;
+		if (cacheHitPct !== undefined) snapshot.cacheHitPct = cacheHitPct;
+		if (lastQueryMs !== undefined) snapshot.lastQueryMs = lastQueryMs;
+		return snapshot;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 999, 1.2k, 1.2M. Only for counts already checked as non-negative integers. */
+function formatTokens(n: number): string {
+	if (n < 1000) return String(n);
+	const scale = n >= 1_000_000 ? 1_000_000 : 1_000;
+	const suffix = n >= 1_000_000 ? "M" : "k";
+	const rounded = Math.round((n / scale) * 10) / 10;
+	return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}${suffix}`;
+}
 const SUBSTRATE_USAGES = ["IN_USE", "NOT_OBSERVED_IN_WINDOW", "UNKNOWN"] as const;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: bus text loses terminal control characters
 const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/g;
@@ -166,7 +254,7 @@ export function createBarStore(): BarStore {
 	return {
 		get: () => state,
 		begin(now) {
-			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate });
+			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate, savings: state.savings });
 		},
 		apply(event) {
 			switch (event.type) {
@@ -284,6 +372,11 @@ export function createBarStore(): BarStore {
 		setSubstrate(substrate) {
 			set({ ...state, substrate });
 		},
+		setSavings(snapshot) {
+			const savings = parseTokenSavings(snapshot);
+			if (!savings) return;
+			set({ ...state, savings });
+		},
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -328,6 +421,21 @@ function substrateSegment(p: Paint, substrate: SubstrateSegment): string {
 /** The substrate segment list: empty until a status has been published, so the bar is unchanged until then. */
 function substrateSegments(state: BarState, p: Paint): string[] {
 	return state.substrate ? [substrateSegment(p, state.substrate)] : [];
+}
+/** Saved stays in the name chip. Turn time shares that chip when requested. `before`/`now` follows the name, with cache and query on that segment, and never displaces planning's protected current stage. */
+function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean): string[] {
+	const savings = state.savings;
+	if (!savings || segments.length === 0) return segments;
+	const saved = `saved ${formatTokens(savings.savedTokens)}`;
+	const chip = includeTurn && savings.lastTurnMs !== undefined ? `${saved} · ${savings.lastTurnMs}ms` : saved;
+	const named = `${segments[0]} ${p.fg("success", chip)}`;
+	let detail = `before ${formatTokens(savings.baselineTokens)} · now ${formatTokens(savings.currentTokens)}`;
+	if (savings.cacheHitPct !== undefined) detail += ` · cache ${savings.cacheHitPct}%`;
+	if (savings.lastQueryMs !== undefined) detail += ` · query ${savings.lastQueryMs}ms`;
+	const compare = p.fg("dim", detail);
+	const rest = segments.slice(1);
+	if (state.phase === "planning" && rest.length > 0) return [named, rest[0] ?? "", compare, ...rest.slice(1)];
+	return [named, compare, ...rest];
 }
 
 function planningSegments(state: BarState, p: Paint, now: number): string[] {
@@ -424,17 +532,33 @@ function segmentsFor(state: BarState, p: Paint, now: number): string[] {
 	}
 }
 
+/** Drop a leading spinner token so a savings chip can share a narrow planning line with the stage. */
+function dropLeadingToken(segment: string): string {
+	const compact = segment.replace(/^(?:\x1b\[[0-9;]*m)*(?:<[A-Za-z]+>)?\S+(?:\x1b\[[0-9;]*m)*\s+/, "");
+	return compact.length > 0 && compact !== segment ? compact : segment;
+}
+
 export function renderBarLine(state: BarState, theme: unknown, width: number, now: number): string {
 	if (width <= 0) return "";
 	const p = paint(theme);
-	let segments = segmentsFor(state, p, now);
+	const base = segmentsFor(state, p, now);
+	let segments = withSavings(state, p, base, true);
 	// planning keeps spinner+name and the current stage (first two); others keep the name
 	const minimum = state.phase === "planning" ? 2 : 1;
+	const sizeOf = (parts: string[]) => {
+		const band = p.band(parts);
+		return parts.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(parts.length);
+	};
+	// Turn milliseconds share the saved chip unless they push planning's protected pair over the width.
+	if (state.phase === "planning" && state.savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		segments = withSavings(state, p, base, false);
+	}
+	if (state.phase === "planning" && state.savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		segments = [dropLeadingToken(segments[0] ?? ""), ...segments.slice(1)];
+	}
 	for (;;) {
-		const band = p.band(segments);
-		const size = segments.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(segments.length);
-		if (size <= width || segments.length <= minimum) {
-			return size <= width ? band.text : truncateToWidth(band.text, width);
+		if (sizeOf(segments) <= width || segments.length <= minimum) {
+			return sizeOf(segments) <= width ? p.band(segments).text : truncateToWidth(p.band(segments).text, width);
 		}
 		segments = segments.slice(0, -1);
 	}

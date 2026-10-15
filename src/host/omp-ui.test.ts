@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
 import { paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
-import { type BarState, createBarComponent, createBarStore, LINGER_MS, parseSubstrateStatus, renderBarLine, type SubstrateSegment } from "./omp-ui.ts";
+import { type BarState, createBarComponent, createBarStore, LINGER_MS, parseSubstrateStatus, parseTokenSavings, renderBarLine, type SubstrateSegment, type TokenSavingsSnapshot } from "./omp-ui.ts";
 import type { PlanView } from "./view.ts";
 import type { ProgressEvent } from "./progress.ts";
 
@@ -648,5 +648,121 @@ describe("substrate segment", () => {
 		store.setSubstrate(undefined);
 		expect(store.get().substrate).toBeUndefined();
 		expect(notified).toBe(3);
+	});
+});
+
+describe("token savings", () => {
+	const snapshot: TokenSavingsSnapshot = {
+		v: 1,
+		sessionId: "sess-1",
+		updatedAt: 1_700_000_000_000,
+		baselineTokens: 1_200_000,
+		currentTokens: 1_200,
+		savedTokens: 1_198_800,
+		points: [{ at: 1, source: "compress", baseline: 1_200_000, current: 1_200, saved: 1_198_800 }],
+	};
+
+	test("a wide line shows saved and before/now", () => {
+		const store = createBarStore();
+		store.setSavings(snapshot);
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+	});
+
+	test("a 50-column planning line keeps the current stage and saved", () => {
+		const state: BarState = { ...planningState(), savings: { ...snapshot, baselineTokens: 20, currentTokens: 8, savedTokens: 12, points: [] } };
+		const line = plain(renderBarLine(state, fakeTheme(), 50, 35_000));
+		expect(line).toContain("graph 3/5");
+		expect(line).toContain("saved 12");
+	});
+
+	test("a snapshot whose saved is not baseline minus current is ignored", () => {
+		const store = createBarStore();
+		store.setSavings(snapshot);
+		const before = renderBarLine(store.get(), fakeTheme(), 300, 0);
+		store.setSavings({ ...snapshot, savedTokens: snapshot.savedTokens - 1 });
+		expect(store.get().savings).toEqual(snapshot);
+		expect(renderBarLine(store.get(), fakeTheme(), 300, 0)).toBe(before);
+	});
+
+	test("parseTokenSavings rejects negatives and accepts a minimal valid object", () => {
+		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		expect(parseTokenSavings(minimal)).toEqual(minimal);
+		expect(parseTokenSavings({ ...minimal, savedTokens: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, baselineTokens: -1, savedTokens: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, currentTokens: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...snapshot, points: [{ at: -1, source: "graph", baseline: 1, current: 0, saved: 1 }] })).toBeUndefined();
+	});
+
+	test("idle, skipped, failed and delivered lines keep the saved chip", () => {
+		for (const key of ["idle", "skipped", "failed", "delivered"] as const) {
+			const line = plain(renderBarLine({ ...phaseStates()[key]!, savings: snapshot }, fakeTheme(), 300, 35_000));
+			expect(line).toContain("saved 1.2M");
+			expect(line).toContain("before 1.2M");
+			expect(line).toContain("now 1.2k");
+		}
+	});
+
+	test("a wide line shows turn milliseconds and cache percent", () => {
+		const store = createBarStore();
+		store.setSavings({ ...snapshot, lastTurnMs: 840, cacheHitPct: 72, lastQueryMs: 15 });
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("840ms");
+		expect(line).toContain("saved 1.2M · 840ms");
+		expect(line).toContain("cache 72%");
+		expect(line).toContain("query 15ms");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+	});
+
+	test("a narrow planning line keeps the stage and saved when turn time does not fit", () => {
+		const state: BarState = {
+			...planningState(),
+			savings: { ...snapshot, baselineTokens: 20, currentTokens: 8, savedTokens: 12, points: [], lastTurnMs: 840, cacheHitPct: 72, lastQueryMs: 15 },
+		};
+		const line = plain(renderBarLine(state, fakeTheme(), 50, 35_000));
+		expect(line).toContain("graph 3/5");
+		expect(line).toContain("saved 12");
+		expect(line).not.toContain("840ms");
+	});
+
+	test("parseTokenSavings rejects lastTurnMs below zero and copies valid perf fields", () => {
+		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		expect(parseTokenSavings({ ...minimal, lastTurnMs: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastTurnMs: 840, cacheHitPct: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, cacheHitPct: 101 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastQueryMs: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastTurnMs: 1.5 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, cacheHitPct: "72" })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastQueryMs: Number.MAX_SAFE_INTEGER + 1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastTurnMs: 840, cacheHitPct: 72, lastQueryMs: 15 })).toEqual({
+			...minimal,
+			lastTurnMs: 840,
+			cacheHitPct: 72,
+			lastQueryMs: 15,
+		});
+		expect(parseTokenSavings({ ...minimal, lastTurnMs: 0, cacheHitPct: 100, lastQueryMs: 0 })).toEqual({
+			...minimal,
+			lastTurnMs: 0,
+			cacheHitPct: 100,
+			lastQueryMs: 0,
+		});
+		expect(parseTokenSavings({ ...minimal, cacheHitPct: 72 })).toEqual({ ...minimal, cacheHitPct: 72 });
+	});
+
+	test("a snapshot without perf fields still renders saved and before/now", () => {
+		const parsed = parseTokenSavings(snapshot);
+		expect(parsed).toEqual(snapshot);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "lastTurnMs")).toBe(false);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "cacheHitPct")).toBe(false);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "lastQueryMs")).toBe(false);
+		const line = plain(renderBarLine({ phase: "idle", stages: {}, savings: parsed }, fakeTheme(), 300, 0));
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+		expect(line).not.toContain("cache ");
+		expect(line).not.toContain("ms");
 	});
 });
