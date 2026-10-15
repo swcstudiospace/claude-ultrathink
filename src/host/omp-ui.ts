@@ -136,6 +136,12 @@ export interface TokenSavingsSnapshot {
 	cacheHitPct?: number;
 	/** Last graphify spawn or cache-hit latency. Omitted until measured. */
 	lastQueryMs?: number;
+	/** RTK session delta since start. Not included in savedTokens. Omitted until measured. */
+	rtkSavedTokens?: number;
+	/** Last provider request payload size in characters. Omitted until measured. */
+	lastPayloadChars?: number;
+	/** Time to first token on the last turn. Omitted until measured. */
+	ttftMs?: number;
 }
 
 function isSessionId(value: unknown): value is string {
@@ -171,7 +177,10 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		const lastTurnMs = optionalPerf(record, "lastTurnMs");
 		const cacheHitPct = optionalPerf(record, "cacheHitPct", 100);
 		const lastQueryMs = optionalPerf(record, "lastQueryMs");
-		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null) return undefined;
+		const rtkSavedTokens = optionalPerf(record, "rtkSavedTokens");
+		const lastPayloadChars = optionalPerf(record, "lastPayloadChars");
+		const ttftMs = optionalPerf(record, "ttftMs");
+		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null || rtkSavedTokens === null || lastPayloadChars === null || ttftMs === null) return undefined;
 		const parsed: TokenSavingsPoint[] = [];
 		for (const point of points) {
 			const next = parseSavingsPoint(point);
@@ -182,6 +191,10 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		if (lastTurnMs !== undefined) snapshot.lastTurnMs = lastTurnMs;
 		if (cacheHitPct !== undefined) snapshot.cacheHitPct = cacheHitPct;
 		if (lastQueryMs !== undefined) snapshot.lastQueryMs = lastQueryMs;
+		// Separate measured counts. Never folded into savedTokens.
+		if (rtkSavedTokens !== undefined) snapshot.rtkSavedTokens = rtkSavedTokens;
+		if (lastPayloadChars !== undefined) snapshot.lastPayloadChars = lastPayloadChars;
+		if (ttftMs !== undefined) snapshot.ttftMs = ttftMs;
 		return snapshot;
 	} catch {
 		return undefined;
@@ -422,16 +435,20 @@ function substrateSegment(p: Paint, substrate: SubstrateSegment): string {
 function substrateSegments(state: BarState, p: Paint): string[] {
 	return state.substrate ? [substrateSegment(p, state.substrate)] : [];
 }
-/** Saved stays in the name chip. Turn time shares that chip when requested. `before`/`now` follows the name, with cache and query on that segment, and never displaces planning's protected current stage. */
-function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean): string[] {
+/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. `before`/`now` follows the name, with cache, query, RTK delta and payload size on that segment, and never displaces planning's protected current stage. */
+function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true): string[] {
 	const savings = state.savings;
 	if (!savings || segments.length === 0) return segments;
 	const saved = `saved ${formatTokens(savings.savedTokens)}`;
-	const chip = includeTurn && savings.lastTurnMs !== undefined ? `${saved} · ${savings.lastTurnMs}ms` : saved;
-	const named = `${segments[0]} ${p.fg("success", chip)}`;
+	const chipParts = [saved];
+	if (includeTurn && savings.lastTurnMs !== undefined) chipParts.push(`${savings.lastTurnMs}ms`);
+	if (includeTtft && savings.ttftMs !== undefined) chipParts.push(`ttft ${savings.ttftMs}ms`);
+	const named = `${segments[0]} ${p.fg("success", chipParts.join(" · "))}`;
 	let detail = `before ${formatTokens(savings.baselineTokens)} · now ${formatTokens(savings.currentTokens)}`;
 	if (savings.cacheHitPct !== undefined) detail += ` · cache ${savings.cacheHitPct}%`;
 	if (savings.lastQueryMs !== undefined) detail += ` · query ${savings.lastQueryMs}ms`;
+	if (savings.rtkSavedTokens !== undefined) detail += ` · rtk +${formatTokens(savings.rtkSavedTokens)}`;
+	if (savings.lastPayloadChars !== undefined) detail += ` · payload ${savings.lastPayloadChars}c`;
 	const compare = p.fg("dim", detail);
 	const rest = segments.slice(1);
 	if (state.phase === "planning" && rest.length > 0) return [named, rest[0] ?? "", compare, ...rest.slice(1)];
@@ -542,16 +559,24 @@ export function renderBarLine(state: BarState, theme: unknown, width: number, no
 	if (width <= 0) return "";
 	const p = paint(theme);
 	const base = segmentsFor(state, p, now);
-	let segments = withSavings(state, p, base, true);
+	let includeTurn = true;
+	let includeTtft = true;
+	let segments = withSavings(state, p, base, includeTurn, includeTtft);
 	// planning keeps spinner+name and the current stage (first two); others keep the name
 	const minimum = state.phase === "planning" ? 2 : 1;
 	const sizeOf = (parts: string[]) => {
 		const band = p.band(parts);
 		return parts.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(parts.length);
 	};
+	// TTFT shares the name chip unless it pushes planning's protected pair over the width. RTK and payload stay on before/now, never the name, so they cannot displace the stage.
+	if (state.phase === "planning" && state.savings?.ttftMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		includeTtft = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft);
+	}
 	// Turn milliseconds share the saved chip unless they push planning's protected pair over the width.
 	if (state.phase === "planning" && state.savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
-		segments = withSavings(state, p, base, false);
+		includeTurn = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft);
 	}
 	if (state.phase === "planning" && state.savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		segments = [dropLeadingToken(segments[0] ?? ""), ...segments.slice(1)];

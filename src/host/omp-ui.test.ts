@@ -765,4 +765,84 @@ describe("token savings", () => {
 		expect(line).not.toContain("cache ");
 		expect(line).not.toContain("ms");
 	});
+
+	test("rtkSavedTokens 10 renders rtk +10 at width 300", () => {
+		const store = createBarStore();
+		store.setSavings({ ...snapshot, rtkSavedTokens: 10, lastPayloadChars: 4096, ttftMs: 120 });
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("rtk +10");
+		expect(line).toContain("payload 4096c");
+		expect(line).toContain("ttft 120ms");
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+		expect(store.get().savings?.savedTokens).toBe(snapshot.savedTokens);
+		const savedAt = line.indexOf("saved 1.2M");
+		const ttftAt = line.indexOf("ttft 120ms");
+		const beforeAt = line.indexOf("before 1.2M");
+		const rtkAt = line.indexOf("rtk +10");
+		const payloadAt = line.indexOf("payload 4096c");
+		expect(ttftAt).toBeGreaterThan(savedAt);
+		expect(beforeAt).toBeGreaterThan(ttftAt);
+		expect(rtkAt).toBeGreaterThan(beforeAt);
+		expect(payloadAt).toBeGreaterThan(rtkAt);
+	});
+
+	test("ttftMs -1 rejects the snapshot", () => {
+		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		expect(parseTokenSavings({ ...minimal, ttftMs: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, rtkSavedTokens: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastPayloadChars: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, ttftMs: 1.5 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, rtkSavedTokens: "10" })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, lastPayloadChars: Number.MAX_SAFE_INTEGER + 1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, ttftMs: -1, rtkSavedTokens: 10, lastPayloadChars: 4 })).toBeUndefined();
+		const copied = parseTokenSavings({ ...minimal, rtkSavedTokens: 10, lastPayloadChars: 4096, ttftMs: 120 });
+		expect(copied).toEqual({ ...minimal, rtkSavedTokens: 10, lastPayloadChars: 4096, ttftMs: 120 });
+		expect(copied?.savedTokens).toBe(0);
+		expect(parseTokenSavings({ ...minimal, rtkSavedTokens: 0, lastPayloadChars: 0, ttftMs: 0 })).toEqual({
+			...minimal,
+			rtkSavedTokens: 0,
+			lastPayloadChars: 0,
+			ttftMs: 0,
+		});
+		const store = createBarStore();
+		store.setSavings(snapshot);
+		store.setSavings({ ...snapshot, ttftMs: -1 });
+		expect(store.get().savings).toEqual(snapshot);
+	});
+
+	test("a snapshot without the new fields still renders saved and before/now", () => {
+		const parsed = parseTokenSavings(snapshot);
+		expect(parsed).toEqual(snapshot);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "rtkSavedTokens")).toBe(false);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "lastPayloadChars")).toBe(false);
+		expect(parsed !== undefined && Object.hasOwn(parsed, "ttftMs")).toBe(false);
+		const line = plain(renderBarLine({ phase: "idle", stages: {}, savings: parsed }, fakeTheme(), 300, 0));
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(line).toContain("now 1.2k");
+		expect(line).not.toContain("rtk ");
+		expect(line).not.toContain("payload ");
+		expect(line).not.toContain("ttft ");
+	});
+
+	test("width 50 planning with the new fields keeps graph and saved", () => {
+		const state: BarState = {
+			...planningState(),
+			savings: {
+				...snapshot,
+				baselineTokens: 20,
+				currentTokens: 8,
+				savedTokens: 12,
+				points: [],
+				rtkSavedTokens: 10,
+				lastPayloadChars: 4096,
+				ttftMs: 123456789,
+			},
+		};
+		const line = plain(renderBarLine(state, fakeTheme(), 50, 35_000));
+		expect(line).toContain("graph 3/5");
+		expect(line).toContain("saved");
+	});
 });
