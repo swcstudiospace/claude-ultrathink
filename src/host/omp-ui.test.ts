@@ -952,4 +952,162 @@ describe("token savings", () => {
 		expect(line).toContain("graph 3/5");
 		expect(line).toContain("saved");
 	});
+
+	test("providerInput 9 renders bill 9 at width 300 and is not added into the saved figure", () => {
+		const store = createBarStore();
+		store.setLiveSession(snapshot.sessionId);
+		store.setSavings({
+			...snapshot,
+			providerInput: 9,
+			providerOutput: 4,
+			providerCacheRead: 50,
+			providerCacheWrite: 2,
+			prefixChanged: 1,
+			toolsChanged: 1,
+			graphReady: 1,
+		});
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("bill 9");
+		expect(line).toContain("out 4");
+		expect(line).toContain("prefix moved");
+		expect(line).toContain("tools moved");
+		expect(line).toContain("graph ready");
+		expect(line).toContain("saved 1.2M");
+		expect(line).toContain("before 1.2M");
+		expect(store.get().savings?.savedTokens).toBe(snapshot.savedTokens);
+		expect(store.get().savings?.savedTokens).toBe(snapshot.baselineTokens - snapshot.currentTokens);
+		expect(store.get().savings?.providerCacheRead).toBe(50);
+		const savedAt = line.indexOf("saved 1.2M");
+		const beforeAt = line.indexOf("before 1.2M");
+		expect(line.indexOf("bill 9")).toBeGreaterThan(beforeAt);
+		expect(line.indexOf("out 4")).toBeGreaterThan(line.indexOf("bill 9"));
+		expect(line.slice(savedAt, beforeAt)).not.toContain("bill");
+		expect(line.slice(savedAt, beforeAt)).not.toContain("50");
+		expect(line.indexOf("prefix moved")).toBeLessThan(beforeAt);
+		expect(line.indexOf("graph ready")).toBeGreaterThan(line.indexOf("tools moved"));
+	});
+
+	test("prefixChanged 2 rejects the snapshot", () => {
+		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		expect(parseTokenSavings({ ...minimal, prefixChanged: 2 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, toolsChanged: 2 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, graphReady: 2 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, prefixChanged: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, toolsChanged: 1.5 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, graphReady: "1" })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerInput: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerOutput: 1.5 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerCacheRead: -1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerCacheWrite: "2" })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerInput: Number.MAX_SAFE_INTEGER + 1 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerInput: 9, prefixChanged: 2 })).toBeUndefined();
+		expect(parseTokenSavings({ ...minimal, providerCacheRead: -1, prefixChanged: 1 })).toBeUndefined();
+		const copied = parseTokenSavings({
+			...minimal,
+			providerInput: 9,
+			providerOutput: 4,
+			providerCacheRead: 50,
+			providerCacheWrite: 2,
+			prefixChanged: 1,
+			toolsChanged: 0,
+			graphReady: 1,
+		});
+		expect(copied).toEqual({
+			...minimal,
+			providerInput: 9,
+			providerOutput: 4,
+			providerCacheRead: 50,
+			providerCacheWrite: 2,
+			prefixChanged: 1,
+			toolsChanged: 0,
+			graphReady: 1,
+		});
+		expect(copied?.savedTokens).toBe(0);
+		expect(parseTokenSavings({ ...minimal, providerInput: 0, providerOutput: 0, providerCacheRead: 0, providerCacheWrite: 0, prefixChanged: 0, toolsChanged: 0, graphReady: 0 })).toEqual({
+			...minimal,
+			providerInput: 0,
+			providerOutput: 0,
+			providerCacheRead: 0,
+			providerCacheWrite: 0,
+			prefixChanged: 0,
+			toolsChanged: 0,
+			graphReady: 0,
+		});
+		const absent = parseTokenSavings(minimal);
+		expect(absent).toEqual(minimal);
+		expect(absent !== undefined && Object.hasOwn(absent, "providerInput")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "providerOutput")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "providerCacheRead")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "providerCacheWrite")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "prefixChanged")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "toolsChanged")).toBe(false);
+		expect(absent !== undefined && Object.hasOwn(absent, "graphReady")).toBe(false);
+		const store = createBarStore();
+		store.setSavings(snapshot);
+		store.setSavings({ ...snapshot, prefixChanged: 2 });
+		expect(store.get().savings).toEqual(snapshot);
+		store.setSavings({ ...snapshot, providerInput: -1 });
+		expect(store.get().savings).toEqual(snapshot);
+		store.setSavings({ ...snapshot, providerCacheRead: -1 });
+		expect(store.get().savings).toEqual(snapshot);
+	});
+
+	test("flag 0 and absent stability fields omit the chips", () => {
+		const store = createBarStore();
+		store.setLiveSession(snapshot.sessionId);
+		store.setSavings({ ...snapshot, prefixChanged: 0, toolsChanged: 0, graphReady: 0, providerInput: 0, providerOutput: 0 });
+		const line = plain(renderBarLine(store.get(), fakeTheme(), 300, 0));
+		expect(line).toContain("bill 0");
+		expect(line).toContain("out 0");
+		expect(line).not.toContain("prefix moved");
+		expect(line).not.toContain("tools moved");
+		expect(line).not.toContain("graph ready");
+		expect(line).not.toContain("prefix stable");
+		expect(line).not.toContain("tools stable");
+		expect(store.get().savings?.savedTokens).toBe(snapshot.savedTokens);
+		const bare = plain(renderBarLine({ phase: "idle", stages: {}, liveSessionId: snapshot.sessionId, savings: snapshot }, fakeTheme(), 300, 0));
+		expect(bare).not.toContain("bill ");
+		expect(bare).not.toContain("prefix moved");
+		expect(bare).toContain("saved 1.2M");
+	});
+
+	test("a mismatched live session hides bill and stability chips", () => {
+		const state: BarState = {
+			phase: "idle",
+			stages: {},
+			liveSessionId: "other-session",
+			savings: { ...snapshot, providerInput: 9, providerOutput: 4, prefixChanged: 1, toolsChanged: 1, graphReady: 1 },
+		};
+		const line = plain(renderBarLine(state, fakeTheme(), 300, 0));
+		expect(line).not.toContain("bill");
+		expect(line).not.toContain("out ");
+		expect(line).not.toContain("prefix moved");
+		expect(line).not.toContain("tools moved");
+		expect(line).not.toContain("graph ready");
+		expect(line).not.toContain("saved");
+	});
+
+	test("width 50 planning with every new field set still contains graph 3/5 and saved", () => {
+		const state: BarState = {
+			...planningState(),
+			liveSessionId: snapshot.sessionId,
+			savings: {
+				...snapshot,
+				baselineTokens: 20,
+				currentTokens: 8,
+				savedTokens: 12,
+				points: [],
+				providerInput: 9_999_999,
+				providerOutput: 9_999_999,
+				providerCacheRead: 9_999_999,
+				providerCacheWrite: 9_999_999,
+				prefixChanged: 1,
+				toolsChanged: 1,
+				graphReady: 1,
+			},
+		};
+		const line = plain(renderBarLine(state, fakeTheme(), 50, 35_000));
+		expect(line).toContain("graph 3/5");
+		expect(line).toContain("saved");
+	});
 });

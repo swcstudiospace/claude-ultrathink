@@ -149,6 +149,20 @@ export interface TokenSavingsSnapshot {
 	lastIdleMs?: number;
 	/** Session cost in cents. Not included in savedTokens. Omitted until measured. */
 	costCents?: number;
+	/** Provider billed input tokens. Not included in savedTokens. Omitted until measured. */
+	providerInput?: number;
+	/** Provider billed output tokens. Not included in savedTokens. Omitted until measured. */
+	providerOutput?: number;
+	/** Provider cache-read tokens. Not included in savedTokens; the hit rate stays on cacheHitPct. Omitted until measured. */
+	providerCacheRead?: number;
+	/** Provider cache-write tokens. Not included in savedTokens. Omitted until measured. */
+	providerCacheWrite?: number;
+	/** 1 when the prompt prefix moved. Not included in savedTokens. Omitted until measured. */
+	prefixChanged?: 0 | 1;
+	/** 1 when the tool set moved. Not included in savedTokens. Omitted until measured. */
+	toolsChanged?: 0 | 1;
+	/** 1 when the graph is ready. Not included in savedTokens. Omitted until measured. */
+	graphReady?: 0 | 1;
 }
 
 function isSessionId(value: unknown): value is string {
@@ -189,8 +203,17 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		const ttftMs = optionalPerf(record, "ttftMs");
 		const lastIdleMs = optionalPerf(record, "lastIdleMs");
 		const costCents = optionalPerf(record, "costCents");
+		const providerInput = optionalPerf(record, "providerInput");
+		const providerOutput = optionalPerf(record, "providerOutput");
+		const providerCacheRead = optionalPerf(record, "providerCacheRead");
+		const providerCacheWrite = optionalPerf(record, "providerCacheWrite");
+		const prefixChanged = optionalPerf(record, "prefixChanged", 1);
+		const toolsChanged = optionalPerf(record, "toolsChanged", 1);
+		const graphReady = optionalPerf(record, "graphReady", 1);
 		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null || rtkSavedTokens === null || lastPayloadChars === null || ttftMs === null) return undefined;
 		if (lastIdleMs === null || costCents === null) return undefined;
+		if (providerInput === null || providerOutput === null || providerCacheRead === null || providerCacheWrite === null) return undefined;
+		if (prefixChanged === null || toolsChanged === null || graphReady === null) return undefined;
 		const parsed: TokenSavingsPoint[] = [];
 		for (const point of points) {
 			const next = parseSavingsPoint(point);
@@ -207,6 +230,14 @@ export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefin
 		if (ttftMs !== undefined) snapshot.ttftMs = ttftMs;
 		if (lastIdleMs !== undefined) snapshot.lastIdleMs = lastIdleMs;
 		if (costCents !== undefined) snapshot.costCents = costCents;
+		// Bill totals and cache-stability flags. Never folded into savedTokens.
+		if (providerInput !== undefined) snapshot.providerInput = providerInput;
+		if (providerOutput !== undefined) snapshot.providerOutput = providerOutput;
+		if (providerCacheRead !== undefined) snapshot.providerCacheRead = providerCacheRead;
+		if (providerCacheWrite !== undefined) snapshot.providerCacheWrite = providerCacheWrite;
+		if (prefixChanged === 0 || prefixChanged === 1) snapshot.prefixChanged = prefixChanged;
+		if (toolsChanged === 0 || toolsChanged === 1) snapshot.toolsChanged = toolsChanged;
+		if (graphReady === 0 || graphReady === 1) snapshot.graphReady = graphReady;
 		return snapshot;
 	} catch {
 		return undefined;
@@ -459,14 +490,17 @@ function shownSavings(state: BarState): TokenSavingsSnapshot | undefined {
 	return savings;
 }
 
-/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. `before`/`now` follows the name, with cache, query, RTK delta, payload size, idle time and cost on that segment, and never displaces planning's protected current stage. Another session's snapshot adds neither the chip nor that segment. */
-function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true): string[] {
+/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. Prefix, tools and graph-ready share it only when the flag is 1. `before`/`now` follows the name, with cache, query, RTK delta, payload size, idle time, cost, bill and output on that segment. Those extras drop before planning's protected stage or saved. Provider cache tokens are never folded into savedTokens. Another session's snapshot adds neither the chip nor that segment. */
+function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true, includeStability = true): string[] {
 	const savings = shownSavings(state);
 	if (!savings || segments.length === 0) return segments;
 	const saved = `saved ${formatTokens(savings.savedTokens)}`;
 	const chipParts = [saved];
 	if (includeTurn && savings.lastTurnMs !== undefined) chipParts.push(`${savings.lastTurnMs}ms`);
 	if (includeTtft && savings.ttftMs !== undefined) chipParts.push(`ttft ${savings.ttftMs}ms`);
+	if (includeStability && savings.prefixChanged === 1) chipParts.push("prefix moved");
+	if (includeStability && savings.toolsChanged === 1) chipParts.push("tools moved");
+	if (includeStability && savings.graphReady === 1) chipParts.push("graph ready");
 	const named = `${segments[0]} ${p.fg("success", chipParts.join(" · "))}`;
 	let detail = `before ${formatTokens(savings.baselineTokens)} · now ${formatTokens(savings.currentTokens)}`;
 	if (savings.cacheHitPct !== undefined) detail += ` · cache ${savings.cacheHitPct}%`;
@@ -475,6 +509,8 @@ function withSavings(state: BarState, p: Paint, segments: string[], includeTurn:
 	if (savings.lastPayloadChars !== undefined) detail += ` · payload ${savings.lastPayloadChars}c`;
 	if (savings.lastIdleMs !== undefined) detail += ` · idle ${savings.lastIdleMs}ms`;
 	if (savings.costCents !== undefined) detail += ` · cost ${savings.costCents}c`;
+	if (includeStability && savings.providerInput !== undefined) detail += ` · bill ${formatTokens(savings.providerInput)}`;
+	if (includeStability && savings.providerOutput !== undefined) detail += ` · out ${formatTokens(savings.providerOutput)}`;
 	const compare = p.fg("dim", detail);
 	const rest = segments.slice(1);
 	if (state.phase === "planning" && rest.length > 0) return [named, rest[0] ?? "", compare, ...rest.slice(1)];
@@ -587,23 +623,29 @@ export function renderBarLine(state: BarState, theme: unknown, width: number, no
 	const base = segmentsFor(state, p, now);
 	let includeTurn = true;
 	let includeTtft = true;
+	let includeStability = true;
 	const savings = shownSavings(state);
-	let segments = withSavings(state, p, base, includeTurn, includeTtft);
+	let segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
 	// planning keeps spinner+name and the current stage (first two); others keep the name
 	const minimum = state.phase === "planning" ? 2 : 1;
 	const sizeOf = (parts: string[]) => {
 		const band = p.band(parts);
 		return parts.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(parts.length);
 	};
+	// Prefix, tools, graph-ready, bill and out drop before the stage or saved when they would overflow the protected span.
+	if (includeStability && segments.length >= minimum && sizeOf(segments.slice(0, minimum)) > width) {
+		includeStability = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
+	}
 	// TTFT shares the name chip unless it pushes planning's protected pair over the width. RTK, payload, idle and cost stay on before/now, never the name, so they cannot displace the stage.
 	if (state.phase === "planning" && savings?.ttftMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		includeTtft = false;
-		segments = withSavings(state, p, base, includeTurn, includeTtft);
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
 	}
 	// Turn milliseconds share the saved chip unless they push planning's protected pair over the width.
 	if (state.phase === "planning" && savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		includeTurn = false;
-		segments = withSavings(state, p, base, includeTurn, includeTtft);
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
 	}
 	if (state.phase === "planning" && savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
 		segments = [dropLeadingToken(segments[0] ?? ""), ...segments.slice(1)];
