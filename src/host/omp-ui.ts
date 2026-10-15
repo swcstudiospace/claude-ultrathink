@@ -239,6 +239,8 @@ export function createBarStore(): BarStore {
 				case "issue":
 					if (state.model) set({ ...state, model: attachIssue(state.model, event) });
 					return;
+				case "activity":
+					return;
 				case "end": {
 					// An unresolved end carries its safe reason although no begin or inference happened.
 					const resolution = projectResolution(event.modelResolution);
