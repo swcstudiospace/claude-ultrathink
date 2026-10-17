@@ -1,0 +1,26 @@
+# DRAFT, NOT INSTALLED. Reference copy only; do not copy into /etc/systemd/system yet.
+# Rollback: systemctl disable --now ultrathink-web
+
+[Unit]
+Description=Ultrathink authenticated web surface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/src/repos/claude-ultrathink
+EnvironmentFile=/etc/ultrathink/ultrathink.env
+ExecStart=/root/.local/share/reflex/bun/bin/bun run services/ultrathink/server.ts
+Restart=on-failure
+RestartSec=3
+MemoryMax=512M
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-web
+
+[Install]
+WantedBy=multi-user.target
