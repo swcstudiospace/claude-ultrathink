@@ -1,9 +1,9 @@
 import { estimateTokens } from "./estimate.ts";
 
 const NOOP_UNDER = 4000;
-const CAP = 6000;
+export const DEFAULT_CAP = 6000;
 
-export interface ShrinkResult {
+interface ShrinkResult {
 	text: string;
 	baseline: number;
 	current: number;
@@ -37,9 +37,9 @@ function collapseDuplicateLines(text: string): string {
 	return out.join("\n");
 }
 
-function headTail(text: string): string {
-	const headLen = Math.floor(CAP * 0.6);
-	const tailLen = CAP - headLen;
+function headTail(text: string, cap: number): string {
+	const headLen = Math.floor(cap * 0.6);
+	const tailLen = cap - headLen;
 	if (text.length <= headLen + tailLen) return text;
 	const omitted = text.length - headLen - tailLen;
 	const head = text.slice(0, headLen);
@@ -48,12 +48,13 @@ function headTail(text: string): string {
 }
 
 /** Shrink tool text. Never throws. saved === baseline - current, or the original text. */
-export function shrinkToolText(text: string): ShrinkResult {
+export function shrinkToolText(text: string, cap: number = DEFAULT_CAP): ShrinkResult {
+	const limit = Number.isSafeInteger(cap) && cap > 0 ? cap : DEFAULT_CAP;
 	try {
 		if (typeof text !== "string" || text.length === 0) return unchanged("");
 		if (text.length < NOOP_UNDER || looksLikeEditableSource(text)) return unchanged(text);
 		let next = collapseDuplicateLines(text);
-		if (next.length > CAP) next = headTail(next);
+		if (next.length > limit) next = headTail(next, limit);
 		const baseline = estimateTokens(text);
 		const current = estimateTokens(next);
 		const saved = baseline - current;

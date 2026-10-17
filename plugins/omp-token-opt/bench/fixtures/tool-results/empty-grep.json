@@ -1,0 +1,14 @@
+{
+  "toolName": "grep",
+  "input": {
+    "pattern": "zz_no_such_symbol",
+    "path": "src"
+  },
+  "isError": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "No matches found"
+    }
+  ]
+}

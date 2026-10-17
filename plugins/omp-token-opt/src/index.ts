@@ -2,12 +2,19 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { shrinkToolText } from "./compress.ts";
+import { BoundedSet } from "./bounded-set.ts";
+import { capFor, createSessionBudget, parseSessionBudget, type SessionBudget } from "./budget.ts";
+import { DEFAULT_CAP, shrinkToolText } from "./compress.ts";
 import { estimateTokens } from "./estimate.ts";
+import { readFlags } from "./flags.ts";
 import { clearSkimArchive, readSkimSpan, rememberSkim, skimArchiveSize, skimSource } from "./skim.ts";
 import { runGraphify } from "./graph.ts";
+import { GRAPH_POINTER, pointerFor } from "./pointer.ts";
+import { createRemoteSink, type RemoteSink } from "./remote-sink.ts";
+import { createSharedCache, type SharedCache } from "./shared-cache.ts";
 import {
 	createLedger,
+	defaultTokenOptDir,
 	isValidSessionId,
 	type Ledger,
 	type SavingsPoint,
@@ -17,6 +24,25 @@ import {
 const EVENT = "token-opt:savings";
 const RTK_TIMEOUT_MS = 2_000;
 const DEDUPE_MIN_CHARS = 200;
+const GRAPH_BUDGET_DEFAULT = 2_000;
+const DEDUPE_MAX_ENTRIES = 4_096;
+const SHUTDOWN_TIMEOUT_MS = 3_000;
+
+/** A tool argument as a string; any other value becomes the empty string. */
+function str(value: unknown): string {
+	return typeof value === "string" ? value : "";
+}
+
+/** Seen-result set. Both Set and BoundedSet satisfy it. */
+interface DedupeSet {
+	has(value: string): boolean;
+	add(value: string): unknown;
+}
+
+interface BudgetState {
+	handle: SessionBudget;
+	limit: number;
+}
 
 /** Stable prefix: never inject system-prompt text, timestamps, hashes, or file counts. */
 export const PREFIX_POLICY = { injectSystemPrompt: false as const };
@@ -30,6 +56,7 @@ interface ToolResultLike {
 	toolName?: string;
 	isError?: boolean;
 	input?: { command?: unknown; path?: unknown };
+	content?: TextBlock[];
 }
 
 interface UsageLike {
@@ -91,6 +118,8 @@ interface PiLike {
 	on(event: "before_provider_request", handler: (event: { payload?: unknown }) => unknown): void;
 	on(event: "message_end", handler: (event: { message?: MessageLike }) => unknown): void;
 	on(event: "cache_warming_decision", handler: (event: { warmCost?: unknown }) => unknown): void;
+	on(event: "session_shutdown", handler: () => unknown): void;
+	on(event: "before_agent_start", handler: (event: { systemPrompt?: unknown }, ctx: { cwd?: unknown }) => unknown): void;
 	events?: { emit(name: string, data: TokenSavingsSnapshot): void };
 }
 
@@ -329,25 +358,62 @@ function isEmptyToolResult(text: string): boolean {
 	return lines.length === 1 && lines[0] === "No matches found";
 }
 
+function l2Key(tenant: string, key: string): string {
+	const digest = createHash("sha256").update(tenant).update("\0").update(key).digest("hex");
+	return `tokopt:v1:${digest}`;
+}
+
 
 export default function tokenOpt(pi: PiLike): void {
 	pi.setLabel("Token opt");
-	const ledger: Ledger = createLedger();
+	const flags = readFlags();
+	const ledger: Ledger = createLedger(flags.asyncLedger ? { asyncWrites: true } : undefined);
+	const tenant = process.env.TOKEN_OPT_TENANT || "local";
+	const sink: RemoteSink | null = flags.remoteSink
+		? createRemoteSink({
+				url: process.env.TOKEN_OPT_TIMESCALE_URL || undefined,
+				fallbackPath: join(defaultTokenOptDir(), "sink-fallback.jsonl"),
+			})
+		: null;
+	const sharedUrl = flags.graphKeyedCache ? process.env.TOKEN_OPT_SHARED_CACHE_URL : undefined;
+	const sharedCache: SharedCache | null = sharedUrl ? createSharedCache({ url: sharedUrl }) : null;
+	const l2 =
+		sharedCache === null
+			? undefined
+			: {
+					get: (key: string) => sharedCache.get(l2Key(tenant, key)),
+					set: (key: string, value: string) => sharedCache.set(l2Key(tenant, key), value),
+					// Singleflight needs the keyed cache and a shared store; off by default.
+					acquire: flags.graphSingleflight
+						? (key: string, ttlMs: number) => sharedCache.acquire(l2Key(tenant, key), ttlMs)
+						: undefined,
+				};
+	// Same grammar as the session budget: a positive safe integer. Unset or invalid uses the default.
+	const graphBudget = flags.graphBudget
+		? (parseSessionBudget(process.env.TOKEN_OPT_GRAPH_BUDGET) ?? GRAPH_BUDGET_DEFAULT)
+		: undefined;
 	const seenTiming = new Set<string>();
 	const seenMessages = new Set<string>();
-	const seenResults = new Map<string, Set<string>>();
+	const seenResults = new Map<string, DedupeSet>();
 	let turnStartedAt: number | null = null;
 	let lastMessageEndAt: number | null = null;
+	let budget: BudgetState | null = null;
 	let rtkBaseline: number | null = null;
 	let rtkEpoch = 0;
 	let rtkBaselineRead: Promise<void> = Promise.resolve();
 	let prefixHash: string | null = null;
 	let toolsHash: string | null = null;
 	const z = pi.zod;
+	function openBudget(): BudgetState | null {
+		if (!flags.sessionBudget) return null;
+		const limit = parseSessionBudget(process.env.TOKEN_OPT_SESSION_TOKEN_BUDGET);
+		return limit === null ? null : { handle: createSessionBudget(limit), limit };
+	}
 	function beginSession(event: unknown, ctx: unknown): void {
 		prefixHash = null;
 		toolsHash = null;
 		clearSkimArchive();
+		budget = openBudget();
 		try {
 			turnStartedAt = null;
 			lastMessageEndAt = null;
@@ -378,6 +444,19 @@ export default function tokenOpt(pi: PiLike): void {
 	function record(point: SavingsPoint): void {
 		const snap = ledger.record(point);
 		publish(snap);
+		sink?.push({
+			at: point.at,
+			sessionId: activeSession(),
+			kind: "savings",
+			source: point.source,
+			baseline: point.baseline,
+			current: point.current,
+			saved: point.saved,
+		});
+	}
+
+	function spendBudget(text: string): void {
+		if (budget) budget.handle.spend(estimateTokens(text));
 	}
 
 	function activeSession(): string {
@@ -388,7 +467,11 @@ export default function tokenOpt(pi: PiLike): void {
 		if (args[0] === "extract") {
 			return { content: [{ type: "text" as const, text: "graphify extract is not spawned" }], isError: true };
 		}
-		const result = await runGraphify(ctx?.cwd ?? process.cwd(), args, signal);
+		const result = await runGraphify(ctx?.cwd ?? process.cwd(), args, signal, {
+			budget: graphBudget,
+			keyedCache: flags.graphKeyedCache,
+			l2,
+		});
 		const graphReady = graphReadyFlag(ctx?.cwd);
 		if (Number.isSafeInteger(result.ms) && result.ms >= 0) {
 			publish(ledger.notePerf({ lastQueryMs: result.ms, graphReady }));
@@ -412,7 +495,7 @@ export default function tokenOpt(pi: PiLike): void {
 		parameters: z.object({ question: z.string() }),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				return await runGraph(["query", params.question ?? ""], signal, ctx);
+				return await runGraph(["query", str(params.question)], signal, ctx);
 			} catch {
 				return { content: [{ type: "text", text: "graph_query failed" }], isError: true };
 			}
@@ -458,7 +541,7 @@ export default function tokenOpt(pi: PiLike): void {
 		parameters: z.object({ from: z.string(), to: z.string() }),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				return await runGraph(["path", params.from ?? "", params.to ?? ""], signal, ctx);
+				return await runGraph(["path", str(params.from), str(params.to)], signal, ctx);
 			} catch {
 				return { content: [{ type: "text", text: "graph_path failed" }], isError: true };
 			}
@@ -472,7 +555,7 @@ export default function tokenOpt(pi: PiLike): void {
 		parameters: z.object({ node: z.string() }),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				return await runGraph(["explain", params.node ?? ""], signal, ctx);
+				return await runGraph(["explain", str(params.node)], signal, ctx);
 			} catch {
 				return { content: [{ type: "text", text: "graph_explain failed" }], isError: true };
 			}
@@ -498,7 +581,8 @@ export default function tokenOpt(pi: PiLike): void {
 		if (ledger.snapshot()) publish(ledger.notePerf({ graphReady: graphReadyFlag(cwd) }));
 		const snap = ledger.snapshot();
 		const base = snap ? formatStatus(snap) : "token-opt: no session";
-		ctx.ui.notify(`${base}\nskim archive ${skimArchiveSize()}\n${graphStatusLine(cwd)}`, "info");
+		const budgetLine = budget ? `\nbudget ${budget.handle.tier()} used ${budget.handle.used()} limit ${budget.limit}` : "";
+		ctx.ui.notify(`${base}\nskim archive ${skimArchiveSize()}\n${graphStatusLine(cwd)}${budgetLine}`, "info");
 	}
 
 	pi.registerCommand("token-status", {
@@ -605,13 +689,14 @@ export default function tokenOpt(pi: PiLike): void {
 						saved: baseline - current,
 					});
 				}
+				spendBudget(pointer);
 				return { content: [{ type: "text", text: pointer }] };
 			}
 			if (joined.length > DEDUPE_MIN_CHARS) {
 				const sessionId = activeSession();
 				let seen = seenResults.get(sessionId);
 				if (!seen) {
-					seen = new Set();
+					seen = flags.boundedDedupe ? new BoundedSet(DEDUPE_MAX_ENTRIES) : new Set<string>();
 					seenResults.set(sessionId, seen);
 				}
 				const hash = createHash("sha256").update(sessionId).update("\0").update(toolName).update("\0").update(joined).digest("hex");
@@ -626,11 +711,15 @@ export default function tokenOpt(pi: PiLike): void {
 						current,
 						saved: baseline - current,
 					});
+					spendBudget(pointer);
 					return { content: [{ type: "text", text: pointer }] };
 				}
 				seen.add(hash);
 			}
-			if (event.toolName === "bash" && String(event.input?.command ?? "").trimStart().startsWith("rtk ")) return;
+			if (event.toolName === "bash" && String(event.input?.command ?? "").trimStart().startsWith("rtk ")) {
+				spendBudget(joined);
+				return;
+			}
 			if (event.toolName === "read" && typeof event.input?.path === "string") {
 				const skimmed = skimSource(joined, event.input.path);
 				if (skimmed.length < joined.length) rememberSkim(event.input.path, joined);
@@ -644,11 +733,17 @@ export default function tokenOpt(pi: PiLike): void {
 						current,
 						saved: baseline - current,
 					});
+					spendBudget(skimmed);
 					return { content: [{ type: "text", text: skimmed }] };
 				}
 			}
-			const shrunk = shrinkToolText(joined);
-			if (shrunk.saved <= 0) return;
+			const shrunk = budget
+				? shrinkToolText(joined, capFor(budget.handle.tier(), DEFAULT_CAP))
+				: shrinkToolText(joined);
+			if (shrunk.saved <= 0) {
+				spendBudget(joined);
+				return;
+			}
 			record({
 				at: Date.now(),
 				source: "compress",
@@ -656,6 +751,7 @@ export default function tokenOpt(pi: PiLike): void {
 				current: shrunk.current,
 				saved: shrunk.saved,
 			});
+			spendBudget(shrunk.text);
 			return { content: [{ type: "text", text: shrunk.text }] };
 		} catch {
 			return;
@@ -688,7 +784,10 @@ export default function tokenOpt(pi: PiLike): void {
 			if (!message.usage) return;
 			const usage = message.usage;
 			const cents = costCentsFrom(usage);
-			if (cents !== null) publish(ledger.notePerf({ costCents: cents }));
+			if (cents !== null) {
+				publish(ledger.notePerf({ costCents: cents }));
+				sink?.push({ at: Date.now(), sessionId: activeSession(), kind: "perf", field: "costCents", value: cents });
+			}
 			const input = finiteInt(usage.input, !("input" in usage));
 			const output = finiteInt(usage.output, !("output" in usage));
 			const cacheRead = finiteInt(usage.cacheRead, !("cacheRead" in usage));
@@ -735,4 +834,36 @@ export default function tokenOpt(pi: PiLike): void {
 			// fail open: do not force warm or stop
 		}
 	});
+
+	/** Bounded shutdown: flush the ledger, then close the sink and shared cache, all within SHUTDOWN_TIMEOUT_MS. */
+	async function shutdown(): Promise<void> {
+		let timer: Timer | undefined;
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, SHUTDOWN_TIMEOUT_MS);
+		});
+		const work = Promise.allSettled([ledger.flush(), sink?.close(), sharedCache?.close()]);
+		try {
+			await Promise.race([work, deadline]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	if (flags.graphPointer) {
+		pi.on("before_agent_start", (event, ctx) => {
+			try {
+				const cwd = ctx?.cwd;
+				const systemPrompt = event?.systemPrompt;
+				if (typeof cwd !== "string" || cwd.length === 0 || !Array.isArray(systemPrompt)) return;
+				if (systemPrompt.some((part) => typeof part === "string" && part.includes(GRAPH_POINTER))) return;
+				const pointer = pointerFor(cwd);
+				if (pointer === null) return;
+				return { systemPrompt: [...systemPrompt, pointer] };
+			} catch {
+				// fail open: keep the prompt unchanged
+			}
+		});
+	}
+	if (flags.asyncLedger || flags.remoteSink || sharedCache !== null) {
+		pi.on("session_shutdown", () => shutdown());
+	}
 }

@@ -251,19 +251,75 @@ export interface Ledger {
 	snapshot(): TokenSavingsSnapshot | null;
 	notePerf(fields: PerfFields): TokenSavingsSnapshot;
 	addProviderUsage(input: number, cacheRead: number, cacheWrite: number, output?: number): TokenSavingsSnapshot;
+	/** Forces pending snapshot writes to disk. Resolves at once when asyncWrites is off. Never rejects. */
+	flush(): Promise<void>;
+	/** Failed flush writes plus dirty markers dropped past maxPendingSessions. */
+	droppedWrites(): number;
+	/** Successful snapshot writes to disk, in both modes. */
+	writesCompleted(): number;
 }
 
-export function createLedger(options?: { dir?: string; now?: () => number }): Ledger {
+const DEFAULT_MAX_PENDING_SESSIONS = 64;
+
+export function createLedger(options?: {
+	dir?: string;
+	now?: () => number;
+	asyncWrites?: boolean;
+	maxPendingSessions?: number;
+}): Ledger {
 	const dir = options?.dir ?? defaultTokenOptDir();
 	const now = options?.now ?? Date.now;
+	const asyncWrites = options?.asyncWrites === true;
+	const maxPendingSessions = options?.maxPendingSessions ?? DEFAULT_MAX_PENDING_SESSIONS;
+	if (!Number.isSafeInteger(maxPendingSessions) || maxPendingSessions <= 0) {
+		throw new LedgerReject("invalid maxPendingSessions");
+	}
 	const memory = new Map<string, TokenSavingsSnapshot>();
 	const usage = new Map<string, ProviderTotals>();
+	// Insertion order is flush order: the most recently touched session is last, so live.json ends on it.
+	const dirty = new Map<string, true>();
+	let flushTimer: Timer | null = null;
+	let dropped = 0;
+	let completed = 0;
 	let activeId: string | null = null;
 
-	function persist(snap: TokenSavingsSnapshot): void {
+	function writeSnapshot(snap: TokenSavingsSnapshot): void {
 		const body = `${JSON.stringify(snap)}\n`;
 		writeAtomic(join(dir, `${snap.sessionId}.json`), body);
 		writeAtomic(join(dir, "live.json"), body);
+		completed += 1;
+	}
+
+	function drainDirty(): void {
+		if (flushTimer !== null) {
+			clearTimeout(flushTimer);
+			flushTimer = null;
+		}
+		const ids = [...dirty.keys()];
+		dirty.clear();
+		for (const id of ids) {
+			const snap = memory.get(id);
+			if (snap === undefined) continue;
+			try {
+				writeSnapshot(snap);
+			} catch {
+				dropped += 1;
+			}
+		}
+	}
+
+	function markDirty(id: string): void {
+		dirty.delete(id);
+		dirty.set(id, true);
+		if (dirty.size > maxPendingSessions) {
+			const oldest = dirty.keys().next();
+			if (!oldest.done) dirty.delete(oldest.value);
+			dropped += 1;
+		}
+		if (flushTimer === null) {
+			flushTimer = setTimeout(drainDirty, 0);
+			flushTimer.unref();
+		}
 	}
 
 	function adoptUsage(id: string, snap: TokenSavingsSnapshot): void {
@@ -312,7 +368,8 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		memory.set(sessionId, snap);
 		adoptUsage(sessionId, snap);
 		activeId = sessionId;
-		persist(snap);
+		if (asyncWrites) markDirty(sessionId);
+		else writeSnapshot(snap);
 		return snap;
 	}
 
@@ -327,7 +384,12 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 
 	function commit(next: TokenSavingsSnapshot, id: string): TokenSavingsSnapshot {
 		if (!isValidSnapshot(next, id)) throw new LedgerReject("snapshot invariant failed");
-		persist(next);
+		if (asyncWrites) {
+			memory.set(id, next);
+			markDirty(id);
+			return next;
+		}
+		writeSnapshot(next);
 		memory.set(id, next);
 		return next;
 	}
@@ -446,6 +508,16 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		snapshot(): TokenSavingsSnapshot | null {
 			if (activeId === null) return null;
 			return memory.get(activeId) ?? null;
+		},
+		flush(): Promise<void> {
+			if (asyncWrites) drainDirty();
+			return Promise.resolve();
+		},
+		droppedWrites(): number {
+			return dropped;
+		},
+		writesCompleted(): number {
+			return completed;
 		},
 	};
 }

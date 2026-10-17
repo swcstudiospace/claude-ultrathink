@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createLedger, isValidSnapshot, LedgerReject, type SavingsPoint } from "./ledger.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -170,5 +170,126 @@ describe("ledger", () => {
 		expect(isValidSnapshot({ ...snap, providerOutput: -1 }, "sess")).toBe(false);
 		expect(isValidSnapshot({ ...snap, prefixChanged: 2 }, "sess")).toBe(false);
 		expect(isValidSnapshot({ ...snap, graphReady: 1 }, "sess")).toBe(true);
+	});
+
+	test("sync mode: flush resolves and writes are counted once per persist", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1 });
+		ledger.load("sess");
+		ledger.record(point(1, 10, 4));
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(2);
+		expect(ledger.droppedWrites()).toBe(0);
+	});
+
+	test("async: snapshot is in memory at once and nothing reaches disk before the flush", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true });
+		ledger.load("sess");
+		ledger.record(point(1, 10, 4));
+		expect(ledger.snapshot()!.savedTokens).toBe(6);
+		expect(ledger.snapshot()!.points.length).toBe(1);
+		expect(ledger.writesCompleted()).toBe(0);
+		expect(existsSync(join(dir, "sess.json"))).toBe(false);
+	});
+
+	test("async: after flush the files on disk equal the latest snapshot", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 10, asyncWrites: true });
+		ledger.load("sess");
+		ledger.record(point(1, 10, 4));
+		ledger.notePerf({ lastTurnMs: 7 });
+		ledger.record(point(2, 8, 1));
+		await ledger.flush();
+		const latest = ledger.snapshot()!;
+		expect(JSON.parse(readFileSync(join(dir, "sess.json"), "utf8"))).toEqual(latest);
+		expect(JSON.parse(readFileSync(join(dir, "live.json"), "utf8"))).toEqual(latest);
+	});
+
+	test("async: N updates in one tick produce exactly one disk write", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true });
+		ledger.load("sess");
+		for (let i = 0; i < 5; i += 1) ledger.record(point(i, 4, 1));
+		ledger.notePerf({ lastQueryMs: 2 });
+		ledger.addProviderUsage(1, 0, 0);
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(1);
+		expect(ledger.snapshot()!.points.length).toBe(5);
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(1);
+	});
+
+	test("async: a failed flush write increments droppedWrites and does not throw", async () => {
+		const root = mkdtempSync(join(tmpdir(), "token-opt-"));
+		// A plain file where the ledger directory should be makes every snapshot write fail.
+		// chmod is not used because root ignores directory permissions.
+		const dir = join(root, "ledger");
+		writeFileSync(dir, "not a directory");
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true });
+		ledger.load("sess");
+		ledger.record(point(1, 10, 4));
+		expect(ledger.snapshot()!.savedTokens).toBe(6);
+		await ledger.flush();
+		expect(ledger.droppedWrites()).toBe(1);
+		expect(ledger.writesCompleted()).toBe(0);
+		expect(ledger.snapshot()!.savedTokens).toBe(6);
+	});
+
+	test("async: exceeding maxPendingSessions drops the oldest dirty marker and counts it", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true, maxPendingSessions: 2 });
+		ledger.load("s1");
+		ledger.load("s2");
+		expect(ledger.droppedWrites()).toBe(0);
+		ledger.load("s3");
+		expect(ledger.droppedWrites()).toBe(1);
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(2);
+		expect(existsSync(join(dir, "s1.json"))).toBe(false);
+		expect(existsSync(join(dir, "s2.json"))).toBe(true);
+		expect(existsSync(join(dir, "s3.json"))).toBe(true);
+	});
+
+	test("async: touching a dirty session moves it to the back of the drop order", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true, maxPendingSessions: 2 });
+		ledger.load("s1");
+		ledger.load("s2");
+		ledger.load("s1");
+		ledger.load("s3");
+		expect(ledger.droppedWrites()).toBe(1);
+		await ledger.flush();
+		expect(existsSync(join(dir, "s1.json"))).toBe(true);
+		expect(existsSync(join(dir, "s2.json"))).toBe(false);
+		expect(existsSync(join(dir, "s3.json"))).toBe(true);
+	});
+
+	test("async: the default maxPendingSessions is 64", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true });
+		for (let i = 0; i < 64; i += 1) ledger.load(`s${i}`);
+		expect(ledger.droppedWrites()).toBe(0);
+		ledger.load("s64");
+		expect(ledger.droppedWrites()).toBe(1);
+	});
+
+	test("async: validation errors still reject and mark nothing dirty", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 1, asyncWrites: true });
+		ledger.load("sess");
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(1);
+		expect(() => ledger.record({ at: 1, source: "graph", baseline: 10, current: 3, saved: 9 })).toThrow(LedgerReject);
+		await ledger.flush();
+		expect(ledger.writesCompleted()).toBe(1);
+		expect(ledger.droppedWrites()).toBe(0);
+	});
+
+	test("maxPendingSessions must be a positive safe integer", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		for (const bad of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
+			expect(() => createLedger({ dir, maxPendingSessions: bad })).toThrow(LedgerReject);
+		}
 	});
 });
