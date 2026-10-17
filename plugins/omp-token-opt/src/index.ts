@@ -117,7 +117,6 @@ interface PiLike {
 	on(event: "tool_result", handler: (event: ToolResultLike) => unknown): void;
 	on(event: "before_provider_request", handler: (event: { payload?: unknown }) => unknown): void;
 	on(event: "message_end", handler: (event: { message?: MessageLike }) => unknown): void;
-	on(event: "cache_warming_decision", handler: (event: { warmCost?: unknown }) => unknown): void;
 	on(event: "session_shutdown", handler: () => unknown): void;
 	on(event: "before_agent_start", handler: (event: { systemPrompt?: unknown }, ctx: { cwd?: unknown }) => unknown): void;
 	events?: { emit(name: string, data: TokenSavingsSnapshot): void };
@@ -394,6 +393,7 @@ export default function tokenOpt(pi: PiLike): void {
 		: undefined;
 	const seenTiming = new Set<string>();
 	const seenMessages = new Set<string>();
+	const seenUnkeyed = new WeakSet<object>();
 	const seenResults = new Map<string, DedupeSet>();
 	let turnStartedAt: number | null = null;
 	let lastMessageEndAt: number | null = null;
@@ -763,9 +763,9 @@ export default function tokenOpt(pi: PiLike): void {
 			const message = event.message;
 			if (!message || message.role !== "assistant") return;
 			lastMessageEndAt = Date.now();
-			const id = message.id;
-			if (typeof id !== "string" || id.length === 0 || seenMessages.has(id)) return;
-			if (!seenTiming.has(id)) {
+			const id = typeof message.id === "string" && message.id.length > 0 ? message.id : null;
+			if (id === null ? seenUnkeyed.has(message) : seenMessages.has(id)) return;
+			if (id !== null && !seenTiming.has(id)) {
 				const stamped = safeDuration(message.durationMs) ?? safeDuration(message.usage?.durationMs);
 				let wall: number | null = null;
 				if (turnStartedAt !== null) {
@@ -794,7 +794,8 @@ export default function tokenOpt(pi: PiLike): void {
 			const cacheWrite = finiteInt(usage.cacheWrite, !("cacheWrite" in usage));
 			if (input === null || output === null || cacheRead === null || cacheWrite === null) return;
 			publish(ledger.addProviderUsage(input, cacheRead, cacheWrite, output));
-			seenMessages.add(id);
+			if (id === null) seenUnkeyed.add(message);
+			else seenMessages.add(id);
 		} catch {
 			// fail open
 		}
@@ -823,15 +824,6 @@ export default function tokenOpt(pi: PiLike): void {
 			}
 		} catch {
 			// fail open
-		}
-	});
-	pi.on("cache_warming_decision", (event) => {
-		try {
-			const warmCost = event?.warmCost;
-			if (typeof warmCost !== "number" || !Number.isSafeInteger(warmCost) || warmCost < 0) return;
-			publish(ledger.notePerf({ lastWarmTokens: warmCost }));
-		} catch {
-			// fail open: do not force warm or stop
 		}
 	});
 

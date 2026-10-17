@@ -293,3 +293,16 @@ describe("ledger", () => {
 		}
 	});
 });
+
+describe("ledger legacy adoption", () => {
+	test("a legacy snapshot with only a cache percentage does not invent lifetime totals", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const first = createLedger({ dir, now: () => 10 });
+		first.load("sess");
+		first.notePerf({ cacheHitPct: 40 });
+		const second = createLedger({ dir, now: () => 11 });
+		second.load("sess");
+		second.addProviderUsage(10, 0, 0, 1);
+		expect(second.snapshot()!.cacheHitPct).toBe(0);
+	});
+});

@@ -183,11 +183,6 @@ describe("tokenOpt", () => {
 			writeFileSync(join(root, "graphify-out", "graph.json"), "{}\n");
 			await statusHandler?.("", { cwd: root, ui: { notify(message) { status = message; } } });
 			expect(status.endsWith("graph ready")).toBe(true);
-			expect(handlers.get("cache_warming_decision")?.({ warmCost: 4 })).toBeUndefined();
-			const warmed = JSON.parse(readFileSync(join(home, ".omp", "agent", "token-opt", "live.json"), "utf8")) as {
-				lastWarmTokens?: number;
-			};
-			expect(warmed.lastWarmTokens).toBe(4);
 		} finally {
 			process.env.HOME = previousHome;
 		}
@@ -389,4 +384,91 @@ describe("tokenOpt", () => {
 			process.env.HOME = previousHome;
 		}
 	});
+});
+
+describe("tokenOpt gap fixes", () => {
+	test("bills an assistant message without an id once per message object", async () => {
+		const home = mkdtempSync(join(tmpdir(), "token-opt-home-"));
+		const previousHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const handlers = new Map<string, (...args: unknown[]) => unknown>();
+			let statusHandler: ((args: string, ctx: { ui: { notify: (message: string) => void } }) => Promise<void>) | undefined;
+			tokenOpt({
+				setLabel() {},
+				zod: { object: () => ({}), string: () => ({}) },
+				registerTool() {},
+				registerCommand(_name: string, options: { handler: NonNullable<typeof statusHandler> }) {
+					statusHandler = options.handler;
+				},
+				on(event: string, handler: (...args: unknown[]) => unknown) {
+					handlers.set(event, handler);
+				},
+				events: { emit() {} },
+			} as unknown as Parameters<typeof tokenOpt>[0]);
+			const message = { role: "assistant", usage: { input: 1, output: 0, cacheRead: 3, cacheWrite: 0 } };
+			handlers.get("message_end")?.({ message });
+			handlers.get("message_end")?.({ message });
+			await statusHandler?.("", { ui: { notify() {} } });
+			const live = JSON.parse(readFileSync(join(home, ".omp", "agent", "token-opt", "live.json"), "utf8")) as {
+				providerInput?: number;
+				providerCacheRead?: number;
+			};
+			expect(live.providerInput).toBe(1);
+			expect(live.providerCacheRead).toBe(3);
+		} finally {
+			process.env.HOME = previousHome;
+		}
+	});
+
+	test("fails open to the original bash command when rtk is not on PATH", async () => {
+		const home = mkdtempSync(join(tmpdir(), "token-opt-home-"));
+		const empty = mkdtempSync(join(tmpdir(), "token-opt-empty-"));
+		const cwd = mkdtempSync(join(tmpdir(), "token-opt-bare-"));
+		expect(await toolCallInChild({ home, path: empty, cwd, command: "git status" })).toBeNull();
+	});
+
+	test("rewrites a bash command through rtk when the extension is absent and rtk is on PATH", async () => {
+		const home = mkdtempSync(join(tmpdir(), "token-opt-home-"));
+		const bin = mkdtempSync(join(tmpdir(), "token-opt-bin-"));
+		writeFileSync(
+			join(bin, "rtk"),
+			["#!/bin/sh", 'if [ "$1" = rewrite ]; then', '  printf "rtk fake %s\\n" "$2"', "fi", ""].join("\n"),
+			{ mode: 0o755 },
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "token-opt-bare-"));
+		const rewritten = (await toolCallInChild({ home, path: bin, cwd, command: "git status" })) as {
+			input: { command: string };
+		} | null;
+		expect(rewritten?.input.command).toBe("rtk fake git status");
+	});
+
+	// Bun.which reads PATH once at process start, so the rtk lookup is exercised in a child process with its own PATH.
+	async function toolCallInChild(opts: { home: string; path: string; cwd: string; command: string }): Promise<unknown> {
+		const indexPath = new URL("./index.ts", import.meta.url).pathname;
+		const script = [
+			`import tokenOpt from ${JSON.stringify(indexPath)};`,
+			"(async () => {",
+			"  const handlers = new Map();",
+			"  tokenOpt({",
+			"    setLabel() {}, zod: { object: () => ({}), string: () => ({}) }, registerTool() {}, registerCommand() {},",
+			"    on(event, handler) { handlers.set(event, handler); }, events: { emit() {} },",
+			"  });",
+			`  const result = await handlers.get("tool_call")({ toolName: "bash", cwd: ${JSON.stringify(opts.cwd)}, input: { command: ${JSON.stringify(opts.command)} } });`,
+			"  console.log(JSON.stringify(result ?? null));",
+			"})();",
+		].join("\n");
+		const proc = Bun.spawn([process.execPath, "-e", script], {
+			env: { ...process.env, HOME: opts.home, PATH: opts.path },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, err, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`child exited ${code}: ${err}`);
+		return JSON.parse(out.trim());
+	}
 });

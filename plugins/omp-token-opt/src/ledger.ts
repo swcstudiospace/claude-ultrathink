@@ -21,7 +21,6 @@ export interface PerfFields {
 	ttftMs?: number;
 	lastIdleMs?: number;
 	costCents?: number;
-	lastWarmTokens?: number;
 	providerInput?: number;
 	providerOutput?: number;
 	providerCacheRead?: number;
@@ -115,7 +114,6 @@ export function isValidSnapshot(value: unknown, sessionId?: string): value is To
 	const ttftMs = "ttftMs" in value ? value.ttftMs : undefined;
 	const lastIdleMs = "lastIdleMs" in value ? value.lastIdleMs : undefined;
 	const costCents = "costCents" in value ? value.costCents : undefined;
-	const lastWarmTokens = "lastWarmTokens" in value ? value.lastWarmTokens : undefined;
 	const providerInput = "providerInput" in value ? value.providerInput : undefined;
 	const providerOutput = "providerOutput" in value ? value.providerOutput : undefined;
 	const providerCacheRead = "providerCacheRead" in value ? value.providerCacheRead : undefined;
@@ -131,7 +129,6 @@ export function isValidSnapshot(value: unknown, sessionId?: string): value is To
 	if (!optionalField(ttftMs, "ttftMs" in value)) return false;
 	if (!optionalField(lastIdleMs, "lastIdleMs" in value)) return false;
 	if (!optionalField(costCents, "costCents" in value)) return false;
-	if (!optionalField(lastWarmTokens, "lastWarmTokens" in value)) return false;
 	if (!optionalField(providerInput, "providerInput" in value)) return false;
 	if (!optionalField(providerOutput, "providerOutput" in value)) return false;
 	if (!optionalField(providerCacheRead, "providerCacheRead" in value)) return false;
@@ -228,7 +225,6 @@ function copyPerf(from: TokenSavingsSnapshot, onto: TokenSavingsSnapshot): void 
 	if (from.ttftMs !== undefined) onto.ttftMs = from.ttftMs;
 	if (from.lastIdleMs !== undefined) onto.lastIdleMs = from.lastIdleMs;
 	if (from.costCents !== undefined) onto.costCents = from.costCents;
-	if (from.lastWarmTokens !== undefined) onto.lastWarmTokens = from.lastWarmTokens;
 	if (from.providerInput !== undefined) onto.providerInput = from.providerInput;
 	if (from.providerOutput !== undefined) onto.providerOutput = from.providerOutput;
 	if (from.providerCacheRead !== undefined) onto.providerCacheRead = from.providerCacheRead;
@@ -338,11 +334,8 @@ export function createLedger(options?: {
 			});
 			return;
 		}
-		if (snap.cacheHitPct === undefined) {
-			usage.set(id, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-			return;
-		}
-		usage.set(id, { input: 100 - snap.cacheHitPct, output: 0, cacheRead: snap.cacheHitPct, cacheWrite: 0 });
+		// A legacy snapshot carries a percentage but no totals. Its denominator is unknown, so adopt zero totals rather than invent one.
+		usage.set(id, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 	}
 
 	function load(sessionId: string): TokenSavingsSnapshot {
@@ -428,9 +421,6 @@ export function createLedger(options?: {
 		if (!optionalField(fields.ttftMs, fields.ttftMs !== undefined)) throw new LedgerReject("invalid ttftMs");
 		if (!optionalField(fields.lastIdleMs, fields.lastIdleMs !== undefined)) throw new LedgerReject("invalid lastIdleMs");
 		if (!optionalField(fields.costCents, fields.costCents !== undefined)) throw new LedgerReject("invalid costCents");
-		if (!optionalField(fields.lastWarmTokens, fields.lastWarmTokens !== undefined)) {
-			throw new LedgerReject("invalid lastWarmTokens");
-		}
 		if (!optionalField(fields.providerInput, fields.providerInput !== undefined)) throw new LedgerReject("invalid providerInput");
 		if (!optionalField(fields.providerOutput, fields.providerOutput !== undefined)) throw new LedgerReject("invalid providerOutput");
 		if (!optionalField(fields.providerCacheRead, fields.providerCacheRead !== undefined)) {
@@ -461,7 +451,6 @@ export function createLedger(options?: {
 		if (fields.ttftMs !== undefined) next.ttftMs = fields.ttftMs;
 		if (fields.lastIdleMs !== undefined) next.lastIdleMs = fields.lastIdleMs;
 		if (fields.costCents !== undefined) next.costCents = fields.costCents;
-		if (fields.lastWarmTokens !== undefined) next.lastWarmTokens = fields.lastWarmTokens;
 		if (fields.providerInput !== undefined) next.providerInput = fields.providerInput;
 		if (fields.providerOutput !== undefined) next.providerOutput = fields.providerOutput;
 		if (fields.providerCacheRead !== undefined) next.providerCacheRead = fields.providerCacheRead;
