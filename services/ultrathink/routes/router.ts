@@ -8,14 +8,16 @@ import type { PhaseRecord, Run, Store } from "../store/store.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
 import { type JournalOptions, type JournalResult, answerRequest, listPendingRequests, sessionStatus, showRequest, startPlan } from "../engine/journal.ts";
 import { type McpToolHost, type ToolOutcome, handleMcpPayload } from "../mcp/mcp.ts";
+import { createOAuth } from "../oauth/oauth.ts";
 
 export interface RouterDeps {
 	config: UltrathinkConfig;
 	store: Store;
 	auth: Auth;
+	now?: () => number;
 }
 
-type Endpoint = "healthz" | "login" | "ultrathink" | "run" | "mcp";
+type Endpoint = "healthz" | "login" | "ultrathink" | "run" | "mcp" | "oauth_protected_resource" | "oauth_authorization_server" | "oauth_authorize" | "oauth_token" | "oauth_register";
 
 type Target = { endpoint: Exclude<Endpoint, "run"> } | { endpoint: "run"; runId: string };
 
@@ -29,6 +31,11 @@ const METHODS: Record<Endpoint, readonly string[]> = {
 	ultrathink: ["GET", "POST"],
 	run: ["GET"],
 	mcp: ["POST"],
+	oauth_protected_resource: ["GET"],
+	oauth_authorization_server: ["GET"],
+	oauth_authorize: ["GET", "POST"],
+	oauth_token: ["POST"],
+	oauth_register: ["POST"],
 };
 
 const RUN_PATH = /^\/ultrathink\/runs\/([^/]+)$/;
@@ -89,6 +96,11 @@ function keyMatches(presented: string | null, expected: string): boolean {
 	return timingSafeEqual(left, right);
 }
 
+function bearerFrom(req: Request): string {
+	const match = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "");
+	return match?.[1] ?? "";
+}
+
 function rpcError(code: number, message: string): unknown {
 	return { jsonrpc: "2.0", id: null, error: { code, message } };
 }
@@ -100,6 +112,15 @@ function toOutcome(result: JournalResult<unknown>): ToolOutcome {
 
 function matchPath(pathname: string): Target | null {
 	if (pathname === "/healthz") return { endpoint: "healthz" };
+	if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") {
+		return { endpoint: "oauth_protected_resource" };
+	}
+	if (pathname === "/.well-known/oauth-authorization-server" || pathname === "/.well-known/openid-configuration") {
+		return { endpoint: "oauth_authorization_server" };
+	}
+	if (pathname === "/oauth/authorize") return { endpoint: "oauth_authorize" };
+	if (pathname === "/oauth/token") return { endpoint: "oauth_token" };
+	if (pathname === "/oauth/register") return { endpoint: "oauth_register" };
 	if (pathname === "/login") return { endpoint: "login" };
 	if (pathname === "/ultrathink") return { endpoint: "ultrathink" };
 	if (pathname === "/mcp") return { endpoint: "mcp" };
@@ -162,6 +183,7 @@ async function readJson(req: Request, maxBytes: number): Promise<JsonRead> {
 
 export function createHandler(deps: RouterDeps): (req: Request, peerIp: string) => Promise<Response> {
 	const { config, store, auth } = deps;
+	const oauth = createOAuth({ origin: config.publicOrigin, stateDir: config.stateDir, auth, now: deps.now });
 
 	async function login(req: Request, peerIp: string): Promise<Response> {
 		if (!isJsonRequest(req) || req.headers.get("origin") !== config.publicOrigin) {
@@ -294,8 +316,11 @@ export function createHandler(deps: RouterDeps): (req: Request, peerIp: string) 
 
 	async function mcpRoute(req: Request, peerIp: string): Promise<Response> {
 		const expectedKey = config.connectorKey;
-		if (expectedKey === undefined) return fail(404, "not_found");
-		if (!keyMatches(req.headers.get("x-connector-key"), expectedKey)) return fail(401, "unauthenticated");
+		const bearerOk = oauth.verifyAccessToken(bearerFrom(req));
+		const keyOk = expectedKey !== undefined && keyMatches(req.headers.get("x-connector-key"), expectedKey);
+		if (!bearerOk && !keyOk) {
+			return fail(401, "unauthenticated", { "WWW-Authenticate": `Bearer resource_metadata="${oauth.resourceMetadataUrl}"` });
+		}
 
 		const limit = auth.allowRequest({ clientIp: clientIpFrom(req, peerIp), ownerId: CONNECTOR_RATE_OWNER });
 		if (!limit.ok) return fail(429, "rate_limited", { "Retry-After": String(limit.retryAfterSec) });
@@ -320,6 +345,11 @@ export function createHandler(deps: RouterDeps): (req: Request, peerIp: string) 
 			}
 
 			if (target.endpoint === "run") return await getRunRoute(req, target.runId);
+		if (target.endpoint === "oauth_protected_resource") return oauth.protectedResourceMetadata();
+		if (target.endpoint === "oauth_authorization_server") return oauth.authorizationServerMetadata();
+		if (target.endpoint === "oauth_register") return await oauth.register(req);
+		if (target.endpoint === "oauth_authorize") return await oauth.authorize(req, clientIpFrom(req, peerIp));
+		if (target.endpoint === "oauth_token") return await oauth.token(req);
 			if (target.endpoint === "healthz") {
 				return store.ping() ? respond(200, { ok: true }) : persistenceUnavailable();
 			}

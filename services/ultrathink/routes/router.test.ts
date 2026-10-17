@@ -311,9 +311,10 @@ describe("MCP endpoint", () => {
 		return body.result;
 	}
 
-	test("is not found when no connector key is configured", async () => {
+	test("challenges with OAuth metadata when no connector key is configured", async () => {
 		const response = await handler(rpc({ jsonrpc: "2.0", id: 1, method: "ping" }), PEER_IP);
-		expect(response.status).toBe(404);
+		expect(response.status).toBe(401);
+		expect(response.headers.get("www-authenticate")).toContain(`${PUBLIC_ORIGIN}/.well-known/oauth-protected-resource/mcp`);
 	});
 
 	test("refuses a missing or wrong connector key", async () => {

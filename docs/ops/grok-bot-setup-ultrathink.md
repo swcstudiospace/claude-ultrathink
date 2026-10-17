@@ -54,3 +54,24 @@ The server makes no paid model call on this path. The only spend is the bot's ow
 - **Prompt cap:** `ULTRATHINK_MAX_INPUT_CHARS`, default 8000 characters.
 - **Answer cap:** `ULTRATHINK_MAX_ANSWER_CHARS`, default 20000 characters. The engine's own limit is 200000 characters, so the server cap is the lower one.
 - **State:** sessions live under `ULTRATHINK_STATE_DIR` (`/var/lib/ultrathink` on this VPS), in `journal/` and `sessions/`. Pending prompts contain the request text, and they are stored there by design.
+
+## 8. Grok Chat: connect with OAuth and PKCE
+
+The connector URL is `https://ultrathink.swcstudio.space/mcp`. It uses OAuth 2.1 with PKCE (S256). Grok finds the server's metadata at `/.well-known/oauth-protected-resource/mcp`, registers itself with dynamic client registration (RFC 7591), and opens a consent page on this server.
+
+1. In Grok, go to grok.com/connectors, click **New Connector**, and select **Custom**.
+2. Enter the URL `https://ultrathink.swcstudio.space/mcp`.
+3. If Grok offers OAuth, choose it and continue. Grok opens the ultrathink consent page. Enter the owner password and click **Approve**.
+4. Confirm the ultrathink tools appear in the connector.
+
+What the server enforces:
+
+- Codes are single-use, expire after 60 seconds, and need the PKCE verifier. A replayed code revokes every token it issued.
+- Access tokens last 1 hour. Refresh tokens last 30 days and rotate on each use. A spent refresh token revokes its grant.
+- Tokens are bound to the MCP resource. A token for another resource is refused.
+- Redirect URIs must be https, or loopback http, and must match the registration exactly.
+- The owner login allows 5 attempts per IP per 15 minutes.
+- The `x-connector-key` header keeps working for the Grok Bot path in section 2.
+
+To revoke every client and token, stop `ultrathink-web`, delete `/var/lib/ultrathink/oauth.json`, and start the service again.
+
