@@ -478,13 +478,16 @@ export default function tokenOpt(pi: PiLike): void {
 		} else {
 			publish(ledger.notePerf({ graphReady }));
 		}
-		const measured = graphDelta(result.text);
-		const estimate = estimateTokens(result.text);
-		record(
-			measured
-				? { at: Date.now(), source: "graph", baseline: measured.baseline, current: measured.current, saved: measured.saved }
-				: { at: Date.now(), source: "graph", baseline: estimate, current: estimate, saved: 0 },
-		);
+		// A cache hit replays text whose savings were already recorded, so it adds no savings point.
+		if (!result.cached) {
+			const measured = graphDelta(result.text);
+			const estimate = estimateTokens(result.text);
+			record(
+				measured
+					? { at: Date.now(), source: "graph", baseline: measured.baseline, current: measured.current, saved: measured.saved }
+					: { at: Date.now(), source: "graph", baseline: estimate, current: estimate, saved: 0 },
+			);
+		}
 		return { content: [{ type: "text" as const, text: result.text }] };
 	}
 

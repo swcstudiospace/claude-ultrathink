@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Token-opt no longer records a second graph saving when a graph query is served from cache. A cache hit replays text whose saving was already recorded.
 - Token-opt bills an assistant message that has no id once per message object instead of skipping it, so cost and cache totals include it. A legacy snapshot that carries only a cache percentage no longer invents lifetime totals. The unrendered warm-token field and its handler are removed.
 - Native Omp insights honor `ULTRATHINK_DECISIONS=0` in current-policy labels while keeping saved decisions readable. A live native UI mounting failure now degrades to the existing bounded read-only snapshot; stale or aborted lifetimes remain silent.
 - Native Grok Bot skill tests fold `>-` descriptions in process, so CI no longer needs PyYAML. The label-safety cwd check compares canonical paths, which is what macOS `getcwd` returns for `/var`.

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import tokenOpt, { PREFIX_POLICY } from "./index.ts";
+import { setGraphifyBinForTests } from "./graph.ts";
 
 describe("tokenOpt", () => {
 	test("does not register before_agent_start, dedupes long results once, and skips rtk when the extension exists", async () => {
@@ -471,4 +472,42 @@ describe("tokenOpt gap fixes", () => {
 		if (code !== 0) throw new Error(`child exited ${code}: ${err}`);
 		return JSON.parse(out.trim());
 	}
+});
+
+describe("tokenOpt graph cache savings", () => {
+	test("a cache hit does not record a second graph saving", async () => {
+		const home = mkdtempSync(join(tmpdir(), "token-opt-home-"));
+		const root = mkdtempSync(join(tmpdir(), "token-opt-graph-"));
+		const bin = join(root, "graphify");
+		writeFileSync(bin, "#!/bin/sh\nprintf 'graphify-tokens: 100 40\\nanswer\\n'\n", { mode: 0o755 });
+		const previousHome = process.env.HOME;
+		process.env.HOME = home;
+		setGraphifyBinForTests(bin);
+		try {
+			const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+			let status = "";
+			let statusHandler: ((args: string, ctx: { cwd?: string; ui: { notify: (message: string) => void } }) => Promise<void>) | undefined;
+			tokenOpt({
+				setLabel() {},
+				zod: { object: () => ({}), string: () => ({}) },
+				registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+					tools.set(tool.name, tool);
+				},
+				registerCommand(_name: string, options: { handler: NonNullable<typeof statusHandler> }) {
+					statusHandler = options.handler;
+				},
+				on() {},
+				events: { emit() {} },
+			} as unknown as Parameters<typeof tokenOpt>[0]);
+			const graphQuery = tools.get("graph_query");
+			const ctx = { cwd: root };
+			await graphQuery?.execute("first", { question: "what" }, undefined, undefined, ctx);
+			await graphQuery?.execute("second", { question: "what" }, undefined, undefined, ctx);
+			await statusHandler?.("", { cwd: root, ui: { notify(message) { status = message; } } });
+			expect(status.includes("saved 60")).toBe(true);
+		} finally {
+			setGraphifyBinForTests(null);
+			process.env.HOME = previousHome;
+		}
+	});
 });
