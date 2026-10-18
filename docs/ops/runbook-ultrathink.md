@@ -61,6 +61,7 @@ Prerequisites: a git checkout of this repository on the VPS (any path; the relea
 6. Build and start the first release with the release script (section 3), then enable everything. When the host still runs the old root-owned service, do not use the script for the first release: follow "First cutover from the old root service" below instead.
 
    ```bash
+   install -m 0644 deploy/ultrathink-tmpfiles.conf /etc/tmpfiles.d/ultrathink.conf && systemd-tmpfiles --create /etc/tmpfiles.d/ultrathink.conf
    systemctl enable ultrathink-web
    systemctl enable --now ultrathink-maintenance.timer
    ```
@@ -121,7 +122,7 @@ The release script's probes need `/readyz`, which the old code lacks, and its re
    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8795/readyz
    ```
 
-   Then install the nginx conf (step 5), verify from outside (step 7), `systemctl enable ultrathink-web`, and `systemctl enable --now ultrathink-maintenance.timer`. Later deploys use the release script, which treats this release as `current`.
+   Then install the nginx conf (step 5), verify from outside (step 7), `systemctl enable ultrathink-web`, and `systemctl enable --now ultrathink-maintenance.timer` (install the tmpfiles entry first, as in step 6). Later deploys use the release script, which treats this release as `current`.
 
 4. Rollback of the cutover: `systemctl stop ultrathink-web`, restore the old unit with `cp -a "$bak"/ultrathink-web.service /etc/systemd/system/`, `systemctl daemon-reload`, `systemctl start ultrathink-web`. The old unit still points at the working tree under `/root`, which the cutover did not modify, and root can read the service-owned state. If the new code changed state the old code cannot read, also restore it: `rm -rf /var/lib/ultrathink && cp -a "$bak"/state /var/lib/ultrathink`. Restore the nginx conf from `$bak` if it was already replaced, then `nginx -t && systemctl reload nginx`.
 
@@ -234,6 +235,7 @@ Common symptoms:
 | 503 | nginx: upstream down or restarting (`systemctl status`). App: not ready, or the planner is busy (`maxConcurrentPlans` jobs running). | Check `journalctl`, `/readyz`, and wait for running plans; raise `ULTRATHINK_MAX_CONCURRENT_PLANS` (1 to 8) if busy is routine. |
 | `planner failed` (result status `failed`) | OpenRouter rejected or timed out: bad or exhausted key, unknown model id, 429 or 5xx from the provider, model timeout, plan timeout. | The result's `error` field and the error log say which. Check the key and credit in the OpenRouter dashboard, `ULTRATHINK_PLANNING_MODEL`, and `ULTRATHINK_MODEL_TIMEOUT_MS` and `ULTRATHINK_PLAN_TIMEOUT_MS`. A plan interrupted by a restart reports `interrupted`. |
 | `budget_exceeded` | The per-run or daily token ceiling was reached (`ULTRATHINK_RUN_TOKEN_CEILING`, `ULTRATHINK_DAILY_TOKEN_CEILING`). The day is a UTC calendar day. | Wait for the next UTC day, or raise the ceiling and restart. The ledger keeps abandoned reservations counted against the ceiling. |
+| `ultrathink-maintenance.service` fails with `status=226/NAMESPACE` ("Failed to set up mount namespacing: /var/backups/ultrathink: No such file or directory") | The backup directory does not exist. systemd builds the `ReadWritePaths=` mount namespace before any `ExecStartPre=` runs, so the unit cannot create it itself. | `install -m 0644 deploy/ultrathink-tmpfiles.conf /etc/tmpfiles.d/ultrathink.conf && systemd-tmpfiles --create /etc/tmpfiles.d/ultrathink.conf`, then start the unit again. |
 | Service flapping | Bad env file, port in use, failed sandbox call. | `systemctl status` shows the start limit (5 starts in 60 seconds). A `SIGSYS` kill means the syscall filter blocked a call: `journalctl -k \| grep -i seccomp`. Roll back the release (section 4). |
 
 ## 8. Suggested alerts

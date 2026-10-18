@@ -18,8 +18,8 @@ Group=ultrathink
 WorkingDirectory=/opt/ultrathink/current
 EnvironmentFile=/etc/ultrathink/ultrathink.env
 Environment=HOME=/var/lib/ultrathink/home
-# "+" runs this one command with full privileges: it creates the archive directory before the sandbox below needs it.
-ExecStartPre=+/usr/bin/install -d -m 0700 -o ultrathink -g ultrathink /var/backups/ultrathink
+# /var/backups/ultrathink comes from deploy/ultrathink-tmpfiles.conf (tmpfiles.d), not from a pre-start command: the
+# mount namespace for ReadWritePaths= is built before any ExecStartPre= runs, so the path must already exist.
 ExecStartPre=/usr/bin/mkdir -p /var/lib/ultrathink/home
 # Invoked through bash so the unit does not depend on the executable bit surviving a release checkout.
 ExecStart=/usr/bin/bash /opt/ultrathink/current/deploy/ultrathink-backup.sh run
