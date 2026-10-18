@@ -47,7 +47,7 @@ Run each item in Grok Bot, in order. The connection counts as verified only when
 
 ## 6. Cost
 
-The server makes no paid model call on the Grok Bot path. The only spend is the bot's own usage in its chat. Server-side plans (section 9) are paid by the operator's OpenRouter account, about 0.1 to 0.3 USD per plan with `x-ai/grok-4.7`, and are bounded by `ULTRATHINK_RUN_TOKEN_CEILING` and `ULTRATHINK_DAILY_TOKEN_CEILING`.
+The server makes no paid model call on the Grok Bot path. The only spend is the bot's own usage in its chat. Server-side plans (section 9) are paid by the operator's OpenRouter account and are bounded by `ULTRATHINK_RUN_TOKEN_CEILING` and `ULTRATHINK_DAILY_TOKEN_CEILING`. One measured plan (2026-10-18, reasoning effort `low`) cost between 0.018 USD (`openai/gpt-5.6-luna`) and 0.153 USD (`x-ai/grok-4.7`) and took 44 to 138 seconds depending on the model. The full table is in [the chat guide](../how-to/use-ultrathink-in-chat.md) under "Time and cost".
 
 ## 7. Known limits
 
@@ -81,7 +81,7 @@ A client can revoke its own token at `POST /oauth/revoke`. To revoke every clien
 
 In a chat that has the connector attached, send `/ultrathink <request>`.
 
-**Server-side planning (the normal case).** The chat model calls `ultrathink_uplift` with the request. The server runs the plugin's pipeline (uplift, Graph of Thought, Chain of Thought, clarifying questions) with the OpenRouter model, in the background, and takes 1 to 5 minutes. The chat model calls `ultrathink_result` with the `sessionId` until the status is `planned`, then asks you the questions in the plan that matter, or states the defaults it assumes, and carries out the plan. The finished plan is also stored in `sessions/` and `jobs/` under `ULTRATHINK_STATE_DIR`. The prompt cap in section 7 applies.
+**Server-side planning (the normal case).** The chat model calls `ultrathink_uplift` with the request. The server runs the plugin's pipeline (uplift, Graph of Thought, Chain of Thought, clarifying questions) with the OpenRouter model, in the background. One measured run took 44 to 138 seconds depending on the model (see the cost section). The chat model calls `ultrathink_result` with the `sessionId` until the status is `planned`, then asks you the questions in the plan that matter, or states the defaults it assumes, and carries out the plan. The finished plan is also stored in `sessions/` and `jobs/` under `ULTRATHINK_STATE_DIR`. The prompt cap in section 7 applies.
 
 **Client-driven fallback.** When the server has no OpenRouter key or planning model, or `ULTRATHINK_SERVER_PLANNING=0`, `ultrathink_uplift` is not listed. The chat model then calls `ultrathink_plan`, answers each pending prompt with `ultrathink_show` and `ultrathink_answer`, and repeats until the status is `planned`. It then calls `ultrathink_result` for the plan. In this mode the server runs no model, and the plan comes from the chat model's own answers.
 

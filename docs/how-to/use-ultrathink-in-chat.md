@@ -103,13 +103,19 @@ When the plan does not fit, whole sections are left out and a note says so. The 
 
 ### Time and cost
 
-| | Typical value |
-|---|---|
-| Time | 1 to 5 minutes |
-| Model calls | about 8 to 11: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1 |
-| Cost | about 0.1 to 0.3 USD per plan with `x-ai/grok-4.7` at 2 and 6 USD per million input and output tokens |
+Measured on 2026-10-18 on this VPS with the real planner. Prompt: "Compare three approaches for caching in a small Node API and recommend one for a team of two." Five models ran in parallel with `ULTRATHINK_MODEL_REASONING_EFFORT` at `low`. All five plans passed the plugin's structure check. Each row is one run, so timing varies from run to run.
 
-The time and cost figures are estimates for typical requests, not measured limits. The result's `usage` field reports the real calls, tokens and, when OpenRouter returns it, the cost of each plan.
+| Model | Time | Model calls | Tokens in / out | Cost | Plan size | Nodes / steps |
+|---|---|---|---|---|---|---|
+| `google/gemini-3.6-flash` | 44 s | 9 | 28.8k / 7.9k | 0.051 USD | 19.8k chars | 6 / 34 |
+| `x-ai/grok-4.3` | 62 s | 9 | 15.3k / 7.9k | 0.036 USD | 8.1k chars | 6 / 44 |
+| `openai/gpt-5.6-luna` | 65 s | 10 | 34.7k / 7.6k | 0.018 USD | 22.0k chars | 7 / 49 |
+| `anthropic/claude-haiku-4.5` | 111 s | 10 | 39.3k / 10.0k | 0.089 USD | 23.9k chars | 7 / 56 |
+| `x-ai/grok-4.7` | 138 s | 10 | 50.9k / 11.7k | 0.153 USD | 23.9k chars | 7 / 56 |
+
+A plan makes 9 to 11 model calls: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1. `x-ai/grok-4.7` at the provider's default reasoning did not finish in 6 minutes: one call passed the 120 s per-call timeout, and the 9 calls it made cost 0.167 USD. That is why the default effort is `low`.
+
+The shipped example model stays `x-ai/grok-4.7`, which is the operator's choice. A faster or cheaper model is one `ULTRATHINK_PLANNING_MODEL` change: `google/gemini-3.6-flash` for speed, `openai/gpt-5.6-luna` for price. Model ids are OpenRouter ids. The result's `usage` field reports the real calls, tokens and, when OpenRouter returns it, the cost of each plan.
 
 Two ceilings bound the spend, both counted in tokens by a ledger in the server's database:
 
@@ -180,6 +186,7 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_MODEL_TIMEOUT_MS` | `120000` | Timeout for one model call, 5000 to 600000. |
 | `ULTRATHINK_PLAN_TIMEOUT_MS` | `600000` | Timeout for one whole plan, 30000 to 1800000. |
 | `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
+| `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. The pipeline already asks the model to write its reasoning steps, so hidden reasoning only adds minutes. |
 | `ULTRATHINK_SERVER_DECISIONS` | off | `1` turns on the Jev decision gate in server-side plans. |
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
@@ -201,7 +208,8 @@ Origin lists take bare origins only (`https://host[:port]`, no path, query or fr
 | Status `failed`, error `budget_exceeded` | The per-run or daily token ceiling was reached. | Wait for the next UTC day, or ask the operator to raise the ceiling. |
 | Status `skipped` | The pipeline declined the request, for example one that starts with a slash command or a `raw:` prefix. | State the request as a plain description of the task and call `ultrathink_uplift` again with a new `sessionId`. |
 | Status `failed`, error `auth` | OpenRouter refused the API key (HTTP 401 or 403). | The operator replaces `OPENROUTER_API_KEY` and restarts. |
-| Status `failed`, error `rate_limited`, `upstream`, `timeout`, `empty` or `bad_response` | The model provider limited, failed, timed out or returned nothing usable, after retries. | Try again with a new `sessionId`. The operator checks the model id, credit and timeouts. |
+| Status `failed`, error `rate_limited`, `upstream`, `empty` or `bad_response` | The model provider limited, failed or returned nothing usable, after retries. | Try again with a new `sessionId`. The operator checks the model id, credit and timeouts. |
+| Status `failed`, error `timeout` | One model call took longer than `ULTRATHINK_MODEL_TIMEOUT_MS`, or the whole plan took longer than `ULTRATHINK_PLAN_TIMEOUT_MS`. | Try a faster model (see the table above) or a lower `ULTRATHINK_MODEL_REASONING_EFFORT`. The cost of the partial run still counts against the ceilings. |
 | Status `failed`, error `interrupted` | The service restarted while the plan ran. | Run it again with a new `sessionId`. |
 | Status `invalid` | The model produced an incomplete plan. | Run it again, or rephrase the request. |
 | Result says `truncated` | The plan was larger than the size limit, so later Graph of Thought sections were left out. | Ask the user for what is missing, or split the request into smaller ones. |
