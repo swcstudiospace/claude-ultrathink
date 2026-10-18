@@ -688,7 +688,7 @@ describe("token savings", () => {
 	});
 
 	test("parseTokenSavings rejects negatives and accepts a minimal valid object", () => {
-		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		const minimal: TokenSavingsSnapshot = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
 		expect(parseTokenSavings(minimal)).toEqual(minimal);
 		expect(parseTokenSavings({ ...minimal, savedTokens: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, baselineTokens: -1, savedTokens: -1 })).toBeUndefined();
@@ -729,7 +729,7 @@ describe("token savings", () => {
 	});
 
 	test("parseTokenSavings rejects lastTurnMs below zero and copies valid perf fields", () => {
-		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		const minimal: TokenSavingsSnapshot = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
 		expect(parseTokenSavings({ ...minimal, lastTurnMs: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, lastTurnMs: 840, cacheHitPct: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, cacheHitPct: 101 })).toBeUndefined();
@@ -789,7 +789,7 @@ describe("token savings", () => {
 	});
 
 	test("ttftMs -1 rejects the snapshot", () => {
-		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		const minimal: TokenSavingsSnapshot = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
 		expect(parseTokenSavings({ ...minimal, ttftMs: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, rtkSavedTokens: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, lastPayloadChars: -1 })).toBeUndefined();
@@ -905,7 +905,7 @@ describe("token savings", () => {
 	});
 
 	test("lastIdleMs -1 rejects the snapshot", () => {
-		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		const minimal: TokenSavingsSnapshot = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
 		expect(parseTokenSavings({ ...minimal, lastIdleMs: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, costCents: -1 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, lastIdleMs: 1.5 })).toBeUndefined();
@@ -988,7 +988,7 @@ describe("token savings", () => {
 	});
 
 	test("prefixChanged 2 rejects the snapshot", () => {
-		const minimal = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
+		const minimal: TokenSavingsSnapshot = { v: 1, sessionId: "s", updatedAt: 1, baselineTokens: 0, currentTokens: 0, savedTokens: 0, points: [] };
 		expect(parseTokenSavings({ ...minimal, prefixChanged: 2 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, toolsChanged: 2 })).toBeUndefined();
 		expect(parseTokenSavings({ ...minimal, graphReady: 2 })).toBeUndefined();
@@ -1044,7 +1044,7 @@ describe("token savings", () => {
 		expect(absent !== undefined && Object.hasOwn(absent, "graphReady")).toBe(false);
 		const store = createBarStore();
 		store.setSavings(snapshot);
-		store.setSavings({ ...snapshot, prefixChanged: 2 });
+		store.setSavings({ ...snapshot, prefixChanged: 2 as unknown as 0 | 1 });
 		expect(store.get().savings).toEqual(snapshot);
 		store.setSavings({ ...snapshot, providerInput: -1 });
 		expect(store.get().savings).toEqual(snapshot);
