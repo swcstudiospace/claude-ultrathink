@@ -1,23 +1,81 @@
-# DRAFT, NOT INSTALLED. Reference copy only; do not copy into /etc/systemd/system yet.
-# Rollback: systemctl disable --now ultrathink-web
+# Installed as /etc/systemd/system/ultrathink-web.service. Keep this file and the installed copy in sync:
+#   install -m 0644 deploy/ultrathink-web.service /etc/systemd/system/ && systemctl daemon-reload && systemctl restart ultrathink-web
+# Code lives in /opt/ultrathink/releases/<sha>-<utc>, with /opt/ultrathink/current pointing at the active release
+# (deploy/ultrathink-release.sh manages the symlink). Bun is installed at /opt/ultrathink/bin/bun, outside any home directory.
+# Audit the sandbox with: systemd-analyze security ultrathink-web
+# Rollback of a release: deploy/ultrathink-release.sh rollback. Stop the service: systemctl disable --now ultrathink-web
 
 [Unit]
-Description=Ultrathink authenticated web surface
+Description=Ultrathink authenticated web surface and MCP server
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
 After=network-online.target
 Wants=network-online.target
+# Systemd gives up after 5 starts in 60 s instead of looping forever on a bad release or a bad env file.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/src/repos/claude-ultrathink
+User=ultrathink
+Group=ultrathink
+WorkingDirectory=/opt/ultrathink/current
 EnvironmentFile=/etc/ultrathink/ultrathink.env
-ExecStart=/root/.local/share/reflex/bun/bin/bun run services/ultrathink/server.ts
-Restart=on-failure
+# Bun and some libraries read $HOME. ProtectHome hides /home and /root, so point it at a directory inside the state dir.
+Environment=HOME=/var/lib/ultrathink/home
+ExecStartPre=/usr/bin/mkdir -p /var/lib/ultrathink/home
+ExecStart=/opt/ultrathink/bin/bun run services/ultrathink/server.ts
+
+# Restart=always (not on-failure): the app calls process.exit(0) on shutdown paths, and any exit the operator did not
+# request through systemctl stop should bring the service back. An explicit systemctl stop is never restarted.
+Restart=always
 RestartSec=3
-MemoryMax=512M
+# The app drains in-flight requests on SIGTERM; give it 30 s before SIGKILL.
+TimeoutStopSec=30
+
+# Resource limits. MemoryMax is a hard cap (OOM-kill inside the cgroup, the host stays healthy); watch it via /metrics.
+MemoryMax=768M
+TasksMax=256
+LimitNOFILE=4096
+
+# State: /var/lib/ultrathink is created and chowned by systemd, writable even under ProtectSystem=strict.
+# UMask=0077 makes the sqlite files, oauth.json and journal entries owner-only (they hold user prompts).
+StateDirectory=ultrathink
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandbox.
 NoNewPrivileges=true
+ProtectSystem=strict
+# /home, /root and /run/user are empty for the service. The code is under /opt, so nothing needs them.
+ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+# Hide other processes. ProcSubset=pid also hides /proc/cpuinfo and /proc/meminfo; if Bun ever needs them,
+# drop ProcSubset first and keep ProtectProc.
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately NOT set: Bun's JavaScriptCore JIT maps writable and executable memory.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# TCP to OpenRouter and loopback listening, plus AF_UNIX for journald. No raw or netlink sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# @system-service is the allow list for ordinary daemons; the second line removes privileged calls. @resources is
+# deliberately not excluded: Bun may call setrlimit at startup and a blocked syscall kills the process with SIGSYS.
+# systemd-analyze security still scores the unit. If the service dies with SIGSYS after a Bun upgrade, find the call with:
+# journalctl -k | grep -i seccomp
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ultrathink-web

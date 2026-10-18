@@ -1,4 +1,8 @@
-# DRAFT, NOT INSTALLED. Reference copy only; do not copy into /etc/systemd/system yet.
+# DRAFT, NOT INSTALLED, AND NOT INSTALLABLE YET. Do not copy into /etc/systemd/system.
+# ExecStart points at services/ultrathink/worker/main.ts, which does not exist: worker/ holds only mirror.ts and worker.ts
+# (library code, no entrypoint and no signal handling). Server-side planning runs inside ultrathink-web (engine/headless.ts),
+# so no separate worker process is needed today. Before enabling this unit, add the entrypoint and then harden the unit
+# like ultrathink-web.service (dedicated user, /opt release, sandbox directives).
 # Rollback: systemctl disable --now ultrathink-worker
 
 [Unit]
