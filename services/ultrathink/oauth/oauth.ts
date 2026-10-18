@@ -9,12 +9,15 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Auth } from "../auth/auth.ts";
+import type { ApprovalProof, Auth } from "../auth/auth.ts";
 
 const ACCESS_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 const PENDING_TTL_MS = 10 * 60 * 1000;
+const POLL_INTERVAL_MS = 10 * 1000;
+const MAX_PENDING = 200;
+const EXPIRED_MESSAGE = "This authorization request expired. Start the connection again from your client.";
 const MAX_CLIENTS = 200;
 const MAX_REDIRECT_URIS = 5;
 const MAX_REDIRECT_URI_CHARS = 2048;
@@ -61,7 +64,10 @@ interface StoreShape {
 	grants: Record<string, GrantRecord>;
 	codes: Record<string, CodeRecord>;
 	tokens: Record<string, TokenRecord>;
+	pending: Record<string, PendingRequest>;
 }
+
+type ApprovalState = "PENDING_APPROVAL" | "APPROVED" | "EXPIRED";
 
 interface PendingRequest {
 	clientId: string;
@@ -69,7 +75,12 @@ interface PendingRequest {
 	codeChallenge: string;
 	resource: string;
 	state: string | null;
+	createdAt: number;
 	expiresAt: number;
+	refreshedAt: number;
+	approvalState: ApprovalState;
+	nonce: string;
+	signature: string;
 }
 
 export interface OAuthOptions {
@@ -100,7 +111,10 @@ const NO_STORE = {
 const HTML_HEADERS = {
 	...NO_STORE,
 	"Content-Type": "text/html; charset=utf-8",
-	"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+	// form-action must allow the registered redirect. Chrome applies it to the
+	// redirect that follows this form post. 'self' alone cancels the jump to
+	// https://grok.com, so the page does not move and the next click is expired.
+	"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http://127.0.0.1:* http://localhost:* http://[::1]:*; frame-ancestors 'none'; base-uri 'none'",
 	"X-Frame-Options": "DENY",
 };
 
@@ -184,7 +198,7 @@ function pkceMatches(verifier: string, challenge: string): boolean {
 }
 
 function emptyStore(): StoreShape {
-	return { clients: {}, grants: {}, codes: {}, tokens: {} };
+	return { clients: {}, grants: {}, codes: {}, tokens: {}, pending: {} };
 }
 
 function loadStore(path: string): StoreShape {
@@ -196,6 +210,7 @@ function loadStore(path: string): StoreShape {
 			grants: parsed.grants ?? {},
 			codes: parsed.codes ?? {},
 			tokens: parsed.tokens ?? {},
+			pending: parsed.pending ?? {},
 		};
 	} catch {
 		// A corrupt file forgets every client and token. Users re-consent; nothing is granted by default.
@@ -218,17 +233,112 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	const path = join(options.stateDir, STATE_FILE);
 	const data = loadStore(path);
 	const pending = new Map<string, PendingRequest>();
+	const polls = new Map<string, NodeJS.Timeout>();
+	const approving = new Set<string>();
+	// A fake clock means a test. Wall-clock polling would race that clock, so only production arms it.
+	const armPolls = options.now === undefined;
+
+	function stopPoll(key: string): void {
+		const timer = polls.get(key);
+		if (timer === undefined) return;
+		clearInterval(timer);
+		polls.delete(key);
+	}
+
+	function proofOf(key: string, request: PendingRequest): ApprovalProof {
+		return {
+			subject: key,
+			nonce: request.nonce,
+			issuedAt: request.createdAt,
+			expiresAt: request.expiresAt,
+			refreshedAt: request.refreshedAt,
+		};
+	}
 
 	function prune(): void {
 		const t = now();
 		for (const [key, record] of Object.entries(data.codes)) if (record.expiresAt <= t) delete data.codes[key];
 		for (const [key, record] of Object.entries(data.tokens)) if (record.expiresAt <= t) delete data.tokens[key];
-		for (const [key, request] of pending) if (request.expiresAt <= t) pending.delete(key);
+		for (const [key, request] of pending) {
+			if (request.expiresAt <= t || request.approvalState === "EXPIRED") {
+				request.approvalState = "EXPIRED";
+				stopPoll(key);
+				pending.delete(key);
+			}
+		}
 	}
 
 	function persist(): void {
 		prune();
+		data.pending = {};
+		for (const [key, request] of pending) data.pending[key] = { ...request };
 		saveStore(options.stateDir, path, data);
+	}
+
+	function expiredResponse(asJson: boolean): Response {
+		if (asJson) return jsonResponse(400, { state: "EXPIRED", error: EXPIRED_MESSAGE });
+		return errorPage(400, EXPIRED_MESSAGE);
+	}
+
+	// Stays PENDING_APPROVAL until the absolute deadline. Each tick refreshes the activity
+	// timestamp and re-signs; it does not extend the deadline or rotate the nonce.
+	function tickApproval(key: string): ApprovalState | null {
+		const request = pending.get(key);
+		if (!request) return null;
+		if (request.approvalState !== "PENDING_APPROVAL") return request.approvalState;
+		const t = now();
+		const deadline = request.createdAt + PENDING_TTL_MS;
+		if (t >= deadline || request.expiresAt <= t) {
+			request.approvalState = "EXPIRED";
+			request.expiresAt = deadline;
+			stopPoll(key);
+			return "EXPIRED";
+		}
+		request.refreshedAt = t;
+		request.expiresAt = deadline;
+		request.signature = options.auth.signApproval(proofOf(key, request));
+		return "PENDING_APPROVAL";
+	}
+
+	function startPoll(key: string): void {
+		if (!armPolls || polls.has(key)) return;
+		const timer = setInterval(() => {
+			try {
+				const state = tickApproval(key);
+				if (state !== "PENDING_APPROVAL") stopPoll(key);
+				persist();
+			} catch {
+				// A disk error must not take down consent. The in-memory request stays pending.
+			}
+		}, POLL_INTERVAL_MS);
+		timer.unref();
+		polls.set(key, timer);
+	}
+
+	function trustedPending(record: PendingRequest, key: string): boolean {
+		if (typeof record?.nonce !== "string" || typeof record.signature !== "string" || typeof record.clientId !== "string") return false;
+		if (record.approvalState !== "PENDING_APPROVAL" && record.approvalState !== "APPROVED" && record.approvalState !== "EXPIRED") return false;
+		if (!Number.isSafeInteger(record.createdAt) || !Number.isSafeInteger(record.expiresAt) || !Number.isSafeInteger(record.refreshedAt)) return false;
+		if (record.expiresAt !== record.createdAt + PENDING_TTL_MS) return false;
+		return options.auth.verifyApproval(proofOf(key, record), record.signature);
+	}
+
+	for (const [key, record] of Object.entries(data.pending)) {
+		if (!trustedPending(record, key)) continue;
+		pending.set(key, { ...record });
+		if (record.approvalState === "PENDING_APPROVAL" && record.expiresAt > now()) startPoll(key);
+	}
+
+	function findPending(requestId: string, nonce: string): { key: string; request: PendingRequest } | null {
+		if (requestId === "" || nonce === "") return null;
+		const key = digest(requestId);
+		const request = pending.get(key);
+		if (!request) return null;
+		const submitted = Buffer.from(nonce);
+		const stored = Buffer.from(request.nonce);
+		if (submitted.length !== stored.length || !timingSafeEqual(submitted, stored)) return null;
+		if (!options.auth.verifyApproval(proofOf(key, request), request.signature)) return null;
+		return { key, request };
 	}
 
 	function revokeGrant(grantId: string): void {
@@ -251,9 +361,9 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		};
 	}
 
-	function consentPage(requestId: string, clientName: string, message: string, status: number): Response {
+	function consentPage(requestId: string, nonce: string, clientName: string, message: string, status: number): Response {
 		const alert = message === "" ? "" : `<p class="err">${escapeHtml(message)}</p>`;
-		const content = `<p>Allow <strong>${escapeHtml(clientName)}</strong> to use the ultrathink planning tools on this server? Enter the owner password to approve.</p>${alert}<form method="post" action="/oauth/authorize"><input type="hidden" name="req" value="${escapeHtml(requestId)}"><label>Owner password<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">Approve</button></form>`;
+		const content = `<p data-approval-state="PENDING_APPROVAL">Allow <strong>${escapeHtml(clientName)}</strong> to use the ultrathink planning tools on this server? Enter the owner password to approve.</p>${alert}<form method="post" action="/oauth/authorize"><input type="hidden" name="req" value="${escapeHtml(requestId)}"><input type="hidden" name="nonce" value="${escapeHtml(nonce)}"><label>Owner password<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">Approve</button></form>`;
 		return htmlPage(status, page("Authorize ultrathink", content));
 	}
 
@@ -282,16 +392,32 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		if (params.get("resource") !== resource) {
 			return redirectWith(redirectUri, { error: "invalid_target", error_description: "resource must be the ultrathink MCP endpoint." }, state);
 		}
+		if (pending.size >= MAX_PENDING) {
+			prune();
+			if (pending.size >= MAX_PENDING) return errorPage(503, "Authorization is temporarily unavailable. Start the connection again from your client.");
+		}
 		const requestId = secret("ut_req_");
-		pending.set(requestId, {
+		const key = digest(requestId);
+		const createdAt = now();
+		const nonce = options.auth.newApprovalNonce();
+		const request: PendingRequest = {
 			clientId: params.get("client_id") ?? "",
 			redirectUri,
 			codeChallenge: challenge,
 			resource,
 			state,
-			expiresAt: now() + PENDING_TTL_MS,
-		});
-		return consentPage(requestId, client.name, "", 200);
+			createdAt,
+			expiresAt: createdAt + PENDING_TTL_MS,
+			refreshedAt: createdAt,
+			approvalState: "PENDING_APPROVAL",
+			nonce,
+			signature: "",
+		};
+		request.signature = options.auth.signApproval(proofOf(key, request));
+		pending.set(key, request);
+		startPoll(key);
+		persist();
+		return consentPage(requestId, nonce, client.name, "", 200);
 	}
 
 	async function authorizePost(req: Request, ip: string): Promise<Response> {
@@ -299,32 +425,55 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		if (text === null) return errorPage(413, "The request is too large.");
 		const form = new URLSearchParams(text);
 		const requestId = form.get("req") ?? "";
-		const request = pending.get(requestId);
-		if (!request || request.expiresAt <= now()) {
-			pending.delete(requestId);
-			return errorPage(400, "This authorization request expired. Start the connection again from your client.");
+		const nonce = form.get("nonce") ?? "";
+		const polling = form.get("action") === "poll";
+		const found = findPending(requestId, nonce);
+		if (!found) return expiredResponse(polling);
+		const approvalState = tickApproval(found.key);
+		if (approvalState !== "PENDING_APPROVAL") {
+			persist();
+			return expiredResponse(polling);
 		}
-		const login = await options.auth.login({ password: form.get("password") ?? "", clientIp: ip });
-		if (!login.ok) {
-			if (login.reason === "rate_limited") return errorPage(429, "Too many attempts. Wait and try again.");
-			const client = own(data.clients, request.clientId);
-			return consentPage(requestId, client?.name ?? "MCP client", "Incorrect password.", 200);
-		}
-		pending.delete(requestId);
-		const grantId = randomBytes(16).toString("base64url");
-		const code = secret("ut_code_");
-		data.grants[grantId] = { clientId: request.clientId, resource: request.resource, createdAt: now() };
-		data.codes[digest(code)] = {
-			clientId: request.clientId,
-			redirectUri: request.redirectUri,
-			codeChallenge: request.codeChallenge,
-			resource: request.resource,
-			grantId,
-			expiresAt: now() + CODE_TTL_MS,
-			used: false,
-		};
 		persist();
-		return redirectWith(request.redirectUri, { code }, request.state);
+		if (polling) {
+			const remaining = Math.max(0, Math.ceil((found.request.expiresAt - now()) / 1000));
+			return jsonResponse(200, { state: "PENDING_APPROVAL", expires_in: remaining, refreshed_at: found.request.refreshedAt });
+		}
+		const clientName = own(data.clients, found.request.clientId)?.name ?? "MCP client";
+		if (approving.has(found.key)) {
+			return consentPage(requestId, found.request.nonce, clientName, "This approval is already being checked. Wait for the result.", 200);
+		}
+		const attempt = options.auth.allowApprovalAttempt(ip);
+		if (!attempt.ok) return errorPage(429, "Too many attempts. Wait and try again.");
+		approving.add(found.key);
+		try {
+			const login = await options.auth.login({ password: form.get("password") ?? "", clientIp: ip });
+			if (!login.ok) {
+				if (login.reason === "rate_limited") return errorPage(429, "Too many attempts. Wait and try again.");
+				if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
+				return consentPage(requestId, found.request.nonce, clientName, "Incorrect password.", 200);
+			}
+			if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
+			found.request.approvalState = "APPROVED";
+			stopPoll(found.key);
+			pending.delete(found.key);
+			const grantId = randomBytes(16).toString("base64url");
+			const code = secret("ut_code_");
+			data.grants[grantId] = { clientId: found.request.clientId, resource: found.request.resource, createdAt: now() };
+			data.codes[digest(code)] = {
+				clientId: found.request.clientId,
+				redirectUri: found.request.redirectUri,
+				codeChallenge: found.request.codeChallenge,
+				resource: found.request.resource,
+				grantId,
+				expiresAt: now() + CODE_TTL_MS,
+				used: false,
+			};
+			persist();
+			return redirectWith(found.request.redirectUri, { code }, found.request.state);
+		} finally {
+			approving.delete(found.key);
+		}
 	}
 
 	async function exchangeCode(form: URLSearchParams): Promise<Response> {

@@ -10,6 +10,14 @@ export interface AuthOptions {
 	now?: () => number;
 }
 
+export interface ApprovalProof {
+	subject: string;
+	nonce: string;
+	issuedAt: number;
+	expiresAt: number;
+	refreshedAt: number;
+}
+
 export interface Auth {
 	login(input: { password: string; clientIp: string }): Promise<
 		| { ok: true; setCookie: string }
@@ -18,6 +26,10 @@ export interface Auth {
 	sessionFor(req: Request): { ownerId: "owner" } | null;
 	logoutCookie(): string;
 	allowRequest(input: { clientIp: string; ownerId: string }): { ok: true } | { ok: false; retryAfterSec: number };
+	newApprovalNonce(): string;
+	signApproval(proof: ApprovalProof): string;
+	verifyApproval(proof: ApprovalProof, signature: string): boolean;
+	allowApprovalAttempt(clientIp: string): { ok: true } | { ok: false; retryAfterSec: number };
 }
 
 const COOKIE_NAME = "ut_session";
@@ -29,6 +41,9 @@ const OWNER_FAILURES_PER_WINDOW = 10;
 const REQUEST_WINDOW_MS = 60 * 1000;
 const OWNER_REQUESTS_PER_WINDOW = 60;
 const IP_REQUESTS_PER_WINDOW = 120;
+const APPROVAL_WINDOW_MS = 60 * 1000;
+const APPROVAL_ATTEMPTS_PER_WINDOW = 2;
+const APPROVAL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_TRACKED_KEYS = 10_000;
 const PRUNE_INTERVAL_MS = 60 * 1000;
 const OWNER_KEY = "owner";
@@ -112,6 +127,7 @@ export function createAuth(options: AuthOptions): Auth {
 	const loginsByIp = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
 	const ownerFailures = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
 	const requests = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
+	const approvalAttempts = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
 
 	// Always performs one Argon2/bcrypt verify so a malformed stored hash
 	// takes the same time as a well-formed one.
@@ -130,6 +146,16 @@ export function createAuth(options: AuthOptions): Auth {
 
 	function sign(expiresAtMs: number): string {
 		return createHmac("sha256", sessionSecret).update(`ut-session|${expiresAtMs}`).digest("base64url");
+	}
+
+	function approvalMac(proof: ApprovalProof): string | null {
+		const times = [proof.issuedAt, proof.expiresAt, proof.refreshedAt];
+		const timesOk = times.every((value) => Number.isSafeInteger(value) && value >= 0 && value <= 9_999_999_999_999_999);
+		if (!APPROVAL_TOKEN.test(proof.subject) || !APPROVAL_TOKEN.test(proof.nonce) || !timesOk) return null;
+		if (proof.expiresAt < proof.issuedAt || proof.refreshedAt < proof.issuedAt) return null;
+		return createHmac("sha256", sessionSecret)
+			.update(`ut-approval|${proof.subject}|${proof.nonce}|${proof.issuedAt}|${proof.expiresAt}|${proof.refreshedAt}`)
+			.digest("base64url");
 	}
 
 	function cookieHeader(value: string, maxAgeSec: number): string {
@@ -204,6 +230,33 @@ export function createAuth(options: AuthOptions): Auth {
 			const owner = requests.hit(`owner:${ownerId}`, REQUEST_WINDOW_MS);
 			if (!owner || owner.count > OWNER_REQUESTS_PER_WINDOW) {
 				return { ok: false, retryAfterSec: retryAfterOf(owner, REQUEST_WINDOW_MS) };
+			}
+			return { ok: true };
+		},
+
+		newApprovalNonce() {
+			return randomBytes(32).toString("base64url");
+		},
+
+		signApproval(proof) {
+			const mac = approvalMac(proof);
+			if (mac === null) throw new Error("invalid approval proof");
+			return mac;
+		},
+
+		verifyApproval(proof, signature) {
+			if (typeof signature !== "string" || signature.length === 0 || signature.length > 128) return false;
+			const expected = approvalMac(proof);
+			if (expected === null) return false;
+			const expectedBuf = Buffer.from(expected);
+			const actualBuf = Buffer.from(signature);
+			return actualBuf.length === expectedBuf.length && timingSafeEqual(actualBuf, expectedBuf);
+		},
+
+		allowApprovalAttempt(clientIp) {
+			const hit = approvalAttempts.hit(clientIp, APPROVAL_WINDOW_MS);
+			if (!hit || hit.count > APPROVAL_ATTEMPTS_PER_WINDOW) {
+				return { ok: false, retryAfterSec: retryAfterOf(hit, APPROVAL_WINDOW_MS) };
 			}
 			return { ok: true };
 		},

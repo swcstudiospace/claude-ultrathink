@@ -211,6 +211,53 @@ describe("allowRequest", () => {
 	});
 });
 
+describe("approval proofs", () => {
+	const proof = {
+		subject: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+		nonce: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456",
+		issuedAt: 1_700_000_000_000,
+		expiresAt: 1_700_000_600_000,
+		refreshedAt: 1_700_000_045_000,
+	};
+
+	test("signs and verifies a nonce-bound approval proof", () => {
+		const auth = makeAuth(makeClock());
+		const nonce = auth.newApprovalNonce();
+		expect(nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		const signature = auth.signApproval({ ...proof, nonce });
+		expect(auth.verifyApproval({ ...proof, nonce }, signature)).toBe(true);
+	});
+
+	test("rejects a tampered nonce, timestamp, or signature", () => {
+		const auth = makeAuth(makeClock());
+		const signature = auth.signApproval(proof);
+		expect(auth.verifyApproval({ ...proof, nonce: `${proof.nonce.slice(0, 42)}A` }, signature)).toBe(false);
+		expect(auth.verifyApproval({ ...proof, expiresAt: proof.expiresAt + 1 }, signature)).toBe(false);
+		expect(auth.verifyApproval({ ...proof, refreshedAt: proof.refreshedAt + 1 }, signature)).toBe(false);
+		expect(auth.verifyApproval(proof, `${signature.slice(0, -1)}A`)).toBe(false);
+		expect(auth.verifyApproval(proof, signature.slice(0, -1))).toBe(false);
+	});
+
+	test("a signature from another secret does not verify", () => {
+		const signature = makeAuth(makeClock(), { sessionSecret: OTHER_SECRET }).signApproval(proof);
+		expect(makeAuth(makeClock()).verifyApproval(proof, signature)).toBe(false);
+	});
+
+	test("allows two approve attempts per minute and the third is limited", () => {
+		const clock = makeClock();
+		const auth = makeAuth(clock);
+		expect(auth.allowApprovalAttempt("198.51.100.40")).toEqual({ ok: true });
+		expect(auth.allowApprovalAttempt("198.51.100.40")).toEqual({ ok: true });
+		const denied = auth.allowApprovalAttempt("198.51.100.40");
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.retryAfterSec).toBeGreaterThan(0);
+		expect(auth.allowApprovalAttempt("198.51.100.41")).toEqual({ ok: true });
+		clock.t += 60_000;
+		expect(auth.allowApprovalAttempt("198.51.100.40")).toEqual({ ok: true });
+	});
+});
+
 describe("clientIpFrom", () => {
 	function requestWithRealIp(value?: string): Request {
 		return new Request(ORIGIN, { headers: value === undefined ? {} : { "x-real-ip": value } });
