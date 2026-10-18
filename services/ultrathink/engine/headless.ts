@@ -321,6 +321,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 						maxOutputTokens: config.modelMaxOutputTokens,
 						timeoutMs: config.modelTimeoutMs,
 						referer: config.publicOrigin,
+						...(config.modelReasoningEffort === undefined ? {} : { reasoningEffort: config.modelReasoningEffort }),
 						sleep,
 						...(opts.fetch ? { fetch: opts.fetch } : {}),
 						onUsage: (usage) => {

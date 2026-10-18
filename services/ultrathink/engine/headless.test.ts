@@ -533,6 +533,31 @@ describe("headless planner: client-mode fallback", () => {
 	});
 });
 
+describe("headless planner: reasoning effort", () => {
+	async function bodiesFor(overrides: Partial<UltrathinkConfig>): Promise<Array<Record<string, unknown>>> {
+		const script = scriptedModel();
+		const bodies: Array<Record<string, unknown>> = [];
+		const openRouter: OpenRouterFetch = async (_url, init) => {
+			const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+			bodies.push(body as unknown as Record<string, unknown>);
+			const content = script(body.messages[0]?.content ?? "", body.messages[1]?.content ?? "");
+			return new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 10, completion_tokens: 5 } }), { status: 200 });
+		};
+		const h = setup(overrides, { completer: undefined, fetch: openRouter });
+		expect(await h.planner.start({ prompt: PROMPT })).toMatchObject({ ok: true, data: { status: "planned" } });
+		return bodies;
+	}
+
+	test("sends reasoning.effort on every call when configured, and no reasoning key otherwise", async () => {
+		const low = await bodiesFor({ modelReasoningEffort: "low" });
+		expect(low.length).toBeGreaterThanOrEqual(8);
+		for (const body of low) expect(body.reasoning).toEqual({ effort: "low" });
+		const unset = await bodiesFor({});
+		expect(unset.length).toBeGreaterThanOrEqual(8);
+		for (const body of unset) expect("reasoning" in body).toBe(false);
+	});
+});
+
 describe("headless planner: isolation", () => {
 	test("the env and options given to planPrompt carry the kill switches and none of the operator's state", async () => {
 		const captured: { call?: { request: Parameters<typeof planPrompt>[0]; env: Record<string, string | undefined>; options: NonNullable<Parameters<typeof planPrompt>[2]> } } = {};

@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { ConfigError, loadConfig, requirePlanningModel } from "./config.ts";
+import { ConfigError, loadConfig, requirePlanningModel, type ReasoningEffort } from "./config.ts";
 
 function randomSecret(): string {
 	return randomBytes(24).toString("base64url");
@@ -442,4 +442,40 @@ describe("origin lists", () => {
 		env.ULTRATHINK_OAUTH_REDIRECT_ORIGINS = "https://app.example.test/callback";
 		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_OAUTH_REDIRECT_ORIGINS");
 	});
+});
+
+describe("modelReasoningEffort", () => {
+	test("unset defaults to low", () => {
+		expect(loadConfig(baseEnv()).modelReasoningEffort).toBe("low");
+	});
+
+	for (const value of ["minimal", "low", "medium", "high"]) {
+		test(`accepts ${value}`, () => {
+			const env = baseEnv();
+			env.ULTRATHINK_MODEL_REASONING_EFFORT = ` ${value} `;
+			expect(loadConfig(env).modelReasoningEffort).toBe(value as ReasoningEffort);
+		});
+	}
+
+	test("default leaves the parameter undefined", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_MODEL_REASONING_EFFORT = "default";
+		expect(loadConfig(env).modelReasoningEffort).toBeUndefined();
+	});
+
+	test("a blank value counts as unset", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_MODEL_REASONING_EFFORT = "  ";
+		expect(loadConfig(env).modelReasoningEffort).toBe("low");
+	});
+
+	for (const value of ["extreme", "LOW", "none", "1"]) {
+		test(`rejects ${value} naming the variable without echoing it`, () => {
+			const env = baseEnv();
+			env.ULTRATHINK_MODEL_REASONING_EFFORT = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_MODEL_REASONING_EFFORT");
+			expect(message).not.toContain(value);
+		});
+	}
 });

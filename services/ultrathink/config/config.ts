@@ -8,6 +8,8 @@ export class ConfigError extends Error {
 	}
 }
 
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+
 export interface UltrathinkConfig {
 	publicOrigin: string;
 	ownerPasswordHash: string;
@@ -32,6 +34,8 @@ export interface UltrathinkConfig {
 	planTimeoutMs: number;
 	modelMaxOutputTokens: number;
 	serverDecisions: boolean;
+	/** Absent means the `reasoning` request parameter is not sent. */
+	modelReasoningEffort?: ReasoningEffort;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -51,6 +55,8 @@ const DEFAULT_MAX_CONCURRENT_PLANS = 2;
 const DEFAULT_MODEL_TIMEOUT_MS = 120000;
 const DEFAULT_PLAN_TIMEOUT_MS = 600000;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 8000;
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high"];
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = "low";
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
 
 function readOptional(
@@ -143,6 +149,22 @@ function readConnectorKey(env: Record<string, string | undefined>): string | und
 		throw new ConfigError(`ULTRATHINK_CONNECTOR_KEY must be at least ${MIN_CONNECTOR_KEY_LENGTH} characters`);
 	}
 	return key;
+}
+
+/** Unset means `low`: the pipeline already writes its reasoning out, so hidden reasoning only adds latency. `default` omits the parameter. */
+function readReasoningEffort(env: Record<string, string | undefined>): ReasoningEffort | undefined {
+	const name = "ULTRATHINK_MODEL_REASONING_EFFORT";
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return DEFAULT_REASONING_EFFORT;
+	}
+	if (raw === "default") {
+		return undefined;
+	}
+	if (!REASONING_EFFORTS.includes(raw as ReasoningEffort)) {
+		throw new ConfigError(`${name} must be one of minimal, low, medium, high or default`);
+	}
+	return raw as ReasoningEffort;
 }
 
 function readFlag(
@@ -331,6 +353,7 @@ export function loadConfig(
 			32000,
 		),
 		serverDecisions: readFlag(env, "ULTRATHINK_SERVER_DECISIONS") === true,
+		modelReasoningEffort: readReasoningEffort(env),
 	};
 }
 

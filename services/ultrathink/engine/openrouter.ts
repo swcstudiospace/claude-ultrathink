@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+
+import type { ReasoningEffort } from "../config/config.ts";
+
 /**
  * OpenRouter chat completions behind the plugin's `Completer` shape.
  *
@@ -47,6 +50,8 @@ export interface OpenRouterCompleterOptions {
 	baseUrl: string;
 	model: string;
 	maxOutputTokens: number;
+	/** Sent as `reasoning: { effort }`; unset omits the parameter. */
+	reasoningEffort?: ReasoningEffort;
 	/** Applies to each HTTP attempt, not to the whole call including retries. */
 	timeoutMs: number;
 	/** Sent as HTTP-Referer; pass the service origin. */
@@ -241,6 +246,7 @@ export function createOpenRouterCompleter(
 			],
 			max_tokens: opts.maxOutputTokens,
 			usage: { include: true },
+			...(opts.reasoningEffort === undefined ? {} : { reasoning: { effort: opts.reasoningEffort } }),
 		});
 		for (let retry = 0; ; retry += 1) {
 			if (signal?.aborted === true) {

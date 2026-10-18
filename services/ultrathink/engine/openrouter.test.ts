@@ -431,3 +431,35 @@ describe("response validation", () => {
 		expect(codes).toEqual(["auth", "rate_limited", "upstream", "bad_response", "empty"]);
 	});
 });
+
+describe("reasoning effort", () => {
+	test("the option is sent as reasoning.effort next to the other fields", async () => {
+		const { complete, calls } = setup([completion("ok")], { reasoningEffort: "low" });
+		await complete("SYS", "USR");
+		expect(JSON.parse((calls[0] as Call).init.body as string)).toEqual({
+			model: "x-ai/grok-4.7",
+			messages: [
+				{ role: "system", content: "SYS" },
+				{ role: "user", content: "USR" },
+			],
+			max_tokens: 1234,
+			usage: { include: true },
+			reasoning: { effort: "low" },
+		});
+	});
+
+	test("every effort value is passed through unchanged", async () => {
+		for (const effort of ["minimal", "low", "medium", "high"] as const) {
+			const { complete, calls } = setup([completion("ok")], { reasoningEffort: effort });
+			await complete("s", "u");
+			expect(JSON.parse((calls[0] as Call).init.body as string).reasoning).toEqual({ effort });
+		}
+	});
+
+	test("without the option the body has no reasoning key", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await complete("s", "u");
+		expect("reasoning" in JSON.parse((calls[0] as Call).init.body as string)).toBe(false);
+	});
+});
+
