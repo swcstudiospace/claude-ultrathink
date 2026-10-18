@@ -7,7 +7,7 @@
 #   ultrathink-backup.sh run              backup, then prune old backups, then prune old state (what the timer runs)
 #   ultrathink-backup.sh backup           consistent copy of the state into /var/backups/ultrathink/ultrathink-<utc>.tar.gz
 #   ultrathink-backup.sh verify <archive> check checksums, SQLite integrity and oauth.json syntax of an archive
-#   ultrathink-backup.sh prune            remove journal, sessions and jobs entries older than the retention window
+#   ultrathink-backup.sh prune            remove journal, sessions and jobs entries and SQLite runs older than the retention window
 #
 # What a backup holds: ultrathink.sqlite (a VACUUM INTO copy, consistent while the service runs), oauth.json
 # (registered clients and tokens; losing it logs every connector out) and the jobs/ directory. The archive holds user
@@ -104,6 +104,8 @@ case "$KEEP" in '' | *[!0-9]*) die "ULTRATHINK_BACKUP_KEEP must be a positive in
 case "$RETENTION_DAYS" in '' | *[!0-9]*) die "ULTRATHINK_RETENTION_DAYS must be a positive integer" ;; esac
 [ "$RETENTION_DAYS" -ge 1 ] || die "ULTRATHINK_RETENTION_DAYS must be at least 1"
 
+RETENTION_MODULE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/services/ultrathink/store/retention.ts"
+
 BUN_TOOL='
 const { Database } = require("bun:sqlite");
 const { readFileSync } = require("node:fs");
@@ -132,6 +134,24 @@ if (action === "copy") {
 		db.close();
 	}
 	console.log("sqlite copy ok, integrity ok, tables: " + check(dst));
+} else if (action === "prune-db") {
+	// Child tables are found through foreign keys by the store module, so the schema is not duplicated here.
+	(async () => {
+		const { pruneRuns } = await import(process.env.UT_RETENTION_MODULE);
+		const cutoffMs = Date.now() - Number(process.env.UT_RETENTION_DAYS) * 86400000;
+		if (!Number.isFinite(cutoffMs)) throw new Error("bad retention window");
+		const db = new Database(process.env.UT_SRC);
+		try {
+			db.run("PRAGMA busy_timeout = 5000");
+			const result = pruneRuns(db, { cutoffMs, today: new Date().toISOString().slice(0, 10) });
+			console.log("database retention: removed " + result.runs + " runs, " + (result.rows.token_ledger ?? 0) + " ledger rows");
+		} finally {
+			db.close();
+		}
+	})().catch((error) => {
+		console.error(String(error && error.message ? error.message : error));
+		process.exit(1);
+	});
 } else if (action === "check") {
 	console.log("sqlite integrity ok, tables: " + check(process.env.UT_SRC));
 } else if (action === "json") {
@@ -144,7 +164,8 @@ if (action === "copy") {
 
 bun_tool() {
 	# bun_tool <action> <src> [dst]
-	UT_ACTION="$1" UT_SRC="$2" UT_DST="${3:-}" "$BUN" -e "$BUN_TOOL"
+	UT_ACTION="$1" UT_SRC="$2" UT_DST="${3:-}" UT_RETENTION_DAYS="$RETENTION_DAYS" \
+		UT_RETENTION_MODULE="$RETENTION_MODULE" "$BUN" -e "$BUN_TOOL"
 }
 
 work_dir=""
@@ -257,14 +278,30 @@ do_prune() {
 	say "retention: removed $removed entries older than $RETENTION_DAYS days"
 }
 
+# SQLite rows: runs (any status) not updated within the retention window, with every row in a table that references
+# runs through a foreign key (phases, token_ledger, run_leases, decisions, and any later table; services/ultrathink/
+# store/retention.ts discovers them). `request` holds user prompts, so this is the database half of the retention policy. Runs with a ledger row dated today (UTC) are kept, so the daily ceiling,
+# which sums token_ledger by day, never loses today's spend. Runs inside one transaction: all or nothing.
+prune_database() {
+	[ -f "$STATE_DIR/ultrathink.sqlite" ] || {
+		warn "no database in $STATE_DIR (skipped)"
+		return 0
+	}
+	bun_tool prune-db "$STATE_DIR/ultrathink.sqlite" || die "database retention failed (nothing was deleted)"
+}
+
 case "$MODE" in
 verify) do_verify "${2:-}" ;;
 backup) do_backup ;;
-prune) do_prune ;;
+prune)
+	do_prune
+	prune_database
+	;;
 run)
 	status=0
 	do_backup || status=1
 	do_prune || status=1
+	prune_database || status=1
 	exit "$status"
 	;;
 esac

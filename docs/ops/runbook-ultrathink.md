@@ -157,7 +157,7 @@ The daily timer runs `deploy/ultrathink-backup.sh run` as user `ultrathink`:
 - `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, and `jobs/`, with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file.
 - Archive `/var/backups/ultrathink/ultrathink-<utc>.tar.gz` (mode 0600 in a 0700 directory), 14 kept.
 - Optional rsync when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set in the env file. For ssh targets put a key and `known_hosts` in `/var/lib/ultrathink/home/.ssh`. The archive contains prompts and OAuth secrets: use an encrypted or trusted target.
-- Retention: `journal/`, `sessions/` and `jobs/` entries untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched.
+- Retention: `journal/`, `sessions/` and `jobs/` entries untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched. SQLite runs not updated within the same window are deleted with their phases and ledger rows in one transaction; the job prints `database retention: removed N runs, M ledger rows`. `deploy/ultrathink-backup.sh prune` runs only the retention part.
 
 Manual run and status:
 
@@ -293,7 +293,7 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 
 | Data | Location | Contents | Retention |
 |---|---|---|---|
-| Runs, phases, token ledger | `/var/lib/ultrathink/ultrathink.sqlite` | Request text, phase output, token reservations | None in the application today: rows are never deleted. Disk growth is the only limit; watch the disk alert. Covered by backups. |
+| Runs, phases, token ledger | `/var/lib/ultrathink/ultrathink.sqlite` | Request text, phase output, token reservations | `ULTRATHINK_RETENTION_DAYS` (default 30) after the run's last update, any status (a run stuck waiting for 30 days is removed too), with every row that references it (phases, ledger rows, and any other table with a foreign key to `runs`: child tables are found through foreign keys, so a new table is covered automatically), deleted in one transaction by the daily maintenance job. The daily token ceiling only counts today's UTC rows, so pruning does not change it; a run with a ledger row dated today is never pruned. Run text includes user prompts, so this is also the privacy window. Covered by backups, which keep older rows for up to 14 days. |
 | OAuth state | `/var/lib/ultrathink/oauth.json` | Registered clients, grants, token records | Pruned by the OAuth module (expired codes and tokens, unused clients). Access tokens live 1 hour, refresh tokens 30 days. |
 | Client-driven sessions | `/var/lib/ultrathink/journal/<session>/` | Prompts, pending questions, answers, metadata | `ULTRATHINK_RETENTION_DAYS` (default 30) after the last change, enforced by the daily maintenance job. |
 | Sessions | `/var/lib/ultrathink/sessions/` | Session records (request, specification) | Same 30 days. |
@@ -313,7 +313,7 @@ Known gaps that are accepted for now. Each has an owner decision pending.
 - **The in-memory limiter refuses new keys when full (S8).** At 10,000 tracked keys with nothing expired, new keys are rejected. A rotating-source attacker could therefore cause 429 for new addresses until entries expire; nginx limits and Cloudflare rules reduce the chance.
 - **Client ID Metadata Documents are not implemented.** Clients that identify themselves by a metadata URL instead of dynamic registration cannot connect. Dynamic client registration (RFC 7591) is the supported path.
 - **`POST /ultrathink` run API has no worker.** The web run API queues runs but nothing executes them (`ultrathink-worker.service` is a draft with a missing entrypoint). Server-side planning for chat clients runs inside `ultrathink-web` instead; do not tell users the run API works.
-- **SQLite has no retention.** Run history and the token ledger grow without bound; abandoned ledger reservations keep counting against ceilings.
+- **Abandoned ledger reservations count until pruned.** A run that never finished keeps its reserved tokens against the per-run and daily ceilings of its own day; the daily job removes the rows after the retention window.
 - **Smoke tests run unsandboxed.** The release script's smoke start uses the production secrets as the service user without the systemd sandbox, on loopback port 8796 for a few seconds.
 
 ## 12. Planner latency and model choice
