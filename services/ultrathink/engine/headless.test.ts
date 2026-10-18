@@ -15,7 +15,7 @@ import { escapeXml } from "../../../src/uplift/xml.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { createLedger } from "../cost/ledger.ts";
 import { openStore, type Store } from "../store/store.ts";
-import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner } from "./headless.ts";
+import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner, type PlannerCall } from "./headless.ts";
 import { answerRequest, listPendingRequests, showRequest, startPlan } from "./journal.ts";
 import type { OpenRouterFetch } from "./openrouter.ts";
 
@@ -530,6 +530,64 @@ describe("headless planner: client-mode fallback", () => {
 		expect(await startPlan(o, { prompt: PROMPT, sessionId })).toMatchObject({ ok: true, data: { status: "needs-model" } });
 		expect(await h.planner.result({ sessionId, waitSeconds: 0 })).toMatchObject({ ok: true, data: { status: "running", mode: "client" } });
 		expect(await h.planner.result({ sessionId: randomUUID(), waitSeconds: 0 })).toEqual({ ok: false, code: "not_found" });
+	});
+});
+
+describe("headless planner: call telemetry", () => {
+	test("emits one event per model call with the session id, model, counts and no prompt text", async () => {
+		const script = scriptedModel();
+		const requests: string[] = [];
+		const openRouter: OpenRouterFetch = async (_url, init) => {
+			const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+			requests.push("x");
+			const content = script(body.messages[0]?.content ?? "", body.messages[1]?.content ?? "");
+			return new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 100, completion_tokens: 50, cost: 0.002 } }), { status: 200 });
+		};
+		const calls: PlannerCall[] = [];
+		const h = setup({}, { completer: undefined, fetch: openRouter, onCall: (call) => calls.push(call) });
+		const sessionId = randomUUID();
+		expect(await h.planner.start({ prompt: PROMPT, sessionId })).toMatchObject({ ok: true, data: { status: "planned" } });
+		expect(calls.length).toBe(requests.length);
+		expect(calls.length).toBeGreaterThanOrEqual(8);
+		for (const call of calls) {
+			expect(call.sessionId).toBe(sessionId);
+			expect(call.model).toBe("x-ai/grok-test");
+			expect(call.outcome).toBe("ok");
+			expect(call.attempts).toBeGreaterThanOrEqual(1);
+			expect(call.ms).toBeGreaterThanOrEqual(0);
+			expect(call.inputTokens).toBe(100);
+			expect(call.outputTokens).toBe(50);
+			expect(call.costUsd).toBeCloseTo(0.002, 6);
+		}
+		const text = JSON.stringify(calls);
+		expect(text).not.toContain(FAKE_KEY);
+		expect(text).not.toContain(PROMPT);
+	});
+
+	test("a failing call emits the error code with zero tokens, and a throwing hook does not affect the job", async () => {
+		const failing: OpenRouterFetch = async () => new Response("nope", { status: 401 });
+		const calls: PlannerCall[] = [];
+		const h = setup(
+			{},
+			{
+				completer: undefined,
+				fetch: failing,
+				onCall: (call) => {
+					calls.push(call);
+					throw new Error("hook failure");
+				},
+			},
+		);
+		const sessionId = randomUUID();
+		const started = await h.planner.start({ prompt: PROMPT, sessionId });
+		expect(started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "auth" } });
+		expect(calls.length).toBeGreaterThanOrEqual(1);
+		for (const call of calls) {
+			expect(call.outcome).toBe("auth");
+			expect(call.inputTokens).toBe(0);
+			expect(call.outputTokens).toBe(0);
+			expect("costUsd" in call).toBe(false);
+		}
 	});
 });
 

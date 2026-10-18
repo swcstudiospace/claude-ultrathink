@@ -61,6 +61,19 @@ export interface OpenRouterCompleterOptions {
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	/** Called once per successful completion; a throwing callback is ignored. */
 	onUsage?: (usage: OpenRouterUsage) => void;
+	/** Called exactly once per `complete()` after the final outcome; a throwing hook is ignored. */
+	onCall?: (info: OpenRouterCallInfo) => void;
+}
+
+/** Outcome of one `complete()` call, reported once after retries. Carries no key, header or body. */
+export interface OpenRouterCallInfo {
+	/** Total time including retries and backoff. */
+	ms: number;
+	outcome: "ok" | OpenRouterErrorCode;
+	/** HTTP status of the final attempt when it reached a response. */
+	status?: number;
+	/** HTTP attempts made. */
+	attempts: number;
 }
 
 const DEFAULT_REFERER = "https://ultrathink.swcstudio.space";
@@ -248,10 +261,26 @@ export function createOpenRouterCompleter(
 			usage: { include: true },
 			...(opts.reasoningEffort === undefined ? {} : { reasoning: { effort: opts.reasoningEffort } }),
 		});
+		const started = performance.now();
+		let attempts = 0;
+		const report = (outcome: OpenRouterCallInfo["outcome"], status?: number): void => {
+			try {
+				opts.onCall?.({
+					ms: performance.now() - started,
+					outcome,
+					...(status === undefined ? {} : { status }),
+					attempts,
+				});
+			} catch {
+				// Telemetry must not change the result of the call.
+			}
+		};
 		for (let retry = 0; ; retry += 1) {
 			if (signal?.aborted === true) {
+				report("aborted");
 				throw new OpenRouterError("aborted");
 			}
+			attempts += 1;
 			const result = await attempt(body, signal);
 			if (result.ok) {
 				try {
@@ -259,9 +288,11 @@ export function createOpenRouterCompleter(
 				} catch {
 					// Accounting must not fail a completion that already succeeded.
 				}
+				report("ok");
 				return result.text;
 			}
 			if (!result.retry || retry >= MAX_RETRIES) {
+				report(result.error.code, result.error.status);
 				throw result.error;
 			}
 			await sleep(result.retryAfterMs ?? backoffMs(retry), signal);

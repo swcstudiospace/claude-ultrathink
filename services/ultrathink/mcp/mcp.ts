@@ -173,7 +173,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 					type: "integer",
 					minimum: 0,
 					maximum: 45,
-					default: 30,
+					default: 40,
 					description: "How long to wait for a running plan before reporting status running.",
 				},
 				detail: {

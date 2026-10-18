@@ -203,7 +203,7 @@ describe("server planning defaults", () => {
 		expect(config.openRouterBaseUrl).toBe("https://openrouter.ai/api/v1");
 		expect(config.serverPlanning).toBe(false);
 		expect(config.maxConcurrentPlans).toBe(2);
-		expect(config.modelTimeoutMs).toBe(120000);
+		expect(config.modelTimeoutMs).toBe(240000);
 		expect(config.planTimeoutMs).toBe(600000);
 		expect(config.modelMaxOutputTokens).toBe(8000);
 		expect(config.serverDecisions).toBe(false);

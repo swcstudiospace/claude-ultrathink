@@ -431,7 +431,7 @@ describe("tools/list", () => {
 			expect(schemaOf(result).required).toEqual(["sessionId"]);
 			expect(Object.keys(schemaOf(result).properties)).toEqual(["sessionId", "waitSeconds", "detail"]);
 			const { waitSeconds, detail } = schemaOf(result).properties;
-			expect(waitSeconds).toMatchObject({ type: "integer", minimum: 0, maximum: 45, default: 30 });
+			expect(waitSeconds).toMatchObject({ type: "integer", minimum: 0, maximum: 45, default: 40 });
 			expect(detail).toMatchObject({ type: "string", enum: ["brief", "full"], default: "brief" });
 			expect(result.annotations).toEqual(READ_ONLY);
 		}

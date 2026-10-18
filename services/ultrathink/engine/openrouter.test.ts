@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	createOpenRouterCompleter,
 	OpenRouterError,
+	type OpenRouterCallInfo,
 	type OpenRouterCompleter,
 	type OpenRouterCompleterOptions,
 	type OpenRouterErrorCode,
@@ -463,3 +464,94 @@ describe("reasoning effort", () => {
 	});
 });
 
+describe("onCall", () => {
+	function recorded(
+		steps: Step[],
+		overrides: Partial<OpenRouterCompleterOptions> = {},
+	): { complete: OpenRouterCompleter; infos: OpenRouterCallInfo[] } {
+		const infos: OpenRouterCallInfo[] = [];
+		const { complete } = setup(steps, { onCall: (info) => infos.push(info), ...overrides });
+		return { complete, infos };
+	}
+
+	test("success reports ok with one attempt and a non-negative duration", async () => {
+		const { complete, infos } = recorded([completion("fine")]);
+		await complete("s", "u");
+		expect(infos).toHaveLength(1);
+		const info = infos[0] as OpenRouterCallInfo;
+		expect(info.outcome).toBe("ok");
+		expect(info.attempts).toBe(1);
+		expect(info.status).toBeUndefined();
+		expect(Number.isFinite(info.ms)).toBe(true);
+		expect(info.ms).toBeGreaterThanOrEqual(0);
+	});
+
+	test("a retried 429 then success reports once with two attempts", async () => {
+		const { complete, infos } = recorded([status(429, { "retry-after": "1" }), completion("fine")]);
+		await complete("s", "u");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "ok", attempts: 2 });
+	});
+
+	test("a terminal auth error reports the code and status once, before the throw", async () => {
+		const { complete, infos } = recorded([status(401)]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("auth");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "auth", status: 401, attempts: 1 });
+	});
+
+	test("exhausted retries report the final error and all attempts", async () => {
+		const { complete, infos } = recorded([status(500), status(502), status(503)]);
+		await failure(complete("s", "u"));
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "upstream", status: 503, attempts: 3 });
+	});
+
+	test("a timeout reports timeout with one attempt", async () => {
+		const { complete, infos } = recorded([pendingUntilAbort], { timeoutMs: 10 });
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("timeout");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "timeout", attempts: 1 });
+	});
+
+	test("an already aborted signal reports aborted with zero attempts", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const { complete, infos } = recorded([completion("never")]);
+		await failure(complete("s", "u", controller.signal));
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "aborted", attempts: 0 });
+	});
+
+	test("the info carries only the documented fields, never the key or a body", async () => {
+		const { complete, infos } = recorded([status(500), completion("secret answer")]);
+		await complete("s", "u");
+		const json = JSON.stringify(infos);
+		expect(Object.keys(infos[0] as OpenRouterCallInfo).sort()).toEqual(["attempts", "ms", "outcome"]);
+		expect(json).not.toContain(KEY);
+		expect(json).not.toContain(BODY_MARK);
+		expect(json).not.toContain("secret answer");
+	});
+
+	test("a throwing hook does not change a success", async () => {
+		const { complete } = setup([completion("fine")], {
+			onCall: () => {
+				throw new Error(`hook broke ${KEY}`);
+			},
+		});
+		expect(await complete("s", "u")).toBe("fine");
+	});
+
+	test("a throwing hook does not change the thrown error", async () => {
+		const { complete } = setup([status(401)], {
+			onCall: () => {
+				throw new Error(`hook broke ${KEY}`);
+			},
+		});
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("auth");
+		expectNoLeak(error);
+	});
+});

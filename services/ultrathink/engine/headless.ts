@@ -63,6 +63,17 @@ export interface HeadlessPlanner {
 	shutdown(): Promise<void>;
 }
 
+export interface PlannerCall {
+	sessionId: string;
+	model: string;
+	ms: number;
+	outcome: string;
+	attempts: number;
+	inputTokens: number;
+	outputTokens: number;
+	costUsd?: number;
+}
+
 export interface HeadlessOptions {
 	config: UltrathinkConfig;
 	store: Store;
@@ -77,6 +88,8 @@ export interface HeadlessOptions {
 	env?: Record<string, string | undefined>;
 	/** Plugin entry point; defaults to `planPrompt`. A test seam, never a behavior switch. */
 	plan?: typeof planPrompt;
+	/** One event per model call; counts and timings only, never keys, prompts or response text. A throwing hook is ignored. */
+	onCall?: (call: PlannerCall) => void;
 }
 
 interface JobFile {
@@ -110,7 +123,7 @@ interface Outcome {
 
 const START_WAIT_MS = 15_000;
 const SHUTDOWN_WAIT_MS = 5_000;
-const DEFAULT_WAIT_SECONDS = 30;
+const DEFAULT_WAIT_SECONDS = 40;
 const MAX_WAIT_SECONDS = 45;
 const POLL_AFTER_SEC = 5;
 const CHARS_PER_TOKEN = 3;
@@ -310,7 +323,26 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 				job.controller.abort();
 				throw error;
 			}
-			const reported: { usage?: OpenRouterUsage } = {};
+			const reported: { usage?: OpenRouterUsage; call?: { ms: number; outcome: string; attempts: number } } = {};
+			const startedAt = now();
+			const emit = (outcome: string, usage?: OpenRouterUsage): void => {
+				if (!opts.onCall) return;
+				const call = reported.call;
+				try {
+					opts.onCall({
+						sessionId: job.sessionId,
+						model,
+						ms: call?.ms ?? Math.max(0, now() - startedAt),
+						outcome: call?.outcome ?? outcome,
+						attempts: call?.attempts ?? 1,
+						inputTokens: usage?.promptTokens ?? 0,
+						outputTokens: usage?.completionTokens ?? 0,
+						...(usage?.costUsd === undefined ? {} : { costUsd: usage.costUsd }),
+					});
+				} catch {
+					// telemetry must never affect the job
+				}
+			};
 			try {
 				const complete =
 					opts.completer ??
@@ -327,10 +359,14 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 						onUsage: (usage) => {
 							reported.usage = usage;
 						},
+						onCall: (info) => {
+							reported.call = { ms: info.ms, outcome: info.outcome, attempts: info.attempts };
+						},
 					});
 				const text = await complete(system, user, signal);
 				job.usage.calls += 1;
 				const { usage } = reported;
+				emit("ok", usage);
 				if (usage) {
 					job.usage.inputTokens += usage.promptTokens;
 					job.usage.outputTokens += usage.completionTokens;
@@ -344,6 +380,8 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 				}
 				return text;
 			} catch (error) {
+				const failure = error instanceof OpenRouterError ? error.code : error instanceof Error && error.name === "AbortError" ? "aborted" : "engine_error";
+				emit(failure);
 				try {
 					ledger.abandon(reservationId);
 				} catch {

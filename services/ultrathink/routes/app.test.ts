@@ -672,6 +672,20 @@ describe("end to end with the real planner", () => {
 		expect(logText).not.toContain(PROMPT);
 		expect(h.app.metrics.render()).not.toContain(FAKE_KEY);
 
+		// One planner_call line per model call: no prompt, no text, no secret, and both metrics agree with the log.
+		const callLogs = logsOf(h, "planner_call");
+		expect(callLogs).toHaveLength(calls);
+		for (const line of callLogs) {
+			expect(line).toMatchObject({ level: "info", sessionId, model: "x-ai/grok-test", attempts: 1, usage: { input: 100, output: 50 } });
+			expect(typeof line.ms).toBe("number");
+			expect(typeof line.outcome).toBe("string");
+			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "sessionId", "ts", "usage"]);
+		}
+		const outcome = String(callLogs[0]?.outcome);
+		expect(sample(h, "ultrathink_planner_calls_total", { outcome })).toBe(calls);
+		expect(sample(h, "ultrathink_planner_call_duration_seconds_count", { outcome })).toBe(calls);
+		expect(h.app.metrics.render()).toContain("# TYPE ultrathink_planner_call_duration_seconds histogram");
+
 		// The same session through ultrathink_status is a server job.
 		const status = await callTool(h, "ultrathink_status", { sessionId });
 		expect(status.structuredContent).toMatchObject({ sessionId, status: "planned" });

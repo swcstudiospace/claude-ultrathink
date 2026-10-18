@@ -286,6 +286,19 @@ export function createApp(deps: RouterDeps): App {
 			now: deps.now,
 			...(deps.fetch ? { fetch: deps.fetch } : {}),
 			...(deps.sleep ? { sleep: deps.sleep } : {}),
+			onCall: (call) => {
+				metrics.inc("ultrathink_planner_calls_total", { outcome: call.outcome });
+				metrics.observe("ultrathink_planner_call_duration_seconds", call.ms / 1000, { outcome: call.outcome });
+				// The logger drops every key containing "token", so the counts travel under `usage`.
+				logger.info("planner_call", {
+					sessionId: call.sessionId,
+					model: call.model,
+					ms: call.ms,
+					outcome: call.outcome,
+					attempts: call.attempts,
+					usage: { input: call.inputTokens, output: call.outputTokens, ...(call.costUsd === undefined ? {} : { costUsd: call.costUsd }) },
+				});
+			},
 		});
 	const allowedOrigins = [config.publicOrigin, ...DEFAULT_ALLOWED_ORIGINS, ...config.allowedOrigins];
 
