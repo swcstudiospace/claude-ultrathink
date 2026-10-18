@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
+import { PROMPT_DEFINITIONS, renderPrompt } from "./prompts.ts";
+
 export const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"] as const;
 
 export interface ToolDefinition {
@@ -23,7 +25,7 @@ export interface McpToolHost {
 const JSONRPC = "2.0";
 const NOTIFICATION_PREFIX = "notifications/";
 const INSTRUCTIONS =
-	"Run ultrathink planning here. Call ultrathink_plan, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned.";
+	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned.";
 
 const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
@@ -37,7 +39,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	{
 		name: "ultrathink_plan",
 		description:
-			"Start or continue an ultrathink planning session for a request. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
+			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command: when the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -162,6 +164,10 @@ async function dispatch(host: McpToolHost, id: unknown, method: string, params: 
 			return rpcResult(id, { tools: TOOL_DEFINITIONS });
 		case "tools/call":
 			return callTool(host, id, params);
+		case "prompts/list":
+			return rpcResult(id, { prompts: PROMPT_DEFINITIONS });
+		case "prompts/get":
+			return getPrompt(id, params);
 		default:
 			return rpcError(id, METHOD_NOT_FOUND, "method not found");
 	}
@@ -173,10 +179,19 @@ function initializeResult(params: unknown) {
 		MCP_PROTOCOL_VERSIONS.find((version) => version === requested) ?? MCP_PROTOCOL_VERSIONS[0];
 	return {
 		protocolVersion,
-		capabilities: { tools: {} },
+		capabilities: { tools: {}, prompts: {} },
 		serverInfo: { name: "ultrathink", version: "0.2.0" },
 		instructions: INSTRUCTIONS,
 	};
+}
+
+function getPrompt(id: unknown, params: unknown): RpcResponse {
+	const name = isRecord(params) ? params.name : undefined;
+	const given = isRecord(params) ? params.arguments : undefined;
+	const args: Record<string, unknown> = isRecord(given) ? given : {};
+	const prompt = renderPrompt(name, args);
+	if (!prompt.ok) return rpcError(id, INVALID_PARAMS, prompt.message);
+	return rpcResult(id, { description: prompt.description, messages: prompt.messages });
 }
 
 async function callTool(host: McpToolHost, id: unknown, params: unknown): Promise<RpcResponse> {

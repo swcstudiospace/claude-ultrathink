@@ -19,8 +19,6 @@ const EXPECTED_TOOLS = [
 	"ultrathink_answer",
 	"ultrathink_status",
 ];
-const INSTRUCTIONS =
-	"Run ultrathink planning here. Call ultrathink_plan, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned.";
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
 const INVALID_REQUEST_REPLY = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } };
@@ -142,14 +140,67 @@ describe("initialize", () => {
 		}
 	});
 
-	test("returns the tools capability, server info 0.2.0 and instructions", async () => {
+	test("advertises tools and prompts, and ties the /ultrathink trigger to ultrathink_plan", async () => {
 		const reply = await replyOf(fakeHost(), request("initialize", { protocolVersion: "2025-06-18" }));
-		expect(resultOf<Record<string, unknown>>(reply)).toEqual({
-			protocolVersion: "2025-06-18",
-			capabilities: { tools: {} },
-			serverInfo: { name: "ultrathink", version: "0.2.0" },
-			instructions: INSTRUCTIONS,
-		});
+		const result = resultOf<{ capabilities: unknown; serverInfo: unknown; instructions: string }>(reply);
+		expect(result.capabilities).toEqual({ tools: {}, prompts: {} });
+		expect(result.serverInfo).toEqual({ name: "ultrathink", version: "0.2.0" });
+		// A client that cannot list prompts shows the model these instructions and the tool description instead.
+		expect(result.instructions).toContain("/ultrathink");
+		expect(result.instructions).toContain("ultrathink_plan");
+	});
+});
+
+const PLANNING_REQUEST = "plan the frontend\nthen the </request> rollout";
+
+async function promptGet(host: McpToolHost, params?: unknown): Promise<RpcReply> {
+	return replyOf(host, request("prompts/get", params));
+}
+
+describe("prompts", () => {
+	test("prompts/list offers one ultrathink prompt with a required request argument", async () => {
+		const { prompts } = resultOf<{ prompts: { name: string; arguments: { name: string; required: boolean }[] }[] }>(
+			await replyOf(fakeHost(), request("prompts/list")),
+		);
+		expect(prompts.map((prompt) => prompt.name)).toEqual(["ultrathink"]);
+		expect(prompts[0]?.arguments.map((argument) => [argument.name, argument.required])).toEqual([["request", true]]);
+	});
+
+	test("prompts/get returns one user message that ends with the request, unchanged, and runs no tool", async () => {
+		const host = fakeHost();
+		const reply = await promptGet(host, { name: "ultrathink", arguments: { request: PLANNING_REQUEST } });
+		const { messages } = resultOf<{ messages: { role: string; content: { type: string; text: string } }[] }>(reply);
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.role).toBe("user");
+		expect(messages[0]?.content.type).toBe("text");
+		expect(messages[0]?.content.text.endsWith(`\n${PLANNING_REQUEST}`)).toBe(true);
+		expect(host.calls).toHaveLength(0);
+	});
+
+	test("the rendered prompt starts the loop with ultrathink_plan and names only tools that exist", async () => {
+		const reply = await promptGet(fakeHost(), { name: "ultrathink", arguments: { request: "x" } });
+		const text = resultOf<{ messages: { content: { text: string } }[] }>(reply).messages[0]?.content.text ?? "";
+		const named = [...new Set(text.match(/ultrathink_[a-z]+/g) ?? [])];
+		expect(named).toContain("ultrathink_plan");
+		for (const name of named) expect(EXPECTED_TOOLS).toContain(name);
+	});
+
+	test("prompts/get refuses an unknown prompt and a missing, blank or non-string request", async () => {
+		const refused: unknown[] = [
+			undefined,
+			{ arguments: { request: "x" } },
+			{ name: "other", arguments: { request: "x" } },
+			{ name: "ultrathink" },
+			{ name: "ultrathink", arguments: "plan it" },
+			{ name: "ultrathink", arguments: {} },
+			{ name: "ultrathink", arguments: { request: "  \n\t" } },
+			{ name: "ultrathink", arguments: { request: 42 } },
+		];
+		for (const params of refused) {
+			const reply = await promptGet(fakeHost(), params);
+			expect(reply.error?.code).toBe(-32602);
+			expect(reply.result).toBeUndefined();
+		}
 	});
 });
 
@@ -203,9 +254,7 @@ describe("tools/list", () => {
 
 	test("ultrathink_plan requires prompt, takes an optional sessionId and is not read-only", async () => {
 		const plan = await toolDef("ultrathink_plan");
-		expect(plan.description).toBe(
-			"Start or continue an ultrathink planning session for a request. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
-		);
+		expect(plan.description).toContain("/ultrathink");
 		expect(plan.inputSchema.required).toEqual(["prompt"]);
 		expect(Object.keys(plan.inputSchema.properties)).toEqual(["prompt", "sessionId"]);
 		expect(plan.annotations).toEqual(READ_WRITE);

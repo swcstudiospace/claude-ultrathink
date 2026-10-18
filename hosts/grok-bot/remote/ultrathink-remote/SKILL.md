@@ -31,7 +31,7 @@ While the status is `needs-model`:
 
 ## Stop
 
-When the status is `planned`, call `ultrathink_status` with `sessionId`, report it in one line, and stop. Any other status that is not `needs-model` gets the same treatment.
+When the status is `planned`, call `ultrathink_status` with `sessionId` and report the status in one line. Then summarize the plan you wrote: the goal, the graph nodes by title, and any questions for the user. Do not paste the full specification. Any other status that is not `needs-model` is reported in one line, and you stop.
 
 ## Rules
 

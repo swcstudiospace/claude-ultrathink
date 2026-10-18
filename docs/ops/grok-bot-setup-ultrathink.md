@@ -75,3 +75,21 @@ What the server enforces:
 
 To revoke every client and token, stop `ultrathink-web`, delete `/var/lib/ultrathink/oauth.json`, and start the service again.
 
+## 9. Use /ultrathink in Grok Chat
+
+In a chat that has the connector attached, send `/ultrathink <request>`. The chat model plans the request. It calls `ultrathink_plan`, answers each pending prompt with `ultrathink_show` and `ultrathink_answer`, and repeats until the status is `planned`. Then it summarizes the plan it wrote. The server runs no model. The finished specification stays in `sessions/` under `ULTRATHINK_STATE_DIR` on the VPS, so the summary comes from the model's own answers. The prompt cap in section 7 applies.
+
+The server offers the command in three ways:
+
+1. **Tool text.** `ultrathink_plan` is described as the entry point for `/ultrathink`, and the server `instructions` say the same. A client that shows the model tool descriptions needs nothing else.
+2. **MCP prompt.** The server lists a prompt named `ultrathink` with a required `request` argument. A client that turns MCP prompts into slash commands shows it in its `/` menu. Grok's connector documentation describes tool discovery only, and no source found says Grok Chat lists MCP prompts. Treat this route as unverified in Grok Chat.
+3. **Custom instructions.** If Grok does not act on a typed `/ultrathink`, paste this into Grok's global custom instructions (Settings, Customize; the label varies by app version):
+
+```text
+When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command. Call ultrathink_plan with it as prompt. While the status is needs-model, answer each pending prompt: call ultrathink_show, write the answer its system text asks for, and call ultrathink_answer. Then call ultrathink_plan again with the same sessionId and prompt. When the status is planned, summarize the plan you wrote. If nothing follows /ultrathink, ask for a request.
+```
+
+To check what Grok does, send `/ultrathink plan the frontend` and look for `ultrathink_plan` calls in the chat. Then type `/` and `@` and see whether `ultrathink` is listed.
+
+Grok Bot uses `hosts/grok-bot/remote/ultrathink-remote/SKILL.md`, which already treats `/ultrathink` as the command.
+
