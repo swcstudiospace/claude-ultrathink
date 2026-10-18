@@ -230,11 +230,13 @@ describe("approval proofs", () => {
 
 	test("rejects a tampered nonce, timestamp, or signature", () => {
 		const auth = makeAuth(makeClock());
+		// Always change the last character: overwriting it with a fixed "A" is a no-op about 1 run in 16.
+		const flip = (value: string): string => `${value.slice(0, -1)}${value.endsWith("A") ? "B" : "A"}`;
 		const signature = auth.signApproval(proof);
-		expect(auth.verifyApproval({ ...proof, nonce: `${proof.nonce.slice(0, 42)}A` }, signature)).toBe(false);
+		expect(auth.verifyApproval({ ...proof, nonce: flip(proof.nonce) }, signature)).toBe(false);
 		expect(auth.verifyApproval({ ...proof, expiresAt: proof.expiresAt + 1 }, signature)).toBe(false);
 		expect(auth.verifyApproval({ ...proof, refreshedAt: proof.refreshedAt + 1 }, signature)).toBe(false);
-		expect(auth.verifyApproval(proof, `${signature.slice(0, -1)}A`)).toBe(false);
+		expect(auth.verifyApproval(proof, flip(signature))).toBe(false);
 		expect(auth.verifyApproval(proof, signature.slice(0, -1))).toBe(false);
 	});
 
