@@ -243,11 +243,13 @@ Scrape `127.0.0.1:8795/metrics` (loopback only; nginx does not proxy it). List t
 | Series | Labels | Meaning |
 |---|---|---|
 | `ultrathink_http_requests_total` | `endpoint`, `status_class` | HTTP requests handled |
-| `ultrathink_http_request_duration_seconds` | `endpoint` (histogram) | Request latency; `/mcp` long-polls up to 45 s, so judge it separately |
+| `ultrathink_http_request_duration_seconds` | `endpoint` (histogram) | Request latency; `/mcp` long-polls up to 40 s per `ultrathink_result` poll, so judge it separately |
 | `ultrathink_mcp_tool_calls_total` | `tool`, `outcome` | MCP tool calls and their result |
 | `ultrathink_auth_failures_total` | `kind` | Failed logins, bearer tokens and connector keys |
 | `ultrathink_rate_limited_total` | `scope` | Requests refused by an in-app limiter |
 | `ultrathink_plan_jobs_total` | `status` | Server-side plan jobs by final status |
+| `ultrathink_planner_calls_total` | `outcome` | OpenRouter model calls by outcome (including `timeout`) |
+| `ultrathink_planner_call_duration_seconds` | histogram | Duration of one model call |
 | `ultrathink_plan_tokens_total` | `direction` | Planner tokens (input and output) |
 | `ultrathink_plan_cost_usd_total` | none | Planner spend reported by OpenRouter |
 | `ultrathink_planner_enabled` | none | 1 when server-side planning is configured |
@@ -263,6 +265,7 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 | Server errors | `ultrathink_http_requests_total{status_class="5xx"}` above 2 percent of all requests for 10 minutes. | Page |
 | Slow requests | p95 of `ultrathink_http_request_duration_seconds` above 5 s for 10 minutes on every endpoint except `/mcp`; for `/mcp` above 60 s. | Ticket |
 | Tool failures | `ultrathink_mcp_tool_calls_total` with an error outcome above 20 percent of calls for 30 minutes. | Ticket |
+| Planner timeouts | `ultrathink_planner_calls_total{outcome="timeout"}` increases, or `ultrathink_planner_call_duration_seconds` p95 approaches `ULTRATHINK_MODEL_TIMEOUT_MS`. A timeout is not retried and fails the whole plan. Find the call with `journalctl -u ultrathink-web -o cat \| grep '"event":"planner_call"'`. | Ticket |
 | Planner failures | `ultrathink_plan_jobs_total{status="failed"}` above 20 percent of finished jobs for 30 minutes (usually key, credit, provider outage or model timeout). | Ticket |
 | Planner disabled | `ultrathink_planner_enabled == 0` when server-side planning is expected (key or model missing from the env file). | Ticket |
 | Budget | `increase(ultrathink_plan_cost_usd_total[24h])` above 80 percent of the daily spend you accept; `ultrathink_plan_tokens_total` summed over both directions above 80 percent of `ULTRATHINK_DAILY_TOKEN_CEILING` for the UTC day; any `budget_exceeded` result in the logs. | Ticket |
@@ -331,13 +334,15 @@ At the provider's default reasoning effort, grok-4.7 did not finish in 6 minutes
 |---|---|---|
 | `ULTRATHINK_PLANNING_MODEL` | none (planning off without it) | OpenRouter model id used for every stage |
 | `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | Reasoning effort sent with each call; the main lever on latency and cost |
-| `ULTRATHINK_MODEL_TIMEOUT_MS` | 120000 | Per model call; a slower call fails and is retried per the planner's retry rules |
+| `ULTRATHINK_MODEL_TIMEOUT_MS` | 240000 | Per model call. A call that exceeds it is not retried: it fails with `timeout` and the whole plan ends as `failed`. Only 429, 5xx and network errors are retried (up to 2 times) |
 | `ULTRATHINK_PLAN_TIMEOUT_MS` | 600000 | Whole plan; a plan over this ends as `failed` |
 | `ULTRATHINK_MAX_CONCURRENT_PLANS` | 2 | Plans running at once; further starts are refused as busy |
 | `ULTRATHINK_RUN_TOKEN_CEILING` | see `config.ts` | Token ceiling for one run |
 | `ULTRATHINK_DAILY_TOKEN_CEILING` | see `config.ts` | Token ceiling per UTC day |
 
-Chat clients wait through long polling (`ultrathink_result` waits up to 45 s per call), so a plan of a few minutes is normal; a plan that needs more than the 10 minute limit will never complete.
+The default per-call timeout is 240 s because grok-4.7 writes about 45 tokens per second, so its single large specification call takes 110 to 120 s; a timeout close to that would fail healthy plans. Every model call is logged as a `planner_call` event (fields `sessionId`, `model`, `ms`, `outcome`, `attempts`, `usage`) and counted in `ultrathink_planner_calls_total{outcome}` and `ultrathink_planner_call_duration_seconds`; use them to see which stage is slow before raising a timeout.
+
+Chat clients wait through long polling (`ultrathink_result` waits up to 40 s per poll), so a plan of a few minutes is normal; a plan that needs more than the 10 minute limit will never complete.
 
 Switching models safely:
 

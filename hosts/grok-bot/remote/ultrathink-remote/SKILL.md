@@ -17,7 +17,7 @@ If the request is empty, reply: "Give a request after /ultrathink, for example: 
 
 ## Start
 
-If the `ultrathink_uplift` tool is available, plan on the server: call it with `prompt` set to the request text and keep the `sessionId`. While the status is `running`, call `ultrathink_result` with `sessionId` (each call waits up to 30 seconds). When the status is `planned`, go to Stop. Any other status is reported in one line, and you stop.
+If the `ultrathink_uplift` tool is available, plan on the server: call it with `prompt` set to the request text and keep the `sessionId`. While the status is `running`, call `ultrathink_result` with `sessionId` (each call waits up to 40 seconds; a plan takes about one to four minutes). When the status is `planned`, go to Stop. Any other status is reported in one line, and you stop.
 
 Otherwise call `ultrathink_plan` with `prompt` set to the request text. Keep the `sessionId` from the result. Include it in your reply, reuse it for every later call in this request, and report the status.
 

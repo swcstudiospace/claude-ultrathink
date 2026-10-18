@@ -83,7 +83,7 @@ Type `/ultrathink` followed by the request, in one message:
 What happens next:
 
 1. The chat model calls `ultrathink_uplift` with everything after `/ultrathink`, verbatim. The reply has a `sessionId` and a status, normally `running`. The call waits up to 15 seconds in case the plan finishes fast.
-2. The model calls `ultrathink_result` with the `sessionId`. Each call waits up to 30 seconds by default (at most 45) and reports `running` if the plan is not ready. The model calls it again until the status is `planned`. No other work is needed from the model meanwhile, and you do not need to answer anything during this wait.
+2. The model calls `ultrathink_result` with the `sessionId`. Each call waits up to 40 seconds by default (at most 45) and reports `running` if the plan is not ready. The model calls it again until the status is `planned`. No other work is needed from the model meanwhile, and you do not need to answer anything during this wait.
 3. When the status is `planned`, the result text is the plan. The model asks you the questions in it that matter, or states the defaults it assumes, and then carries out the plan.
 
 If the request is empty (`/ultrathink` alone), the model should ask for a request and call no tool.
@@ -113,9 +113,9 @@ Measured on 2026-10-18 on this VPS with the real planner. Prompt: "Compare three
 | `anthropic/claude-haiku-4.5` | 111 s | 10 | 39.3k / 10.0k | 0.089 USD | 23.9k chars | 7 / 56 |
 | `x-ai/grok-4.7` | 138 s | 10 | 50.9k / 11.7k | 0.153 USD | 23.9k chars | 7 / 56 |
 
-A plan makes 9 to 11 model calls: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1. `x-ai/grok-4.7` at the provider's default reasoning did not finish in 6 minutes: one call passed the 120 s per-call timeout, and the 9 calls it made cost 0.167 USD. That is why the default effort is `low`.
+A plan makes 9 to 11 model calls: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1. `x-ai/grok-4.7` at the provider's default reasoning did not finish in 6 minutes: one call passed the per-call timeout (120 s at the time of the test; the default is now 240 s), and the 9 calls it made cost 0.167 USD. That is why the default effort is `low`. `x-ai/grok-4.7` writes about 45 tokens per second, so its single large specification call takes 110 to 120 s even at `low`.
 
-The shipped example model stays `x-ai/grok-4.7`, which is the operator's choice. A faster or cheaper model is one `ULTRATHINK_PLANNING_MODEL` change: `google/gemini-3.6-flash` for speed, `openai/gpt-5.6-luna` for price. Model ids are OpenRouter ids. The result's `usage` field reports the real calls, tokens and, when OpenRouter returns it, the cost of each plan.
+The shipped example model stays `x-ai/grok-4.7`, which is the operator's choice. A faster or cheaper model is one `ULTRATHINK_PLANNING_MODEL` change: `google/gemini-3.6-flash` for speed, `openai/gpt-5.6-luna` for price. Model ids are OpenRouter ids. The result's `usage` field reports the real calls, tokens and, when OpenRouter returns it, the cost of each plan. The server logs every model call (`planner_call`) and exposes `ultrathink_planner_calls_total` and `ultrathink_planner_call_duration_seconds`, which show which calls are slow.
 
 Two ceilings bound the spend, both counted in tokens by a ledger in the server's database:
 
@@ -124,7 +124,7 @@ Two ceilings bound the spend, both counted in tokens by a ledger in the server's
 
 A plan that would pass a ceiling stops with `budget_exceeded`. Abandoned reservations keep counting, so the ledger errs toward stopping early.
 
-The server runs at most `ULTRATHINK_MAX_CONCURRENT_PLANS` plans at once (default 2). It cancels a model call after `ULTRATHINK_MODEL_TIMEOUT_MS` (default 120000) and a whole plan after `ULTRATHINK_PLAN_TIMEOUT_MS` (default 600000).
+The server runs at most `ULTRATHINK_MAX_CONCURRENT_PLANS` plans at once (default 2). It cancels a model call after `ULTRATHINK_MODEL_TIMEOUT_MS` (default 240000) and a whole plan after `ULTRATHINK_PLAN_TIMEOUT_MS` (default 600000).
 
 ## Make it reliable
 
@@ -183,7 +183,7 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base. https only, no credentials, query or fragment. |
 | `ULTRATHINK_SERVER_PLANNING` | unset | `0` turns server-side mode off. `1` requires the key and the model, otherwise the server refuses to start. Unset means on when both are set. |
 | `ULTRATHINK_MAX_CONCURRENT_PLANS` | `2` | Plans that run at once, 1 to 8. More starts return `busy`. |
-| `ULTRATHINK_MODEL_TIMEOUT_MS` | `120000` | Timeout for one model call, 5000 to 600000. |
+| `ULTRATHINK_MODEL_TIMEOUT_MS` | `240000` | Timeout for one model call, 5000 to 600000. A call that times out is not retried. |
 | `ULTRATHINK_PLAN_TIMEOUT_MS` | `600000` | Timeout for one whole plan, 30000 to 1800000. |
 | `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
 | `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. The pipeline already asks the model to write its reasoning steps, so hidden reasoning only adds minutes. |
@@ -209,7 +209,7 @@ Origin lists take bare origins only (`https://host[:port]`, no path, query or fr
 | Status `skipped` | The pipeline declined the request, for example one that starts with a slash command or a `raw:` prefix. | State the request as a plain description of the task and call `ultrathink_uplift` again with a new `sessionId`. |
 | Status `failed`, error `auth` | OpenRouter refused the API key (HTTP 401 or 403). | The operator replaces `OPENROUTER_API_KEY` and restarts. |
 | Status `failed`, error `rate_limited`, `upstream`, `empty` or `bad_response` | The model provider limited, failed or returned nothing usable, after retries. | Try again with a new `sessionId`. The operator checks the model id, credit and timeouts. |
-| Status `failed`, error `timeout` | One model call took longer than `ULTRATHINK_MODEL_TIMEOUT_MS`, or the whole plan took longer than `ULTRATHINK_PLAN_TIMEOUT_MS`. | Try a faster model (see the table above) or a lower `ULTRATHINK_MODEL_REASONING_EFFORT`. The cost of the partial run still counts against the ceilings. |
+| Status `failed`, error `timeout` | One model call took longer than `ULTRATHINK_MODEL_TIMEOUT_MS`, or the whole plan took longer than `ULTRATHINK_PLAN_TIMEOUT_MS`. A timeout is not retried: the plan fails with `timeout`. | Try a faster model (see the table above) or a lower `ULTRATHINK_MODEL_REASONING_EFFORT`. The cost of the partial run still counts against the ceilings. |
 | Status `failed`, error `interrupted` | The service restarted while the plan ran. | Run it again with a new `sessionId`. |
 | Status `invalid` | The model produced an incomplete plan. | Run it again, or rephrase the request. |
 | Result says `truncated` | The plan was larger than the size limit, so later Graph of Thought sections were left out. | Ask the user for what is missing, or split the request into smaller ones. |
