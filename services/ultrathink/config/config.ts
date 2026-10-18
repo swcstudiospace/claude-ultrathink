@@ -22,19 +22,35 @@ export interface UltrathinkConfig {
 	dailyTokenCeiling: number;
 	planningModel: string | undefined;
 	connectorKey: string | undefined;
+	allowedOrigins: string[];
+	oauthRedirectOrigins: string[];
+	openRouterApiKey: string | undefined;
+	openRouterBaseUrl: string;
+	serverPlanning: boolean;
+	maxConcurrentPlans: number;
+	modelTimeoutMs: number;
+	planTimeoutMs: number;
+	modelMaxOutputTokens: number;
+	serverDecisions: boolean;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
 const DEFAULT_PORT = 8795;
 const DEFAULT_MAX_INPUT_CHARS = 8000;
 const DEFAULT_MAX_ANSWER_CHARS = 20000;
-const MAX_BODY_BYTES = 16384;
+const MAX_BODY_BYTES = 65536;
 const DEFAULT_RUN_TOKEN_CEILING = 150000;
 const DEFAULT_DAILY_TOKEN_CEILING = 1000000;
 const MIN_SESSION_SECRET_LENGTH = 32;
 const MIN_CONNECTOR_KEY_LENGTH = 32;
 const INTEGER_PATTERN = /^[0-9]+$/;
 const PLANNING_MODEL_PATTERN = /^[A-Za-z0-9._:\/-]{1,80}$/;
+const MIN_OPENROUTER_KEY_LENGTH = 20;
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_MAX_CONCURRENT_PLANS = 2;
+const DEFAULT_MODEL_TIMEOUT_MS = 120000;
+const DEFAULT_PLAN_TIMEOUT_MS = 600000;
+const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 8000;
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
 
 function readOptional(
@@ -129,10 +145,120 @@ function readConnectorKey(env: Record<string, string | undefined>): string | und
 	return key;
 }
 
+function readFlag(
+	env: Record<string, string | undefined>,
+	name: string,
+): boolean | undefined {
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return undefined;
+	}
+	if (raw === "1") {
+		return true;
+	}
+	if (raw === "0") {
+		return false;
+	}
+	throw new ConfigError(`${name} must be 0 or 1`);
+}
+
+function readOpenRouterApiKey(env: Record<string, string | undefined>): string | undefined {
+	const key = readOptional(env, "OPENROUTER_API_KEY");
+	if (key !== undefined && key.length < MIN_OPENROUTER_KEY_LENGTH) {
+		throw new ConfigError(`OPENROUTER_API_KEY must be at least ${MIN_OPENROUTER_KEY_LENGTH} characters`);
+	}
+	return key;
+}
+
+function readOpenRouterBaseUrl(env: Record<string, string | undefined>): string {
+	const name = "ULTRATHINK_OPENROUTER_BASE_URL";
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return DEFAULT_OPENROUTER_BASE_URL;
+	}
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		throw new ConfigError(`${name} must be an absolute https:// URL`);
+	}
+	if (
+		url.protocol !== "https:" ||
+		url.username !== "" ||
+		url.password !== "" ||
+		url.search !== "" ||
+		url.hash !== "" ||
+		raw.includes("?") ||
+		raw.includes("#")
+	) {
+		throw new ConfigError(
+			`${name} must be an https:// URL without credentials, query or fragment`,
+		);
+	}
+	return raw.replace(/\/+$/, "");
+}
+
+function readServerPlanning(
+	env: Record<string, string | undefined>,
+	apiKey: string | undefined,
+	planningModel: string | undefined,
+): boolean {
+	const flag = readFlag(env, "ULTRATHINK_SERVER_PLANNING");
+	if (flag === true) {
+		if (apiKey === undefined) {
+			throw new ConfigError("ULTRATHINK_SERVER_PLANNING=1 requires OPENROUTER_API_KEY");
+		}
+		if (planningModel === undefined) {
+			throw new ConfigError("ULTRATHINK_SERVER_PLANNING=1 requires ULTRATHINK_PLANNING_MODEL");
+		}
+	}
+	return flag !== false && apiKey !== undefined && planningModel !== undefined;
+}
+
+/** Comma list of bare origins (scheme://host[:port], no path, query, fragment or credentials), normalized and de-duplicated. */
+function readOriginList(
+	env: Record<string, string | undefined>,
+	name: string,
+	protocols: readonly string[],
+): string[] {
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return [];
+	}
+	const schemes = protocols.map((protocol) => `${protocol}//`).join(" or ");
+	const message = `${name} must be a comma-separated list of bare origins starting with ${schemes} (no path, query, fragment or credentials)`;
+	const origins = new Set<string>();
+	for (const part of raw.split(",")) {
+		const entry = part.trim();
+		if (entry === "") {
+			continue;
+		}
+		let url: URL;
+		try {
+			url = new URL(entry);
+		} catch {
+			throw new ConfigError(message);
+		}
+		const authority = entry.slice(entry.indexOf("//") + 2);
+		if (
+			!protocols.includes(url.protocol) ||
+			!entry.toLowerCase().startsWith(`${url.protocol}//`) ||
+			authority === "" ||
+			/[\/?#@\\]/.test(authority)
+		) {
+			throw new ConfigError(message);
+		}
+		origins.add(url.origin);
+	}
+	return [...origins];
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
 	const stateDir = readOptional(env, "ULTRATHINK_STATE_DIR") ?? DEFAULT_STATE_DIR;
+	const planningModel = readPlanningModel(env);
+	const openRouterApiKey = readOpenRouterApiKey(env);
 	return {
 		publicOrigin: readPublicOrigin(env),
 		ownerPasswordHash: readRequired(env, "ULTRATHINK_OWNER_PASSWORD_HASH"),
@@ -169,8 +295,42 @@ export function loadConfig(
 			1,
 			Number.MAX_SAFE_INTEGER,
 		),
-		planningModel: readPlanningModel(env),
+		planningModel,
 		connectorKey: readConnectorKey(env),
+		allowedOrigins: readOriginList(env, "ULTRATHINK_ALLOWED_ORIGINS", ["https:", "http:"]),
+		oauthRedirectOrigins: readOriginList(env, "ULTRATHINK_OAUTH_REDIRECT_ORIGINS", ["https:"]),
+		openRouterApiKey,
+		openRouterBaseUrl: readOpenRouterBaseUrl(env),
+		serverPlanning: readServerPlanning(env, openRouterApiKey, planningModel),
+		maxConcurrentPlans: readInteger(
+			env,
+			"ULTRATHINK_MAX_CONCURRENT_PLANS",
+			DEFAULT_MAX_CONCURRENT_PLANS,
+			1,
+			8,
+		),
+		modelTimeoutMs: readInteger(
+			env,
+			"ULTRATHINK_MODEL_TIMEOUT_MS",
+			DEFAULT_MODEL_TIMEOUT_MS,
+			5000,
+			600000,
+		),
+		planTimeoutMs: readInteger(
+			env,
+			"ULTRATHINK_PLAN_TIMEOUT_MS",
+			DEFAULT_PLAN_TIMEOUT_MS,
+			30000,
+			1800000,
+		),
+		modelMaxOutputTokens: readInteger(
+			env,
+			"ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS",
+			DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
+			256,
+			32000,
+		),
+		serverDecisions: readFlag(env, "ULTRATHINK_SERVER_DECISIONS") === true,
 	};
 }
 

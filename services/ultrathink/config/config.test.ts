@@ -59,7 +59,7 @@ describe("loadConfig defaults", () => {
 		expect(config.port).toBe(8795);
 		expect(config.maxInputChars).toBe(8000);
 		expect(config.maxAnswerChars).toBe(20000);
-		expect(config.maxBodyBytes).toBe(16384);
+		expect(config.maxBodyBytes).toBe(65536);
 		expect(config.runTokenCeiling).toBe(150000);
 		expect(config.dailyTokenCeiling).toBe(1000000);
 		expect(config.planningModel).toBeUndefined();
@@ -189,5 +189,257 @@ describe("sessionSecret", () => {
 		const env = baseEnv();
 		env.ULTRATHINK_SESSION_SECRET = randomSecret().slice(0, 32);
 		expect(loadConfig(env).sessionSecret).toHaveLength(32);
+	});
+});
+
+const FAKE_KEY = `sk-or-test-${"k".repeat(24)}`;
+
+describe("server planning defaults", () => {
+	test("new fields default to disabled server planning with documented limits", () => {
+		const config = loadConfig(baseEnv());
+		expect(config.allowedOrigins).toEqual([]);
+		expect(config.oauthRedirectOrigins).toEqual([]);
+		expect(config.openRouterApiKey).toBeUndefined();
+		expect(config.openRouterBaseUrl).toBe("https://openrouter.ai/api/v1");
+		expect(config.serverPlanning).toBe(false);
+		expect(config.maxConcurrentPlans).toBe(2);
+		expect(config.modelTimeoutMs).toBe(120000);
+		expect(config.planTimeoutMs).toBe(600000);
+		expect(config.modelMaxOutputTokens).toBe(8000);
+		expect(config.serverDecisions).toBe(false);
+	});
+
+	test("maxBodyBytes defaults to 65536", () => {
+		expect(loadConfig(baseEnv()).maxBodyBytes).toBe(65536);
+	});
+
+	test("explicit values are read", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_MAX_CONCURRENT_PLANS = "4";
+		env.ULTRATHINK_MODEL_TIMEOUT_MS = "30000";
+		env.ULTRATHINK_PLAN_TIMEOUT_MS = "90000";
+		env.ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS = "4096";
+		env.ULTRATHINK_SERVER_DECISIONS = "1";
+		const config = loadConfig(env);
+		expect(config.maxConcurrentPlans).toBe(4);
+		expect(config.modelTimeoutMs).toBe(30000);
+		expect(config.planTimeoutMs).toBe(90000);
+		expect(config.modelMaxOutputTokens).toBe(4096);
+		expect(config.serverDecisions).toBe(true);
+	});
+});
+
+describe("server planning bounds", () => {
+	const bounds: Array<[string, number, number]> = [
+		["ULTRATHINK_MAX_CONCURRENT_PLANS", 1, 8],
+		["ULTRATHINK_MODEL_TIMEOUT_MS", 5000, 600000],
+		["ULTRATHINK_PLAN_TIMEOUT_MS", 30000, 1800000],
+		["ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS", 256, 32000],
+	];
+	for (const [name, min, max] of bounds) {
+		test(`${name} accepts ${min} and ${max}`, () => {
+			for (const value of [min, max]) {
+				const env = baseEnv();
+				env[name] = String(value);
+				expect(() => loadConfig(env)).not.toThrow();
+			}
+		});
+
+		test(`${name} rejects out-of-range and malformed values`, () => {
+			for (const value of [String(min - 1), String(max + 1), "1.5", "-1", "12abc", "1e3"]) {
+				const env = baseEnv();
+				env[name] = value;
+				expect(messageOf(() => loadConfig(env))).toContain(name);
+			}
+		});
+	}
+
+	test("server decisions accepts only 0 or 1", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_SERVER_DECISIONS = "0";
+		expect(loadConfig(env).serverDecisions).toBe(false);
+		env.ULTRATHINK_SERVER_DECISIONS = "yes";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_SERVER_DECISIONS");
+	});
+});
+
+describe("openRouterApiKey", () => {
+	test("is read and trimmed", () => {
+		const env = baseEnv();
+		env.OPENROUTER_API_KEY = `  ${FAKE_KEY}  `;
+		expect(loadConfig(env).openRouterApiKey).toBe(FAKE_KEY);
+	});
+
+	test("a blank key counts as unset", () => {
+		const env = baseEnv();
+		env.OPENROUTER_API_KEY = "   ";
+		expect(loadConfig(env).openRouterApiKey).toBeUndefined();
+	});
+
+	test("a key shorter than 20 characters is rejected without echoing it", () => {
+		const env = baseEnv();
+		const short = FAKE_KEY.slice(0, 19);
+		env.OPENROUTER_API_KEY = short;
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("OPENROUTER_API_KEY");
+		expect(message).not.toContain(short);
+	});
+
+	test("a key of exactly 20 characters is accepted", () => {
+		const env = baseEnv();
+		env.OPENROUTER_API_KEY = FAKE_KEY.slice(0, 20);
+		expect(loadConfig(env).openRouterApiKey).toHaveLength(20);
+	});
+});
+
+describe("openRouterBaseUrl", () => {
+	test("accepts an https URL and strips trailing slashes", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_OPENROUTER_BASE_URL = "https://router.example.test/api/v1//";
+		expect(loadConfig(env).openRouterBaseUrl).toBe("https://router.example.test/api/v1");
+	});
+
+	for (const value of [
+		"http://openrouter.ai/api/v1",
+		"openrouter.ai/api/v1",
+		"ftp://openrouter.ai/api/v1",
+		"https://user:pass@openrouter.ai/api/v1",
+		"https://openrouter.ai/api/v1?x=1",
+		"https://openrouter.ai/api/v1#frag",
+	]) {
+		test(`rejects ${value}`, () => {
+			const env = baseEnv();
+			env.ULTRATHINK_OPENROUTER_BASE_URL = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_OPENROUTER_BASE_URL");
+			expect(message).not.toContain("pass@");
+		});
+	}
+});
+
+describe("serverPlanning derivation", () => {
+	function withPlanning(extra: Record<string, string | undefined>): Record<string, string | undefined> {
+		return { ...baseEnv(), ...extra };
+	}
+
+	test("is true when the key and the planning model are set", () => {
+		const config = loadConfig(
+			withPlanning({ OPENROUTER_API_KEY: FAKE_KEY, ULTRATHINK_PLANNING_MODEL: "x-ai/grok-4.7" }),
+		);
+		expect(config.serverPlanning).toBe(true);
+	});
+
+	test("is false without the key", () => {
+		expect(loadConfig(withPlanning({ ULTRATHINK_PLANNING_MODEL: "x-ai/grok-4.7" })).serverPlanning).toBe(false);
+	});
+
+	test("is false without the planning model", () => {
+		expect(loadConfig(withPlanning({ OPENROUTER_API_KEY: FAKE_KEY })).serverPlanning).toBe(false);
+	});
+
+	test("ULTRATHINK_SERVER_PLANNING=0 disables it even with key and model", () => {
+		const config = loadConfig(
+			withPlanning({
+				OPENROUTER_API_KEY: FAKE_KEY,
+				ULTRATHINK_PLANNING_MODEL: "x-ai/grok-4.7",
+				ULTRATHINK_SERVER_PLANNING: "0",
+			}),
+		);
+		expect(config.serverPlanning).toBe(false);
+	});
+
+	test("ULTRATHINK_SERVER_PLANNING=1 with key and model enables it", () => {
+		const config = loadConfig(
+			withPlanning({
+				OPENROUTER_API_KEY: FAKE_KEY,
+				ULTRATHINK_PLANNING_MODEL: "x-ai/grok-4.7",
+				ULTRATHINK_SERVER_PLANNING: "1",
+			}),
+		);
+		expect(config.serverPlanning).toBe(true);
+	});
+
+	test("ULTRATHINK_SERVER_PLANNING=1 without a key throws a ConfigError", () => {
+		const message = messageOf(() =>
+			loadConfig(withPlanning({ ULTRATHINK_PLANNING_MODEL: "x-ai/grok-4.7", ULTRATHINK_SERVER_PLANNING: "1" })),
+		);
+		expect(message).toContain("OPENROUTER_API_KEY");
+	});
+
+	test("ULTRATHINK_SERVER_PLANNING=1 without a planning model throws a ConfigError", () => {
+		const message = messageOf(() =>
+			loadConfig(withPlanning({ OPENROUTER_API_KEY: FAKE_KEY, ULTRATHINK_SERVER_PLANNING: "1" })),
+		);
+		expect(message).toContain("ULTRATHINK_PLANNING_MODEL");
+	});
+
+	test("any other ULTRATHINK_SERVER_PLANNING value is rejected", () => {
+		const message = messageOf(() =>
+			loadConfig(withPlanning({ ULTRATHINK_SERVER_PLANNING: "true" })),
+		);
+		expect(message).toContain("ULTRATHINK_SERVER_PLANNING");
+	});
+});
+
+describe("origin lists", () => {
+	test("trims, skips empty entries, normalizes and de-duplicates", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_ALLOWED_ORIGINS =
+			" https://a.example.test , http://b.example.test:8080,, HTTPS://A.EXAMPLE.TEST ,https://a.example.test ";
+		expect(loadConfig(env).allowedOrigins).toEqual([
+			"https://a.example.test",
+			"http://b.example.test:8080",
+		]);
+	});
+
+	test("a blank list is empty", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_ALLOWED_ORIGINS = "  ";
+		expect(loadConfig(env).allowedOrigins).toEqual([]);
+	});
+
+	test("oauth redirect origins accept https and parse like allowed origins", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_OAUTH_REDIRECT_ORIGINS = "https://app.example.test, https://app.example.test,https://c.example.test:8443";
+		expect(loadConfig(env).oauthRedirectOrigins).toEqual([
+			"https://app.example.test",
+			"https://c.example.test:8443",
+		]);
+	});
+
+	test("oauth redirect origins reject http", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_OAUTH_REDIRECT_ORIGINS = "http://app.example.test";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_OAUTH_REDIRECT_ORIGINS");
+	});
+
+	const notBare = [
+		"https://a.example.test/",
+		"https://a.example.test/path",
+		"https://a.example.test?x=1",
+		"https://a.example.test#frag",
+		"https://user:secret@a.example.test",
+		"https://user@a.example.test",
+		"ftp://a.example.test",
+		"a.example.test",
+		"//a.example.test",
+		"javascript:alert(1)",
+		"https://",
+		"*",
+	];
+	for (const value of notBare) {
+		test(`allowed origins reject ${value}`, () => {
+			const env = baseEnv();
+			env.ULTRATHINK_ALLOWED_ORIGINS = `https://ok.example.test,${value}`;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_ALLOWED_ORIGINS");
+			expect(message).not.toContain("secret");
+		});
+	}
+
+	test("a bad entry in the oauth list names that variable", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_OAUTH_REDIRECT_ORIGINS = "https://app.example.test/callback";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_OAUTH_REDIRECT_ORIGINS");
 	});
 });

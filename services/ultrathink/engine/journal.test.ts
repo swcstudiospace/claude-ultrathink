@@ -2,9 +2,10 @@
 // Copyright (C) 2026 SWC Studio
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { claudeConfigPaths, loadConfig } from "../../../src/config.ts";
 import { journalDir, stageOf } from "../../../src/host/grokbot.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../../../src/think/prompts.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../../../src/uplift/prompt.ts";
@@ -229,5 +230,37 @@ describe("grok-bot journal service", () => {
 		expect(await startPlan(o, { prompt: "x".repeat(4001) })).toEqual({ ok: false, code: "invalid_input" });
 		const cleaned = await startPlan(o, { prompt: "\u0007Build a CLI\u0000 now" });
 		expect(cleaned).toMatchObject({ ok: true, data: { status: "needs-model" } });
+	});
+});
+
+describe("journal config isolation", () => {
+	test("ignores a hostile operator config reachable through HOME, XDG_CONFIG_HOME and CLAUDE_CONFIG_DIR", async () => {
+		const hostile = tmp();
+		const body = JSON.stringify({ uplift: { enabled: false } });
+		for (const file of [
+			join(hostile, "xdg", "ultrathink", "config.json"),
+			join(hostile, "claude", "ultrathink.json"),
+			join(hostile, "home", ".config", "ultrathink", "config.json"),
+		]) {
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, body);
+		}
+		const keys = ["HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"] as const;
+		const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+		process.env.HOME = join(hostile, "home");
+		process.env.XDG_CONFIG_HOME = join(hostile, "xdg");
+		process.env.CLAUDE_CONFIG_DIR = join(hostile, "claude");
+		try {
+			// The fixture is hostile: read the way the plugin reads it, it switches planning off.
+			expect(loadConfig(claudeConfigPaths(join(hostile, "cwd"))).uplift.enabled).toBe(false);
+			const stateDir = newState();
+			const plan = await startPlan(opts(stateDir), { prompt: PROMPT });
+			expect(plan).toMatchObject({ ok: true, data: { status: "needs-model" } });
+		} finally {
+			for (const key of keys) {
+				if (saved[key] === undefined) delete process.env[key];
+				else process.env[key] = saved[key];
+			}
+		}
 	});
 });

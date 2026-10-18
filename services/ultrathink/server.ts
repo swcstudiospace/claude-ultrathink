@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
+import pkg from "../../package.json";
 import { createAuth } from "./auth/auth.ts";
 import { ConfigError, type UltrathinkConfig, loadConfig } from "./config/config.ts";
-import { createHandler } from "./routes/router.ts";
+import { createShutdown, installProcessHandlers } from "./lifecycle.ts";
+import { createLogger } from "./obs/log.ts";
+import { createApp } from "./routes/router.ts";
 import { openStore } from "./store/store.ts";
+
+// Running plans are aborted and marked interrupted within 5 s of the signal; the rest is draining connections.
+const SHUTDOWN_TIMEOUT_MS = 20_000;
+// Long polling waits up to 45 s per tool call.
+const IDLE_TIMEOUT_SEC = 75;
 
 function loadConfigOrExit(): UltrathinkConfig {
 	try {
@@ -19,43 +27,39 @@ function loadConfigOrExit(): UltrathinkConfig {
 }
 
 const config = loadConfigOrExit();
+const logger = createLogger();
 const store = openStore(config.dbPath);
 const auth = createAuth({
 	ownerPasswordHash: config.ownerPasswordHash,
 	sessionSecret: config.sessionSecret,
 	cookieSecure: config.publicOrigin.startsWith("https://"),
 });
-const handler = createHandler({ config, store, auth });
-
-async function handleLogged(req: Request, peerIp: string): Promise<Response> {
-	const started = performance.now();
-	const response = await handler(req, peerIp);
-	const { pathname } = new URL(req.url);
-	const elapsedMs = Math.round(performance.now() - started);
-	console.log(`${req.method} ${pathname} ${response.status} ${elapsedMs}ms`);
-	return response;
-}
+const app = createApp({ config, store, auth, logger });
 
 const server = Bun.serve({
 	hostname: "127.0.0.1",
 	port: config.port,
-	idleTimeout: 30,
+	idleTimeout: IDLE_TIMEOUT_SEC,
+	maxRequestBodySize: config.maxBodyBytes,
 	fetch(req, bunServer) {
-		return handleLogged(req, bunServer.requestIP(req)?.address ?? "");
+		return app.handle(req, bunServer.requestIP(req)?.address ?? "");
 	},
 });
 
-let stopping = false;
+const shutdown = createShutdown({
+	server: { stop: () => server.stop() },
+	app,
+	store,
+	logger,
+	timeoutMs: SHUTDOWN_TIMEOUT_MS,
+	exit: (code) => process.exit(code),
+});
+installProcessHandlers(shutdown, logger, process);
 
-function shutdown(): void {
-	if (stopping) return;
-	stopping = true;
-	server.stop();
-	store.close();
-	process.exit(0);
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-
-console.log(`ultrathink listening on 127.0.0.1:${config.port}`);
+logger.info("listening", {
+	version: pkg.version,
+	port: server.port,
+	serverPlanning: config.serverPlanning,
+	planningModel: config.planningModel ?? null,
+	maxConcurrentPlans: config.maxConcurrentPlans,
+});

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { type Auth, createAuth } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { type Store, openStore } from "../store/store.ts";
+import { createLogger } from "../obs/log.ts";
 import { createHandler } from "./router.ts";
 
 const PUBLIC_ORIGIN = "https://ultrathink.test";
@@ -16,6 +17,7 @@ const PEER_IP = "127.0.0.1";
 const OWNER_ID = "owner";
 const MAX_BODY_BYTES = 1024;
 const MAX_INPUT_CHARS = 200;
+const silent = createLogger({ write: () => undefined });
 
 type Handler = (req: Request, peerIp: string) => Promise<Response>;
 type ToolResult = { isError: boolean; structuredContent: Record<string, unknown> };
@@ -64,10 +66,20 @@ beforeAll(async () => {
 		dailyTokenCeiling: 1000000,
 		planningModel: undefined,
 		connectorKey: undefined,
+		allowedOrigins: [],
+		oauthRedirectOrigins: [],
+		openRouterApiKey: undefined,
+		openRouterBaseUrl: "https://openrouter.ai/api/v1",
+		serverPlanning: false,
+		maxConcurrentPlans: 2,
+		modelTimeoutMs: 120000,
+		planTimeoutMs: 600000,
+		modelMaxOutputTokens: 8000,
+		serverDecisions: false,
 	};
 	auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);
-	handler = createHandler({ config, store, auth });
+	handler = createHandler({ config, store, auth, logger: silent });
 
 	const login = await handler(
 		new Request(`${PUBLIC_ORIGIN}/login`, {
@@ -266,7 +278,7 @@ describe("router", () => {
 		test("POST returns 503 and healthz returns 503 when the store is closed", async () => {
 			const closed = openStore(join(dir, "closed.db"));
 			closed.close();
-			const closedHandler = createHandler({ config, store: closed, auth });
+			const closedHandler = createHandler({ config, store: closed, auth, logger: silent });
 
 			const health = await closedHandler(new Request(`${PUBLIC_ORIGIN}/healthz`), PEER_IP);
 			expect(health.status).toBe(503);
@@ -290,7 +302,7 @@ describe("MCP endpoint", () => {
 	let planKey = "";
 
 	beforeAll(() => {
-		mcp = createHandler({ config: { ...config, connectorKey: CONNECTOR_KEY }, store, auth });
+		mcp = createHandler({ config: { ...config, connectorKey: CONNECTOR_KEY }, store, auth, logger: silent });
 	});
 
 	function rpc(body: unknown, headers: Record<string, string> = {}): Request {
@@ -356,13 +368,14 @@ describe("MCP endpoint", () => {
 		expect(await response.text()).toBe("");
 	});
 
-	test("tools/list returns exactly the five journal tools", async () => {
+	test("tools/list returns the five journal tools and ultrathink_result when server planning is off", async () => {
 		const list = await mcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), PEER_IP);
 		const listBody = (await list.json()) as { result: { tools: { name: string }[] } };
 		expect(listBody.result.tools.map((tool) => tool.name).sort()).toEqual([
 			"ultrathink_answer",
 			"ultrathink_pending",
 			"ultrathink_plan",
+			"ultrathink_result",
 			"ultrathink_show",
 			"ultrathink_status",
 		]);

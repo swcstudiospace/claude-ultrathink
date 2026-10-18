@@ -1,43 +1,92 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { PROMPT_DEFINITIONS, renderPrompt } from "./prompts.ts";
+import pkg from "../../../package.json";
+import { promptDefinitions, renderPrompt } from "./prompts.ts";
 
-export const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"] as const;
+/** Newest first: initialize answers with the requested version when listed here, otherwise the first. */
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
+
+/** Version assumed for a request that names none. It is the newest one that still allows JSON-RPC batches. */
+export const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+
+/** Versions from this one on forbid batches. Versions are ISO dates, so string order is date order. */
+const BATCH_REMOVED_IN = "2025-06-18";
 
 export interface ToolDefinition {
 	name: string;
+	title: string;
 	description: string;
 	inputSchema: Record<string, unknown>;
 	annotations: Record<string, unknown>;
 }
 
-/** The host's result for one tool call. A refusal is a normal outcome, not an exception. */
+/**
+ * The host's result for one tool call. A refusal is a normal outcome, not an exception.
+ * When `text` is present it is the tool result content and `data` becomes structuredContent only;
+ * otherwise the content is the JSON of `data`.
+ */
 export type ToolOutcome =
-	| { ok: true; data: Record<string, unknown> }
+	| { ok: true; data: Record<string, unknown>; text?: string }
 	| { ok: false; code: string; errors?: string[] };
 
 /** The domain side. The host runs each tool; this module only speaks MCP. */
 export interface McpToolHost {
 	call(name: string, args: Record<string, unknown>): ToolOutcome | Promise<ToolOutcome>;
+	/** Absent means { serverPlanning: false }. */
+	capabilities?(): { serverPlanning: boolean };
+}
+
+export interface McpContext {
+	/** The negotiated MCP-Protocol-Version of this request. Absent means DEFAULT_PROTOCOL_VERSION. */
+	protocolVersion?: string;
 }
 
 const JSONRPC = "2.0";
 const NOTIFICATION_PREFIX = "notifications/";
-const INSTRUCTIONS =
-	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned.";
+const UPLIFT_TOOL = "ultrathink_uplift";
+
+const CLIENT_INSTRUCTIONS =
+	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned. Then call ultrathink_result with the sessionId, ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+const SERVER_INSTRUCTIONS =
+	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. While its status is running, call ultrathink_result with the sessionId until the status is planned. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+
+const SERVER_INFO = { name: "ultrathink", version: pkg.version };
 
 const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 
-const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
-const READ_WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
+// idempotentHint only means something for a tool that writes; the read-only tools carry it too so every tool states it.
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 
+/** Every tool the service can offer. Use toolDefinitions for the list a host actually serves. */
 export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	{
+		name: UPLIFT_TOOL,
+		title: "Plan a request on the server",
+		description:
+			"The entry point for the /ultrathink command. When the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. When the status is running, call ultrathink_result with the sessionId.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				prompt: { type: "string", description: "The request to plan." },
+				sessionId: {
+					type: "string",
+					description: "Session id from a previous call. Omit to start a new session.",
+				},
+			},
+			required: ["prompt"],
+			additionalProperties: false,
+		},
+		annotations: READ_WRITE_OPEN_WORLD,
+	},
+	{
 		name: "ultrathink_plan",
+		title: "Start or continue a client-answered plan",
 		description:
 			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command: when the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
 		inputSchema: {
@@ -56,6 +105,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	},
 	{
 		name: "ultrathink_pending",
+		title: "List pending prompts",
 		description: "List the prompts still waiting for an answer in a planning session.",
 		inputSchema: {
 			type: "object",
@@ -67,6 +117,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	},
 	{
 		name: "ultrathink_show",
+		title: "Show a pending prompt",
 		description: "Return the system and user text of one pending prompt, to be answered by the calling model.",
 		inputSchema: {
 			type: "object",
@@ -82,6 +133,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	},
 	{
 		name: "ultrathink_answer",
+		title: "Answer a pending prompt",
 		description:
 			"Store the answer to one pending prompt. The answer is validated. A rejected answer returns the reasons and the prompt stays pending.",
 		inputSchema: {
@@ -98,6 +150,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 	},
 	{
 		name: "ultrathink_status",
+		title: "Get planning status",
 		description: "Return the status of a planning session and its pending prompts.",
 		inputSchema: {
 			type: "object",
@@ -107,7 +160,42 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		},
 		annotations: READ_ONLY,
 	},
+	{
+		name: "ultrathink_result",
+		title: "Get the uplifted plan",
+		description:
+			"Return the finished plan for a session from ultrathink_uplift or a finished ultrathink_plan session: the request, the specification, the Graph of Thought conclusions and the clarifying questions. If the plan is still running, this waits up to waitSeconds and then reports status running; call it again. After receiving the plan, ask the user its questions that matter (or state the defaults you assume) and carry out the plan.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				sessionId: { type: "string" },
+				waitSeconds: {
+					type: "integer",
+					minimum: 0,
+					maximum: 45,
+					default: 30,
+					description: "How long to wait for a running plan before reporting status running.",
+				},
+				detail: {
+					type: "string",
+					enum: ["brief", "full"],
+					default: "brief",
+					description: "full adds the numbered Chain of Thought steps of every node.",
+				},
+			},
+			required: ["sessionId"],
+			additionalProperties: false,
+		},
+		annotations: READ_ONLY,
+	},
 ];
+
+const CLIENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = TOOL_DEFINITIONS.filter((tool) => tool.name !== UPLIFT_TOOL);
+
+/** The tools a host serves: ultrathink_uplift exists only when the host plans on the server. */
+export function toolDefinitions(serverPlanning: boolean): readonly ToolDefinition[] {
+	return serverPlanning ? TOOL_DEFINITIONS : CLIENT_TOOL_DEFINITIONS;
+}
 
 type RpcResponse =
 	| { jsonrpc: "2.0"; id: unknown; result: unknown }
@@ -119,85 +207,118 @@ interface ToolResult {
 	isError: boolean;
 }
 
+/** One message's reply. `status` is set only when the HTTP status must differ from 200. */
+interface Handled {
+	reply: RpcResponse;
+	status?: number;
+}
+
 /**
- * Handles one parsed JSON-RPC payload: a single message or a batch.
- * Returns null when nothing should be sent back (notifications only).
- * Batch messages run one at a time, in payload order, so host side effects follow the batch order.
+ * Handles one parsed JSON-RPC payload.
+ * Returns null when nothing should be sent back (notifications and client responses only).
+ * A batch is refused with 400 from 2025-06-18 on and handled for 2025-03-26, one message at a time in
+ * payload order, so host side effects follow the batch order. A request id that is not a string or an
+ * integer is refused with 400.
  */
-export async function handleMcpPayload(host: McpToolHost, payload: unknown): Promise<{ body: unknown } | null> {
+export async function handleMcpPayload(
+	host: McpToolHost,
+	payload: unknown,
+	ctx?: McpContext,
+): Promise<{ body: unknown; status?: number } | null> {
 	if (!Array.isArray(payload)) {
-		const reply = await handleMessage(host, payload);
-		return reply === null ? null : { body: reply };
+		const handled = await handleMessage(host, payload);
+		if (handled === null) return null;
+		return handled.status === undefined
+			? { body: handled.reply }
+			: { body: handled.reply, status: handled.status };
+	}
+	if ((ctx?.protocolVersion ?? DEFAULT_PROTOCOL_VERSION) >= BATCH_REMOVED_IN) {
+		return { body: invalidRequest(), status: 400 };
 	}
 	if (payload.length === 0) return { body: invalidRequest() };
 	const replies: RpcResponse[] = [];
 	for (const message of payload) {
-		const reply = await handleMessage(host, message);
-		if (reply !== null) replies.push(reply);
+		const handled = await handleMessage(host, message);
+		if (handled !== null) replies.push(handled.reply);
 	}
 	return replies.length === 0 ? null : { body: replies };
 }
 
-async function handleMessage(host: McpToolHost, message: unknown): Promise<RpcResponse | null> {
-	if (!isRecord(message)) return invalidRequest();
-	if (message.jsonrpc !== JSONRPC || typeof message.method !== "string") return invalidRequest();
+async function handleMessage(host: McpToolHost, message: unknown): Promise<Handled | null> {
+	if (!isRecord(message) || message.jsonrpc !== JSONRPC) return { reply: invalidRequest() };
 	const id = message.id;
 	const method = message.method;
-	// A message without an id is a notification, and notifications/* never get a reply.
-	// Notifications are not dispatched, so no host side effect runs without a reply.
-	if (id === undefined || method.startsWith(NOTIFICATION_PREFIX)) return null;
+	if (method === undefined) {
+		// A message with an id and a result or error answers a request the server never sends: no reply.
+		const isResponse = id !== undefined && ("result" in message || "error" in message);
+		return isResponse ? null : { reply: invalidRequest() };
+	}
+	if (typeof method !== "string") return { reply: invalidRequest() };
+	// A message without an id is a notification. It is never dispatched, so no host side effect runs without a reply.
+	if (id === undefined) return null;
+	if (typeof id !== "string" && !(typeof id === "number" && Number.isInteger(id))) {
+		return { reply: invalidRequest(), status: 400 };
+	}
+	// A request cannot be a notification: the client waits for an answer.
+	if (method.startsWith(NOTIFICATION_PREFIX)) return { reply: rpcError(id, METHOD_NOT_FOUND, "method not found") };
 	try {
-		return await dispatch(host, id, method, message.params);
+		return { reply: await dispatch(host, id, method, message.params) };
 	} catch {
 		// Host failures are reported without the thrown message or stack.
-		return rpcError(id, INTERNAL_ERROR, "internal error");
+		return { reply: rpcError(id, INTERNAL_ERROR, "internal error") };
 	}
 }
 
 async function dispatch(host: McpToolHost, id: unknown, method: string, params: unknown): Promise<RpcResponse> {
+	const serverPlanning = host.capabilities?.().serverPlanning === true;
 	switch (method) {
 		case "initialize":
-			return rpcResult(id, initializeResult(params));
+			return rpcResult(id, initializeResult(params, serverPlanning));
 		case "ping":
 			return rpcResult(id, {});
 		case "tools/list":
-			return rpcResult(id, { tools: TOOL_DEFINITIONS });
+			return rpcResult(id, { tools: toolDefinitions(serverPlanning) });
 		case "tools/call":
-			return callTool(host, id, params);
+			return callTool(host, id, params, serverPlanning);
 		case "prompts/list":
-			return rpcResult(id, { prompts: PROMPT_DEFINITIONS });
+			return rpcResult(id, { prompts: promptDefinitions({ serverPlanning }) });
 		case "prompts/get":
-			return getPrompt(id, params);
+			return getPrompt(id, params, serverPlanning);
 		default:
 			return rpcError(id, METHOD_NOT_FOUND, "method not found");
 	}
 }
 
-function initializeResult(params: unknown) {
+function initializeResult(params: unknown, serverPlanning: boolean) {
 	const requested = isRecord(params) ? params.protocolVersion : undefined;
 	const protocolVersion =
-		MCP_PROTOCOL_VERSIONS.find((version) => version === requested) ?? MCP_PROTOCOL_VERSIONS[0];
+		SUPPORTED_PROTOCOL_VERSIONS.find((version) => version === requested) ?? SUPPORTED_PROTOCOL_VERSIONS[0];
 	return {
 		protocolVersion,
 		capabilities: { tools: {}, prompts: {} },
-		serverInfo: { name: "ultrathink", version: "0.2.0" },
-		instructions: INSTRUCTIONS,
+		serverInfo: SERVER_INFO,
+		instructions: serverPlanning ? SERVER_INSTRUCTIONS : CLIENT_INSTRUCTIONS,
 	};
 }
 
-function getPrompt(id: unknown, params: unknown): RpcResponse {
+function getPrompt(id: unknown, params: unknown, serverPlanning: boolean): RpcResponse {
 	const name = isRecord(params) ? params.name : undefined;
 	const given = isRecord(params) ? params.arguments : undefined;
 	const args: Record<string, unknown> = isRecord(given) ? given : {};
-	const prompt = renderPrompt(name, args);
+	const prompt = renderPrompt(name, args, { serverPlanning });
 	if (!prompt.ok) return rpcError(id, INVALID_PARAMS, prompt.message);
 	return rpcResult(id, { description: prompt.description, messages: prompt.messages });
 }
 
-async function callTool(host: McpToolHost, id: unknown, params: unknown): Promise<RpcResponse> {
+async function callTool(
+	host: McpToolHost,
+	id: unknown,
+	params: unknown,
+	serverPlanning: boolean,
+): Promise<RpcResponse> {
 	const name = isRecord(params) ? params.name : undefined;
 	const args = isRecord(params) ? params.arguments : undefined;
-	if (typeof name !== "string" || !TOOL_DEFINITIONS.some((tool) => tool.name === name)) {
+	if (typeof name !== "string" || !toolDefinitions(serverPlanning).some((tool) => tool.name === name)) {
 		return rpcError(id, INVALID_PARAMS, "unknown tool");
 	}
 	if (!isRecord(args)) {
@@ -214,10 +335,11 @@ async function callTool(host: McpToolHost, id: unknown, params: unknown): Promis
 function toolResult(outcome: unknown): ToolResult {
 	if (!isRecord(outcome) || typeof outcome.ok !== "boolean") throw new Error("malformed host outcome");
 	if (outcome.ok) {
-		const data = outcome.data;
+		const { data, text } = outcome;
 		if (!isRecord(data)) throw new Error("malformed host outcome");
+		if (text !== undefined && typeof text !== "string") throw new Error("malformed host outcome");
 		return {
-			content: [{ type: "text", text: JSON.stringify(data) }],
+			content: [{ type: "text", text: text ?? JSON.stringify(data) }],
 			structuredContent: data,
 			isError: false,
 		};

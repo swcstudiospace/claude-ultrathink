@@ -45,7 +45,18 @@ export interface RequestView {
 	user?: string;
 }
 
-export type JournalErrorCode = "invalid_session_id" | "session_conflict" | "not_found" | "answer_too_long" | "invalid_answer" | "invalid_input" | "engine_error";
+export type JournalErrorCode =
+	| "invalid_session_id"
+	| "session_conflict"
+	| "not_found"
+	| "answer_too_long"
+	| "invalid_answer"
+	| "invalid_input"
+	| "engine_error"
+	| "busy"
+	| "budget_exceeded"
+	| "not_ready"
+	| "disabled";
 
 export type JournalResult<T> = { ok: true; data: T } | { ok: false; code: JournalErrorCode; errors?: string[] };
 
@@ -55,12 +66,12 @@ const ok = <T>(data: T): JournalResult<T> => ({ ok: true, data });
 
 const fail = (code: JournalErrorCode, errors?: string[]): JournalResult<never> => (errors ? { ok: false, code, errors } : { ok: false, code });
 
-function isSessionId(value: unknown): value is string {
+export function isSessionId(value: unknown): value is string {
 	return typeof value === "string" && SESSION_ID_PATTERN.test(value);
 }
 
 /** Drops C0 control characters except tab and newline, then trims. */
-function cleanText(value: string): string {
+export function cleanText(value: string): string {
 	let out = "";
 	for (const ch of value) {
 		const code = ch.charCodeAt(0);
@@ -93,6 +104,18 @@ function guard<T>(run: () => JournalResult<T>): JournalResult<T> {
 	}
 }
 
+/**
+ * Empty home and config directories under the state dir, as the env the plugin resolves its config files from. The
+ * operator's own `~/.config/ultrathink` and `~/.claude/ultrathink.json` are never read by a service-driven plan.
+ * `CLAUDE_CONFIG_DIR` is included because the Claude user layer resolves through it, not through HOME.
+ */
+export function isolatedConfigEnv(stateDir: string): Record<"HOME" | "XDG_CONFIG_HOME" | "CLAUDE_CONFIG_DIR", string> {
+	const home = join(stateDir, "home");
+	const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), CLAUDE_CONFIG_DIR: join(home, ".claude") };
+	for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+	return env;
+}
+
 export async function startPlan(opts: JournalOptions, input: { prompt: unknown; sessionId?: unknown }): Promise<JournalResult<PlanView>> {
 	const sessionId = input.sessionId === undefined ? randomUUID() : input.sessionId;
 	if (!isSessionId(sessionId)) return fail("invalid_session_id");
@@ -113,6 +136,7 @@ export async function startPlan(opts: JournalOptions, input: { prompt: unknown; 
 				ULTRATHINK_HINDSIGHT: "0",
 				ULTRATHINK_RAGFLOW: "0",
 				ULTRATHINK_STATE_DIR: opts.stateDir,
+				...isolatedConfigEnv(opts.stateDir),
 			},
 			debounceMs: DEBOUNCE_MS,
 		});
