@@ -3,7 +3,8 @@
 # Copyright (C) 2026 SWC Studio
 #
 # Builds dist/ultrathink-connector-<version>.zip for Customize > Plugins > Add > Upload plugin.
-# The manifest sits at the archive root; dist/, this script and test files are left out.
+# The manifest sits at the archive root. Only an explicit allowlist is packed, so a stray file in the working tree
+# (a key, an editor backup, a build output) can never reach the archive.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -14,7 +15,7 @@ if [ ! -f "$manifest" ]; then
 	exit 1
 fi
 
-version=$(grep -m1 '"version"' "$manifest" | sed -e 's/^.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/')
+version=$(grep -m1 '"version"' "$manifest" | sed -e 's/^.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/' || true)
 case "$version" in
 	"" | *[!0-9A-Za-z.+-]*)
 		echo "package.sh: cannot read a usable version from $manifest" >&2
@@ -28,12 +29,24 @@ mkdir -p "$dist"
 rm -f "$archive"
 
 cd "$here"
-# Dotfiles (.gitignore, .DS_Store, anything under a dot directory) stay out, except .mcp.json and .claude-plugin/.
-files=$(find . -type f \
-	! -path './dist/*' ! -name 'package.sh' ! -name '*.test.*' ! -name '.DS_Store' \
-	! \( -name '.*' ! -path './.mcp.json' ! -path './.claude-plugin/*' \) \
-	! \( -path '*/.*/*' ! -path './.claude-plugin/*' \) \
-	| sed -e 's|^\./||' | sort)
+# The allowlist: the manifest, the server entry, the README, every command file and every non-test, non-dot file of skills/.
+for required in .claude-plugin/plugin.json .mcp.json README.md; do
+	if [ ! -f "$required" ]; then
+		echo "package.sh: missing $here/$required" >&2
+		exit 1
+	fi
+done
+files=$(
+	{
+		printf '%s\n' .claude-plugin/plugin.json .mcp.json README.md
+		if [ -d commands ]; then
+			find commands -maxdepth 1 -type f -name '*.md' ! -name '.*' ! -name '*.test.*'
+		fi
+		if [ -d skills ]; then
+			find skills -type f ! -name '*.test.*' ! -path '*/.*'
+		fi
+	} | sort
+)
 if command -v zip >/dev/null 2>&1; then
 	# zip -@ reads one path per line, so no -x pattern can catch .claude-plugin/ by accident.
 	printf '%s\n' "$files" | zip -q "$archive" -@

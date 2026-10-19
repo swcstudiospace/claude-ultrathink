@@ -38,7 +38,7 @@ export const MAX_LIMIT = 20;
 const MAX_DIR_ENTRIES = 5000;
 const MAX_CANDIDATES = 200;
 /** Larger files are skipped unread: a plan record with every node filled stays far below this. */
-const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_BYTES = 1024 * 1024;
 /** Text is cut to this many characters before it is normalised, so a megabyte goal costs nothing. */
 const GOAL_SCAN_CHARS = 2048;
 const JOB_STATUSES: Record<string, true> = { running: true, planned: true, failed: true, invalid: true, skipped: true };
@@ -236,12 +236,17 @@ function summarize(stateDir: string, sources: Sources): SessionSummary | undefin
 	return { sessionId: id, status, mode, updatedAt: Math.trunc(updatedAt), goal, nodeCount: record?.nodeCount ?? 0, hasGraph: record?.hasGraph ?? false };
 }
 
-/** Summaries of the `candidates` most recently touched sessions, newest first by their own timestamp. */
-function collect(stateDir: string, candidates: number): SessionSummary[] {
-	const newest = scan(stateDir)
+/** The `candidates` most recently touched sessions, newest first by file modification time. */
+function newestSources(stateDir: string, candidates: number): Array<{ id: string; time: number; sources: Sources }> {
+	return scan(stateDir)
 		.map((sources) => ({ id: sources.id, time: Math.max(sources.jobMtime ?? 0, sources.metaMtime ?? 0, sources.recordMtime ?? 0), sources }))
 		.sort(byRecency)
 		.slice(0, candidates);
+}
+
+/** Summaries of the `candidates` most recently touched sessions, newest first by their own timestamp. */
+function collect(stateDir: string, candidates: number): SessionSummary[] {
+	const newest = newestSources(stateDir, candidates);
 	const summaries: SessionSummary[] = [];
 	for (const { sources } of newest) {
 		try {
@@ -268,10 +273,22 @@ export function listSessions(stateDir: string, options: { limit?: number } = {})
 	}
 }
 
-/** Id of the newest session whose plan is finished (status "planned"), or undefined when there is none. */
+/**
+ * Id of the newest session whose plan is finished (status "planned"), or undefined when there is none. Candidates are
+ * visited newest first and the walk stops at the first planned one, so a state directory full of unfinished sessions
+ * costs reads only until that session.
+ */
 export function newestPlannedSessionId(stateDir: string): string | undefined {
 	try {
-		return collect(stateDir, MAX_CANDIDATES).find((summary) => summary.status === "planned")?.sessionId;
+		for (const { sources } of newestSources(stateDir, MAX_CANDIDATES)) {
+			try {
+				const summary = summarize(stateDir, sources);
+				if (summary?.status === "planned") return summary.sessionId;
+			} catch {
+				// One unreadable session never hides the others.
+			}
+		}
+		return undefined;
 	} catch {
 		return undefined;
 	}

@@ -8,9 +8,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import { COMMAND_OVERLAY, parseFrontmatter, REPOSITORY_ROOT } from "./commands.ts";
+import { renderPrompt } from "./prompts.ts";
+import { CONNECTOR_TOOL_DEFINITIONS } from "./tools-connector.ts";
 
 const BUNDLE = join(REPOSITORY_ROOT, "plugins", "ultrathink-connector");
 const COMMANDS_DIRECTORY = join(BUNDLE, "commands");
@@ -81,6 +84,19 @@ describe("plugin bundle commands", () => {
 		}
 	});
 
+	test("every statement of how /ultrathink-last reads the sessions agrees on limit 5", () => {
+		expect(read("commands/ultrathink-last.md")).toContain("`ultrathink_sessions` with `limit` 5");
+		expect(read("commands/ultrathink-last.md")).toContain("newest session whose status is planned");
+		const rendered = renderPrompt("ultrathink-last", {});
+		if (!rendered.ok) throw new Error("expected the ultrathink-last prompt");
+		const promptText = rendered.messages.map((message) => message.content.text).join("\n");
+		expect(promptText).toContain("ultrathink_sessions with limit 5");
+		const routing = readFileSync(join(REPOSITORY_ROOT, "services", "ultrathink", "mcp", "mcp.ts"), "utf8");
+		expect(routing).toContain("/ultrathink-last calls ultrathink_sessions with limit 5");
+		const sessionsTool = CONNECTOR_TOOL_DEFINITIONS.find((tool) => tool.name === "ultrathink_sessions");
+		expect(sessionsTool?.description).toContain("call this with limit 5");
+	});
+
 	test("plan commands show the wave tree first and stop on failed, invalid or skipped", () => {
 		for (const name of ["ultrathink", "ultrathink-plan"]) {
 			const body = read(`commands/${name}.md`);
@@ -115,15 +131,67 @@ describe("plugin bundle manifest and connector", () => {
 		});
 	});
 
-	test("package.sh builds the archive the README names, without dist, itself or test files", () => {
+	test("package.sh packs an explicit allowlist and names the archive the README names", () => {
 		const script = read("package.sh");
 		expect(script).toContain("set -eu");
 		expect(script).toContain(".claude-plugin/plugin.json");
 		expect(script).toContain("python3 -m zipfile");
-		for (const excluded of ["dist", "package.sh", "*.test.*"]) expect(script).toContain(excluded);
+		// The old scan of the whole working tree is gone: only named paths and the commands/ and skills/ trees are packed.
+		expect(script).not.toMatch(/find \./);
+		expect(script).toContain("find commands");
+		expect(script).toContain("find skills");
+		expect(script).toContain("|| true)");
 		expect(read(".gitignore").trim()).toBe("dist/");
 		expect(read("README.md")).toContain("ultrathink-connector-<version>.zip");
 	});
+
+	const canBuild = Bun.which("zip") !== null || Bun.which("python3") !== null;
+	const canList = Bun.which("unzip") !== null || Bun.which("python3") !== null;
+	test.skipIf(!canBuild || !canList)(
+		"running package.sh packs exactly the allowlist, whatever else sits in the working tree (skipped without zip or python3 to build, or unzip or python3 to list)",
+		async () => {
+			const copy = mkdtempSync(join(tmpdir(), "ut-bundle-"));
+			try {
+				cpSync(BUNDLE, copy, { recursive: true, filter: (source) => basename(source) !== "dist" });
+				// Files that must stay out: a secret, an editor backup, a test, a dotfile in skills/ and a non-markdown file in commands/.
+				writeFileSync(join(copy, ".env"), "SECRET=1\n");
+				writeFileSync(join(copy, "notes.txt"), "scratch\n");
+				writeFileSync(join(copy, "commands", "draft.md.bak"), "x\n");
+				writeFileSync(join(copy, "commands", "helper.test.md"), "x\n");
+				writeFileSync(join(copy, "skills", "ultrathink-connector", ".hidden"), "x\n");
+				writeFileSync(join(copy, "skills", "ultrathink-connector", "skill.test.ts"), "x\n");
+
+				const build = Bun.spawn(["sh", "package.sh"], { cwd: copy, stdout: "pipe", stderr: "pipe" });
+				const [built, failure, code] = await Promise.all([new Response(build.stdout).text(), new Response(build.stderr).text(), build.exited]);
+				expect(code, failure).toBe(0);
+				const archive = built.trim().split("\n").at(-1) ?? "";
+				expect(archive).toMatch(/ultrathink-connector-\d+\.\d+\.\d+\.zip$/);
+
+				const lister =
+					Bun.which("unzip") !== null
+						? ["unzip", "-Z1", archive]
+						: ["python3", "-c", "import sys, zipfile; print('\\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))", archive];
+				const list = Bun.spawn(lister, { stdout: "pipe", stderr: "pipe" });
+				const [listed, listFailure, listCode] = await Promise.all([new Response(list.stdout).text(), new Response(list.stderr).text(), list.exited]);
+				expect(listCode, listFailure).toBe(0);
+				const expected = [
+					".claude-plugin/plugin.json",
+					".mcp.json",
+					"README.md",
+					...commandFiles().map((file) => `commands/${file}`),
+					"skills/ultrathink-connector/SKILL.md",
+				].sort();
+				expect(
+					listed
+						.split("\n")
+						.filter((name) => name !== "")
+						.sort(),
+				).toEqual(expected);
+			} finally {
+				rmSync(copy, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("plugin bundle skill", () => {

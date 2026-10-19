@@ -424,6 +424,16 @@ function validateEntry(name: string, entry: OverlayEntry, overlay: Readonly<Reco
 	return problems;
 }
 
+/** Thrown when the command files and the overlay disagree; callers tell it from an I/O failure by class or `code`. */
+export class CatalogDriftError extends Error {
+	readonly code = "CATALOG_DRIFT";
+
+	constructor(problems: readonly string[]) {
+		super(`command catalog drift: ${problems.join("; ")}`);
+		this.name = "CatalogDriftError";
+	}
+}
+
 /**
  * Builds the catalog from the real files under `root`. Throws, naming every offender, when a defined command has no
  * overlay entry, an overlay key has no source, two names share a prompt or tool identifier, or an entry is malformed.
@@ -473,7 +483,7 @@ export function loadCommandCatalog(
 		const entry = overlay[name];
 		if (entry !== undefined) problems.push(...validateEntry(name, entry, overlay));
 	}
-	if (problems.length > 0) throw new Error(`command catalog drift: ${problems.join("; ")}`);
+	if (problems.length > 0) throw new CatalogDriftError(problems);
 
 	const commands: CatalogCommand[] = [];
 	for (const [name, entry] of Object.entries(overlay)) {

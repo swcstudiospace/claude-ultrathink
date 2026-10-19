@@ -224,6 +224,7 @@ const SCRIPT = String.raw`
 	// ---- JSON-RPC 2.0 over postMessage ------------------------------------------------------------
 	function post(msg) {
 		msg.jsonrpc = "2.0";
+		// targetOrigin "*" is required: the host's origin is unknowable inside the sandbox. Only messages whose source is window.parent are accepted back.
 		window.parent.postMessage(msg, "*");
 	}
 	function notify(method, params) {

@@ -76,7 +76,7 @@ export async function main(env: Env = process.env): Promise<number> {
 	const stateDir = resolveConnectorStateDir(env);
 	let host: McpToolHost;
 	try {
-		mkdirSync(stateDir, { recursive: true });
+		mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 		host = createStdioHost(stateDir, logger);
 	} catch (error) {
 		process.stderr.write(`ultrathink-connector: cannot start: ${error instanceof Error ? error.message : "unknown error"}\n`);
@@ -87,8 +87,9 @@ export async function main(env: Env = process.env): Promise<number> {
 		logger.error("unhandled_rejection", { error: reason instanceof Error ? reason.name : "UnknownError" });
 	});
 	process.on("uncaughtException", (error) => {
-		logger.error("uncaught_exception", { error: error.name });
-		process.exit(1);
+		// Exit from the write callback so the line that explains the crash is flushed; the timer covers a stuck stderr.
+		setTimeout(() => process.exit(1), SIGNAL_EXIT_MS);
+		process.stderr.write(`ultrathink-connector: uncaught exception: ${error.name}\n`, () => process.exit(1));
 	});
 
 	const controller = new AbortController();

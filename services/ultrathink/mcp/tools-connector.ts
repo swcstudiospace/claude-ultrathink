@@ -12,7 +12,7 @@
  */
 
 import { clientPlanView } from "../engine/plan-view.ts";
-import { type GraphView, type GraphViewNode, renderGraphBlock } from "../engine/graph-view.ts";
+import { fenced, type GraphView, type GraphViewNode, renderGraphBlock } from "../engine/graph-view.ts";
 import type { HeadlessPlanner, ResultView } from "../engine/headless.ts";
 import { isSessionId } from "../engine/journal.ts";
 import { listSessions, newestPlannedSessionId, type SessionSummary } from "../engine/sessions.ts";
@@ -165,11 +165,12 @@ function optionalText(value: unknown): { ok: true; value: string | undefined } |
 	return { ok: true, value: value.trim() === "" ? undefined : value };
 }
 
+/** Node text is model-written: inside a fence it can never read as a heading, a link or a `Session:` line of this tool's own. */
 function nodeSection(node: GraphViewNode): string {
 	const lines = [`### ${node.id}: ${node.title} [${node.kind}] - wave ${node.wave}`, `Question: ${node.question}`];
 	if (node.steps.length > 0) lines.push("Steps:", ...node.steps.map((step, index) => `${index + 1}. ${step}`));
 	if (node.conclusion !== "") lines.push(`Conclusion: ${node.conclusion}`);
-	return lines.join("\n");
+	return fenced(lines.join("\n"), "text");
 }
 
 /** The node ids are model text, so an exact match wins and a case-insensitive match is the fallback. */
@@ -220,11 +221,14 @@ function sessionsText(sessions: readonly SessionSummary[], planning: PlanningInf
 		return lines.join("\n");
 	}
 	lines.push(`Recent sessions, newest first (${sessions.length}):`);
+	// Goals are model or user text: fenced, they cannot read as Markdown of their own.
+	const table: string[] = [];
 	for (const session of sessions) {
 		const nodes = session.hasGraph ? `${session.nodeCount} nodes` : "no graph";
 		const goal = session.goal === "" ? "(no goal yet)" : session.goal;
-		lines.push(`- ${session.sessionId} | ${session.status} | ${session.mode} | ${when(session.updatedAt)} | ${nodes} | ${goal}`);
+		table.push(`- ${session.sessionId} | ${session.status} | ${session.mode} | ${when(session.updatedAt)} | ${nodes} | ${goal}`);
 	}
+	lines.push(fenced(table.join("\n"), "text"));
 	return lines.join("\n");
 }
 
@@ -262,14 +266,17 @@ export function catalogFromOverlay(overlay = COMMAND_OVERLAY): CommandCatalog {
 	return { commands, find: (name) => index.get(name) };
 }
 
-/** What `/ultrathink-think <args>` carries: an optional session id, then an optional node id. */
-function thinkArguments(text: string | undefined): { sessionId?: string; node?: string } | undefined {
-	const tokens = (text ?? "").split(/\s+/).filter((token) => token !== "");
-	if (tokens.length > 2) return undefined;
-	const [first, second] = tokens;
-	if (first === undefined) return {};
-	if (isSessionId(first)) return second === undefined ? { sessionId: first } : { sessionId: first, node: second };
-	return second === undefined ? { node: first } : undefined;
+/**
+ * What `/ultrathink-think <args>` carries: an optional session id, then an optional node id. A node id is model text and
+ * may hold spaces, so everything after the session id (or the whole text when it starts with no session id) is the node.
+ */
+function thinkArguments(text: string | undefined): { sessionId?: string; node?: string } {
+	const match = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(text ?? "");
+	if (match === null) return {};
+	const first = match[1] ?? "";
+	if (!isSessionId(first)) return { node: (text ?? "").trim() };
+	const node = (match[2] ?? "").trim();
+	return node === "" ? { sessionId: first } : { sessionId: first, node };
 }
 
 export function createConnectorHandlers(deps: ConnectorDeps): ConnectorHandlers {
@@ -328,7 +335,7 @@ export function createConnectorHandlers(deps: ConnectorDeps): ConnectorHandlers 
 	function sessions(args: Record<string, unknown>): ToolOutcome {
 		const { limit } = args;
 		if (limit !== undefined && limit !== null && (typeof limit !== "number" || !Number.isFinite(limit))) {
-			return invalid("limit must be a number from 1 to 20");
+			return invalid("limit must be a number; it is clamped to 1..20");
 		}
 		const list = listSessions(stateDir, typeof limit === "number" ? { limit } : {});
 		const info = planning();
@@ -390,7 +397,6 @@ export function createConnectorHandlers(deps: ConnectorDeps): ConnectorHandlers 
 			}
 			case "ultrathink-think": {
 				const parsed = thinkArguments(request);
-				if (parsed === undefined) return invalid("args must be an optional session id and an optional node id");
 				const inner = await graph(parsed);
 				const shown = inner.ok && typeof inner.data.sessionId === "string";
 				return wrapped(name, support, inner, shown ? "Graph of Thought of the plan. Show its wave tree to the user first, unchanged, in a code block." : NO_PLANNED_SESSION);

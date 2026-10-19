@@ -211,6 +211,22 @@ describe("listSessions", () => {
 		expect(listSessions(state, { limit: 20 }).map((s) => s.sessionId)).toEqual([good]);
 	});
 
+	test("a file over 1 MiB is skipped unread, one just under it is listed", () => {
+		const state = tmp();
+		const [small, huge] = [randomUUID(), randomUUID()];
+		writeJob(state, small, "planned", NOW - 1);
+		const path = join(state, "jobs", `${huge}.json`);
+		const body = { sessionId: huge, runId: randomUUID(), status: "planned", createdAt: NOW - 1000, updatedAt: NOW, padding: "" };
+		const overhead = JSON.stringify(body).length + 1;
+		writeFileSync(path, `${JSON.stringify({ ...body, padding: "x".repeat(1024 * 1024 + 1 - overhead) })}\n`);
+		touch(path, NOW);
+		expect(listSessions(state).map((s) => s.sessionId)).toEqual([small]);
+		expect(newestPlannedSessionId(state)).toBe(small);
+		writeFileSync(path, `${JSON.stringify({ ...body, padding: "x".repeat(1024 * 1024 - overhead) })}\n`);
+		touch(path, NOW);
+		expect(listSessions(state).map((s) => s.sessionId)).toEqual([huge, small]);
+	});
+
 	test("a malformed graph does not hide its session", () => {
 		const state = tmp();
 		const id = randomUUID();

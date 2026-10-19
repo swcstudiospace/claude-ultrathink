@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ULTRATHINK_VERBS } from "../../../src/uplift/commands.ts";
 import {
+	CatalogDriftError,
 	COMMAND_OVERLAY,
 	CONNECTOR_NATIVE_NAMES,
 	helpText,
@@ -19,6 +20,7 @@ import {
 	toPromptName,
 	toToolName,
 } from "./commands.ts";
+import { loadCatalogWithFallback } from "./connector-host.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -204,6 +206,49 @@ describe("the catalog loader refuses drift", () => {
 	test("an empty repository root loads with the native commands only", () => {
 		const catalog = loadCommandCatalog(fixtureRoot({}), nativeOverlay());
 		expect(catalog.commands.map((command) => command.name)).toEqual([...CONNECTOR_NATIVE_NAMES]);
+	});
+});
+
+describe("loadCatalogWithFallback", () => {
+	test("drift is a CatalogDriftError with a stable code", () => {
+		const root = fixtureRoot({ "commands/ultrathink-foo.md": frontmatter("ultrathink-foo") });
+		let thrown: unknown;
+		try {
+			loadCommandCatalog(root, nativeOverlay());
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(CatalogDriftError);
+		expect((thrown as CatalogDriftError).code).toBe("CATALOG_DRIFT");
+	});
+
+	test("absent source directories fall back to the static overlay and report why", () => {
+		const reasons: unknown[] = [];
+		const catalog = loadCatalogWithFallback((error) => reasons.push(error), fixtureRoot({}));
+		expect(reasons.length).toBe(1);
+		expect(catalog.commands.map((command) => command.name)).toEqual(Object.keys(COMMAND_OVERLAY));
+	});
+
+	test("present sources load the real catalog without a fallback", () => {
+		const reasons: unknown[] = [];
+		const catalog = loadCatalogWithFallback((error) => reasons.push(error));
+		expect(reasons).toEqual([]);
+		expect(catalog.commands.map((command) => command.name)).toEqual(Object.keys(COMMAND_OVERLAY));
+		expect(catalog.find("ultrathink-status")?.sources.length).toBeGreaterThan(0);
+	});
+
+	test("drift is rethrown, not downgraded to the overlay", () => {
+		const root = fixtureRoot({ "commands/ultrathink-foo.md": frontmatter("ultrathink-foo") });
+		const reasons: unknown[] = [];
+		expect(() => loadCatalogWithFallback((error) => reasons.push(error), root)).toThrow(CatalogDriftError);
+		expect(reasons).toEqual([]);
+	});
+
+	test("an unreadable source (a file where a directory belongs) is rethrown", () => {
+		const root = fixtureRoot({ commands: "not a directory" });
+		const reasons: unknown[] = [];
+		expect(() => loadCatalogWithFallback((error) => reasons.push(error), root)).toThrow();
+		expect(reasons).toEqual([]);
 	});
 });
 
