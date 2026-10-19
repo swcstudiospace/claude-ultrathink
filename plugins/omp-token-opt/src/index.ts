@@ -10,6 +10,7 @@ import { readFlags } from "./flags.ts";
 import { clearSkimArchive, readSkimSpan, rememberSkim, skimArchiveSize, skimSource } from "./skim.ts";
 import { runGraphify } from "./graph.ts";
 import { GRAPH_POINTER, pointerFor } from "./pointer.ts";
+import { createTrailingRefresh } from "./refresh.ts";
 import { createRemoteSink, type RemoteSink } from "./remote-sink.ts";
 import { createSharedCache, type SharedCache } from "./shared-cache.ts";
 import {
@@ -28,6 +29,7 @@ const DEDUPE_MIN_CHARS = 200;
 const GRAPH_BUDGET_DEFAULT = 2_000;
 const DEDUPE_MAX_ENTRIES = 4_096;
 const SHUTDOWN_TIMEOUT_MS = 3_000;
+const SESSION_COSTS_MAX = 64;
 
 /** A tool argument as a string; any other value becomes the empty string. */
 function str(value: unknown): string {
@@ -412,8 +414,10 @@ export default function tokenOpt(pi: PiLike): void {
 	const seenMessages = new Set<string>();
 	const seenUnkeyed = new WeakSet<object>();
 	let sessionCostUsd = 0;
-	let rtkRefresh: Promise<void> | null = null;
-	let rtkRefreshedAt = 0;
+	/** Unrounded dollars per session, so switching away and back never falls back to the rounded cents. */
+	const sessionCosts = new Map<string, number>();
+	/** One `rtk gain` at a time; hook-driven calls are rate limited and a skipped one schedules a trailing read, /token-status forces a fresh read. */
+	const refreshRtkDelta = createTrailingRefresh(readRtkDelta, RTK_REFRESH_MIN_MS);
 	const seenResults = new Map<string, DedupeSet>();
 	let turnStartedAt: number | null = null;
 	let lastMessageEndAt: number | null = null;
@@ -456,8 +460,8 @@ export default function tokenOpt(pi: PiLike): void {
 
 	function loadSnapshot(sessionId: string): void {
 		const snap = ledger.load(sessionId);
-		// Resume the running cost total from the persisted session cost.
-		sessionCostUsd = (snap.costCents ?? 0) / 100;
+		// Resume the running cost total: the unrounded one when this process has seen the session, else the persisted cents.
+		sessionCostUsd = sessionCosts.get(sessionId) ?? (snap.costCents ?? 0) / 100;
 		publish(snap);
 	}
 
@@ -612,17 +616,6 @@ export default function tokenOpt(pi: PiLike): void {
 		} catch {
 			// fail open: omit the field
 		}
-	}
-
-	/** One `rtk gain` at a time; hook-driven calls are also rate limited, /token-status forces a fresh read. */
-	function refreshRtkDelta(force = false): Promise<void> {
-		if (rtkRefresh !== null) return rtkRefresh;
-		if (!force && Date.now() - rtkRefreshedAt < RTK_REFRESH_MIN_MS) return Promise.resolve();
-		rtkRefresh = readRtkDelta().finally(() => {
-			rtkRefresh = null;
-			rtkRefreshedAt = Date.now();
-		});
-		return rtkRefresh;
 	}
 
 	async function notifyStatus(ctx: NotifyCtx): Promise<void> {
@@ -847,6 +840,13 @@ export default function tokenOpt(pi: PiLike): void {
 				if (Number.isSafeInteger(cents)) {
 					publish(ledger.notePerf({ costCents: cents }));
 					sessionCostUsd = nextTotal;
+					const costKey = activeSession();
+					sessionCosts.delete(costKey);
+					sessionCosts.set(costKey, nextTotal);
+					if (sessionCosts.size > SESSION_COSTS_MAX) {
+						const oldest = sessionCosts.keys().next().value;
+						if (oldest !== undefined) sessionCosts.delete(oldest);
+					}
 					sink?.push({ at: Date.now(), sessionId: activeSession(), kind: "perf", field: "costCents", value: dollars * 100 });
 				}
 			}

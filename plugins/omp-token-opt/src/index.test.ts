@@ -246,6 +246,20 @@ describe("tokenOpt", () => {
 		expect(liveOf(home).costCents).toBe(12);
 	});
 
+	test("switching to another session and back does not drop the fractions of a cent", () => {
+		const home = useHome();
+		const { handlers } = mount();
+		const end = handlers.get("message_end");
+		const message = () => ({ message: { role: "assistant", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.0049 } } } });
+		handlers.get("session_start")?.({ sessionId: "sess-a" }, {});
+		end?.(message());
+		handlers.get("session_switch")?.({ sessionId: "sess-b" }, {});
+		handlers.get("session_switch")?.({ sessionId: "sess-a" }, {});
+		end?.(message());
+		// 2 x $0.0049 = 0.98 cents. Resuming from the persisted, rounded 0 cents would have published 0 again.
+		expect(liveOf(home).costCents).toBe(1);
+	});
+
 	test("a later different system string sets prefixChanged without savings", async () => {
 		useHome();
 		const { handlers, commands } = mount();
