@@ -13,10 +13,11 @@ import {
 	type ToolOutcome,
 	toolDefinitions,
 } from "./mcp.ts";
+import { createResourceRegistry, UI_RESOURCE_MIME_TYPE } from "./resources.ts";
 
 const SESSION_ID = "session-1";
 const PLANNED: ToolOutcome = { ok: true, data: { sessionId: SESSION_ID, status: "planned", pending: [] } };
-const CLIENT_TOOLS = [
+const ORIGINAL_CLIENT_TOOLS = [
 	"ultrathink_plan",
 	"ultrathink_pending",
 	"ultrathink_show",
@@ -24,7 +25,11 @@ const CLIENT_TOOLS = [
 	"ultrathink_status",
 	"ultrathink_result",
 ];
+// The three connector tools are always listed, in both modes: Grok never refreshes tools/list.
+const CONNECTOR_TOOLS = ["ultrathink_graph", "ultrathink_sessions", "ultrathink_command"];
+const CLIENT_TOOLS = [...ORIGINAL_CLIENT_TOOLS, ...CONNECTOR_TOOLS];
 const SERVER_TOOLS = ["ultrathink_uplift", ...CLIENT_TOOLS];
+const UI_URI = "ui://ultrathink/graph";
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
@@ -82,6 +87,7 @@ interface ToolDef {
 	description: string;
 	inputSchema: Record<string, unknown>;
 	annotations: Record<string, unknown>;
+	_meta?: Record<string, unknown>;
 }
 
 interface Schema {
@@ -173,10 +179,18 @@ describe("initialize", () => {
 		}
 	});
 
-	test("advertises tools and prompts and names the server after the package version", async () => {
-		const result = await initialize(fakeHost());
-		expect(result.capabilities).toEqual({ tools: {}, prompts: {} });
-		expect(result.serverInfo).toEqual({ name: "ultrathink", version: pkg.version });
+	test("advertises tools, prompts, resources and the UI extension, and names the server after the package version", async () => {
+		for (const host of [fakeHost(), serverHost()]) {
+			const result = await initialize(host);
+			// The extension is announced even though the client sent none: claude.ai web renders apps without it.
+			expect(result.capabilities).toEqual({
+				tools: {},
+				prompts: {},
+				resources: {},
+				extensions: { "io.modelcontextprotocol/ui": {} },
+			});
+			expect(result.serverInfo).toEqual({ name: "ultrathink", version: pkg.version });
+		}
 	});
 
 	test("client mode ties the /ultrathink trigger to the client-driven loop and the result tool", async () => {
@@ -184,7 +198,8 @@ describe("initialize", () => {
 			const { instructions } = await initialize(host);
 			// A client that cannot list prompts shows the model these instructions and the tool description instead.
 			expect(instructions).toContain("/ultrathink");
-			expect(instructions.length).toBeLessThan(2000);
+			// Claude Code cuts instructions at 4096 characters.
+			expect(instructions.length).toBeLessThanOrEqual(3500);
 			const named = toolNames(instructions);
 			expect(named).toContain("ultrathink_plan");
 			expect(named).toContain("ultrathink_result");
@@ -193,12 +208,37 @@ describe("initialize", () => {
 		}
 	});
 
-	test("server mode ties the /ultrathink trigger to ultrathink_uplift and ultrathink_result only", async () => {
+	test("server mode ties the /ultrathink trigger to ultrathink_uplift and ultrathink_result", async () => {
 		const { instructions } = await initialize(serverHost());
 		expect(instructions).toContain("/ultrathink");
-		expect(instructions.length).toBeLessThan(2000);
+		expect(instructions.length).toBeLessThanOrEqual(3500);
 		const named = toolNames(instructions);
-		expect(named.sort()).toEqual(["ultrathink_result", "ultrathink_uplift"]);
+		expect(named).toContain("ultrathink_uplift");
+		expect(named).toContain("ultrathink_result");
+		expect(named).not.toContain("ultrathink_plan");
+		for (const name of named) expect(SERVER_TOOLS).toContain(name);
+	});
+
+	test("both modes map the slash commands to the connector tools", async () => {
+		for (const host of [fakeHost(), serverHost()]) {
+			const { instructions } = await initialize(host);
+			expect(instructions).toContain("/ultrathink-think");
+			expect(instructions).toContain("/ultrathink-last");
+			expect(instructions).toContain("/ultrathink-status");
+			expect(instructions).toContain("/ultrathink-quick");
+			expect(instructions).toContain("wave tree");
+			expect(instructions).toContain("only if your interface renders Mermaid");
+			const named = toolNames(instructions);
+			for (const name of CONNECTOR_TOOLS) expect(named).toContain(name);
+		}
+	});
+
+	test("server mode keeps the model from drawing the graph a second time, client mode asks for it once", async () => {
+		const server = (await initialize(serverHost())).instructions;
+		expect(server).toMatch(/do not call ultrathink_graph/i);
+		const client = (await initialize(fakeHost())).instructions;
+		expect(client).toMatch(/call ultrathink_graph once/i);
+		expect(client).not.toMatch(/do not call ultrathink_graph/i);
 	});
 });
 
@@ -214,15 +254,24 @@ async function promptText(host: McpToolHost, text: string): Promise<string> {
 }
 
 describe("prompts", () => {
-	test("prompts/list offers one ultrathink prompt with a required request argument in both modes", async () => {
+	test("prompts/list offers the supported commands, the planning one first with a required request argument, in both modes", async () => {
 		for (const host of [fakeHost(), serverHost()]) {
 			const { prompts } = resultOf<{
 				prompts: { name: string; arguments: { name: string; required: boolean }[] }[];
 			}>(await replyOf(host, request("prompts/list")));
-			expect(prompts.map((prompt) => prompt.name)).toEqual(["ultrathink"]);
+			expect(prompts.map((prompt) => prompt.name)).toEqual([
+				"ultrathink",
+				"ultrathink-plan",
+				"ultrathink-think",
+				"ultrathink-last",
+				"ultrathink-status",
+				"ultrathink-quick",
+			]);
 			expect(prompts[0]?.arguments.map((argument) => [argument.name, argument.required])).toEqual([
 				["request", true],
 			]);
+			// Unsupported commands are not listed: they would crowd the real plugin commands in a slash menu.
+			expect(prompts.map((prompt) => prompt.name)).not.toContain("ultrathink-ship");
 		}
 	});
 
@@ -377,15 +426,15 @@ describe("ping", () => {
 });
 
 describe("tools/list", () => {
-	test("a host without capabilities lists the six client-mode tools, without ultrathink_uplift", async () => {
+	test("a host without capabilities lists the nine client-mode tools, without ultrathink_uplift", async () => {
 		expect((await listTools()).map((tool) => tool.name)).toEqual(CLIENT_TOOLS);
 	});
 
-	test("a host with serverPlanning false lists the same six tools", async () => {
+	test("a host with serverPlanning false lists the same nine tools", async () => {
 		expect((await listTools(fakeHost(PLANNED, false))).map((tool) => tool.name)).toEqual(CLIENT_TOOLS);
 	});
 
-	test("a host with serverPlanning true lists seven tools, ultrathink_uplift first", async () => {
+	test("a host with serverPlanning true lists ten tools, ultrathink_uplift first", async () => {
 		expect((await listTools(serverHost())).map((tool) => tool.name)).toEqual(SERVER_TOOLS);
 	});
 
@@ -393,9 +442,9 @@ describe("tools/list", () => {
 		let serverPlanning = false;
 		const host = fakeHost();
 		host.capabilities = () => ({ serverPlanning });
-		expect((await listTools(host)).length).toBe(6);
+		expect((await listTools(host)).length).toBe(9);
 		serverPlanning = true;
-		expect((await listTools(host)).length).toBe(7);
+		expect((await listTools(host)).length).toBe(10);
 	});
 
 	test("returns the exported definitions", async () => {
@@ -422,6 +471,9 @@ describe("tools/list", () => {
 		expect(schemaOf(uplift).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(uplift).properties)).toEqual(["prompt", "sessionId"]);
 		expect(uplift.annotations).toEqual(READ_WRITE_OPEN_WORLD);
+		expect(uplift.description).toContain("followed by a space");
+		expect(uplift.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
+		expect(uplift.description).toContain("ultrathink_command");
 	});
 
 	test("ultrathink_result requires sessionId, bounds waitSeconds to 0..45 and offers brief or full detail", async () => {
@@ -437,12 +489,69 @@ describe("tools/list", () => {
 		}
 	});
 
+	test("the seven original tools keep their names, in order, after ultrathink_uplift", async () => {
+		expect((await listTools(serverHost())).slice(0, 7).map((tool) => tool.name)).toEqual([
+			"ultrathink_uplift",
+			...ORIGINAL_CLIENT_TOOLS,
+		]);
+		expect((await listTools(serverHost())).slice(7).map((tool) => tool.name)).toEqual(CONNECTOR_TOOLS);
+	});
+
+	test("ultrathink_uplift and ultrathink_graph carry the UI resource in both the nested and the legacy flat key", async () => {
+		for (const name of ["ultrathink_uplift", "ultrathink_graph"]) {
+			const tool = await toolDef(name, serverHost());
+			expect(tool._meta?.ui).toEqual({ resourceUri: UI_URI });
+			expect(tool._meta?.["ui/resourceUri"]).toBe(UI_URI);
+		}
+		// Nothing is gated on what the client announced: the same list serves every client.
+		expect((await toolDef("ultrathink_graph", fakeHost()))._meta?.ui).toEqual({ resourceUri: UI_URI });
+	});
+
+	test("ultrathink_result and ultrathink_graph allow results up to 200000 characters; no other tool has either meta", async () => {
+		for (const tool of await listTools(serverHost())) {
+			const hasLimit = tool.name === "ultrathink_result" || tool.name === "ultrathink_graph";
+			expect(tool._meta?.["anthropic/maxResultSizeChars"]).toBe(hasLimit ? 200000 : undefined);
+			const hasUi = tool.name === "ultrathink_uplift" || tool.name === "ultrathink_graph";
+			expect(tool._meta?.ui !== undefined).toBe(hasUi);
+		}
+	});
+
+	test("ultrathink_graph takes an optional sessionId, node and detail and is read-only", async () => {
+		const graph = await toolDef("ultrathink_graph");
+		expect(graph.description).toContain("/ultrathink-think");
+		expect(graph.description).toContain("wave tree first");
+		expect(schemaOf(graph).required).toBeUndefined();
+		expect(Object.keys(schemaOf(graph).properties)).toEqual(["sessionId", "node", "detail"]);
+		expect(schemaOf(graph).properties.detail).toMatchObject({ enum: ["brief", "full"] });
+		expect(graph.annotations).toEqual(READ_ONLY);
+	});
+
+	test("ultrathink_sessions takes an optional limit of 1 to 20 and is read-only", async () => {
+		const sessions = await toolDef("ultrathink_sessions");
+		expect(sessions.description).toContain("/ultrathink-status");
+		expect(sessions.description).toContain("wave tree first");
+		expect(schemaOf(sessions).required).toBeUndefined();
+		expect(schemaOf(sessions).properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 20 });
+		expect(sessions.annotations).toEqual(READ_ONLY);
+	});
+
+	test("ultrathink_command requires command, takes args and is read-only", async () => {
+		const command = await toolDef("ultrathink_command");
+		expect(command.description).toContain("/ultrathink-");
+		expect(schemaOf(command).required).toEqual(["command"]);
+		expect(Object.keys(schemaOf(command).properties)).toEqual(["command", "args"]);
+		expect(command.annotations).toEqual(READ_ONLY);
+	});
+
 	test("ultrathink_plan requires prompt, takes an optional sessionId and is not read-only", async () => {
 		const plan = await toolDef("ultrathink_plan");
 		expect(plan.description).toContain("/ultrathink");
 		expect(schemaOf(plan).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(plan).properties)).toEqual(["prompt", "sessionId"]);
 		expect(plan.annotations).toEqual(READ_WRITE);
+		expect(plan.description).toContain("followed by a space");
+		expect(plan.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
+		expect(plan.description).toContain("ultrathink_command");
 	});
 
 	test("ultrathink_pending requires sessionId and is read-only", async () => {
@@ -543,6 +652,9 @@ describe("argument forwarding", () => {
 			["ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "option-a" }],
 			["ultrathink_status", { sessionId: SESSION_ID }],
 			["ultrathink_result", { sessionId: SESSION_ID, waitSeconds: 10, detail: "full" }],
+			["ultrathink_graph", { sessionId: SESSION_ID, node: "n2", detail: "full" }],
+			["ultrathink_sessions", { limit: 3 }],
+			["ultrathink_command", { command: "ultrathink-ship", args: "the branch" }],
 		];
 		for (const [name, args] of cases) {
 			const host = fakeHost();
@@ -559,6 +671,13 @@ describe("tool results", () => {
 		expect(result.isError).toBe(false);
 		expect(result.structuredContent).toEqual(data);
 		expect(result.content).toEqual([{ type: "text", text: JSON.stringify(data) }]);
+	});
+
+	test("a host that repeats the text in the data gives the same text in content and structuredContent", async () => {
+		const text = "Graph of Thought: wave 1";
+		const result = await invoke(fakeHost({ ok: true, data: { status: "planned", text }, text }), "ultrathink_graph", {});
+		expect(result.content).toEqual([{ type: "text", text }]);
+		expect(result.structuredContent.text).toBe(text);
 	});
 
 	test("a host success with text returns that text as the content and the data as structuredContent", async () => {
@@ -662,11 +781,84 @@ describe("tools/call errors", () => {
 
 describe("unknown methods", () => {
 	test("return -32601 with the request id", async () => {
-		expect(await bodyOf(fakeHost(), request("resources/list", {}, 7))).toEqual({
+		expect(await bodyOf(fakeHost(), request("sampling/createMessage", {}, 7))).toEqual({
 			jsonrpc: "2.0",
 			id: 7,
 			error: { code: -32601, message: "method not found" },
 		});
+	});
+});
+
+describe("resources", () => {
+	const HTML = "<!doctype html><title>graph</title>";
+	const UI_META = { csp: {}, prefersBorder: false };
+
+	function hostWithUi(): FakeHost {
+		const host = fakeHost();
+		host.resources = createResourceRegistry([
+			{
+				uri: UI_URI,
+				name: "ultrathink-graph",
+				title: "UltraThink graph",
+				description: "The plan graph.",
+				mimeType: UI_RESOURCE_MIME_TYPE,
+				html: () => HTML,
+				meta: UI_META,
+			},
+		]);
+		return host;
+	}
+
+	test("resources/list returns the UI document with its mime type and _meta.ui", async () => {
+		const { resources } = resultOf<{ resources: Record<string, unknown>[] }>(
+			await replyOf(hostWithUi(), request("resources/list")),
+		);
+		expect(resources).toEqual([
+			{
+				uri: UI_URI,
+				name: "ultrathink-graph",
+				title: "UltraThink graph",
+				description: "The plan graph.",
+				mimeType: "text/html;profile=mcp-app",
+				_meta: { ui: UI_META },
+			},
+		]);
+	});
+
+	test("resources/read returns the document with the MCP Apps mime type and _meta.ui", async () => {
+		const reply = await replyOf(hostWithUi(), request("resources/read", { uri: UI_URI }));
+		expect(resultOf<unknown>(reply)).toEqual({
+			contents: [{ uri: UI_URI, mimeType: "text/html;profile=mcp-app", text: HTML, _meta: { ui: UI_META } }],
+		});
+	});
+
+	test("resources/templates/list is empty", async () => {
+		expect(resultOf<unknown>(await replyOf(hostWithUi(), request("resources/templates/list")))).toEqual({
+			resourceTemplates: [],
+		});
+	});
+
+	test("an unknown ui uri is -32002 with the request id", async () => {
+		const body = await bodyOf(hostWithUi(), request("resources/read", { uri: "ui://ultrathink/other" }, "r-1"));
+		expect(body).toEqual({ jsonrpc: "2.0", id: "r-1", error: { code: -32002, message: "resource not found" } });
+	});
+
+	test("a missing, non-string or non-ui uri is -32602", async () => {
+		const refused: unknown[] = [undefined, {}, { uri: 5 }, { uri: null }, { uri: "https://example.com/x" }, { uri: "ui://" }, "ui://ultrathink/graph"];
+		for (const params of refused) {
+			const reply = await replyOf(hostWithUi(), request("resources/read", params));
+			expect(reply.error?.code).toBe(-32602);
+			expect(reply.result).toBeUndefined();
+		}
+	});
+
+	test("a host without a registry lists nothing and finds nothing", async () => {
+		const host = fakeHost();
+		expect(resultOf<unknown>(await replyOf(host, request("resources/list")))).toEqual({ resources: [] });
+		expect(resultOf<unknown>(await replyOf(host, request("resources/templates/list")))).toEqual({ resourceTemplates: [] });
+		expect((await replyOf(host, request("resources/read", { uri: UI_URI }))).error?.code).toBe(-32002);
+		expect((await replyOf(host, request("resources/read", { uri: 5 }))).error?.code).toBe(-32602);
+		expect(host.calls).toHaveLength(0);
 	});
 });
 

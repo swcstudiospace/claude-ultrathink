@@ -195,14 +195,22 @@ const SCRIPT = String.raw`
 		return n;
 	}
 	function clearNode(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+	// First n UTF-16 units, minus a trailing high surrogate that would lose its pair.
+	function cut(s, n) {
+		if (s.length <= n) return s;
+		var end = n < 0 ? 0 : n;
+		var last = end > 0 ? s.charCodeAt(end - 1) : 0;
+		if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+		return s.slice(0, end);
+	}
 	function str(v, max) {
 		if (typeof v === "number" && isFinite(v)) v = String(v);
 		if (typeof v !== "string") return "";
-		return v.length > max ? v.slice(0, max) : v;
+		return v.length > max ? cut(v, max) : v;
 	}
 	function oneLine(s, max) {
 		s = String(s).replace(/\s+/g, " ").trim();
-		return s.length > max ? s.slice(0, max - 1) + "\u2026" : s;
+		return s.length > max ? cut(s, max - 1) + "\u2026" : s;
 	}
 	function num(v) { return typeof v === "number" && isFinite(v) ? v : 0; }
 	function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }

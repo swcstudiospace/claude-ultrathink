@@ -83,6 +83,17 @@ describe("graph app document", () => {
 		for (const [name, re] of forbidden) expect({ name, found: re.test(html) }).toEqual({ name, found: false });
 	});
 
+	test("client-side cuts never leave half of an emoji at the boundary", () => {
+		const cutSource = /function cut\(s, n\) \{[\s\S]*?\n\s*\}/.exec(script)?.[0];
+		const lineSource = /function oneLine\(s, max\) \{[\s\S]*?\n\s*\}/.exec(script)?.[0];
+		expect(cutSource).toBeDefined();
+		expect(lineSource).toBeDefined();
+		const oneLine = new Function(`${cutSource}\n${lineSource}\nreturn oneLine;`)() as (s: string, max: number) => string;
+		// Max 120 with the ellipsis: the emoji occupies units 118 and 119 and must go whole.
+		expect(oneLine(`${"a".repeat(118)}😀tail`, 120)).toBe(`${"a".repeat(118)}…`);
+		expect(oneLine(`${"a".repeat(117)}😀tail`, 120)).toBe(`${"a".repeat(117)}😀…`);
+	});
+
 	test("has no inline handlers, no external references and no handler properties", () => {
 		expect(/\son[a-z]+\s*=/i.test(markup)).toBe(false);
 		expect(/\s(?:src|href|srcset|action|formaction)\s*=/i.test(markup)).toBe(false);

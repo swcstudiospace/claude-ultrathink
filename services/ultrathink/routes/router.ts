@@ -9,9 +9,12 @@ import { type Auth, clientIpFrom } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { type Ledger, createLedger } from "../cost/ledger.ts";
 import { type HeadlessPlanner, type ResultView, createHeadlessPlanner } from "../engine/headless.ts";
-import { type JournalOptions, type JournalResult, answerRequest, listPendingRequests, sessionStatus, showRequest, startPlan } from "../engine/journal.ts";
+import type { JournalOptions } from "../engine/journal.ts";
 import type { OpenRouterFetch } from "../engine/openrouter.ts";
+import { defaultGraphResources, loadCatalogWithFallback } from "../mcp/connector-host.ts";
 import { type McpToolHost, type ToolOutcome, handleMcpPayload } from "../mcp/mcp.ts";
+import { createToolHost } from "../mcp/tool-host.ts";
+import type { PlanningInfo } from "../mcp/tools-connector.ts";
 import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "../mcp/transport.ts";
 import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../obs/log.ts";
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
@@ -77,6 +80,7 @@ interface RequestCtx {
 	endpoint: Endpoint | "not_found";
 	authKind: AuthKind;
 	rpcMethod?: string;
+	mcpVersion?: string;
 	tool?: string;
 }
 
@@ -101,9 +105,6 @@ const RUN_PATH = /^\/ultrathink\/runs\/([^/]+)$/;
 const CONNECTOR_RATE_OWNER = "connector";
 
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
-
-/** Finished plans remembered so each is counted once; the oldest are forgotten first. */
-const COUNTED_PLANS_MAX = 2000;
 
 const LOG_VALUE_MAX = 64;
 
@@ -166,11 +167,6 @@ function bearerFrom(req: Request): string {
 
 function rpcError(code: number, message: string): unknown {
 	return { jsonrpc: "2.0", id: null, error: { code, message } };
-}
-
-function toOutcome(result: JournalResult<unknown>): ToolOutcome {
-	if (result.ok) return { ok: true, data: result.data as Record<string, unknown> };
-	return { ok: false, code: result.code, ...(result.errors !== undefined ? { errors: result.errors } : {}) };
 }
 
 function matchPath(pathname: string): Target | null {
@@ -277,12 +273,13 @@ export function createApp(deps: RouterDeps): App {
 		now: deps.now,
 		redirectOrigins: [...DEFAULT_REDIRECT_ORIGINS, ...config.oauthRedirectOrigins],
 	});
+	const ledger = deps.ledger ?? lazyLedger(store, config, deps.now);
 	const planner =
 		deps.planner ??
 		createHeadlessPlanner({
 			config,
 			store,
-			ledger: deps.ledger ?? lazyLedger(store, config, deps.now),
+			ledger,
 			now: deps.now,
 			...(deps.fetch ? { fetch: deps.fetch } : {}),
 			...(deps.sleep ? { sleep: deps.sleep } : {}),
@@ -477,16 +474,30 @@ export function createApp(deps: RouterDeps): App {
 		maxAnswerChars: config.maxAnswerChars,
 	};
 
-	const countedPlans = new Set<string>();
+	// A release without its commands/ and skills/ directories still serves the static overlay instead of failing to start.
+	const catalog = loadCatalogWithFallback((error) => logger.warn("command_catalog_fallback", { error }));
+	const resources = defaultGraphResources();
 
-	/** Counts a finished server plan once: the job, its tokens and its cost. */
-	function recordFinished(view: ResultView): void {
-		if (view.mode !== "server" || view.status === "running" || countedPlans.has(view.sessionId)) return;
-		countedPlans.add(view.sessionId);
-		if (countedPlans.size > COUNTED_PLANS_MAX) {
-			const oldest = countedPlans.values().next().value;
-			if (oldest !== undefined) countedPlans.delete(oldest);
+	function planningInfo(): PlanningInfo {
+		if (!planner.enabled) return { serverPlanning: false };
+		let usedTodayTokens: number | undefined;
+		try {
+			usedTodayTokens = ledger.spentForDay(new Date((deps.now ?? Date.now)()).toISOString().slice(0, 10));
+		} catch {
+			// A ledger that cannot answer leaves the usage out instead of hiding the rest.
 		}
+		return {
+			serverPlanning: true,
+			...(config.planningModel === undefined ? {} : { model: config.planningModel }),
+			maxConcurrentPlans: config.maxConcurrentPlans,
+			runTokenCeiling: config.runTokenCeiling,
+			dailyTokenCeiling: config.dailyTokenCeiling,
+			...(usedTodayTokens === undefined ? {} : { usedTodayTokens }),
+		};
+	}
+
+	/** Counts a finished server plan: the job, its tokens and its cost. The tool host calls it once per plan. */
+	function recordFinished(view: ResultView): void {
 		metrics.inc("ultrathink_plan_jobs_total", { status: view.status });
 		const { usage } = view;
 		if (!usage) return;
@@ -495,49 +506,15 @@ export function createApp(deps: RouterDeps): App {
 		if (usage.costUsd !== undefined && usage.costUsd > 0) metrics.inc("ultrathink_plan_cost_usd_total", undefined, usage.costUsd);
 	}
 
-	async function runTool(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
-		switch (name) {
-			case "ultrathink_plan":
-				return toOutcome(await startPlan(journalOpts, { prompt: args.prompt, sessionId: args.sessionId }));
-			case "ultrathink_pending": {
-				const pending = listPendingRequests(journalOpts, { sessionId: args.sessionId });
-				return toOutcome(pending.ok ? { ok: true, data: { pending: pending.data } } : pending);
-			}
-			case "ultrathink_show":
-				return toOutcome(showRequest(journalOpts, { sessionId: args.sessionId, key: args.key, part: args.part }));
-			case "ultrathink_answer":
-				return toOutcome(answerRequest(journalOpts, { sessionId: args.sessionId, key: args.key, answer: args.answer }));
-			case "ultrathink_status": {
-				const server = planner.status({ sessionId: args.sessionId });
-				return toOutcome(server ?? sessionStatus(journalOpts, { sessionId: args.sessionId }));
-			}
-			case "ultrathink_uplift": {
-				const started = await planner.start({ prompt: args.prompt, sessionId: args.sessionId });
-				if (started.ok && started.data.status !== "running") {
-					// The start view carries no usage; the finished view does.
-					const finished = await planner.result({ sessionId: started.data.sessionId, waitSeconds: 0 });
-					if (finished.ok) recordFinished(finished.data);
-				}
-				return toOutcome(started);
-			}
-			case "ultrathink_result": {
-				const result = await planner.result({ sessionId: args.sessionId, waitSeconds: args.waitSeconds, detail: args.detail });
-				if (!result.ok) return toOutcome(result);
-				recordFinished(result.data);
-				const { text, ...data } = result.data;
-				return { ok: true, data, text };
-			}
-			default:
-				return { ok: false, code: "unknown_tool" };
-		}
-	}
+	const toolHost = createToolHost({ journalOpts, planner, catalog, resources, planningInfo, onPlanFinished: recordFinished });
 
 	const mcpHost: McpToolHost = {
-		capabilities: () => ({ serverPlanning: planner.enabled }),
+		capabilities: toolHost.capabilities,
+		resources: toolHost.resources,
 		async call(name, args) {
 			let outcome: ToolOutcome;
 			try {
-				outcome = await runTool(name, args);
+				outcome = await toolHost.call(name, args);
 			} catch (error) {
 				logger.error("tool_error", { tool: name, error });
 				outcome = { ok: false, code: "engine_error" };
@@ -563,6 +540,10 @@ export function createApp(deps: RouterDeps): App {
 	}
 
 	async function mcpRoute(req: Request, ctx: RequestCtx): Promise<Response> {
+		// Logged as sent (cut to the log limit) so the operator sees which revision a hosted client probes with.
+		const versionHeader = req.headers.get("mcp-protocol-version");
+		if (versionHeader !== null) ctx.mcpVersion = versionHeader.slice(0, LOG_VALUE_MAX);
+
 		// A browser always sends an Origin; native and server-side clients send none.
 		if (!originAllowed(req.headers.get("origin"), allowedOrigins)) return fail(403, "forbidden_origin");
 
@@ -583,8 +564,16 @@ export function createApp(deps: RouterDeps): App {
 		if (!limit.ok) return rateLimited(ctx, "mcp", limit.retryAfterSec);
 
 		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
-		const version = resolveProtocolVersion(req.headers.get("mcp-protocol-version"));
-		if (!version.ok) return respond(400, rpcError(-32600, "unsupported MCP-Protocol-Version"));
+		const version = resolveProtocolVersion(versionHeader);
+		if (!version.ok) {
+			// Only the method name of a parseable body is kept, so the log shows what the client tried; the answer never depends on it.
+			const peeked = await readJson(req, config.maxBodyBytes);
+			if (peeked.ok) {
+				describeRpc(peeked.value, ctx);
+				ctx.tool = undefined;
+			}
+			return respond(400, rpcError(-32600, "unsupported MCP-Protocol-Version"));
+		}
 		const parsed = await readJson(req, config.maxBodyBytes);
 		if (!parsed.ok) return respond(400, rpcError(-32700, "parse error"));
 		describeRpc(parsed.value, ctx);
@@ -676,6 +665,7 @@ export function createApp(deps: RouterDeps): App {
 			status: response.status,
 			ms: Math.round(elapsedMs),
 			...(ctx.rpcMethod === undefined ? {} : { rpcMethod: ctx.rpcMethod }),
+			...(ctx.mcpVersion === undefined ? {} : { mcpVersion: ctx.mcpVersion }),
 			...(ctx.tool === undefined ? {} : { tool: ctx.tool }),
 			authKind: ctx.authKind,
 			ip: ctx.ip,

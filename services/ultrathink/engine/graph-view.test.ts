@@ -172,6 +172,15 @@ describe("buildGraphView", () => {
 		expect(built.truncated).toBe(true);
 	});
 
+	test("a cut never leaves half of an emoji at the boundary", () => {
+		// TITLE_MAX is 120 with the ellipsis; the emoji straddles the cut at unit 119.
+		const built = view({ goal: "g", nodes: [node("a", "understand", [], { title: `${"t".repeat(118)}😀tail` })] });
+		const title = built.nodes[0]!.title;
+		expect(title).toBe(`${"t".repeat(118)}…`);
+		expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(title)).toBe(false);
+		expect(built.truncated).toBe(true);
+	});
+
 	test("draws at most 24 nodes", () => {
 		const nodes = Array.from({ length: 30 }, (_, i) => node(`n${i + 1}`, "generate", i === 0 ? [] : [`n${i}`]));
 		const built = view({ goal: "g", nodes });

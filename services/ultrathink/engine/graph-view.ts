@@ -94,13 +94,19 @@ function str(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
+/** The first `max` UTF-16 code units, minus a trailing high surrogate that would be left without its pair. */
+function cut(text: string, max: number): string {
+	if (text.length <= max) return text;
+	let end = Math.max(0, max);
+	const last = text.charCodeAt(end - 1);
+	if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
+	return text.slice(0, end);
+}
+
 /** Cuts to at most `max` characters, ellipsis included, without splitting a surrogate pair. */
 function clip(text: string, max: number): string {
 	if (text.length <= max) return text;
-	let end = Math.max(0, max - 1);
-	const last = text.charCodeAt(end - 1);
-	if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
-	return `${text.slice(0, end).trimEnd()}…`;
+	return `${cut(text, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
 /** One line: controls become spaces, whitespace collapses. */
@@ -211,7 +217,7 @@ export function buildGraphView(record: SessionRecord): GraphView | null {
 		const raw = str(source.id).trim();
 		let thinking = str(source.thinking);
 		if (thinking.length > THINKING_READ_MAX) {
-			thinking = thinking.slice(0, THINKING_READ_MAX);
+			thinking = cut(thinking, THINKING_READ_MAX);
 			ctx.truncated = true;
 		}
 		const conclusion = block(source.conclusion);

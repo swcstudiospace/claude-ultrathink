@@ -3,6 +3,8 @@
 
 import pkg from "../../../package.json";
 import { promptDefinitions, renderPrompt } from "./prompts.ts";
+import type { ResourceRegistry } from "./resources.ts";
+import { CONNECTOR_TOOL_DEFINITIONS, GRAPH_UI_META, LARGE_RESULT_META, READ_ONLY } from "./tools-connector.ts";
 
 /** Newest first: initialize answers with the requested version when listed here, otherwise the first. */
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
@@ -19,12 +21,15 @@ export interface ToolDefinition {
 	description: string;
 	inputSchema: Record<string, unknown>;
 	annotations: Record<string, unknown>;
+	/** MCP `_meta`: the UI resource a host draws the result with, and the result size Claude Code allows. */
+	_meta?: Record<string, unknown>;
 }
 
 /**
  * The host's result for one tool call. A refusal is a normal outcome, not an exception.
  * When `text` is present it is the tool result content and `data` becomes structuredContent only;
- * otherwise the content is the JSON of `data`.
+ * otherwise the content is the JSON of `data`. Claude Code shows the model structuredContent instead of content
+ * when both exist, so a host that returns `text` also puts the same text in `data.text`.
  */
 export type ToolOutcome =
 	| { ok: true; data: Record<string, unknown>; text?: string }
@@ -35,6 +40,8 @@ export interface McpToolHost {
 	call(name: string, args: Record<string, unknown>): ToolOutcome | Promise<ToolOutcome>;
 	/** Absent means { serverPlanning: false }. */
 	capabilities?(): { serverPlanning: boolean };
+	/** The `ui://` documents the host serves. Absent means none: resources/list is empty and every read is not found. */
+	resources?: ResourceRegistry;
 }
 
 export interface McpContext {
@@ -45,21 +52,30 @@ export interface McpContext {
 const JSONRPC = "2.0";
 const NOTIFICATION_PREFIX = "notifications/";
 const UPLIFT_TOOL = "ultrathink_uplift";
+const UI_EXTENSION = "io.modelcontextprotocol/ui";
 
-const CLIENT_INSTRUCTIONS =
+// Claude Code cuts server instructions at 4096 characters; each mode stays under the 3500 the tests pin.
+const CLIENT_PLANNING =
 	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned. Then call ultrathink_result with the sessionId, ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
-const SERVER_INSTRUCTIONS =
+const SERVER_PLANNING =
 	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. While its status is running, call ultrathink_result with the sessionId until the status is planned. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+const COMMAND_ROUTING =
+	"A message that starts with /ultrathink- and a command name is that command, not a request to plan. /ultrathink-think [sessionId] calls ultrathink_graph with the sessionId when one follows (the newest planned session otherwise). /ultrathink-last calls ultrathink_sessions with limit 5, then ultrathink_graph and ultrathink_result with the sessionId of the newest session whose status is planned. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> (for example /ultrathink-plan or /ultrathink-ship) calls ultrathink_command with command set to the name and args set to the rest of the message, verbatim; relay its message to the user and make the tool call it names in next. When a plan is ready, show its wave tree to the user first, unchanged, in a code block, and its mermaid diagram too only if your interface renders Mermaid.";
+const CLIENT_GRAPH_RULE =
+	"When a client-answered plan is ready, call ultrathink_graph once with its sessionId besides ultrathink_result.";
+const SERVER_GRAPH_RULE =
+	"With server planning the plan card already shows the graph: after ultrathink_result, do not call ultrathink_graph for the same session unless the user asks for it, for example with /ultrathink-think or /ultrathink-last.";
+const CLIENT_INSTRUCTIONS = [CLIENT_PLANNING, COMMAND_ROUTING, CLIENT_GRAPH_RULE].join("\n\n");
+const SERVER_INSTRUCTIONS = [SERVER_PLANNING, COMMAND_ROUTING, SERVER_GRAPH_RULE].join("\n\n");
 
 const SERVER_INFO = { name: "ultrathink", version: pkg.version };
 
 const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
+const RESOURCE_NOT_FOUND = -32002;
 const INTERNAL_ERROR = -32603;
 
-// idempotentHint only means something for a tool that writes; the read-only tools carry it too so every tool states it.
-const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 
@@ -69,7 +85,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		name: UPLIFT_TOOL,
 		title: "Plan a request on the server",
 		description:
-			"The entry point for the /ultrathink command. When the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. When the status is running, call ultrathink_result with the sessionId.",
+			"The entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. When the status is running, call ultrathink_result with the sessionId.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -83,12 +99,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			additionalProperties: false,
 		},
 		annotations: READ_WRITE_OPEN_WORLD,
+		_meta: GRAPH_UI_META,
 	},
 	{
 		name: "ultrathink_plan",
 		title: "Start or continue a client-answered plan",
 		description:
-			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command: when the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
+			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -187,7 +204,9 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			additionalProperties: false,
 		},
 		annotations: READ_ONLY,
+		_meta: LARGE_RESULT_META,
 	},
+	...CONNECTOR_TOOL_DEFINITIONS,
 ];
 
 const CLIENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = TOOL_DEFINITIONS.filter((tool) => tool.name !== UPLIFT_TOOL);
@@ -284,6 +303,12 @@ async function dispatch(host: McpToolHost, id: unknown, method: string, params: 
 			return rpcResult(id, { prompts: promptDefinitions({ serverPlanning }) });
 		case "prompts/get":
 			return getPrompt(id, params, serverPlanning);
+		case "resources/list":
+			return rpcResult(id, { resources: host.resources?.list() ?? [] });
+		case "resources/templates/list":
+			return rpcResult(id, { resourceTemplates: host.resources?.templates() ?? [] });
+		case "resources/read":
+			return readResource(host, id, params);
 		default:
 			return rpcError(id, METHOD_NOT_FOUND, "method not found");
 	}
@@ -295,10 +320,23 @@ function initializeResult(params: unknown, serverPlanning: boolean) {
 		SUPPORTED_PROTOCOL_VERSIONS.find((version) => version === requested) ?? SUPPORTED_PROTOCOL_VERSIONS[0];
 	return {
 		protocolVersion,
-		capabilities: { tools: {}, prompts: {} },
+		// The UI extension is announced unconditionally: claude.ai web renders MCP Apps without sending the extension itself.
+		capabilities: { tools: {}, prompts: {}, resources: {}, extensions: { [UI_EXTENSION]: {} } },
 		serverInfo: SERVER_INFO,
 		instructions: serverPlanning ? SERVER_INSTRUCTIONS : CLIENT_INSTRUCTIONS,
 	};
+}
+
+/** The 2025-era revisions answer a resource that does not exist with -32002; -32602 is for a malformed uri. */
+function readResource(host: McpToolHost, id: unknown, params: unknown): RpcResponse {
+	const uri = isRecord(params) ? params.uri : undefined;
+	const read = host.resources
+		? host.resources.read(uri)
+		: { ok: false as const, code: typeof uri === "string" ? ("not_found" as const) : ("invalid_uri" as const) };
+	if (read.ok) return rpcResult(id, { contents: read.contents });
+	return read.code === "not_found"
+		? rpcError(id, RESOURCE_NOT_FOUND, "resource not found")
+		: rpcError(id, INVALID_PARAMS, "invalid params: uri must be a ui:// uri");
 }
 
 function getPrompt(id: unknown, params: unknown, serverPlanning: boolean): RpcResponse {

@@ -368,14 +368,17 @@ describe("MCP endpoint", () => {
 		expect(await response.text()).toBe("");
 	});
 
-	test("tools/list returns the five journal tools and ultrathink_result when server planning is off", async () => {
+	test("tools/list returns the six journal tools and the three connector tools when server planning is off", async () => {
 		const list = await mcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), PEER_IP);
 		const listBody = (await list.json()) as { result: { tools: { name: string }[] } };
 		expect(listBody.result.tools.map((tool) => tool.name).sort()).toEqual([
 			"ultrathink_answer",
+			"ultrathink_command",
+			"ultrathink_graph",
 			"ultrathink_pending",
 			"ultrathink_plan",
 			"ultrathink_result",
+			"ultrathink_sessions",
 			"ultrathink_show",
 			"ultrathink_status",
 		]);

@@ -7,7 +7,8 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../../package.json";
-import { stageOf } from "../../../src/host/grokbot.ts";
+import { type SessionRecord, writeSession } from "../../../src/claude/state.ts";
+import { journalDir, stageOf, writeMeta } from "../../../src/host/grokbot.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../../../src/think/prompts.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../../../src/uplift/prompt.ts";
 import { escapeXml } from "../../../src/uplift/xml.ts";
@@ -417,20 +418,20 @@ describe("OAuth routes", () => {
 });
 
 describe("tool surface", () => {
-	test("without server planning the list has six tools and ultrathink_uplift does not exist", async () => {
+	test("without server planning the list has nine tools and ultrathink_uplift does not exist", async () => {
 		const h = harness();
 		expect(h.app.planner.enabled).toBe(false);
-		expect(await toolNames(h)).toEqual(["ultrathink_answer", "ultrathink_pending", "ultrathink_plan", "ultrathink_result", "ultrathink_show", "ultrathink_status"]);
+		expect(await toolNames(h)).toEqual(["ultrathink_answer", "ultrathink_command", "ultrathink_graph", "ultrathink_pending", "ultrathink_plan", "ultrathink_result", "ultrathink_sessions", "ultrathink_show", "ultrathink_status"]);
 
 		const response = await rpc(h, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ultrathink_uplift", arguments: { prompt: "plan it" } } });
 		const body = await json<{ error?: { code: number } }>(response);
 		expect(body.error?.code).toBe(-32602);
 	});
 
-	test("with an enabled planner the list has seven tools including ultrathink_uplift", async () => {
+	test("with an enabled planner the list has ten tools including ultrathink_uplift", async () => {
 		const h = harness({ deps: { planner: stubPlanner(true) } });
 		const names = await toolNames(h);
-		expect(names).toHaveLength(7);
+		expect(names).toHaveLength(10);
 		expect(names).toContain("ultrathink_uplift");
 		expect(h.app.planner.enabled).toBe(true);
 		expect(sample(h, "ultrathink_planner_enabled")).toBe(1);
@@ -442,7 +443,8 @@ describe("tool surface", () => {
 		expect(on.app.planner.enabled).toBe(true);
 	});
 
-	test("uplift then result: the plan text is the tool content and structuredContent carries no text", async () => {
+	// Claude Code hands the model structuredContent instead of content when both exist, so the plan text is in both.
+	test("uplift then result: the plan text is the tool content and also structuredContent.text", async () => {
 		const planner = stubPlanner(true);
 		const h = harness({ deps: { planner } });
 		const sessionId = randomSessionId();
@@ -458,7 +460,7 @@ describe("tool surface", () => {
 		expect(result.structuredContent.sessionId).toBe(sessionId);
 		expect(result.structuredContent.status).toBe("planned");
 		expect(result.structuredContent.mode).toBe("server");
-		expect("text" in result.structuredContent).toBe(false);
+		expect(result.structuredContent.text).toBe(PLAN_TEXT);
 		expect(result.structuredContent.questions).toEqual([{ question: "Which database?", default: "Postgres" }]);
 		expect(planner.results).toEqual([{ sessionId, waitSeconds: 0, detail: "full" }]);
 	});
@@ -645,8 +647,10 @@ describe("end to end with the real planner", () => {
 		const result = await callTool(h, "ultrathink_result", { sessionId, waitSeconds: 0 });
 		expect(result.isError).toBe(false);
 		expect(result.structuredContent).toMatchObject({ sessionId, status: "planned", mode: "server" });
-		expect("text" in result.structuredContent).toBe(false);
 		const text = result.content[0]?.text ?? "";
+		// Claude Code shows the model structuredContent instead of content, so the plan text must be in both.
+		expect(result.structuredContent.text).toBe(text);
+		expect(result.structuredContent.graph).toBeDefined();
 		expect(text).toContain(PROMPT);
 		expect(text).toContain("Should output be a JSON array or JSON lines?");
 		expect(text).not.toContain("TodoWrite");
@@ -690,7 +694,195 @@ describe("end to end with the real planner", () => {
 		const status = await callTool(h, "ultrathink_status", { sessionId });
 		expect(status.structuredContent).toMatchObject({ sessionId, status: "planned" });
 
+		// The graph tool draws the same finished server job; reading it again does not count the plan twice.
+		const graph = await callTool(h, "ultrathink_graph", { sessionId });
+		expect(graph.isError).toBe(false);
+		expect(graph.structuredContent).toMatchObject({ sessionId, status: "planned", mode: "server" });
+		expect(graph.content[0]?.text).toContain("```mermaid");
+		expect(graph.structuredContent.text).toBe(graph.content[0]?.text);
+		expect(sample(h, "ultrathink_plan_jobs_total", { status: "planned" })).toBe(1);
+
 		await h.app.shutdown();
+	});
+});
+
+describe("command surface", () => {
+	const GRAPH = {
+		goal: "Ship the CSV converter",
+		nodes: [
+			{ id: "n1", title: "Understand", kind: "understand", question: "What is asked?", dependsOn: [] as string[], thinking: "1. Read it.\n2. Restate it.", conclusion: "A converter." },
+			{ id: "n2", title: "Parser", kind: "decompose", question: "How is CSV parsed?", dependsOn: ["n1"], thinking: "1. Stream rows.", conclusion: "Streaming parser." },
+			{ id: "n3", title: "Plan", kind: "synthesize", question: "What is the order?", dependsOn: ["n2"], thinking: "1. Parse, then write.", conclusion: "Two waves." },
+		],
+	} satisfies NonNullable<SessionRecord["graph"]>;
+
+	/** A finished client-driven session on disk, as the grok-bot adapter leaves it. */
+	function seedPlanned(h: Harness): string {
+		const sessionId = randomSessionId();
+		writeMeta(journalDir(h.dir, sessionId), { sessionId, original: "Build the converter", status: "planned" });
+		writeSession(h.dir, {
+			sessionId,
+			at: Date.now(),
+			result: { xml: "<BUILD_PROMPT><ORIGINAL>Build the converter</ORIGINAL></BUILD_PROMPT>", original: "Build the converter", root: "BUILD_PROMPT", source: "llm" },
+			graph: GRAPH,
+		});
+		return sessionId;
+	}
+
+	async function call<T>(h: Harness, method: string, params?: unknown): Promise<{ result?: T; error?: { code: number; message: string } }> {
+		const response = await rpc(h, { jsonrpc: "2.0", id: 1, method, ...(params === undefined ? {} : { params }) });
+		expect(response.status).toBe(200);
+		return json(response);
+	}
+
+	test("initialize announces resources and the UI extension, and the instructions map the slash commands", async () => {
+		for (const planner of [stubPlanner(true), stubPlanner(false)]) {
+			const h = harness({ deps: { planner } });
+			const { result } = await call<{ capabilities: Json; instructions: string }>(h, "initialize", { protocolVersion: "2025-11-25" });
+			expect(result?.capabilities).toEqual({ tools: {}, prompts: {}, resources: {}, extensions: { "io.modelcontextprotocol/ui": {} } });
+			const instructions = result?.instructions ?? "";
+			expect(instructions.length).toBeLessThanOrEqual(3500);
+			for (const phrase of ["/ultrathink-think", "ultrathink_graph", "ultrathink_sessions", "ultrathink_command", "/ultrathink-quick"]) {
+				expect(instructions).toContain(phrase);
+			}
+			expect(instructions.includes("ultrathink_uplift")).toBe(planner.enabled);
+		}
+	});
+
+	test("tools/list carries the UI resource on ultrathink_uplift and ultrathink_graph and lists the same connector tools in both modes", async () => {
+		const server = harness({ deps: { planner: stubPlanner(true) } });
+		const { result } = await call<{ tools: Array<{ name: string; _meta?: Json }> }>(server, "tools/list");
+		const tools = result?.tools ?? [];
+		expect(tools).toHaveLength(10);
+		const withUi = tools.filter((tool) => tool._meta?.ui !== undefined).map((tool) => tool.name);
+		expect(withUi).toEqual(["ultrathink_uplift", "ultrathink_graph"]);
+		expect(tools.find((tool) => tool.name === "ultrathink_graph")?._meta).toEqual({
+			ui: { resourceUri: "ui://ultrathink/graph" },
+			"ui/resourceUri": "ui://ultrathink/graph",
+			"anthropic/maxResultSizeChars": 200000,
+		});
+		const client = harness();
+		expect((await toolNames(client)).filter((name) => ["ultrathink_graph", "ultrathink_sessions", "ultrathink_command"].includes(name))).toHaveLength(3);
+	});
+
+	test("prompts/list lists the supported commands and prompts/get answers all of them, unsupported ones with the reason", async () => {
+		const h = harness();
+		const { result } = await call<{ prompts: Array<{ name: string }> }>(h, "prompts/list");
+		expect(result?.prompts.map((prompt) => prompt.name)).toEqual(["ultrathink", "ultrathink-plan", "ultrathink-think", "ultrathink-last", "ultrathink-status", "ultrathink-quick"]);
+
+		const quick = await call<{ messages: Array<{ content: { text: string } }> }>(h, "prompts/get", { name: "ultrathink-quick", arguments: { message: "what is 2+2" } });
+		expect(quick.result?.messages[0]?.content.text.endsWith("\nwhat is 2+2")).toBe(true);
+
+		const unsupported = await call<{ messages: Array<{ content: { text: string } }> }>(h, "prompts/get", { name: "ultrathink-ship" });
+		expect(unsupported.error).toBeUndefined();
+		expect(unsupported.result?.messages[0]?.content.text).toContain("does not support");
+
+		const missing = await call(h, "prompts/get", { name: "ultrathink-nope" });
+		expect(missing.error?.code).toBe(-32602);
+	});
+
+	test("resources serve the graph app with the MCP Apps mime type, and an unknown uri is -32002", async () => {
+		const h = harness();
+		const listed = await call<{ resources: Array<{ uri: string; mimeType: string; _meta: Json }> }>(h, "resources/list");
+		expect(listed.result?.resources.map((resource) => [resource.uri, resource.mimeType])).toEqual([["ui://ultrathink/graph", "text/html;profile=mcp-app"]]);
+
+		const read = await call<{ contents: Array<{ uri: string; mimeType: string; text: string; _meta: Json }> }>(h, "resources/read", { uri: "ui://ultrathink/graph" });
+		const [contents] = read.result?.contents ?? [];
+		expect(contents?.mimeType).toBe("text/html;profile=mcp-app");
+		expect(contents?.text).toMatch(/^<!doctype html>/i);
+		expect(contents?._meta).toEqual({ ui: { csp: {}, prefersBorder: false } });
+
+		expect((await call(h, "resources/read", { uri: "ui://ultrathink/other" })).error?.code).toBe(-32002);
+		expect((await call(h, "resources/read", { uri: 5 })).error?.code).toBe(-32602);
+		expect((await call<{ resourceTemplates: unknown[] }>(h, "resources/templates/list")).result?.resourceTemplates).toEqual([]);
+	});
+
+	test("prompts/list and resources/list without credentials are still 401", async () => {
+		const h = harness();
+		for (const method of ["prompts/list", "resources/list", "resources/read"]) {
+			const response = await h.app.handle(
+				new Request(RESOURCE, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { uri: "ui://ultrathink/graph" } }) }),
+				PEER,
+			);
+			expect(response.status).toBe(401);
+			expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
+		}
+	});
+
+	test("ultrathink_sessions lists a client-driven session started over the wire", async () => {
+		const h = harness();
+		const plan = await callTool(h, "ultrathink_plan", { prompt: "plan the sessions listing" });
+		const sessionId = String(plan.structuredContent.sessionId);
+		const sessions = await callTool(h, "ultrathink_sessions", {});
+		expect(sessions.isError).toBe(false);
+		expect(sessions.structuredContent.planning).toEqual({ serverPlanning: false });
+		expect(sessions.structuredContent.sessions).toMatchObject([{ sessionId, status: "running", mode: "client", hasGraph: false }]);
+		expect(sessions.content[0]?.text).toContain(sessionId);
+		expect(sessions.structuredContent.text).toBe(sessions.content[0]?.text);
+		expect(sample(h, "ultrathink_mcp_tool_calls_total", { tool: "ultrathink_sessions", outcome: "ok" })).toBe(1);
+	});
+
+	test("ultrathink_sessions reports the server planning mode, ceilings and today's usage", async () => {
+		const h = harness({ config: { planningModel: "x-ai/grok-test" }, deps: { planner: stubPlanner(true), now: () => Date.UTC(2026, 9, 19, 12) } });
+		const sessions = await callTool(h, "ultrathink_sessions", { limit: 3 });
+		expect(sessions.structuredContent.planning).toEqual({
+			serverPlanning: true,
+			model: "x-ai/grok-test",
+			maxConcurrentPlans: 2,
+			runTokenCeiling: 5_000_000,
+			dailyTokenCeiling: 50_000_000,
+			usedTodayTokens: 0,
+		});
+		expect(sessions.content[0]?.text).toContain("server planning");
+	});
+
+	test("ultrathink_graph draws a seeded planned session, and one node of it", async () => {
+		const h = harness();
+		const sessionId = seedPlanned(h);
+		const graph = await callTool(h, "ultrathink_graph", {});
+		expect(graph.isError).toBe(false);
+		expect(graph.structuredContent).toMatchObject({ sessionId, status: "planned", mode: "client" });
+		const text = graph.content[0]?.text ?? "";
+		expect(text).toContain("```mermaid");
+		expect(text).toContain("Wave 1");
+		expect(graph.structuredContent.text).toBe(text);
+		expect(graph.structuredContent.graph).toMatchObject({ version: 1, goal: "Ship the CSV converter", counts: { nodes: 3 } });
+
+		const node = await callTool(h, "ultrathink_graph", { sessionId, node: "n2" });
+		expect(node.content[0]?.text).toContain("Conclusion: Streaming parser.");
+
+		const missing = await callTool(h, "ultrathink_graph", { sessionId, node: "n9" });
+		expect(missing.isError).toBe(true);
+		expect(missing.structuredContent.error).toBe("not_found");
+		expect(sample(h, "ultrathink_mcp_tool_calls_total", { tool: "ultrathink_graph", outcome: "error" })).toBe(1);
+	});
+
+	test("ultrathink_command lists every command, runs think and returns the planning call", async () => {
+		const h = harness();
+		seedPlanned(h);
+		const help = await callTool(h, "ultrathink_command", { command: "help" });
+		expect(help.isError).toBe(false);
+		expect(help.structuredContent.support).toBe("native");
+		expect(help.content[0]?.text).toContain("/ultrathink-ship - unsupported");
+		expect(help.structuredContent.text).toBe(help.content[0]?.text);
+
+		const think = await callTool(h, "ultrathink_command", { command: "/ultrathink-think" });
+		expect(think.structuredContent).toMatchObject({ command: "ultrathink-think", support: "native" });
+		expect(think.content[0]?.text).toContain("```mermaid");
+
+		const plan = await callTool(h, "ultrathink_command", { command: "ultrathink-plan", args: "plan the rollout" });
+		expect(plan.structuredContent).toMatchObject({ support: "alias", next: { tool: "ultrathink_plan", arguments: { prompt: "plan the rollout" } } });
+
+		const server = harness({ deps: { planner: stubPlanner(true) } });
+		const serverPlan = await callTool(server, "ultrathink_command", { command: "ultrathink", args: "plan the rollout" });
+		expect(serverPlan.structuredContent).toMatchObject({ support: "native", next: { tool: "ultrathink_uplift" } });
+
+		const unsupported = await callTool(h, "ultrathink_command", { command: "ultrathink-ship" });
+		expect(unsupported.structuredContent.support).toBe("unsupported");
+		expect((await callTool(h, "ultrathink_command", { command: "nope" })).structuredContent.support).toBe("unknown");
+		const refused = await callTool(h, "ultrathink_command", { command: 5 });
+		expect(refused.isError).toBe(true);
+		expect(refused.structuredContent.error).toBe("invalid_input");
 	});
 });
 

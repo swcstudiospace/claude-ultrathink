@@ -71,6 +71,13 @@ describe("renderChatPlan", () => {
 		expect(full.text.length).toBeGreaterThan(brief.text.length);
 	});
 
+	test("a one-line cut never leaves half of an emoji at the boundary", () => {
+		// The engine line is capped at 120 units with the ellipsis; the emoji straddles the cut at unit 119.
+		const { text } = renderChatPlan(record({ engine: `${"e".repeat(118)}😀tail` }), { detail: "brief", maxChars: 40_000 });
+		expect(text).toContain(`Engine: ${"e".repeat(118)}…\n`);
+		expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text)).toBe(false);
+	});
+
 	test("header carries session id, engine and node count; request and spec are present", () => {
 		const { text } = renderChatPlan(record(), { detail: "brief", maxChars: 40_000 });
 		expect(text).toContain("11111111-2222-4333-8444-555555555555");
