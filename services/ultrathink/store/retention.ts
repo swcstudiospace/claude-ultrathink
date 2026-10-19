@@ -55,7 +55,10 @@ function childTables(db: Database): Array<{ table: string; column: string }> {
  * Any error rolls everything back and propagates.
  */
 export function pruneRuns(db: Database, options: PruneOptions): PruneResult {
-	return db.transaction((): PruneResult => {
+	// BEGIN IMMEDIATE: a deferred transaction that reads and then upgrades to a write
+	// fails at once with SQLITE_BUSY_SNAPSHOT (the busy timeout is not consulted) when
+	// the web process commits in between.
+	const prune = db.transaction((): PruneResult => {
 		const ledger = columnsOf(db, "token_ledger");
 		const guard =
 			ledger.has("run_id") && ledger.has("day") ? " AND id NOT IN (SELECT run_id FROM token_ledger WHERE day >= ?)" : "";
@@ -74,5 +77,6 @@ export function pruneRuns(db: Database, options: PruneOptions): PruneResult {
 		const { changes: runs } = db.query("DELETE FROM runs WHERE id IN (SELECT id FROM ut_doomed)").run();
 		db.run("DROP TABLE ut_doomed");
 		return { runs, rows };
-	})();
+	});
+	return prune.immediate();
 }

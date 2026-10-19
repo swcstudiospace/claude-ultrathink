@@ -57,6 +57,9 @@ const DEFAULT_PLAN_TIMEOUT_MS = 600000;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 8000;
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high"];
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = "low";
+// The formats Bun.password.verify accepts: PHC argon2 strings and modular-crypt bcrypt strings.
+const OWNER_HASH_FORMAT =
+	/^(?:\$argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+|\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53})$/;
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
 
 function readOptional(
@@ -110,15 +113,32 @@ function readPublicOrigin(env: Record<string, string | undefined>): string {
 			"ULTRATHINK_PUBLIC_ORIGIN must be an absolute https:// URL",
 		);
 	}
-	if (url.protocol === "https:") {
-		return raw;
+	if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS[url.hostname] === true)) {
+		throw new ConfigError(
+			"ULTRATHINK_PUBLIC_ORIGIN must use https:// (http:// is allowed only for localhost or 127.0.0.1)",
+		);
 	}
-	if (url.protocol === "http:" && LOOPBACK_HOSTS[url.hostname] === true) {
-		return raw;
+	// Consumers build "<origin>/mcp" and compare it with the browser's Origin
+	// header, so only scheme, host and port may be configured; a trailing slash
+	// is dropped and the host is lower-cased by url.origin.
+	if (url.username !== "" || url.password !== "" || url.pathname !== "/" || raw.includes("?") || raw.includes("#")) {
+		throw new ConfigError(
+			"ULTRATHINK_PUBLIC_ORIGIN must be an origin only (scheme, host and optional port, with no credentials, path, query or fragment)",
+		);
 	}
-	throw new ConfigError(
-		"ULTRATHINK_PUBLIC_ORIGIN must use https:// (http:// is allowed only for localhost or 127.0.0.1)",
-	);
+	return url.origin;
+}
+
+function readOwnerPasswordHash(env: Record<string, string | undefined>): string {
+	const hash = readRequired(env, "ULTRATHINK_OWNER_PASSWORD_HASH");
+	if (!OWNER_HASH_FORMAT.test(hash)) {
+		// A "$argon2id$..." value expanded by a shell or compose file loses its
+		// "$name" segments; never echo the value.
+		throw new ConfigError(
+			"ULTRATHINK_OWNER_PASSWORD_HASH must be an argon2 or bcrypt hash as produced by Bun.password.hash (check that no '$' segment was shell-expanded)",
+		);
+	}
+	return hash;
 }
 
 function readSessionSecret(env: Record<string, string | undefined>): string {
@@ -283,7 +303,7 @@ export function loadConfig(
 	const openRouterApiKey = readOpenRouterApiKey(env);
 	return {
 		publicOrigin: readPublicOrigin(env),
-		ownerPasswordHash: readRequired(env, "ULTRATHINK_OWNER_PASSWORD_HASH"),
+		ownerPasswordHash: readOwnerPasswordHash(env),
 		sessionSecret: readSessionSecret(env),
 		stateDir,
 		dbPath: `${stateDir}/ultrathink.sqlite`,

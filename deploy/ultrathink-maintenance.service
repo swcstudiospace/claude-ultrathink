@@ -3,7 +3,8 @@
 # and jobs entries (see deploy/ultrathink-backup.sh for the settings).
 # Run by hand: systemctl start ultrathink-maintenance.service ; journalctl -u ultrathink-maintenance -n 50 --no-pager
 # Optional settings (ULTRATHINK_RETENTION_DAYS, ULTRATHINK_BACKUP_RSYNC_TARGET, ULTRATHINK_BACKUP_KEEP) go in
-# /etc/ultrathink/ultrathink.env. For rsync over ssh, put a key and known_hosts in /var/lib/ultrathink/home/.ssh (mode 0700).
+# /etc/ultrathink/ultrathink.env. For rsync over ssh, put the key (id_ed25519) and known_hosts in /var/lib/ultrathink/home/.ssh (mode 0700);
+# the backup script passes both paths to ssh explicitly because OpenSSH ignores $HOME.
 
 [Unit]
 Description=Ultrathink backup and state retention

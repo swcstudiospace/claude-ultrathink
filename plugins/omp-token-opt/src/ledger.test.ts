@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createLedger, isValidSnapshot, LedgerReject, type SavingsPoint } from "./ledger.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -137,6 +137,58 @@ describe("ledger", () => {
 		expect(() => ledger.notePerf({ lastQueryMs: 9 })).toThrow(LedgerReject);
 		expect(readFileSync(live, "utf8")).toBe(before);
 		expect(ledger.snapshot()!.lastQueryMs).toBeUndefined();
+	});
+
+	test("a lock owned by a live process is neither broken nor removed by a rejected write", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 10 });
+		ledger.load("sess");
+		const lock = join(dir, ".lock");
+		const token = `${process.pid}:owner:x`;
+		writeFileSync(lock, token);
+		expect(() => ledger.notePerf({ lastQueryMs: 9 })).toThrow(LedgerReject);
+		expect(readFileSync(lock, "utf8")).toBe(token);
+	});
+
+	test("a lock left by a crashed process is broken at once and released afterwards", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 10 });
+		ledger.load("sess");
+		const lock = join(dir, ".lock");
+		// Above any real pid_max, so the owner cannot exist.
+		writeFileSync(lock, "2147483646:1:x");
+		const started = Date.now();
+		ledger.notePerf({ lastQueryMs: 9 });
+		expect(Date.now() - started).toBeLessThan(400);
+		expect(JSON.parse(readFileSync(join(dir, "live.json"), "utf8")).lastQueryMs).toBe(9);
+		expect(existsSync(lock)).toBe(false);
+		expect(readdirSync(dir).filter((name) => name.includes(".stale."))).toEqual([]);
+	});
+
+	test("a lock held past the stale window by a hung live owner is broken", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 10 });
+		ledger.load("sess");
+		const lock = join(dir, ".lock");
+		writeFileSync(lock, `${process.pid}:hung:x`);
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(lock, old, old);
+		ledger.notePerf({ lastQueryMs: 4 });
+		expect(JSON.parse(readFileSync(join(dir, "live.json"), "utf8")).lastQueryMs).toBe(4);
+		expect(existsSync(lock)).toBe(false);
+	});
+
+	test("a failed write removes its tmp file and its own lock", () => {
+		const dir = mkdtempSync(join(tmpdir(), "token-opt-"));
+		const ledger = createLedger({ dir, now: () => 10 });
+		ledger.load("sess");
+		const live = join(dir, "live.json");
+		rmSync(live);
+		// rename(file, directory) fails, after the tmp file was written.
+		mkdirSync(live);
+		expect(() => ledger.notePerf({ lastQueryMs: 9 })).toThrow();
+		expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+		expect(existsSync(join(dir, ".lock"))).toBe(false);
 	});
 
 	test("cache hit percent uses lifetime provider totals after the window slides", () => {

@@ -182,11 +182,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# One `run` step in its own subshell. bash ignores `set -e` inside anything on the left of `||`, and `die` exits, so
+# without this a hard failure in the backup would end the script before retention ran. The subshell does not inherit
+# the EXIT trap, so it installs its own to remove the staging and verification directories.
+run_step() {
+	(
+		trap cleanup EXIT
+		"$@"
+	)
+}
+
 do_verify() {
 	local archive="${1:-}" top dirs dir
 	[ -n "$archive" ] || usage
 	[ -f "$archive" ] || die "archive not found: $archive"
-	verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/ultrathink-verify.XXXXXX")"
+	verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/ultrathink-verify.XXXXXX")" || die "cannot create a temporary directory"
 	say "extracting $archive"
 	tar -xzf "$archive" -C "$verify_dir" --no-same-owner || die "cannot extract $archive"
 	top="$(find "$verify_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
@@ -223,12 +233,15 @@ do_backup() {
 	local stamp name stage archive tmp_archive rsync_failed=0 dir copied_dirs=""
 	[ -d "$STATE_DIR" ] || die "state directory not found: $STATE_DIR"
 	[ -f "$STATE_DIR/ultrathink.sqlite" ] || die "database not found: $STATE_DIR/ultrathink.sqlite"
-	install -d -m 0700 "$BACKUP_DIR"
-	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+	install -d -m 0700 "$BACKUP_DIR" || die "cannot create $BACKUP_DIR"
+	# A run killed by SIGKILL (timeout escalation, OOM) skips the EXIT trap and leaves a plaintext copy of the state here.
+	find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '.work.*' -mmin +1440 -exec rm -rf -- {} + ||
+		warn "cannot remove stale staging directories in $BACKUP_DIR"
+	stamp="$(date -u +%Y%m%dT%H%M%SZ)" || die "date failed"
 	name="ultrathink-$stamp"
-	work_dir="$(mktemp -d "$BACKUP_DIR/.work.XXXXXX")"
+	work_dir="$(mktemp -d "$BACKUP_DIR/.work.XXXXXX")" || die "cannot create a staging directory in $BACKUP_DIR"
 	stage="$work_dir/$name"
-	mkdir -m 0700 "$stage"
+	mkdir -m 0700 "$stage" || die "cannot create $stage"
 
 	say "copying the database with VACUUM INTO"
 	bun_tool copy "$STATE_DIR/ultrathink.sqlite" "$stage/ultrathink.sqlite" || die "database copy failed"
@@ -266,7 +279,11 @@ do_backup() {
 
 	if [ -n "$RSYNC_TARGET" ]; then
 		say "rsync to the configured target"
-		if ! rsync -a --chmod=F600 -e 'ssh -o BatchMode=yes -o ConnectTimeout=20' -- "$archive" "$RSYNC_TARGET"; then
+		# ssh ignores $HOME and reads ~ from the passwd entry (/var/lib/ultrathink for the service user), so the key and
+		# known_hosts under $HOME/.ssh, where the runbook puts them, are passed explicitly.
+		if ! rsync -a --chmod=F600 \
+			-e "ssh -o BatchMode=yes -o ConnectTimeout=20 -o IdentitiesOnly=yes -i $HOME/.ssh/id_ed25519 -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+			-- "$archive" "$RSYNC_TARGET"; then
 			warn "rsync failed; the local backup is intact"
 			rsync_failed=1
 		fi
@@ -325,9 +342,9 @@ prune)
 	;;
 run)
 	status=0
-	do_backup || status=1
-	do_prune || status=1
-	prune_database || status=1
+	run_step do_backup || status=1
+	run_step do_prune || status=1
+	run_step prune_database || status=1
 	exit "$status"
 	;;
 esac

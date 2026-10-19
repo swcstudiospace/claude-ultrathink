@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 
 export interface AuthOptions {
 	ownerPasswordHash: string;
@@ -263,9 +264,30 @@ export function createAuth(options: AuthOptions): Auth {
 	};
 }
 
+/**
+ * Limiter key for an address. An IPv6 client controls its whole /64, so the
+ * key is the /64 prefix; otherwise rotating the low 64 bits would bypass every
+ * per-IP window. IPv4-mapped IPv6 addresses key as the IPv4 address.
+ */
+function limiterKey(address: string): string {
+	if (isIP(address) !== 6) return address;
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+	if (mapped?.[1] !== undefined && isIP(mapped[1]) === 4) return mapped[1];
+	const [head = "", tail = ""] = address.split("::", 2);
+	const headGroups = head === "" ? [] : head.split(":");
+	const tailGroups = address.includes("::") ? (tail === "" ? [] : tail.split(":")) : [];
+	const groups = address.includes("::")
+		? [...headGroups, ...Array<string>(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0"), ...tailGroups]
+		: headGroups;
+	return `${groups
+		.slice(0, 4)
+		.map((group) => Number.parseInt(group, 16).toString(16))
+		.join(":")}::/64`;
+}
+
 export function clientIpFrom(req: Request, peerIp: string): string {
-	if (LOOPBACK_PEERS[peerIp] !== true) return peerIp;
+	if (LOOPBACK_PEERS[peerIp] !== true) return limiterKey(peerIp);
 	const forwarded = req.headers.get("x-real-ip")?.trim();
-	if (forwarded && FORWARDED_IP.test(forwarded)) return forwarded;
-	return peerIp;
+	if (forwarded && FORWARDED_IP.test(forwarded) && isIP(forwarded) !== 0) return limiterKey(forwarded);
+	return limiterKey(peerIp);
 }

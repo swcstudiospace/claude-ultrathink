@@ -31,7 +31,8 @@ CURRENT="$ROOT/current"
 PREVIOUS="$ROOT/previous"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${ULTRATHINK_REPO:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}"
+# Only `release` needs a git checkout; rollback and status must work from an installed copy that has no .git.
+REPO=""
 
 SMOKE_PID=""
 SMOKE_STATE=""
@@ -154,6 +155,9 @@ point_symlink() {
 
 restart_and_probe() {
 	local port="$1"
+	# A release that crash-loops hits the unit's start limit and lands in "failed"; without this, the rollback restart
+	# inside the same window is refused ("Start request repeated too quickly").
+	systemctl reset-failed "$UNIT" 2>/dev/null || true
 	say "restarting $UNIT"
 	systemctl restart "$UNIT" || return 1
 	probe "$port" "production"
@@ -211,11 +215,12 @@ smoke_test() {
 }
 
 do_release() {
-	local ref="${1:-}" sha short stamp release old_current port
+	local ref="${1:-}" sha short stamp release old_current old_previous port
 	[ -n "$ref" ] || usage
 	require_root
 	require_tools
 	take_lock
+	REPO="${ULTRATHINK_REPO:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}" || die "cannot locate the git checkout; set ULTRATHINK_REPO"
 	load_env_file
 	port="$(env_value ULTRATHINK_PORT 8795)"
 
@@ -224,6 +229,7 @@ do_release() {
 	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 	release="$RELEASES/$short-$stamp"
 	old_current="$(current_target)"
+	old_previous="$(previous_target)"
 
 	say "releasing $ref ($sha) from $REPO"
 	say "uncommitted changes in the working tree are NOT part of the release (git archive of the commit)"
@@ -254,12 +260,13 @@ do_release() {
 	say "switching $CURRENT to $release"
 	if [ -n "$old_current" ]; then point_symlink "$PREVIOUS" "$old_current"; fi
 	point_symlink "$CURRENT" "$release"
-
 	if ! restart_and_probe "$port"; then
 		warn "new release failed its production probe"
 		if [ -n "$old_current" ]; then
 			say "rolling back to $old_current"
 			point_symlink "$CURRENT" "$old_current"
+			# The failed switch pointed previous at old_current; put the earlier rollback target back.
+			if [ -n "$old_previous" ]; then point_symlink "$PREVIOUS" "$old_previous"; else rm -f -- "$PREVIOUS"; fi
 			if restart_and_probe "$port"; then
 				warn "rolled back; the failed release is kept at $release for inspection"
 			else

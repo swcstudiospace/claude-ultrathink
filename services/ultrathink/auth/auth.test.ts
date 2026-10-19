@@ -278,5 +278,21 @@ describe("clientIpFrom", () => {
 	test("falls back to the peer when a loopback request has no usable header", () => {
 		expect(clientIpFrom(requestWithRealIp(), "127.0.0.1")).toBe("127.0.0.1");
 		expect(clientIpFrom(requestWithRealIp("not an ip!"), "127.0.0.1")).toBe("127.0.0.1");
+		expect(clientIpFrom(requestWithRealIp("1:2:3:4:5:6:7:8:9"), "127.0.0.1")).toBe("127.0.0.1");
+	});
+
+	test("keys an IPv6 client by its /64 so rotating the low bits does not dodge a per-IP limit", () => {
+		const loopback = "127.0.0.1";
+		const a = clientIpFrom(requestWithRealIp("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), loopback);
+		const b = clientIpFrom(requestWithRealIp("2001:DB8:1:2::1"), loopback);
+		expect(a).toBe("2001:db8:1:2::/64");
+		expect(b).toBe(a);
+		expect(clientIpFrom(requestWithRealIp("2001:db8:1:3::1"), loopback)).toBe("2001:db8:1:3::/64");
+		expect(clientIpFrom(requestWithRealIp("2001:db8::1"), loopback)).toBe("2001:db8:0:0::/64");
+		expect(clientIpFrom(requestWithRealIp(), "2001:db8:9:9:1:2:3:4")).toBe("2001:db8:9:9::/64");
+	});
+
+	test("keys an IPv4-mapped IPv6 address as the IPv4 address", () => {
+		expect(clientIpFrom(requestWithRealIp("::ffff:198.51.100.9"), "127.0.0.1")).toBe("198.51.100.9");
 	});
 });

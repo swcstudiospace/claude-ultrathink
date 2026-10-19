@@ -10,8 +10,9 @@ function randomSecret(): string {
 }
 
 function randomHash(): string {
-	const salt = randomBytes(16).toString("base64url");
-	const digest = randomBytes(16).toString("base64url");
+	// PHC strings use standard base64 without padding, as Bun.password.hash writes them.
+	const salt = randomBytes(16).toString("base64").replace(/=+$/, "");
+	const digest = randomBytes(16).toString("base64").replace(/=+$/, "");
 	return `$argon2id$v=19$m=65536,t=2,p=1$${salt}$${digest}`;
 }
 
@@ -172,6 +173,59 @@ describe("publicOrigin", () => {
 		expect(messageOf(() => loadConfig(env))).toContain(
 			"ULTRATHINK_PUBLIC_ORIGIN",
 		);
+	});
+});
+
+describe("publicOrigin normalization", () => {
+	test("drops a trailing slash and lower-cases the host", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PUBLIC_ORIGIN = "https://Ultrathink.SWCStudio.space/";
+		expect(loadConfig(env).publicOrigin).toBe("https://ultrathink.swcstudio.space");
+	});
+
+	test("keeps an explicit non-default port", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PUBLIC_ORIGIN = "https://ultrathink.swcstudio.space:8443";
+		expect(loadConfig(env).publicOrigin).toBe("https://ultrathink.swcstudio.space:8443");
+	});
+
+	test("rejects a path, a query, a fragment and credentials without echoing the value", () => {
+		for (const value of [
+			"https://ultrathink.swcstudio.space/some/path",
+			"https://ultrathink.swcstudio.space/?a=1",
+			"https://ultrathink.swcstudio.space/#frag",
+			"https://owner:secret@ultrathink.swcstudio.space",
+		]) {
+			const env = baseEnv();
+			env.ULTRATHINK_PUBLIC_ORIGIN = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_PUBLIC_ORIGIN");
+			expect(message).not.toContain("swcstudio.space");
+			expect(message).not.toContain("secret");
+		}
+	});
+});
+
+describe("ownerPasswordHash", () => {
+	test("accepts the argon2id and bcrypt hashes Bun.password produces", () => {
+		const env = baseEnv();
+		const argon = Bun.password.hashSync("pw", "argon2id");
+		env.ULTRATHINK_OWNER_PASSWORD_HASH = argon;
+		expect(loadConfig(env).ownerPasswordHash).toBe(argon);
+		const bcrypt = Bun.password.hashSync("pw", { algorithm: "bcrypt", cost: 4 });
+		env.ULTRATHINK_OWNER_PASSWORD_HASH = bcrypt;
+		expect(loadConfig(env).ownerPasswordHash).toBe(bcrypt);
+	});
+
+	test("rejects a plaintext value and a shell-expanded hash without echoing either", () => {
+		const expanded = Bun.password.hashSync("pw", "argon2id").replace("$argon2id", "");
+		for (const value of ["plaintext-not-a-hash", expanded, "$argon2id$truncated"]) {
+			const env = baseEnv();
+			env.ULTRATHINK_OWNER_PASSWORD_HASH = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_OWNER_PASSWORD_HASH");
+			expect(message).not.toContain(value);
+		}
 	});
 });
 

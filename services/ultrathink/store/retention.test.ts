@@ -99,4 +99,38 @@ describe("pruneRuns", () => {
 
 		for (const table of ["runs", "phases", "token_ledger", "future_notes"]) expect(count(db, table, "old")).toBe(1);
 	});
+
+	test("takes the write lock up front: a deferred transaction can fail with SQLITE_BUSY_SNAPSHOT when the web process commits mid-prune", () => {
+		const db = openDb();
+		addRun(db, "old", "complete", OLD, "2026-09-08");
+		const modes: string[] = [];
+		const spy = new Proxy(db, {
+			get(target, property) {
+				if (property === "transaction") {
+					return (fn: () => unknown) => {
+						const wrapped = target.transaction(fn);
+						return Object.assign(
+							() => {
+								modes.push("deferred");
+								return wrapped();
+							},
+							{
+								immediate: () => {
+									modes.push("immediate");
+									return wrapped.immediate();
+								},
+							},
+						);
+					};
+				}
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+
+		const result = pruneRuns(spy, { cutoffMs: CUTOFF, today: TODAY });
+
+		expect(modes).toEqual(["immediate"]);
+		expect(result.runs).toBe(1);
+	});
 });
