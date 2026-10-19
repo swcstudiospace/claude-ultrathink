@@ -361,7 +361,7 @@ Switching models safely:
 
 ## 13. Connector surface and diagnostics
 
-Status: the connector has never been connected to Claude chat, Claude Code or Grok Chat in a live session. Until it has, the first connection from each client is the evidence, and this section is how to read it. Nothing here claims a client behavior that the logs have not shown.
+Status: Grok Chat connected to this server live on 2026-10-18 and 2026-10-19, against the older build (7 tools, 1 prompt, no resources). No connection from Claude chat, Claude Desktop or Claude Code appears in the retained server logs of 2026-10-11 to 2026-10-19 (no Claude user agent, no Anthropic address range, no claude.ai redirect URI), so none is known to have connected. The v1.14 surface described below went live with release `f1e8a4fab33f-20261019T154303Z` on 2026-10-19 at 15:43 UTC. For the first connection from a client with none seen yet, this section is how to read it. Nothing here claims a client behavior that the logs have not shown. The dated record is in [the evidence file](evidence-connector-commands.md#2026-10-19-live-observations-and-release).
 
 ### Inventory
 
@@ -374,9 +374,11 @@ Status: the connector has never been connected to Claude chat, Claude Code or Gr
 | Resource | 1: `ui://ultrathink/graph` (name `ultrathink-graph`, MIME `text/html;profile=mcp-app`), a self-contained HTML card of at most 512 KiB, served with an empty content security policy (`csp: {}`), no `domain` and `prefersBorder: false`. The app loads nothing external. `resources/templates/list` returns an empty list. |
 | Capabilities in `initialize` | `tools`, `prompts` and `resources`, plus the extension `io.modelcontextprotocol/ui`, announced unconditionally because claude.ai web is reported to render MCP Apps without sending the extension itself. No `listChanged`, no subscriptions, no logging. |
 | Protocol versions | `2025-11-25`, `2025-06-18` and `2025-03-26`. `initialize` answers the requested version when it is listed, otherwise `2025-11-25`. A request with no `MCP-Protocol-Version` header is treated as `2025-03-26`. Any other header value, including `2026-07-28`, gets HTTP 400 with JSON-RPC error `-32600` `unsupported MCP-Protocol-Version`. JSON-RPC batches get 400 from `2025-06-18`. `2026-07-28` is not served and `server/discover` answers `-32601`. |
+| OAuth metadata | The authorization server metadata advertises `registration_endpoint`, token auth method `none` and PKCE `S256`, and does not advertise `client_id_metadata_document_supported`. Claude must therefore be added with OAuth client "Register automatically"; "Use Claude's published identity" needs a Client ID Metadata Document, which this server does not offer. |
 | Errors | A `resources/read` for an unknown `ui://` uri returns `-32002`; a malformed uri returns `-32602`. `GET` and `DELETE` on `/mcp` return 405 with `Allow: POST`, before authentication. |
 | Command catalog | Read from `commands/` and `skills/` in the release, with the decision per command in `COMMAND_OVERLAY` (`services/ultrathink/mcp/commands.ts`). A release without those directories serves the static overlay and logs a `command_catalog_fallback` warning at start. |
 | Plugin bundle | `plugins/ultrathink-connector/`, built with `sh plugins/ultrathink-connector/package.sh` into a zip for Claude's plugin upload. Its `.mcp.json` points at the production URL and holds no key. |
+| Tool definition check | `services/ultrathink/mcp/definitions.ts` checks every tool definition: name pattern and uniqueness, description length and content (no absolute paths, stack frames or secret-like strings), a hand-checked JSON Schema subset and boolean annotations. `ultrathink-web` and `ultrathink-connector` refuse to start when a definition fails, naming the tool on stderr, and `bun test` runs the same check, so `deploy/ultrathink-release.sh` stops before it switches `current`. |
 
 Metrics: `ultrathink_mcp_tool_calls_total{tool,outcome}` carries the three new tool names.
 
@@ -465,3 +467,5 @@ When registrations are limited, wait for `Retry-After`. Restarting `ultrathink-w
 ### After changing tools
 
 Grok fetches a connector's tool list once and refreshes it only when the connector is re-authenticated (`https://github.com/xai-org/plugin-marketplace/issues/1402`); tell Grok users to reconnect after any release that changes a tool name, description or schema. Whether claude.ai re-fetches `tools/list` on its own is not verified: have Claude users remove and re-add the connector.
+
+The first live Grok session (2026-10-18 and 2026-10-19 logs) sent `initialize` and `notifications/initialized` before every `tools/call` and never sent a second `tools/list`.
