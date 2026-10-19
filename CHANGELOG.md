@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Graph x Chain views for the hosted connector (`services/ultrathink/engine/graph-view.ts`): a structured graph view, a plain-text wave tree and a Mermaid flowchart, all derived from the finished session's graph (no second reasoning model). The plan text from `ultrathink_result` now leads with the wave tree in a code block, then the diagram, and tells the chat model to show the tree first. Mermaid 11 parsed and rendered twelve graphs in strict mode, including hostile titles. Whether Claude chat or Grok Chat renders a fenced Mermaid block is not verified, which is why the tree comes first.
+- An MCP App card for the graph at `ui://ultrathink/graph` (`ui/graph-app.ts`): waves, node cards, dependency edges, a detail panel, keyboard navigation, light and dark themes, a progress state that polls `ultrathink_result` while a plan runs, and a "Use all defaults" button that sends a `ui/message`. It loads nothing external. It ran in a headless Chrome host harness, never inside Claude, and custom connectors are reported to render MCP Apps inconsistently, so the text result stays complete without it.
+- The `resources` capability (`resources/list`, `resources/read`, an empty `resources/templates/list`), the `io.modelcontextprotocol/ui` extension in `initialize`, `_meta.ui.resourceUri` on `ultrathink_uplift` and `ultrathink_graph`, and `anthropic/maxResultSizeChars` on the large results.
+- A command catalog and six MCP prompts (`ultrathink`, `ultrathink-plan`, `ultrathink-think`, `ultrathink-last`, `ultrathink-status`, `ultrathink-quick`). The catalog is read from the plugin's command and skill files and decided per command in `COMMAND_OVERLAY`: 22 commands, of which 4 are native, 1 an alias, 1 a passthrough and 16 unsupported on the connector with a reason and an alternative. `docs/commands.md` has the table.
+- Three connector tools, always listed: `ultrathink_graph` (`/ultrathink-think`), `ultrathink_sessions` (`/ultrathink-status` and the first step of `/ultrathink-last`) and `ultrathink_command` (every other `/ultrathink-<name>`). The hosted server now offers 10 tools, 9 without server planning.
+- `structuredContent.text`: every text-bearing tool result repeats its text in `structuredContent.text`, because Claude Code hands the model `structuredContent` instead of `content`.
+- A local stdio server, `bin/ultrathink-connector` (`services/ultrathink/stdio/`; on Windows `bun <path>\services\ultrathink\stdio\main.ts`): newline-delimited JSON-RPC through the same protocol core as HTTP, with no planner, no OAuth and no network access. State goes to `ULTRATHINK_STATE_DIR` or the `connector` directory under the host state directory, logs to stderr at `ULTRATHINK_LOG_LEVEL`. One conformance suite runs against the tool host, the HTTP app and a spawned stdio process.
+- A Claude plugin bundle, `plugins/ultrathink-connector/`: six commands, a skill with the playbook for the tools and an `.mcp.json` for the hosted URL with no key, built into an upload zip by `package.sh`. A parity test keeps its commands equal to the catalog's supported commands.
+- Connector diagnostics: `/mcp` request log lines carry `mcpVersion` (the `MCP-Protocol-Version` header as sent) and `rpcMethod`, also for a request refused for an unknown version, so a hosted client's first connection can be read from the log. Runbook section 13 has the inventory, how to read that connection, a curl and stdio smoke checklist and the rate limits.
+- Documentation for every client in `docs/how-to/use-ultrathink-in-chat.md`: Claude Desktop and claude.ai (plugin bundle and custom connector), Claude Code, Grok Chat and local stdio. It states that Claude chat and Grok Chat authenticate by OAuth only, that Grok never refreshes its tool list, that hosted Claude does not deliver server instructions, that the registration limit is 10 per hour per address, and that the connector has not been connected to either client yet.
+
+### Changed
+
+- The descriptions of the two entry tools `ultrathink_uplift` and `ultrathink_plan` now say that a message starting with `/ultrathink-` (with a hyphen) is another command and name the tool to use, and `initialize` instructions carry the routing for every command. The `ultrathink_result` plan text starts with the wave tree block and ends with a request to show it first.
+
 ### Fixed
 
 - OAuth consent: a pending approval stays valid for 10 minutes, approve attempts are limited, and the consent page policy lets the browser follow the redirect back to the client. Before, Chrome cancelled the redirect to grok.com, the page did not move, and the second click showed "This authorization request expired".

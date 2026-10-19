@@ -28,12 +28,14 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Upgrade and move](how-to/upgrade-and-move.md): update each host and move the clone.
 - [Uninstall](how-to/uninstall.md): remove ultrathink from each host, plus its shared config, credentials and state.
 - [Use with Grok Bot](how-to/use-with-grok-bot.md): the native Grok Bot host (`bin/ultrathink-grokbot` plus skills; no prompt hook).
+- [Use /ultrathink in Claude, Claude Code and Grok Chat](how-to/use-ultrathink-in-chat.md): connect the hosted connector or the local stdio server to each client, with what is and is not verified per client.
 - [Run pstack skills beside GSD in Cursor](how-to/use-pstack-with-cursor.md): install the Cursor hook, enable it in your user config, and check it with doctor.
 
 ## Reference
 
 - [Configuration](configuration.md): config files, every key and its default, environment variables, state directories.
 - [Commands](commands.md): the `/ultrathink-*` commands, prompt prefixes and the `bin/` CLIs.
+- [Runbook: the hosted connector](ops/runbook-ultrathink.md): operate the hosted server, including the connector inventory, the log fields and the smoke checks (section 13).
 - [Tracking](tracking.md): the rows ultrathink creates in Notion and Linear, and when.
 - [Ship](ship.md): the done check, pull request, review loop and merge gate.
 - [Troubleshooting](troubleshooting.md): symptoms, causes and fixes.

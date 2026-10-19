@@ -1,6 +1,8 @@
-# Use /ultrathink in Grok Chat, Claude and Claude Code
+# Use /ultrathink in Claude, Claude Code and Grok Chat
 
-This guide connects a chat client to the hosted ultrathink server and shows how to run `/ultrathink <request>` from it. The server is at `https://ultrathink.swcstudio.space/mcp`. For the server's operation, see the [runbook](../ops/runbook-ultrathink.md). For Grok Bot, see [Connect Grok Bot to ultrathink](../ops/grok-bot-setup-ultrathink.md).
+This guide connects a chat client to the hosted ultrathink server, or to the same connector running on your machine over stdio, and shows how to run `/ultrathink <request>` and the other connector commands from it. The hosted server is at `https://ultrathink.swcstudio.space/mcp`. For the server's operation, see the [runbook](../ops/runbook-ultrathink.md). For Grok Bot, see [Connect Grok Bot to ultrathink](../ops/grok-bot-setup-ultrathink.md). For every command and what each client does with it, see [Commands: Connector](../commands.md#connector).
+
+**Status: not verified live.** This connector has never been connected to Claude chat, Claude Code or Grok Chat in a live session. What a client does with it is taken from vendor documentation and public issue reports read on 2026-10-19, with the source named where it matters; anything no source settles is marked *not verified*. The list of what has and has not been run is under [What is not verified](#what-is-not-verified).
 
 ## What /ultrathink does in a chat
 
@@ -23,15 +25,15 @@ The server offers two ways to do the thinking. The tool list tells you which one
 |---|---|---|
 | Who thinks | The server calls an OpenRouter model. | The chat model answers each planning prompt itself. |
 | Tools the chat model uses | `ultrathink_uplift`, then `ultrathink_result` | `ultrathink_plan`, `ultrathink_pending`, `ultrathink_show`, `ultrathink_answer`, `ultrathink_status`, then `ultrathink_result` |
-| Tool count | 7 tools | 6 tools (`ultrathink_uplift` is not listed) |
+| Tool count | 10 tools: the six client-driven tools, `ultrathink_uplift`, and the three connector tools `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command` | 9 tools (`ultrathink_uplift` is not listed) |
 | Who pays | The operator's OpenRouter account. | Your chat plan. The server makes no paid call. |
-| Used by | Grok Chat, Claude, Claude Code | Grok Bot, or any client when server-side mode is off |
+| Used by | The hosted server when planning is configured: Grok Chat, Claude chat, Claude Code | Grok Bot, the local stdio server, or any client when server-side mode is off |
 
 Server-side mode is on when `OPENROUTER_API_KEY` and `ULTRATHINK_PLANNING_MODEL` are both set and `ULTRATHINK_SERVER_PLANNING` is not `0`. Without them the server lists no `ultrathink_uplift`, and its prompt and instructions describe the client-driven loop. The client-driven tools stay available in both modes. `ultrathink_result` returns the plan for a finished session from either mode.
 
 ## Connect a client
 
-All three clients use the same URL and the same login: OAuth 2.1 with PKCE, and the owner password on the consent page. The server finds each client through its metadata at `/.well-known/oauth-protected-resource/mcp` and registers it with dynamic client registration.
+All hosted routes use the same URL and the same login: OAuth 2.1 with PKCE, and the owner password on the consent page. The server finds each client through its metadata at `/.well-known/oauth-protected-resource/mcp` and registers it with dynamic client registration.
 
 The server accepts a client's redirect URI only when it is https on one of these origins, or http on loopback (any port):
 
@@ -44,25 +46,52 @@ The operator can add origins with `ULTRATHINK_OAUTH_REDIRECT_ORIGINS`. A client 
 
 The consent page names the client, says that the name is unverified, and shows the origin you will be sent back to. Approve only an address you recognize.
 
-### Grok Chat
+### What each client can do
 
-1. Open grok.com/connectors and click **New Connector**.
-2. Select **Custom**.
-3. Enter the URL `https://ultrathink.swcstudio.space/mcp`.
-4. Choose OAuth when Grok offers it. Grok opens the ultrathink consent page.
-5. Enter the owner password and click **Approve**.
-6. Check that the ultrathink tools are listed in the connector, including `ultrathink_uplift`.
+| | Claude Desktop and claude.ai chat | Claude Code | Grok Chat | Local stdio |
+|---|---|---|---|---|
+| How it connects | Plugin bundle (Connectors tab) or custom connector, from Anthropic's cloud | `claude mcp add` | Custom connector at grok.com/connectors | The client starts `bin/ultrathink-connector` |
+| Sign-in | OAuth only | OAuth, or the `x-connector-key` header | OAuth only | None (local process) |
+| Typed `/ultrathink ...` | Plain text unless picked from the "/" menu, where the plugin's commands appear | Plugin commands and `/mcp__ultrathink__<prompt>` | No known command surface; tool descriptions and custom instructions | Depends on the client |
+| MCP prompts | Only as "+" menu attachments, not as slash commands | `/mcp__ultrathink__<prompt>` | No evidence of any prompt surface | Depends on the client |
+| Server `instructions` | Not delivered to the model | Delivered, cut at 4,096 characters | Not verified | Depends on the client |
+| Tool list refresh | Not verified; remove and re-add the connector after a tool change | Honours `list_changed` and reconnects with `/mcp` (this server sends no `list_changed`, so reconnect after a tool change) | Fetched once and cached; only re-authentication refreshes it | The client restarts the process |
 
-### Claude and Claude Desktop
+What the evidence says, and where it stops:
+
+- **OAuth only.** Claude's custom connector dialog offers OAuth client settings; its "Request headers" option is a beta for limited organizations, takes at most four headers, and allows only standard names (`authorization`, `x-api-key`, `x-auth-token`) or names Anthropic approves, so the connector key header is not usable there. Grok's custom connector UI was only seen to offer OAuth, and no static header field was found in xAI's documentation or in operator reports. The `x-connector-key` header is for Grok Bot and Claude Code (`--header`). Sources: `https://claude.com/docs/connectors/custom/add-unlisted`, `https://docs.x.ai/grok/connectors`.
+- **Grok never refreshes its tool list.** Grok fetches a connector's tools once, when it connects, and caches them. It does not refetch on `initialize` and ignores `list_changed`; only re-authenticating the connector refreshes the list, and the iOS app has no re-authenticate button. A maintainer confirmed this on 2026-10-13 in `https://github.com/xai-org/plugin-marketplace/issues/1402`. After any tool change on the server (for example the three connector tools added in this release, or a changed description), disconnect and reconnect the connector in Grok before testing.
+- **Hosted Claude does not deliver server `instructions`.** Open issue `https://github.com/anthropics/claude-ai-mcp/issues/93`, still reproduced on 2026-10-15. The routing text therefore also sits in each tool's description, and the Claude plugin's skill carries the playbook. Claude Code does deliver instructions; the connector's stay under 3,500 characters because Claude Code cuts them at 4,096.
+- **Prompts.** In Claude chat, a server's MCP prompts appear only as attachments in the "+" menu ("Add from ultrathink") and are not run as typed messages. Reliability is reported as poor: `https://github.com/anthropics/claude-ai-mcp/issues/333` describes prompts from custom connectors vanishing from the UI. In Claude Code they are slash commands named `/mcp__ultrathink__<prompt>`. Nothing found says Grok Chat has a prompt surface.
+- **Claude Code gets `structuredContent` instead of `content`.** Anthropic documents that when a tool returns `structuredContent`, Claude Code hands the model that JSON instead of the `content` text (`https://claude.com/docs/connectors/building/mcp-apps/quickstart`). The connector therefore returns the same text twice, as the tool content and as `structuredContent.text`. What claude.ai chat and Grok Chat hand the model is not verified.
+- **The plan leads with a wave tree.** The plan text starts with a plain-text wave tree in a code block, and the Mermaid diagram follows it. Whether Claude chat or Grok Chat renders a fenced `mermaid` block in a reply is not verified: no Anthropic or xAI document says it does. The tree is the part that is sure to be readable.
+- **The MCP App card is unreliable in custom connectors.** The tools `ultrathink_uplift` and `ultrathink_graph` point at the `ui://ultrathink/graph` resource, an interactive card. Claude web and Desktop are listed as MCP Apps clients, but reports say custom (non-directory) connectors sometimes get text only or an empty frame (`https://github.com/anthropics/claude-ai-mcp/issues/471`, `/165`). The text result is complete without the card, so a client that does not draw it loses nothing but the picture. Grok Chat is not listed as an MCP Apps client.
+- **Registration limit.** The server allows 10 client registrations per hour per client address, and Claude registers a new client on every fresh connection (dynamic client registration; Anthropic recommends client ID metadata documents instead, which this server does not implement). Anthropic's connector traffic comes from a fixed address range, so many fresh connections can exhaust the limit; the 11th registration returns 429 with `Retry-After`. Wait that long and connect again. The operator's checks are in runbook section 13.
+- **Which protocol revision a hosted client opens with.** Claude is reported to open every connection with a `server/discover` request under `MCP-Protocol-Version: 2026-07-28`. This server speaks 2025-11-25, 2025-06-18 and 2025-03-26 and answers that probe with HTTP 400, which a spec-following client reads as "legacy server" before it falls back to `initialize`. That fallback is confirmed for the official TypeScript SDK 2.3.1 and Python SDK 2.3.0 against an earlier build of this server; for hosted Claude and for Grok Chat it is *not verified*. [Runbook section 13](../ops/runbook-ultrathink.md#13-connector-surface-and-diagnostics) shows how to read the first connection in the logs.
+
+### Claude Desktop and claude.ai: plugin bundle
+
+The plugin in `plugins/ultrathink-connector/` bundles six commands, a skill with the playbook, and the connector entry for the hosted server. It is the route that puts the commands in Claude chat's "/" menu: according to Anthropic, a plugin's commands and skills appear in that menu, labelled by plugin, and in chat a command loads as a skill that Claude applies (`https://claude.com/docs/plugins/platform-support`).
+
+1. From the repository root, run `sh plugins/ultrathink-connector/package.sh`. It writes `plugins/ultrathink-connector/dist/ultrathink-connector-<version>.zip`.
+2. In claude.ai or Claude Desktop, open **Customize > Plugins > Add > Upload plugin** and select the zip. Anthropic's documented limit for chat is 200 MB and 5,000 files.
+3. Open the plugin, select its **Connectors** tab, then add and connect `ultrathink`. The consent page opens. Enter the owner password and click **Approve**.
+4. In a chat, pick a command from the "/" menu, for example `/ultrathink` and then your request. Where Claude namespaces plugin commands they appear as `/ultrathink-connector:<name>`.
+
+On Team and Enterprise plans an Owner may have to add the connector for the organization first. A typed `/ultrathink foo` that you did not pick from the menu is plain text to the model. To point the plugin at your own deployment, see `plugins/ultrathink-connector/README.md`.
+
+### Claude Desktop and claude.ai: custom connector
+
+Use this when you do not want the plugin. You get the tools, and the model follows a typed `/ultrathink` only because their descriptions tell it to.
 
 1. Open Settings, then Connectors.
 2. Choose **Add custom connector**.
 3. Enter a name (`ultrathink`) and the URL `https://ultrathink.swcstudio.space/mcp`.
-4. Leave the advanced OAuth client ID and secret empty so that Claude registers itself automatically.
+4. Leave the advanced OAuth client ID and secret empty. If the dialog asks how Claude should register, choose automatic registration; the "published identity" option needs client ID metadata documents, which this server does not advertise.
 5. Choose **Connect**. The consent page opens. Enter the owner password and click **Approve**.
-6. In a new chat, open the connectors menu and switch the ultrathink connector on for that chat.
+6. In a new chat, open the connectors menu and switch the ultrathink connector on for that chat. The auth settings cannot be edited after the connector is added; to change them, remove the connector and add it again.
 
-Menu labels differ by app version and plan. Custom connectors may not be available on every plan.
+Menu labels differ by app version and plan. Custom connectors may not be available on every plan. Claude shows an Allow once, Always allow or Blocked choice per tool; the read-only tools declare `readOnlyHint`, which Anthropic says lets them run without a per-call prompt.
 
 ### Claude Code
 
@@ -71,6 +100,64 @@ claude mcp add --transport http ultrathink https://ultrathink.swcstudio.space/mc
 ```
 
 Then run `/mcp` inside Claude Code, select `ultrathink`, and choose to authenticate. Claude Code opens the browser and receives the code on a loopback address, which the redirect rules allow. Enter the owner password on the consent page. Add `--scope user` to the command to make the server available in every project.
+
+Claude Code can also send the connector key instead of running OAuth. The key is a secret: put it in a shell variable without echoing it, and know that Claude Code stores the header in its own configuration.
+
+```bash
+claude mcp add --transport http ultrathink https://ultrathink.swcstudio.space/mcp --header "x-connector-key: $ULTRATHINK_CONNECTOR_KEY"
+```
+
+The six prompts are `/mcp__ultrathink__ultrathink`, `/mcp__ultrathink__ultrathink-plan`, `/mcp__ultrathink__ultrathink-think`, `/mcp__ultrathink__ultrathink-last`, `/mcp__ultrathink__ultrathink-status` and `/mcp__ultrathink__ultrathink-quick`, with space-separated arguments, for example `/mcp__ultrathink__ultrathink plan a CSV export`. If you already have the ultrathink plugin installed in Claude Code, its own `/ultrathink-*` commands plan locally with no server; use the connector when you want the hosted planner. To load the connector's plugin bundle in Claude Code, run `claude --plugin-dir plugins/ultrathink-connector`.
+
+### Grok Chat
+
+1. Open grok.com/connectors and click **New Connector**.
+2. Select **Custom**.
+3. Enter the URL `https://ultrathink.swcstudio.space/mcp`.
+4. Choose OAuth when Grok offers it. Grok opens the ultrathink consent page. If Grok shows a manual "OAuth Credentials Required" dialog, the server needs no client secret: it registers public clients (token auth method none, PKCE).
+5. Enter the owner password and click **Approve**.
+6. Check that the ultrathink tools are listed in the connector, including `ultrathink_uplift`, `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`. If a tool you expect is missing, the list is stale: re-authenticate or reconnect (see above).
+
+Grok Chat gets the tools only. There is no plugin bundle for it, so a typed `/ultrathink` works through the tool descriptions and, if the model ignores them, the custom instructions below.
+
+### Local stdio
+
+`bin/ultrathink-connector` runs the connector on your machine over stdio for any client that starts MCP servers as processes. It has no planner, no OAuth and no network access: the client's own model does the planning through nine tools (the six client-driven tools and the three connector tools; `ultrathink_uplift` is not offered), and the six prompts and the graph card resource are served as on the hosted server. It needs Bun 1.2 or later (see [Finding Bun](../configuration.md#finding-bun)).
+
+| Setting | Meaning |
+|---|---|
+| `ULTRATHINK_STATE_DIR` | Where sessions are kept. Default: the `connector` directory under the host state directory, which is `~/.claude/ultrathink/connector` unless `CLAUDE_CONFIG_DIR` or another host's variables say otherwise. A path inside a `.planning` tree is ignored. |
+| `ULTRATHINK_LOG_LEVEL` | `info`, `warn` or `error`. Default `warn`. Logs go to stderr, never stdout, and never contain request text. |
+
+Claude Desktop reads local servers from `claude_desktop_config.json`. Open it from the Claude menu: **Settings**, then **Developer**, then **Edit Config**. The Model Context Protocol documentation gives the location as `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS and `%APPDATA%\Claude\claude_desktop_config.json` on Windows (`https://modelcontextprotocol.io/docs/develop/connect-local-servers`); it names no Linux path, so use **Edit Config** there. Paths in the file must be absolute. Replace the placeholders:
+
+```json
+{
+  "mcpServers": {
+    "ultrathink": {
+      "command": "<path-to-clone>/bin/ultrathink-connector",
+      "args": [],
+      "env": { "ULTRATHINK_STATE_DIR": "<path-to-state-directory>" }
+    }
+  }
+}
+```
+
+On Windows there is no shell wrapper. Run Bun on the entry file directly:
+
+```json
+{
+  "mcpServers": {
+    "ultrathink": {
+      "command": "bun",
+      "args": ["<path>\\services\\ultrathink\\stdio\\main.ts"],
+      "env": { "ULTRATHINK_STATE_DIR": "<path-to-state-directory>" }
+    }
+  }
+}
+```
+
+That is `bun <path>\services\ultrathink\stdio\main.ts`. If Claude Desktop cannot find `bun`, give the full path to `bun.exe` as the command. Claude Code can start the same process with `claude mcp add --transport stdio ultrathink -- <path-to-clone>/bin/ultrathink-connector`. Claude Desktop writes the server's stderr to `mcp-server-ultrathink.log` in its log directory, `~/Library/Logs/Claude` on macOS and `%APPDATA%\Claude\logs` on Windows. Checking the server by hand is in the [runbook](../ops/runbook-ultrathink.md#13-connector-surface-and-diagnostics). That a local-server entry shows the six prompts and the card in Claude Desktop is not verified.
 
 ## Use it
 
@@ -87,6 +174,8 @@ What happens next:
 3. When the status is `planned`, the result text is the plan. The model asks you the questions in it that matter, or states the defaults it assumes, and then carries out the plan.
 
 If the request is empty (`/ultrathink` alone), the model should ask for a request and call no tool.
+
+With server-side planning the plan text starts with the Graph of Thought x Chain of Thought block: a wave tree in a code block, then a Mermaid diagram. The model is told to show the tree to you first, unchanged. In a client that draws MCP Apps, the card is bound to the `ultrathink_uplift` call: it shows progress, polls `ultrathink_result` itself and then draws the graph, so the model does not need `ultrathink_graph` for the same session unless you ask for it.
 
 The request is limited by `ULTRATHINK_MAX_INPUT_CHARS` (default 8000 characters).
 
@@ -126,41 +215,51 @@ A plan that would pass a ceiling stops with `budget_exceeded`. Abandoned reserva
 
 The server runs at most `ULTRATHINK_MAX_CONCURRENT_PLANS` plans at once (default 2). It cancels a model call after `ULTRATHINK_MODEL_TIMEOUT_MS` (default 240000) and a whole plan after `ULTRATHINK_PLAN_TIMEOUT_MS` (default 600000).
 
-## Make it reliable
+## Commands and the typed /ultrathink
 
-A typed `/ultrathink` is only text. No client turns it into a command by itself. It works when the model sees the tool descriptions, the server instructions or a prompt that tell it what to do with that text. These routes add up:
+A typed `/ultrathink` is only text. A custom MCP server cannot register a slash command, and no client turns the text into a command by itself. The connector reaches the model on four layers, and each client uses a different subset:
 
-1. **Tool descriptions and server instructions.** `ultrathink_uplift` is described as the entry point for `/ultrathink`, and the server's `instructions` say the same. A client that shows the model this text needs nothing else. This works in all three clients, as far as the tool list reaches the model.
-2. **MCP prompt.** The server lists one prompt, `ultrathink`, with a required `request` argument. It returns the full tool sequence plus your request as one user message. Claude Code shows it as `/mcp__ultrathink__ultrathink`. Claude should list it under the plus menu, which is not verified (see below). Grok documents no prompt surface, so do not count on it there.
-3. **Custom instructions.** If the model ignores a typed `/ultrathink`, add the text below.
+1. **Tool descriptions.** `ultrathink_uplift` (or `ultrathink_plan`) is described as the entry point for `/ultrathink`, and the three connector tools state the trigger for `/ultrathink-think`, `/ultrathink-last`, `/ultrathink-status` and every other `/ultrathink-<name>`: everything after the command is the request, verbatim. This works in any client that shows the model the tool list, so it is the layer to rely on in Claude chat and Grok Chat.
+2. **Server `instructions`.** The same routing, delivered to Claude Code. Hosted Claude does not deliver it (issue 93); whether Grok Chat does is not verified.
+3. **MCP prompts.** Six prompts, one per supported command (see the [command table](../commands.md#connector)). A prompt returns text for the client to send and runs no tool. Claude Code lists them as `/mcp__ultrathink__<name>`; Claude chat lists them only as "+" menu attachments.
+4. **A plugin or custom instructions.** The Claude plugin bundle adds the commands to Claude chat's "/" menu. For Grok Chat, and for Claude without the plugin, paste the text below.
+
+Of the 22 commands the plugin knows, six work on the connector: `/ultrathink`, `/ultrathink-plan`, `/ultrathink-think`, `/ultrathink-last`, `/ultrathink-status` and `/ultrathink-quick`. The other 16 need a plugin host (git, a shell, trackers, local Teachable Moments state) or have no meaning in chat. Typing one makes the model call `ultrathink_command`, which answers with the reason and what to do instead.
 
 For Grok, paste this into Grok's custom instructions (Settings, Customize; the label varies by app version):
 
 ```text
-When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command, verbatim. Call ultrathink_uplift with it as prompt. If the status is running, call ultrathink_result with the sessionId, and call it again until the status is planned. Do not invent a sessionId or a status. When the plan is ready, ask the user the questions in it that matter, state the defaults you assume for the rest, and carry out the plan. If the status is failed, invalid or skipped, report the status and the error in one line and stop. If nothing follows /ultrathink, ask for a request and call no tool.
+When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command, verbatim. Call ultrathink_uplift with it as prompt. If the status is running, call ultrathink_result with the sessionId, and call it again until the status is planned. Do not invent a sessionId or a status. When the plan is ready, show the user its wave tree first, unchanged, in a code block, ask the questions in the plan that matter, state the defaults you assume for the rest, and carry out the plan. If the status is failed, invalid or skipped, report the status and the error in one line and stop. If nothing follows /ultrathink, ask for a request and call no tool.
+A message that starts with /ultrathink- and a command name is another command, not a request to plan. /ultrathink-think [sessionId] [node] calls ultrathink_graph. /ultrathink-last calls ultrathink_sessions with limit 5, then ultrathink_graph and ultrathink_result with the sessionId of the newest session whose status is planned. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> calls ultrathink_command with command set to the name and args set to the rest, verbatim; relay its message and make the tool call it names in next.
 ```
 
-For Claude, paste the same text into the instructions of a Claude Project that has the ultrathink connector switched on. For Claude Code, add it to `CLAUDE.md`, or use the prompt route above.
+For Claude, paste the same text into the instructions of a Claude Project that has the ultrathink connector switched on. For Claude Code, add it to `CLAUDE.md`, or use the prompt route.
 
-If server-side planning is off (no `ultrathink_uplift` in the tool list), the text above does not apply. Use the client-driven text in [Connect Grok Bot to ultrathink](../ops/grok-bot-setup-ultrathink.md) section 9.
+If server-side planning is off (no `ultrathink_uplift` in the tool list), the first paragraph does not apply. Use the client-driven text in [Connect Grok Bot to ultrathink](../ops/grok-bot-setup-ultrathink.md) section 9 in its place and keep the second paragraph.
 
 ### What is not verified
 
-- Whether Grok Chat or Claude list the server's MCP prompt in a menu. Claude Code's `/mcp__<server>__<prompt>` form is Claude Code's documented behavior. For the hosted apps, the plus-menu entry is the expected behavior, and it has not been checked against this server.
-- That the model follows a typed `/ultrathink`. This is a convention that the descriptions, the prompt and your custom instructions encourage. A model can still answer the request directly without calling a tool. Say "use ultrathink" or run the prompt when that happens.
+- Anything about a live connection. The connector has not been connected to Claude chat, Claude Code or Grok Chat, so no step above was seen working in those products.
+- Whether Claude's "/" menu lists the plugin's commands for this connector, whether `$ARGUMENTS` is filled in when chat loads a command as a skill, and whether the Connectors tab accepts the owner-password sign-in. These follow Anthropic's plugin documentation.
+- Whether Grok Chat or Claude hand the model `structuredContent`, `_meta`, or the server's instructions. Only Claude Code's behavior is documented.
+- Whether the MCP App card renders inside Claude or Grok. The card was run in a real headless Chrome through a host harness that implements the MCP Apps specification (handshake, themes, 360 to 1000 px widths, keyboard navigation, a content security policy with `connect-src 'none'`), not inside either product. Real hosts may differ.
+- Whether Claude chat or Grok Chat renders a fenced Mermaid block. The Mermaid source was parsed and rendered with Mermaid 11 in strict mode for twelve graphs, including hostile ones, but that says nothing about those two products.
+- Which protocol revision Claude chat and Grok Chat open with, and how they react to the 400 on a 2026-07-28 probe. The fallback was confirmed only for the official SDK clients.
+- Grok Chat's redirect addresses on iOS, Android and Tesla, its tool-result size limit, per-call timeout and tool description length limit, and whether it uses client ID metadata documents.
+- That the model follows a typed `/ultrathink`. This is a convention that the descriptions, the prompts and your custom instructions encourage. A model can still answer the request directly without calling a tool. Say "use ultrathink" or run the prompt when that happens.
 - Which model a hosted client uses. The server cannot see it, and server-side mode does not depend on it: the planning model is the server's OpenRouter model.
 
-To check a client, send `/ultrathink plan a short test feature` and look for an `ultrathink_uplift` call in the chat, then `ultrathink_result` calls, then a plan with questions.
+To check a client, send `/ultrathink plan a short test feature` and look for an `ultrathink_uplift` call in the chat, then `ultrathink_result` calls, then a plan that starts with a wave tree and ends with questions. Then send `/ultrathink-status` and look for an `ultrathink_sessions` call.
 
 ## Security
 
 - **Owner password.** Only the owner can approve a client. The owner password is an argon2id hash in `ULTRATHINK_OWNER_PASSWORD_HASH`. The consent login allows 5 attempts per IP per 15 minutes. Anyone who knows the password can connect a client, so do not reuse it.
 - **Tokens.** Authorization codes are single-use and live 60 seconds. Access tokens last 1 hour and refresh tokens 30 days. Refresh tokens rotate on each use, and a spent one revokes its grant. Tokens are bound to the `/mcp` resource.
 - **Revoking.** A client can revoke its own token at `POST /oauth/revoke` (RFC 7009). To revoke every client and token, stop the service, delete `/var/lib/ultrathink/oauth.json`, and start it again (`systemctl stop ultrathink-web`, `rm /var/lib/ultrathink/oauth.json`, `systemctl start ultrathink-web`). Every client then registers and asks you to approve again. Plans are not lost. To lock out the owner login, rotate the hash (runbook section 6).
-- **Connector key.** The legacy `x-connector-key` header (`ULTRATHINK_CONNECTOR_KEY`) is for Grok Bot, which cannot do OAuth. It works on `/mcp` next to OAuth. Do not paste it into Grok Chat or Claude. Rotate it in [the Grok Bot guide](../ops/grok-bot-setup-ultrathink.md) section 5.
+- **Connector key.** The legacy `x-connector-key` header (`ULTRATHINK_CONNECTOR_KEY`) is for Grok Bot, which cannot do OAuth, and for Claude Code (`--header`). It works on `/mcp` next to OAuth. Do not paste it into Grok Chat or Claude chat: neither client's connector UI can send it. Rotate it in [the Grok Bot guide](../ops/grok-bot-setup-ultrathink.md) section 5.
 - **Browser origins.** `/mcp` refuses a request whose `Origin` header is not the server's own origin, `https://claude.ai`, `https://claude.com`, `https://grok.com`, `https://console.x.ai` or an origin in `ULTRATHINK_ALLOWED_ORIGINS`. A request with no `Origin` header (native and server-side clients) is allowed.
 - **Where your text goes.** In server-side mode the request and the model's intermediate text go to OpenRouter and the model provider you chose, under their privacy terms. The server stores the request, the prompts and the plan under `/var/lib/ultrathink` (`journal/`, `sessions/`, `jobs/`) for 30 days by default. Do not send secrets in a request.
-- **Logs.** The server logs one JSON line per request: request id, HTTP method and path, status, duration, JSON-RPC method, tool name, auth kind and client address. It does not log prompt text, plans, the owner password, tokens, the connector key, the OpenRouter key or authorization headers; fields with such names are dropped by the logger.
+- **Logs.** The server logs one JSON line per request: request id, HTTP method and path, status, duration, JSON-RPC method, tool name, the `MCP-Protocol-Version` header as sent, auth kind and client address. It does not log prompt text, plans, the owner password, tokens, the connector key, the OpenRouter key or authorization headers; fields with such names are dropped by the logger.
 - **OpenRouter key.** The key stays on the server (`OPENROUTER_API_KEY` in `/etc/ultrathink/ultrathink.env`). Use a key with a spending limit.
 
 ## Configuration
@@ -214,5 +313,9 @@ Origin lists take bare origins only (`https://host[:port]`, no path, query or fr
 | Status `invalid` | The model produced an incomplete plan. | Run it again, or rephrase the request. |
 | Result says `truncated` | The plan was larger than the size limit, so later Graph of Thought sections were left out. | Ask the user for what is missing, or split the request into smaller ones. |
 | The model does not call any tool | The client did not act on the typed `/ultrathink`. | Use the MCP prompt, add the custom instructions above, or say "use the ultrathink connector". |
+| A tool you expect is missing in Grok Chat | Grok fetches the tool list once and caches it; only re-authenticating the connector refreshes it (xai-org/plugin-marketplace issue 1402). | Disconnect and reconnect the connector, then check the tool list again. |
+| The typed `/ultrathink-think` or `/ultrathink-last` starts a plan | The model read the command as `/ultrathink`. | Use the custom instructions text above, or the plugin command, or the prompt. Tell it the message is `/ultrathink-think`, not a request to plan. |
+| Registration returns 429 `temporarily_unavailable` | More than 10 registrations per hour from one client address; Claude registers a client on every fresh connection. | Wait for `Retry-After` and connect again. Do not remove and re-add the connector in a loop. |
+| The card is empty or missing in a client that should draw it | The host did not mount the `ui://ultrathink/graph` resource. Reports say custom connectors are inconsistent. | Read the wave tree in the result text; it carries the same plan. |
 
 For server-side checks (logs, `/readyz`, metrics), see the runbook section 7.

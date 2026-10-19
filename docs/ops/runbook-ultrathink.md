@@ -224,6 +224,8 @@ curl -s http://127.0.0.1:8795/metrics | head -50
 
 Logs are one JSON object per line with `ts`, `level`, `event` and, for requests, a request id (also returned to the client as `X-Request-Id`), HTTP method and path, status, duration, JSON-RPC method, tool name, auth kind and client address. Error logs carry the `correlationId` that appears in a 500 response body. To follow one request: take the `X-Request-Id` (or `correlationId`) from the client, then `journalctl -u ultrathink-web -o cat | grep <id>`. Secrets, tokens, cookies and authorization headers are dropped from log fields by design. The exact event names are defined in `services/ultrathink/routes/router.ts`; list them with `journalctl -u ultrathink-web -o cat | grep -o '"event":"[^"]*"' | sort | uniq -c | sort -rn`.
 
+Request lines for `/mcp` also carry `mcpVersion` (the `MCP-Protocol-Version` header exactly as the client sent it, cut to a short length; absent when the client sent none) and `rpcMethod` (the JSON-RPC method of the body, or `batch`), and `tool` on `tools/call`. A request refused for an unknown protocol version still logs its `rpcMethod`. Section 13 shows how to read them.
+
 Common symptoms:
 
 | Symptom | Usual cause | Check and action |
@@ -237,6 +239,7 @@ Common symptoms:
 | `budget_exceeded` | The per-run or daily token ceiling was reached (`ULTRATHINK_RUN_TOKEN_CEILING`, `ULTRATHINK_DAILY_TOKEN_CEILING`). The day is a UTC calendar day. | Wait for the next UTC day, or raise the ceiling and restart. The ledger keeps abandoned reservations counted against the ceiling. |
 | `ultrathink-maintenance.service` fails with `status=226/NAMESPACE` ("Failed to set up mount namespacing: /var/backups/ultrathink: No such file or directory") | The backup directory does not exist. systemd builds the `ReadWritePaths=` mount namespace before any `ExecStartPre=` runs, so the unit cannot create it itself. | `install -m 0644 deploy/ultrathink-tmpfiles.conf /etc/tmpfiles.d/ultrathink.conf && systemd-tmpfiles --create /etc/tmpfiles.d/ultrathink.conf`, then start the unit again. |
 | Service flapping | Bad env file, port in use, failed sandbox call. | `systemctl status` shows the start limit (5 starts in 60 seconds). A `SIGSYS` kill means the syscall filter blocked a call: `journalctl -k \| grep -i seccomp`. Roll back the release (section 4). |
+| A client connects, then lists no tools or never calls any | The probe was refused and the client did not fall back, the tool list is stale (Grok caches it), or the rate limit fired. | Read the first connection in the request log (section 13). Grok only refreshes its tool list on re-authentication. |
 
 ## 8. Suggested alerts
 
@@ -353,3 +356,110 @@ Switching models safely:
 3. Run one plan from a chat client with a short prompt.
 4. Check the cost and size of that plan: `curl -s http://127.0.0.1:8795/metrics | grep ultrathink_plan_` (`ultrathink_plan_cost_usd_total`, `ultrathink_plan_tokens_total`; the counters start from zero at the restart, so the values are that plan), and inspect the job file under `/var/lib/ultrathink/jobs/` (as root; it holds the request and the plan) for the status, usage and any error.
 5. If the plan failed, was slow, or cost more than expected, restore the old line and restart again. If it passed, delete the commented old line.
+
+## 13. Connector surface and diagnostics
+
+Status: the connector has never been connected to Claude chat, Claude Code or Grok Chat in a live session. Until it has, the first connection from each client is the evidence, and this section is how to read it. Nothing here claims a client behavior that the logs have not shown.
+
+### Inventory
+
+| Item | Value |
+|---|---|
+| Tools in server mode | 10: `ultrathink_uplift`, `ultrathink_plan`, `ultrathink_pending`, `ultrathink_show`, `ultrathink_answer`, `ultrathink_status`, `ultrathink_result`, `ultrathink_graph`, `ultrathink_sessions`, `ultrathink_command`. Server mode is on when `ultrathink_planner_enabled` is 1. |
+| Tools without server planning, and on stdio | 9: the same without `ultrathink_uplift`. |
+| Connector tools | `ultrathink_graph` (`/ultrathink-think`), `ultrathink_sessions` (`/ultrathink-status`, first step of `/ultrathink-last`) and `ultrathink_command` (every other `/ultrathink-<name>`). They are always listed, so a client that never refreshes `tools/list` cannot miss them. |
+| Prompts | 6: `ultrathink`, `ultrathink-plan`, `ultrathink-think`, `ultrathink-last`, `ultrathink-status`, `ultrathink-quick`. The 16 unsupported commands are not listed; `prompts/get` for one returns an explanation. A prompt returns text and runs no tool. |
+| Resource | 1: `ui://ultrathink/graph` (name `ultrathink-graph`, MIME `text/html;profile=mcp-app`), a self-contained HTML card of at most 512 KiB, served with an empty content security policy (`csp: {}`), no `domain` and `prefersBorder: false`. The app loads nothing external. `resources/templates/list` returns an empty list. |
+| Capabilities in `initialize` | `tools`, `prompts` and `resources`, plus the extension `io.modelcontextprotocol/ui`, announced unconditionally because claude.ai web is reported to render MCP Apps without sending the extension itself. No `listChanged`, no subscriptions, no logging. |
+| Protocol versions | `2025-11-25`, `2025-06-18` and `2025-03-26`. `initialize` answers the requested version when it is listed, otherwise `2025-11-25`. A request with no `MCP-Protocol-Version` header is treated as `2025-03-26`. Any other header value, including `2026-07-28`, gets HTTP 400 with JSON-RPC error `-32600` `unsupported MCP-Protocol-Version`. JSON-RPC batches get 400 from `2025-06-18`. `2026-07-28` is not served and `server/discover` answers `-32601`. |
+| Errors | A `resources/read` for an unknown `ui://` uri returns `-32002`; a malformed uri returns `-32602`. `GET` and `DELETE` on `/mcp` return 405 with `Allow: POST`, before authentication. |
+| Command catalog | Read from `commands/` and `skills/` in the release, with the decision per command in `COMMAND_OVERLAY` (`services/ultrathink/mcp/commands.ts`). A release without those directories serves the static overlay and logs a `command_catalog_fallback` warning at start. |
+| Plugin bundle | `plugins/ultrathink-connector/`, built with `sh plugins/ultrathink-connector/package.sh` into a zip for Claude's plugin upload. Its `.mcp.json` points at the production URL and holds no key. |
+
+Metrics: `ultrathink_mcp_tool_calls_total{tool,outcome}` carries the three new tool names.
+
+### Read a first Claude or Grok connection
+
+List the MCP and OAuth requests of the last hour, oldest first:
+
+```bash
+journalctl -u ultrathink-web --since "1 hour ago" -o cat | grep '"event":"request"' | grep -E '"endpoint":"(mcp|oauth_[a-z_]+)"'
+```
+
+Each line has `ts`, `status`, `endpoint`, `rpcMethod`, `mcpVersion`, `tool`, `authKind` (`none`, `bearer` or `connector-key`) and `ip`. The order to expect for a new connector:
+
+1. `POST /mcp` with `status` 401 and `authKind` `none`: the client learns it must sign in. Then `oauth_protected_resource`, `oauth_authorization_server`, `oauth_register` (201), `oauth_authorize` and `oauth_token` requests: the OAuth flow. A 429 on `oauth_register` is the registration limit (below).
+2. With a token, the first `POST /mcp` shows which revision the client opens with:
+   - **`status` 400 with `mcpVersion` `2026-07-28` and `rpcMethod` `server/discover`, then `status` 200 with `rpcMethod` `initialize` from the same `ip`.** The client probed for the newer revision, read the 400 as "legacy server" and fell back. This is the expected, working case for a client that probes.
+   - **`status` 200 `initialize` with no 400 before it.** A legacy-only client. Also working.
+   - **`status` 400 and then nothing from that `ip`.** The client treated the 400 as fatal. This is a hard failure: serving `2026-07-28` (a dual-era server) becomes urgent. Keep the log lines as the evidence.
+3. After `initialize` expect `notifications/initialized` (202), often a `GET /mcp` that returns 405 (the client's optional event stream; harmless), then `tools/list`, `prompts/list` and perhaps `resources/list` with `mcpVersion` `2025-11-25`. The `initialize` line itself usually has no `mcpVersion`, because the header is sent only after the version is negotiated.
+4. Tool use appears as `rpcMethod` `tools/call` with `tool` set. A client that lists tools and never calls one points at the model or the client, not the server.
+
+A 5xx on the probe would be worse than a 400: official SDK clients treat a 5xx or an unusable 2xx on a probe as a hard error. The router answers an unknown `MCP-Protocol-Version` with 400 whatever the body holds, so a probe does not produce one.
+
+### Smoke checklist with curl
+
+Run it on the VPS against `http://127.0.0.1:8795` (or against the public URL). The key goes into a variable and is never printed:
+
+```bash
+BASE=http://127.0.0.1:8795
+UT_KEY=$(grep -m1 '^ULTRATHINK_CONNECTOR_KEY=' /etc/ultrathink/ultrathink.env | cut -d= -f2-)
+rpc() { curl -s "$BASE/mcp" -H "x-connector-key: $UT_KEY" -H 'content-type: application/json' "$@"; }
+rpc -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+rpc -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+rpc -d '{"jsonrpc":"2.0","id":3,"method":"prompts/list"}'
+rpc -d '{"jsonrpc":"2.0","id":4,"method":"resources/list"}'
+rpc -d '{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"ui://ultrathink/graph"}}'
+rpc -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ultrathink_sessions","arguments":{}}}'
+```
+
+Expected:
+
+1. `initialize`: `result.protocolVersion` `2025-11-25`, capabilities `tools`, `prompts`, `resources` and the `io.modelcontextprotocol/ui` extension, `serverInfo.name` `ultrathink`, and `instructions` text that names `/ultrathink`.
+2. `tools/list`: 10 tools (9 when `ultrathink_planner_enabled` is 0). `ultrathink_graph` and `ultrathink_uplift` carry `_meta.ui.resourceUri` `ui://ultrathink/graph`.
+3. `prompts/list`: the 6 prompt names above.
+4. `resources/list`: one entry, `ui://ultrathink/graph`, MIME `text/html;profile=mcp-app`.
+5. `resources/read`: `result.contents[0].text` is an HTML document with the same MIME type. A different `ui://` uri returns error `-32002`.
+6. `tools/call`: `isError` false and `structuredContent.text` equal to the content text (the copy Claude Code reads).
+
+The refusal cases, each with its expected status:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'            # 401, WWW-Authenticate: Bearer resource_metadata=...
+curl -s -i -X GET "$BASE/mcp"                                                                                                                             # 405, Allow: POST
+rpc -H 'MCP-Protocol-Version: 2026-07-28' -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' -w '\n%{http_code}\n'                                  # 400, -32600 unsupported MCP-Protocol-Version
+rpc -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}'                                                                                              # 200 with -32601 method not found
+rpc -H 'MCP-Protocol-Version: 2025-11-25' -d '[{"jsonrpc":"2.0","id":1,"method":"ping"}]' -w '\n%{http_code}\n'                                           # 400, batches are refused from 2025-06-18
+```
+
+Finish with `unset UT_KEY`. After a release that changes tools, also check the tool names in `ultrathink_mcp_tool_calls_total` once a client has used them.
+
+### Smoke check of the stdio server
+
+The stdio server needs no running service. From a checkout, send JSON-RPC lines into `bin/ultrathink-connector` with a throwaway state directory:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | ULTRATHINK_STATE_DIR="$(mktemp -d)" bin/ultrathink-connector
+```
+
+Expect two JSON lines on stdout and nothing else: an `initialize` result, then a `tools/list` result with 9 tools and no `ultrathink_uplift`. Diagnostics go to stderr (level `warn` by default, `ULTRATHINK_LOG_LEVEL=info` for more) and never include request text. A line that is not JSON gets `-32700`; a line over 1 MiB gets `-32600`. The process exits when stdin ends. Without Bun it exits 127 with an install hint; on Windows use `bun <path>\services\ultrathink\stdio\main.ts`. The same assertions run against the tool host, the HTTP app and a spawned stdio process in `services/ultrathink/mcp/conformance.test.ts`.
+
+### Rate limits that matter for connectors
+
+| Limit | Value | What it looks like |
+|---|---|---|
+| Client registration (`POST /oauth/register`) | 10 per hour per client address, in memory (a restart clears it). | 429 `temporarily_unavailable` with `Retry-After`. Claude registers a new client on every fresh connection, and Anthropic's connector traffic comes from a fixed address range (160.79.104.0/21 in Anthropic's documentation), so a burst of fresh connections can exhaust the limit for every Claude user. Grok registers through dynamic client registration too. |
+| `/mcp` in the app | 120 per minute per client address, and 60 per minute for all connector traffic together (one shared bucket for key and OAuth clients). | 429 `rate_limited` with `Retry-After`, logged as `rate_limited` with `scope` `mcp`. Do not poll `ultrathink_result` with `waitSeconds: 0` in a loop. |
+| `/mcp` in nginx | 120 per minute per client address, burst 60. | nginx's default 429 page. |
+| OAuth in nginx and the app | nginx 30 per minute (burst 20); the app limits authorize to 30 per minute and token and revoke to 60 per minute. | 429 on the OAuth endpoints. |
+| Login | nginx 5 per minute; the app allows 5 attempts per address per 15 minutes. | 429 or a login refusal. |
+
+When registrations are limited, wait for `Retry-After`. Restarting `ultrathink-web` also clears the in-memory limiter, at the cost of a restart. Raising the limit needs a code change (`REGISTER_LIMIT` in `services/ultrathink/oauth/oauth.ts`).
+
+### After changing tools
+
+Grok fetches a connector's tool list once and refreshes it only when the connector is re-authenticated (`https://github.com/xai-org/plugin-marketplace/issues/1402`); tell Grok users to reconnect after any release that changes a tool name, description or schema. Whether claude.ai re-fetches `tools/list` on its own is not verified: have Claude users remove and re-add the connector.
