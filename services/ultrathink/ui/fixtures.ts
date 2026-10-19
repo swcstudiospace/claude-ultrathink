@@ -305,6 +305,17 @@ function build(): Record<string, Fixture> {
 			},
 			polls: [],
 		},
+		{
+			name: "plannedstart",
+			description: "Start view that already says planned, with no graph: the card fetches the plan itself with one ultrathink_result call",
+			conforming: true,
+			args: { prompt: "Migrate billing" },
+			initial: {
+				content: [{ type: "text", text: "Planning is finished. Call ultrathink_result with this sessionId to collect the plan." }],
+				structuredContent: { sessionId: SESSION, status: "planned" },
+			},
+			polls: [planned(EIGHT)],
+		},
 	];
 	return Object.fromEntries(list.map((f) => [f.name, f]));
 }

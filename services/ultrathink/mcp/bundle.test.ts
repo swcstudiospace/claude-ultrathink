@@ -76,7 +76,8 @@ describe("plugin bundle commands", () => {
 	test("a command only names tools of its own catalog entry", () => {
 		const known = [...Object.values(COMMAND_OVERLAY).flatMap((entry) => entry.tools), ...CLIENT_DRIVEN_TOOLS];
 		for (const [name, entry] of supported) {
-			const allowed = entry.tools.includes("ultrathink_plan") ? [...entry.tools, ...CLIENT_DRIVEN_TOOLS] : entry.tools;
+			// The client-driven plan flow also draws the card with ultrathink_graph (CLIENT_GRAPH_RULE); the overlay lists the entry tools only.
+			const allowed = entry.tools.includes("ultrathink_plan") ? [...entry.tools, ...CLIENT_DRIVEN_TOOLS, "ultrathink_graph"] : entry.tools;
 			for (const tool of read(`commands/${name}.md`).match(/ultrathink_[a-z]+/g) ?? []) {
 				expect(known, `${name} mentions the unknown tool ${tool}`).toContain(tool);
 				expect(allowed, `${name} mentions ${tool}, which its catalog entry does not list`).toContain(tool);
@@ -87,6 +88,7 @@ describe("plugin bundle commands", () => {
 	test("every statement of how /ultrathink-last reads the sessions agrees on limit 5", () => {
 		expect(read("commands/ultrathink-last.md")).toContain("`ultrathink_sessions` with `limit` 5");
 		expect(read("commands/ultrathink-last.md")).toContain("newest session whose status is planned");
+		expect(read("skills/ultrathink-connector/SKILL.md")).toContain("`ultrathink_sessions` with `limit` 5");
 		const rendered = renderPrompt("ultrathink-last", {});
 		if (!rendered.ok) throw new Error("expected the ultrathink-last prompt");
 		const promptText = rendered.messages.map((message) => message.content.text).join("\n");

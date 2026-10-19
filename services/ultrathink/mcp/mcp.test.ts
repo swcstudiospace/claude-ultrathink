@@ -507,9 +507,9 @@ describe("tools/list", () => {
 		expect((await toolDef("ultrathink_graph", fakeHost()))._meta?.ui).toEqual({ resourceUri: UI_URI });
 	});
 
-	test("ultrathink_result and ultrathink_graph allow results up to 200000 characters; no other tool has either meta", async () => {
+	test("ultrathink_result, ultrathink_graph and ultrathink_command allow results up to 200000 characters; no other tool has either meta", async () => {
 		for (const tool of await listTools(serverHost())) {
-			const hasLimit = tool.name === "ultrathink_result" || tool.name === "ultrathink_graph";
+			const hasLimit = ["ultrathink_result", "ultrathink_graph", "ultrathink_command"].includes(tool.name);
 			expect(tool._meta?.["anthropic/maxResultSizeChars"]).toBe(hasLimit ? 200000 : undefined);
 			const hasUi = tool.name === "ultrathink_uplift" || tool.name === "ultrathink_graph";
 			expect(tool._meta?.ui !== undefined).toBe(hasUi);
@@ -731,6 +731,21 @@ describe("tool results", () => {
 		const result = await invoke(host, "ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "x" });
 		expect(result.isError).toBe(true);
 		expect(result.structuredContent).toEqual({ error: "invalid_answer", errors });
+	});
+
+	test("a refusal with errors lists them in the content text after the code", async () => {
+		const errors = ["answer is not valid JSON", "missing field: angle"];
+		const host = fakeHost({ ok: false, code: "invalid_answer", errors });
+		const result = await invoke(host, "ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "x" });
+		expect(result.content).toEqual([
+			{ type: "text", text: "request refused: invalid_answer (answer is not valid JSON; missing field: angle)" },
+		]);
+	});
+
+	test("a refusal with an empty errors array keeps the bare code in the content text", async () => {
+		const host = fakeHost({ ok: false, code: "invalid_answer", errors: [] });
+		const result = await invoke(host, "ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "x" });
+		expect(result.content).toEqual([{ type: "text", text: "request refused: invalid_answer" }]);
 	});
 
 	test("a refusal without errors has no errors key", async () => {

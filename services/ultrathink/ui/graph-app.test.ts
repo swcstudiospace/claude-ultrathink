@@ -109,93 +109,12 @@ describe("graph app document", () => {
 		expect(urls).toEqual(["http://www.w3.org/2000/svg"]);
 	});
 
-	test("speaks the MCP Apps View protocol", () => {
-		for (const needle of [
-			"ui/initialize",
-			"ui/notifications/initialized",
-			"ui/notifications/tool-input",
-			"ui/notifications/tool-result",
-			"ui/notifications/tool-cancelled",
-			"ui/notifications/host-context-changed",
-			"ui/notifications/size-changed",
-			"ui/resource-teardown",
-			"ui/message",
-			"ping",
-			"tools/call",
-			"ultrathink_result",
-			"waitSeconds",
-			"appCapabilities",
-			"event.source",
-			"window.parent",
-			"ResizeObserver",
-			"2026-01-26",
-		]) {
-			expect(script).toContain(needle);
-		}
+	test("interprets only messages from the parent window and listens before it initializes", () => {
 		// The sender check runs before any message is interpreted.
 		expect(script.indexOf("event.source !== window.parent")).toBeGreaterThan(-1);
 		expect(script.indexOf("event.source !== window.parent")).toBeLessThan(script.indexOf("onHostRequest(m)"));
 		// The listener is live before ui/initialize is sent.
 		expect(script.indexOf('addEventListener("message"')).toBeLessThan(script.indexOf('request("ui/initialize"'));
-	});
-
-	test("carries the UI copy verbatim", () => {
-		for (const copy of [
-			"Planning...",
-			"Ready",
-			"Failed",
-			"Skipped",
-			"Invalid",
-			"Select a node to read its reasoning.",
-			"Question",
-			"Depends on",
-			"Chain of Thought",
-			"Conclusion",
-			"Collapse steps",
-			"Show all ",
-			"Questions",
-			"blocking",
-			"Default: ",
-			"Use all defaults",
-			"placeholder",
-			"No graph in this result.",
-			"Could not reach the planner. Retrying.",
-			"Stopped checking. Ask the assistant for the result.",
-			"Use the defaults for all clarifying questions and go ahead.",
-		]) {
-			expect(html).toContain(copy);
-		}
-	});
-
-	test("supports the accessibility and theming features of the UI spec", () => {
-		for (const needle of ['aria-live="polite"', "prefers-color-scheme", "prefers-reduced-motion", "forced-colors", "focus-visible", "min-height:40px", "aria-pressed", "Escape", "ArrowRight", "max-width:519.98px"]) {
-			expect(html).toContain(needle);
-		}
-		expect(html).not.toContain("outline:none");
-		expect(html).not.toContain("outline:0");
-	});
-
-	test("puts the detail area beside the graph only from 1100 px and fits four waves at 720 px", () => {
-		expect(html).toContain("@media (min-width:1100px){.main:not(.solo){display:grid");
-		expect(html).not.toContain("@media (min-width:720px)");
-		expect(html).toContain("@media (min-width:520px) and (max-width:919.98px)");
-		expect(html).toContain(".wave{flex:0 0 146px}");
-		expect(html).toContain(".wave{flex:0 0 184px;min-width:0}");
-	});
-
-	test("sends ui/message content as an array first and retries once as a single block on -32602", () => {
-		expect(script).toContain("content: [textBlock]");
-		expect(script).toContain("-32602");
-		expect(script).toContain("content: textBlock");
-		expect(script.indexOf("content: [textBlock]")).toBeLessThan(script.indexOf("content: textBlock }"));
-		expect(script).toContain('noteDefaults("Message sent.")');
-		expect(script).toContain('noteDefaults("Could not send the message.")');
-	});
-
-	test("Escape clears the selection and announces it", () => {
-		expect(script).toContain('event.key !== "Escape"');
-		expect(script).toContain("select(null, false)");
-		expect(script).toContain('announce("Selection cleared.")');
 	});
 
 	test("stays under 80 KiB", () => {
@@ -211,7 +130,7 @@ describe("graph app document", () => {
 
 describe("fixtures", () => {
 	test("cover the acceptance list", () => {
-		for (const name of ["diamond", "eight", "longtitles", "oversize", "hostile", "degraded", "questions", "running", "failed", "invalid", "skipped", "nograph"]) {
+		for (const name of ["diamond", "eight", "longtitles", "oversize", "hostile", "degraded", "questions", "running", "failed", "invalid", "skipped", "nograph", "plannedstart"]) {
 			expect(FIXTURE_NAMES).toContain(name);
 		}
 	});

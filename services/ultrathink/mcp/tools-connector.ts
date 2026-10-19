@@ -113,6 +113,7 @@ export const CONNECTOR_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			additionalProperties: false,
 		},
 		annotations: READ_ONLY,
+		_meta: LARGE_RESULT_META,
 	},
 ];
 
@@ -391,24 +392,31 @@ export function createConnectorHandlers(deps: ConnectorDeps): ConnectorHandlers 
 				}
 				const tool = serverPlanning ? "ultrathink_uplift" : "ultrathink_plan";
 				const text = serverPlanning
-					? `Plan commands run through their own tools. Call ultrathink_uplift with prompt set to the request, verbatim; while its status is running call ultrathink_result with the sessionId until the status is planned, then ask the user the questions in the plan that matter and carry out the plan.`
+					? `Plan commands run through their own tools. Call ultrathink_uplift with prompt set to the request, verbatim; then call ultrathink_result with the sessionId until the status is planned, also when ultrathink_uplift already reports planned, then ask the user the questions in the plan that matter and carry out the plan.`
 					: `Plan commands run through their own tools. Call ultrathink_plan with prompt set to the request, verbatim, answer each pending prompt with ultrathink_show and ultrathink_answer, call ultrathink_plan again with the same sessionId and prompt until the status is planned, then call ultrathink_result with the sessionId.`;
 				return textOutcome({ command: name, support, message: text, next: { tool, arguments: { prompt: request } } }, text);
 			}
 			case "ultrathink-think": {
 				const parsed = thinkArguments(request);
 				const inner = await graph(parsed);
-				const shown = inner.ok && typeof inner.data.sessionId === "string";
-				return wrapped(name, support, inner, shown ? "Graph of Thought of the plan. Show its wave tree to the user first, unchanged, in a code block." : NO_PLANNED_SESSION);
+				const drawn = inner.ok && isRecord(inner.data.graph);
+				const hasSession = inner.ok && typeof inner.data.sessionId === "string";
+				const message = drawn
+					? "Graph of Thought of the plan. Show its wave tree to the user first, unchanged, in a code block."
+					: hasSession
+						? "This session has no graph to draw. Relay the text to the user."
+						: NO_PLANNED_SESSION;
+				return wrapped(name, support, inner, message);
 			}
 			case "ultrathink-last": {
 				const inner = await graph({});
 				if (!inner.ok) return inner;
 				const sessionId = inner.data.sessionId;
 				const extra = typeof sessionId === "string" ? { next: { tool: "ultrathink_result", arguments: { sessionId } } } : {};
-				const summary =
-					typeof sessionId === "string"
-						? "The newest planned session. Show its wave tree to the user first, unchanged, in a code block, then call ultrathink_result with the sessionId in next for the plan itself."
+				const summary = isRecord(inner.data.graph)
+					? "The newest planned session. Show its wave tree to the user first, unchanged, in a code block, then call ultrathink_result with the sessionId in next for the plan itself."
+					: typeof sessionId === "string"
+						? "The newest planned session has no graph to draw. Call ultrathink_result with the sessionId in next for the plan itself."
 						: NO_PLANNED_SESSION;
 				return wrapped(name, support, inner, summary, extra);
 			}
@@ -436,4 +444,8 @@ function wrapped(
 	if (!inner.ok) return inner;
 	const { text, ...result } = inner.data;
 	return textOutcome({ command, support, message, result, ...extra }, typeof text === "string" ? text : message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

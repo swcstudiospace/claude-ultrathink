@@ -176,7 +176,7 @@ const SCRIPT = String.raw`
 	var S = {
 		status: "idle", sessionId: "", pollAfter: 0, text: "", error: "", graph: null, questions: [],
 		selected: null, collapsed: false, startedAt: 0, note: "", gaveUp: false, failures: 0, torn: false,
-		canTools: true, canMessage: false, sending: false, sent: false,
+		canTools: true, canMessage: false, sending: false, sent: false, finalFor: "",
 		cards: new Map(), flat: [], waveCards: [], inner: null, svg: null, edges: [], animate: false,
 		elapsedEl: null, defaultsBtn: null, qNote: null
 	};
@@ -519,6 +519,28 @@ const SCRIPT = String.raw`
 			else if (S.status === "running") announce("Planning started.");
 			else announce((LABELS[S.status] || "Done") + ".");
 		}
+		fetchFinal();
+	}
+	// ultrathink_uplift can answer planned with no graph and no plan text (a quick or repeated plan); only ultrathink_result has the plan, so ask for it once per session.
+	function fetchFinal() {
+		if (S.status !== "planned" || S.graph || !S.sessionId || !S.canTools || S.torn || S.finalFor === S.sessionId) return;
+		var sid = S.sessionId;
+		S.finalFor = sid;
+		S.note = "Fetching the plan.";
+		renderHead();
+		scheduleSize();
+		function failed() {
+			if (S.torn || S.sessionId !== sid) return;
+			S.note = "Could not fetch the plan. Ask the assistant for the result.";
+			renderHead();
+			scheduleSize();
+		}
+		request("tools/call", { name: RESULT_TOOL, arguments: { sessionId: sid, waitSeconds: 0 } }, 30000).then(function (res) {
+			if (S.torn || S.sessionId !== sid || S.status !== "planned" || S.graph) return;
+			if (!res || typeof res !== "object" || res.isError === true) { failed(); return; }
+			S.note = "";
+			try { ingest(res, true); } catch (e) { fatal("Could not display this result."); }
+		}, failed);
 	}
 	function fatal(message) {
 		stopPolling();

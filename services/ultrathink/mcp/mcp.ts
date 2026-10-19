@@ -58,7 +58,7 @@ const UI_EXTENSION = "io.modelcontextprotocol/ui";
 const CLIENT_PLANNING =
 	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned. Then call ultrathink_result with the sessionId, ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
 const SERVER_PLANNING =
-	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. While its status is running, call ultrathink_result with the sessionId until the status is planned. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. Then call ultrathink_result with the sessionId until its status is planned, also when ultrathink_uplift already reports planned, because only ultrathink_result returns the plan. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
 const COMMAND_ROUTING =
 	"A message that starts with /ultrathink- and a command name is that command, not a request to plan. /ultrathink-think [sessionId] calls ultrathink_graph with the sessionId when one follows (the newest planned session otherwise). /ultrathink-last calls ultrathink_sessions with limit 5, then ultrathink_graph and ultrathink_result with the sessionId of the newest session whose status is planned. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> (for example /ultrathink-plan or /ultrathink-ship) calls ultrathink_command with command set to the name and args set to the rest of the message, verbatim; relay its message to the user and make the tool call it names in next. When a plan is ready, show its wave tree to the user first, unchanged, in a code block, and its mermaid diagram too only if your interface renders Mermaid.";
 const CLIENT_GRAPH_RULE =
@@ -85,7 +85,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		name: UPLIFT_TOOL,
 		title: "Plan a request on the server",
 		description:
-			"The entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. When the status is running, call ultrathink_result with the sessionId.",
+			"The entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. Then call ultrathink_result with the sessionId until its status is planned, also when this tool already reports planned, because only ultrathink_result returns the plan.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -385,8 +385,9 @@ function toolResult(outcome: unknown): ToolResult {
 	const { code, errors } = outcome;
 	if (typeof code !== "string") throw new Error("malformed host outcome");
 	if (errors !== undefined && !isStringArray(errors)) throw new Error("malformed host outcome");
+	const detail = errors !== undefined && errors.length > 0 ? ` (${errors.join("; ")})` : "";
 	return {
-		content: [{ type: "text", text: `request refused: ${code}` }],
+		content: [{ type: "text", text: `request refused: ${code}${detail}` }],
 		structuredContent: { error: code, ...(errors !== undefined ? { errors } : {}) },
 		isError: true,
 	};

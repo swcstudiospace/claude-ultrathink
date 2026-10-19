@@ -74,8 +74,12 @@ export function createToolHost(deps: ToolHostDeps): ToolHost {
 
 	/** ultrathink_result without a planner: the views of client-driven sessions, validated as the planner would. */
 	function clientResult(args: Record<string, unknown>): JournalResult<ResultView> {
-		const { sessionId, detail } = args;
+		const { sessionId, detail, waitSeconds } = args;
 		if (!isSessionId(sessionId)) return { ok: false, code: "invalid_session_id" };
+		// Nothing to wait for without a planner, but a malformed value is refused as the planner would.
+		if (waitSeconds !== undefined && (typeof waitSeconds !== "number" || Number.isNaN(waitSeconds))) {
+			return { ok: false, code: "invalid_input" };
+		}
 		if (detail !== undefined && detail !== "brief" && detail !== "full") return { ok: false, code: "invalid_input" };
 		return clientPlanView(journalOpts.stateDir, sessionId, detail === "full" ? "full" : "brief");
 	}

@@ -124,6 +124,8 @@ Grok Chat gets the tools only. There is no plugin bundle for it, so a typed `/ul
 
 `bin/ultrathink-connector` runs the connector on your machine over stdio for any client that starts MCP servers as processes. It has no planner, no OAuth and no network access: the client's own model does the planning through nine tools (the six client-driven tools and the three connector tools; `ultrathink_uplift` is not offered), and the six prompts and the graph card resource are served as on the hosted server. It needs Bun 1.2 or later (see [Finding Bun](../configuration.md#finding-bun)).
 
+The stdio server reads only client-driven sessions. If `ULTRATHINK_STATE_DIR` points at the hosted server's directory, `ultrathink_sessions` lists server-mode jobs that `ultrathink_graph` and `ultrathink_result` cannot show.
+
 | Setting | Meaning |
 |---|---|
 | `ULTRATHINK_STATE_DIR` | Where sessions are kept. Default: the `connector` directory under the host state directory, which is `~/.claude/ultrathink/connector` unless `CLAUDE_CONFIG_DIR` or another host's variables say otherwise. A path inside a `.planning` tree is ignored. |

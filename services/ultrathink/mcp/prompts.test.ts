@@ -112,12 +112,17 @@ describe("the ultrathink prompt", () => {
 		expect(render.ok && render.description).toBe(SERVER_DESCRIPTION);
 	});
 
-	test("the alias renders the same messages", () => {
-		for (const options of [undefined, { serverPlanning: true }]) {
-			expect(renderPrompt("ultrathink-plan", { request: REQUEST }, options)).toEqual(
-				renderPrompt("ultrathink", { request: REQUEST }, options),
-			);
-		}
+	test("the alias renders the same messages in server mode", () => {
+		const options = { serverPlanning: true };
+		expect(renderPrompt("ultrathink-plan", { request: REQUEST }, options)).toEqual(renderPrompt("ultrathink", { request: REQUEST }, options));
+	});
+
+	test("in client-driven mode the alias adds the graph step that the original prompt does not have", () => {
+		const plain = textOf(renderPrompt("ultrathink", { request: REQUEST }));
+		const alias = textOf(renderPrompt("ultrathink-plan", { request: REQUEST }));
+		expect(plain).not.toContain("ultrathink_graph");
+		expect(alias).toContain("ultrathink_graph");
+		expect(alias.endsWith(`\n${REQUEST}`)).toBe(true);
 	});
 
 	test("the request is kept unmodified, including leading and trailing whitespace", () => {

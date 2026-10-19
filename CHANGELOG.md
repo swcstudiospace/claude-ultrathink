@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The descriptions of the two entry tools `ultrathink_uplift` and `ultrathink_plan` now say that a message starting with `/ultrathink-` (with a hyphen) is another command and name the tool to use, and `initialize` instructions carry the routing for every command. The `ultrathink_result` plan text starts with the wave tree block and ends with a request to show it first.
+- The plan card fetches a finished plan itself when `ultrathink_uplift` already reports planned, and the server texts say to call `ultrathink_result` until the status is planned, also then. A refused tool call now carries its reasons in the content text, after the code. The stdio server validates `waitSeconds` for `ultrathink_result` like the HTTP server does. `ultrathink_command` declares the large-result size hint like the other large tools, and its `think` and `last` messages ask for a wave tree only when the result has a graph. The plugin skill and commands match the server on `limit` 5 for `/ultrathink-last` and on the show order (wave tree first, the diagram only if the interface renders Mermaid), and the client-driven plan flow names the one `ultrathink_graph` call.
 
 ### Fixed
 

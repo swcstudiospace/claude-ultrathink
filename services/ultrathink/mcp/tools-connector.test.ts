@@ -138,14 +138,14 @@ describe("definitions", () => {
 		expect(command?.inputSchema.required).toEqual(["command"]);
 	});
 
-	test("only the graph tool carries the UI resource, and it also allows large results", () => {
+	test("only the graph tool carries the UI resource; the graph and command tools allow large results", () => {
 		const [graph, sessions, command] = CONNECTOR_TOOL_DEFINITIONS;
 		expect(graph?._meta).toEqual({ ...GRAPH_UI_META, ...LARGE_RESULT_META });
 		expect(obj(graph?._meta?.ui).resourceUri).toBe("ui://ultrathink/graph");
 		expect(graph?._meta?.["ui/resourceUri"]).toBe("ui://ultrathink/graph");
 		expect(graph?._meta?.["anthropic/maxResultSizeChars"]).toBe(200000);
 		expect(sessions?._meta).toBeUndefined();
-		expect(command?._meta).toBeUndefined();
+		expect(command?._meta).toEqual(LARGE_RESULT_META);
 	});
 
 	test("each description names the slash command it serves, since hosted Claude never shows the server instructions", () => {
@@ -430,6 +430,25 @@ describe("ultrathink_command", () => {
 		const { data, text } = okOf(await handlers.command({ command: "ultrathink-last" }));
 		expect("next" in data).toBe(false);
 		expect(text).toContain("no planned ultrathink session");
+	});
+
+	test("think and last do not tell the model to show a wave tree when the planned session has no graph", async () => {
+		const { stateDir, handlers } = setup();
+		const sessionId = seedClient(stateDir, "planned");
+		const last = okOf(await handlers.command({ command: "ultrathink-last" }));
+		expect(last.data).toMatchObject({ next: { tool: "ultrathink_result", arguments: { sessionId } } });
+		expect(String(last.data.message)).not.toContain("wave tree");
+		expect(String(last.data.message)).toContain("no graph");
+		const think = okOf(await handlers.command({ command: "ultrathink-think", args: sessionId }));
+		expect(String(think.data.message)).not.toContain("wave tree");
+		expect(String(think.data.message)).toContain("no graph");
+	});
+
+	test("think without any planned session uses the no-session message", async () => {
+		const { handlers } = setup();
+		const think = okOf(await handlers.command({ command: "ultrathink-think" }));
+		expect(String(think.data.message)).toContain("no planned ultrathink session");
+		expect(String(think.data.message)).not.toContain("wave tree");
 	});
 
 	test("status returns the sessions listing", async () => {

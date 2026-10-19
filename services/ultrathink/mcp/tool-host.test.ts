@@ -233,6 +233,20 @@ describe("ultrathink_result", () => {
 		expect(data.text).toBe(text);
 		expect(data.graph).toEqual(buildGraphView(record(sessionId)));
 	});
+
+	test("without a planner a malformed waitSeconds is refused and a number is accepted and ignored", async () => {
+		const { host, stateDir } = setup();
+		const sessionId = randomUUID();
+		writeMeta(journalDir(stateDir, sessionId), { sessionId, original: "Ship it", status: "planned" });
+		writeSession(stateDir, record(sessionId));
+		for (const waitSeconds of ["5", Number.NaN, null, {}]) {
+			expect(await host.call("ultrathink_result", { sessionId, waitSeconds })).toEqual({ ok: false, code: "invalid_input" });
+		}
+		for (const waitSeconds of [0, 45, 1000, -3]) {
+			const { data } = okOf(await host.call("ultrathink_result", { sessionId, waitSeconds }));
+			expect(data).toMatchObject({ sessionId, status: "planned", mode: "client" });
+		}
+	});
 });
 
 describe("the connector tools", () => {

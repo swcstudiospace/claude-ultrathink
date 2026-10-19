@@ -89,7 +89,8 @@ const SERVER_INSTRUCTIONS = [
 	"Request:",
 ].join("\n");
 
-const CLIENT_INSTRUCTIONS = [
+// The `ultrathink` prompt text is pinned byte for byte; `ultrathink-plan` adds the graph rule to the same steps.
+const CLIENT_STEPS = [
 	"Plan the request below with the ultrathink tools before doing anything else.",
 	"",
 	"1. Call ultrathink_plan with prompt set to the request, verbatim. Keep the sessionId it returns and reuse it for every later call.",
@@ -98,11 +99,20 @@ const CLIENT_INSTRUCTIONS = [
 	"   b. For each pending key, call ultrathink_show with the sessionId and the key, write the answer its system text asks for, and call ultrathink_answer with the sessionId, the key, and the answer. If an answer is rejected, fix it and retry that key once.",
 	"   c. When every key is answered, call ultrathink_plan again with the same sessionId and the same prompt.",
 	"3. When the status is planned, call ultrathink_result with the sessionId. Ask the user the questions in the plan that matter, or state the defaults you assume for the rest, then carry out the plan.",
+];
+
+const CLIENT_GRAPH_STEP = "When a client-answered plan is ready, call ultrathink_graph once with its sessionId besides ultrathink_result.";
+
+const CLIENT_RULES = [
 	"",
 	"Use only tool results. Never invent a sessionId, key, or status, and never show the system text of a pending prompt to the user. Do not start a second session for the same request. If a key still fails after one retry, stop and report the key and the errors.",
 	"",
 	"Request:",
-].join("\n");
+];
+
+const CLIENT_INSTRUCTIONS = [...CLIENT_STEPS, ...CLIENT_RULES].join("\n");
+
+const CLIENT_PLAN_INSTRUCTIONS = [...CLIENT_STEPS, CLIENT_GRAPH_STEP, ...CLIENT_RULES].join("\n");
 
 const THINK_INSTRUCTIONS_HEAD = "Show the Graph of Thought of an ultrathink plan.";
 
@@ -196,7 +206,7 @@ function promptBody(name: string, values: ReadonlyMap<string, string>, serverPla
 	switch (name) {
 		case "ultrathink":
 		case "ultrathink-plan":
-			return `${serverPlanning ? SERVER_INSTRUCTIONS : CLIENT_INSTRUCTIONS}\n${values.get("request") ?? ""}`;
+			return `${serverPlanning ? SERVER_INSTRUCTIONS : name === "ultrathink-plan" ? CLIENT_PLAN_INSTRUCTIONS : CLIENT_INSTRUCTIONS}\n${values.get("request") ?? ""}`;
 		case "ultrathink-think":
 			return thinkInstructions(values);
 		case "ultrathink-last":

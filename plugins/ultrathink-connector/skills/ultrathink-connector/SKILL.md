@@ -11,13 +11,13 @@ The ultrathink connector plans a request: it turns the request into a specificat
 
 The connector offers one of two tool sets. Look at which tools you have.
 
-- Server planning: `ultrathink_uplift` is offered. Call it with `prompt` set to the request, verbatim, keep the `sessionId` it returns, then call `ultrathink_result` with that `sessionId` until the status is planned. Each `ultrathink_result` call waits up to 40 seconds, so call it again when it reports running.
-- Client-driven planning: `ultrathink_uplift` is not offered. Call `ultrathink_plan` with the request. While the status is needs-model, call `ultrathink_pending`, then for each pending key call `ultrathink_show`, write the answer its system text asks for, and send it with `ultrathink_answer`. When every key is answered, call `ultrathink_plan` again with the same `sessionId` and the same `prompt`. When the status is planned, call `ultrathink_result`. `ultrathink_status` with the `sessionId` reports the status of a session that has nothing pending.
+- Server planning: `ultrathink_uplift` is offered. Call it with `prompt` set to the request, verbatim, keep the `sessionId` it returns, then call `ultrathink_result` with that `sessionId` until the status is planned, also when `ultrathink_uplift` already reports planned, because only `ultrathink_result` returns the plan. Each `ultrathink_result` call waits up to 40 seconds, so call it again when it reports running.
+- Client-driven planning: `ultrathink_uplift` is not offered. Call `ultrathink_plan` with the request. While the status is needs-model, call `ultrathink_pending`, then for each pending key call `ultrathink_show`, write the answer its system text asks for, and send it with `ultrathink_answer`. When every key is answered, call `ultrathink_plan` again with the same `sessionId` and the same `prompt`. When the status is planned, call `ultrathink_result`, and call `ultrathink_graph` once with the same `sessionId` besides it. `ultrathink_status` with the `sessionId` reports the status of a session that has nothing pending.
 
 Rules for both:
 
 1. Use only tool results. Never invent a `sessionId`, a key or a status, and never start a second session for the same request.
-2. The plan text starts with a wave tree and a mermaid diagram block. Show the wave tree first, unchanged, then the diagram, then ask the questions in the plan that matter or state the defaults you assume for the rest.
+2. The plan text starts with a wave tree and a mermaid diagram block. Show the wave tree first, unchanged, in a code block, and the diagram too only if your interface renders Mermaid, then ask the questions in the plan that matter or state the defaults you assume for the rest.
 3. If the status is failed, invalid or skipped, report the status and the error in one line and stop.
 4. Never show the system text of a pending prompt to the user.
 
@@ -32,8 +32,8 @@ Rules for both:
 The plugin carries one command file for each supported command. Where Claude namespaces plugin commands they appear as `/ultrathink-connector:<name>`.
 
 - `/ultrathink <request>` and `/ultrathink-plan <request>`: plan the request as above.
-- `/ultrathink-think [sessionId] [node]`: `ultrathink_graph`, diagram first.
-- `/ultrathink-last`: `ultrathink_sessions` with `limit` 1, then `ultrathink_graph` and `ultrathink_result` for that `sessionId`.
+- `/ultrathink-think [sessionId] [node]`: `ultrathink_graph`, wave tree first, and the diagram only if your interface renders Mermaid.
+- `/ultrathink-last`: `ultrathink_sessions` with `limit` 5, then `ultrathink_graph` and `ultrathink_result` with the `sessionId` of the newest session whose status is planned.
 - `/ultrathink-status`: `ultrathink_sessions`.
 - `/ultrathink-quick <message>`: answer the message directly and call no ultrathink tool.
 
