@@ -362,7 +362,7 @@ This registers three servers, `notion`, `linear` and `greptile`, each running `<
 <clone>/bin/ultrathink-mcp auth status
 ```
 
-Linear and Greptile also accept an OAuth login (`auth login linear`, `auth login greptile`) instead of an API key. `set-key` also accepts `--env-file <path> --var <NAME>` to read the key from a dotenv file. `auth login` starts a browser OAuth flow with a callback on `127.0.0.1:8765` on the machine running the command. For a login over SSH or on a machine without a browser, see [Set up Notion](how-to/set-up-notion.md) and [Troubleshooting](troubleshooting.md#notion-oauth-over-ssh). `auth logout <provider>` removes a provider's stored credentials.
+Linear and Greptile also accept an OAuth login (`auth login linear`, `auth login greptile`) instead of an API key. `set-key` also accepts `--env-file <path> --var <NAME>` to read the key from a dotenv file. An OpenRouter key is checked before it is stored: its format must be `sk-or-…`, and one non-destructive request to OpenRouter's key endpoint must accept it. A rejected key is not stored. Pass `--no-verify` to store it after the format check only (for an offline machine). `auth login` starts a browser OAuth flow with a callback on `127.0.0.1:8765` on the machine running the command. For a login over SSH or on a machine without a browser, see [Set up Notion](how-to/set-up-notion.md) and [Troubleshooting](troubleshooting.md#notion-oauth-over-ssh). `auth logout <provider>` removes a provider's stored credentials.
 
 ### Check it
 

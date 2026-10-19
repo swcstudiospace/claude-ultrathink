@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `auth set-key openrouter` checks the key before storing it: the format must be `sk-or-…`, and one non-destructive request to OpenRouter's key endpoint must accept it. A rejected key is never stored, and a transient failure is retried three times. `--no-verify` stores the key after the format check only.
+
 ### Fixed
 
 - OAuth consent: a pending approval stays valid for 10 minutes, approve attempts are limited, and the consent page policy lets the browser follow the redirect back to the client. Before, Chrome cancelled the redirect to grok.com, the page did not move, and the second click showed "This authorization request expired".

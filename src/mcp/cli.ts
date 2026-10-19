@@ -20,6 +20,7 @@ import {
 	status,
 } from "./oauth.ts";
 import type { AuthDeps } from "./oauth.ts";
+import { checkOpenRouterKeyFormat, verifyOpenRouterKey } from "./openrouter-key.ts";
 import { isMcpProviderId, isProviderId, MCP_PROVIDER_IDS, MCP_PROVIDERS, notMcpServer, USER_AGENT } from "./providers.ts";
 import type { McpProviderId, ProviderId } from "./providers.ts";
 import { defaultRun, mountTailscale, planRedirect, readTailscaleDns, unmountTailscale } from "./redirect.ts";
@@ -234,6 +235,10 @@ async function setKey(id: ProviderId, args: string[], deps: AuthDeps): Promise<v
 		if (key === undefined) throw new Error(`${name} not found in ${file}`);
 	}
 	if (!key) throw new Error("empty api key");
+	if (id === "openrouter") {
+		const check = args.includes("--no-verify") ? checkOpenRouterKeyFormat(key) : await verifyOpenRouterKey(key, { fetch: deps.fetch });
+		if (!check.ok) throw new Error(check.message);
+	}
 	await setApiKey(id, key, deps);
 	out(`${id}: api key stored (${key.length} chars)`);
 }

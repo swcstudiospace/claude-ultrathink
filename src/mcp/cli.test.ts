@@ -320,7 +320,7 @@ describe("openrouter API-key provider", () => {
 	};
 
 	test("set-key --stdin stores the key 0600 and prints only its length", () => {
-		const { code, stdout, stderr } = runWith({ stdin: `${K}\n` }, "auth", "set-key", "openrouter", "--stdin");
+		const { code, stdout, stderr } = runWith({ stdin: `${K}\n` }, "auth", "set-key", "openrouter", "--stdin", "--no-verify");
 		expect(code).toBe(0);
 		expect(stdout).toBe("openrouter: api key stored (35 chars)\n");
 		noLeak(stdout, stderr);
@@ -331,7 +331,7 @@ describe("openrouter API-key provider", () => {
 	test("set-key --env-file --var stores the key from an env file", () => {
 		const file = join(root, "openrouter.env");
 		writeFileSync(file, `# keys\nOPENROUTER_API_KEY=${K}\n`);
-		const { code, stdout, stderr } = run("auth", "set-key", "openrouter", "--env-file", file, "--var", "OPENROUTER_API_KEY");
+		const { code, stdout, stderr } = run("auth", "set-key", "openrouter", "--env-file", file, "--var", "OPENROUTER_API_KEY", "--no-verify");
 		expect(code).toBe(0);
 		expect(stdout).toBe("openrouter: api key stored (35 chars)\n");
 		noLeak(stdout, stderr);
