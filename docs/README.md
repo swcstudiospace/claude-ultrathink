@@ -36,6 +36,7 @@ ultrathink plans every non-trivial prompt into a spec and a Graph of Thought bef
 - [Configuration](configuration.md): config files, every key and its default, environment variables, state directories.
 - [Commands](commands.md): the `/ultrathink-*` commands, prompt prefixes and the `bin/` CLIs.
 - [Runbook: the hosted connector](ops/runbook-ultrathink.md): operate the hosted server, including the connector inventory, the log fields and the smoke checks (section 13).
+- [Evidence: connector commands and graph views](ops/evidence-connector-commands.md): what was run for the command surface, the graph views, the stdio server and the plugin bundle, and what was not.
 - [Tracking](tracking.md): the rows ultrathink creates in Notion and Linear, and when.
 - [Ship](ship.md): the done check, pull request, review loop and merge gate.
 - [Troubleshooting](troubleshooting.md): symptoms, causes and fixes.
