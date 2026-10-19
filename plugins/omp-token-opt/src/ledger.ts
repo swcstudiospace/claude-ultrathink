@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -21,7 +21,6 @@ export interface PerfFields {
 	ttftMs?: number;
 	lastIdleMs?: number;
 	costCents?: number;
-	lastWarmTokens?: number;
 	providerInput?: number;
 	providerOutput?: number;
 	providerCacheRead?: number;
@@ -115,7 +114,6 @@ export function isValidSnapshot(value: unknown, sessionId?: string): value is To
 	const ttftMs = "ttftMs" in value ? value.ttftMs : undefined;
 	const lastIdleMs = "lastIdleMs" in value ? value.lastIdleMs : undefined;
 	const costCents = "costCents" in value ? value.costCents : undefined;
-	const lastWarmTokens = "lastWarmTokens" in value ? value.lastWarmTokens : undefined;
 	const providerInput = "providerInput" in value ? value.providerInput : undefined;
 	const providerOutput = "providerOutput" in value ? value.providerOutput : undefined;
 	const providerCacheRead = "providerCacheRead" in value ? value.providerCacheRead : undefined;
@@ -131,7 +129,6 @@ export function isValidSnapshot(value: unknown, sessionId?: string): value is To
 	if (!optionalField(ttftMs, "ttftMs" in value)) return false;
 	if (!optionalField(lastIdleMs, "lastIdleMs" in value)) return false;
 	if (!optionalField(costCents, "costCents" in value)) return false;
-	if (!optionalField(lastWarmTokens, "lastWarmTokens" in value)) return false;
 	if (!optionalField(providerInput, "providerInput" in value)) return false;
 	if (!optionalField(providerOutput, "providerOutput" in value)) return false;
 	if (!optionalField(providerCacheRead, "providerCacheRead" in value)) return false;
@@ -164,58 +161,110 @@ function readJson(path: string): unknown {
 	}
 }
 const LOCK_WAIT_MS = 500;
-const LOCK_STALE_MS = 5_000;
+// A write holds the lock for one small file write plus a rename, so a lock older than this belongs to a hung owner.
+const LOCK_STALE_MS = 2_000;
+const LOCK_RETRY_MS = 10;
+let lockSeq = 0;
 
-function lockIsStale(lockPath: string): boolean {
+interface LockObservation {
+	token: string;
+	ino: number;
+	mtimeMs: number;
+}
+
+function observeLock(lockPath: string): LockObservation | null {
 	try {
-		const age = Date.now() - statSync(lockPath).mtimeMs;
-		return age > LOCK_STALE_MS;
+		const st = statSync(lockPath);
+		// A directory lock left by an older build has no token; it is identified by inode alone.
+		const token = st.isFile() ? readFileSync(lockPath, "utf8") : "";
+		return { token, ino: st.ino, mtimeMs: st.mtimeMs };
 	} catch {
-		return false;
+		return null;
 	}
 }
 
-function acquireLock(lockPath: string): void {
-	const started = Date.now();
-	let removedStale = false;
-	for (;;) {
+function ownerIsDead(token: string): boolean {
+	const match = /^(\d+):/.exec(token);
+	if (match === null) return false;
+	try {
+		process.kill(Number(match[1]), 0);
+		return false;
+	} catch (err) {
+		return err !== null && typeof err === "object" && "code" in err && err.code === "ESRCH";
+	}
+}
+
+/**
+ * Removes the lock only if it is still the one that was judged stale. The rename is atomic, so two
+ * waiters cannot both remove the same file; the claimed file is then checked against what was observed
+ * and put back if a live owner replaced it in between.
+ */
+function breakStale(lockPath: string, seen: LockObservation): void {
+	const claim = `${lockPath}.stale.${process.pid}.${lockSeq++}`;
+	try {
+		renameSync(lockPath, claim);
+	} catch {
+		return;
+	}
+	const claimed = observeLock(claim);
+	if (claimed === null || claimed.ino !== seen.ino || claimed.token !== seen.token) {
 		try {
-			mkdirSync(lockPath);
-			return;
-		} catch (err) {
-			const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
-			if (code !== "EEXIST") throw new LedgerReject("ledger lock failed");
-			if (!removedStale && lockIsStale(lockPath)) {
-				removedStale = true;
-				try {
-					rmSync(lockPath, { recursive: true, force: true });
-				} catch {
-					// another writer may have removed it
-				}
-				continue;
-			}
-			if (Date.now() - started >= LOCK_WAIT_MS) throw new LedgerReject("ledger lock timeout");
-			Bun.sleepSync(20);
+			linkSync(claim, lockPath);
+		} catch {
+			// someone else already created a new lock; the owner's token check keeps its release safe
 		}
 	}
+	rmSync(claim, { recursive: true, force: true });
 }
 
+/** Returns the owner token that releaseLock needs. */
+function acquireLock(lockPath: string): string {
+	const token = `${process.pid}:${lockSeq++}:${Date.now().toString(36)}`;
+	const started = Date.now();
+	for (;;) {
+		try {
+			writeFileSync(lockPath, token, { flag: "wx" });
+			return token;
+		} catch (err) {
+			const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
+			if (code !== "EEXIST") {
+				// a failed write may have left an empty lock file behind
+				rmSync(lockPath, { force: true });
+				throw new LedgerReject("ledger lock failed");
+			}
+		}
+		if (Date.now() - started >= LOCK_WAIT_MS) throw new LedgerReject("ledger lock timeout");
+		const seen = observeLock(lockPath);
+		// A crashed owner is detected at once; a hung owner after LOCK_STALE_MS.
+		if (seen !== null && (ownerIsDead(seen.token) || Date.now() - seen.mtimeMs > LOCK_STALE_MS)) {
+			breakStale(lockPath, seen);
+			continue;
+		}
+		Bun.sleepSync(LOCK_RETRY_MS);
+	}
+}
+
+/** Removes the lock only while it still carries this writer's token. */
+function releaseLock(lockPath: string, token: string): void {
+	try {
+		if (readFileSync(lockPath, "utf8") === token) rmSync(lockPath, { force: true });
+	} catch {
+		// already reclaimed by a waiter
+	}
+}
 
 function writeAtomic(path: string, body: string): void {
 	const dir = dirname(path);
 	mkdirSync(dir, { recursive: true });
 	const lockPath = join(dir, ".lock");
-	acquireLock(lockPath);
+	const token = acquireLock(lockPath);
 	const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
 	try {
 		writeFileSync(tmp, body);
 		renameSync(tmp, path);
 	} finally {
-		try {
-			rmSync(lockPath, { recursive: true, force: true });
-		} catch {
-			// a stale directory lock can be reclaimed after 5s
-		}
+		rmSync(tmp, { force: true });
+		releaseLock(lockPath, token);
 	}
 }
 
@@ -228,7 +277,6 @@ function copyPerf(from: TokenSavingsSnapshot, onto: TokenSavingsSnapshot): void 
 	if (from.ttftMs !== undefined) onto.ttftMs = from.ttftMs;
 	if (from.lastIdleMs !== undefined) onto.lastIdleMs = from.lastIdleMs;
 	if (from.costCents !== undefined) onto.costCents = from.costCents;
-	if (from.lastWarmTokens !== undefined) onto.lastWarmTokens = from.lastWarmTokens;
 	if (from.providerInput !== undefined) onto.providerInput = from.providerInput;
 	if (from.providerOutput !== undefined) onto.providerOutput = from.providerOutput;
 	if (from.providerCacheRead !== undefined) onto.providerCacheRead = from.providerCacheRead;
@@ -251,19 +299,75 @@ export interface Ledger {
 	snapshot(): TokenSavingsSnapshot | null;
 	notePerf(fields: PerfFields): TokenSavingsSnapshot;
 	addProviderUsage(input: number, cacheRead: number, cacheWrite: number, output?: number): TokenSavingsSnapshot;
+	/** Forces pending snapshot writes to disk. Resolves at once when asyncWrites is off. Never rejects. */
+	flush(): Promise<void>;
+	/** Failed flush writes plus dirty markers dropped past maxPendingSessions. */
+	droppedWrites(): number;
+	/** Successful snapshot writes to disk, in both modes. */
+	writesCompleted(): number;
 }
 
-export function createLedger(options?: { dir?: string; now?: () => number }): Ledger {
+const DEFAULT_MAX_PENDING_SESSIONS = 64;
+
+export function createLedger(options?: {
+	dir?: string;
+	now?: () => number;
+	asyncWrites?: boolean;
+	maxPendingSessions?: number;
+}): Ledger {
 	const dir = options?.dir ?? defaultTokenOptDir();
 	const now = options?.now ?? Date.now;
+	const asyncWrites = options?.asyncWrites === true;
+	const maxPendingSessions = options?.maxPendingSessions ?? DEFAULT_MAX_PENDING_SESSIONS;
+	if (!Number.isSafeInteger(maxPendingSessions) || maxPendingSessions <= 0) {
+		throw new LedgerReject("invalid maxPendingSessions");
+	}
 	const memory = new Map<string, TokenSavingsSnapshot>();
 	const usage = new Map<string, ProviderTotals>();
+	// Insertion order is flush order: the most recently touched session is last, so live.json ends on it.
+	const dirty = new Map<string, true>();
+	let flushTimer: Timer | null = null;
+	let dropped = 0;
+	let completed = 0;
 	let activeId: string | null = null;
 
-	function persist(snap: TokenSavingsSnapshot): void {
+	function writeSnapshot(snap: TokenSavingsSnapshot): void {
 		const body = `${JSON.stringify(snap)}\n`;
 		writeAtomic(join(dir, `${snap.sessionId}.json`), body);
 		writeAtomic(join(dir, "live.json"), body);
+		completed += 1;
+	}
+
+	function drainDirty(): void {
+		if (flushTimer !== null) {
+			clearTimeout(flushTimer);
+			flushTimer = null;
+		}
+		const ids = [...dirty.keys()];
+		dirty.clear();
+		for (const id of ids) {
+			const snap = memory.get(id);
+			if (snap === undefined) continue;
+			try {
+				writeSnapshot(snap);
+			} catch {
+				dropped += 1;
+			}
+		}
+	}
+
+	function markDirty(id: string): void {
+		dirty.delete(id);
+		dirty.set(id, true);
+		if (dirty.size > maxPendingSessions) {
+			const oldest = dirty.keys().next();
+			if (!oldest.done) dirty.delete(oldest.value);
+			dropped += 1;
+		}
+		if (flushTimer === null) {
+			flushTimer = setTimeout(drainDirty, 0);
+			flushTimer.unref();
+		}
 	}
 
 	function adoptUsage(id: string, snap: TokenSavingsSnapshot): void {
@@ -282,11 +386,8 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 			});
 			return;
 		}
-		if (snap.cacheHitPct === undefined) {
-			usage.set(id, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-			return;
-		}
-		usage.set(id, { input: 100 - snap.cacheHitPct, output: 0, cacheRead: snap.cacheHitPct, cacheWrite: 0 });
+		// A legacy snapshot carries a percentage but no totals. Its denominator is unknown, so adopt zero totals rather than invent one.
+		usage.set(id, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 	}
 
 	function load(sessionId: string): TokenSavingsSnapshot {
@@ -312,7 +413,8 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		memory.set(sessionId, snap);
 		adoptUsage(sessionId, snap);
 		activeId = sessionId;
-		persist(snap);
+		if (asyncWrites) markDirty(sessionId);
+		else writeSnapshot(snap);
 		return snap;
 	}
 
@@ -327,7 +429,12 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 
 	function commit(next: TokenSavingsSnapshot, id: string): TokenSavingsSnapshot {
 		if (!isValidSnapshot(next, id)) throw new LedgerReject("snapshot invariant failed");
-		persist(next);
+		if (asyncWrites) {
+			memory.set(id, next);
+			markDirty(id);
+			return next;
+		}
+		writeSnapshot(next);
 		memory.set(id, next);
 		return next;
 	}
@@ -366,9 +473,6 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		if (!optionalField(fields.ttftMs, fields.ttftMs !== undefined)) throw new LedgerReject("invalid ttftMs");
 		if (!optionalField(fields.lastIdleMs, fields.lastIdleMs !== undefined)) throw new LedgerReject("invalid lastIdleMs");
 		if (!optionalField(fields.costCents, fields.costCents !== undefined)) throw new LedgerReject("invalid costCents");
-		if (!optionalField(fields.lastWarmTokens, fields.lastWarmTokens !== undefined)) {
-			throw new LedgerReject("invalid lastWarmTokens");
-		}
 		if (!optionalField(fields.providerInput, fields.providerInput !== undefined)) throw new LedgerReject("invalid providerInput");
 		if (!optionalField(fields.providerOutput, fields.providerOutput !== undefined)) throw new LedgerReject("invalid providerOutput");
 		if (!optionalField(fields.providerCacheRead, fields.providerCacheRead !== undefined)) {
@@ -399,7 +503,6 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		if (fields.ttftMs !== undefined) next.ttftMs = fields.ttftMs;
 		if (fields.lastIdleMs !== undefined) next.lastIdleMs = fields.lastIdleMs;
 		if (fields.costCents !== undefined) next.costCents = fields.costCents;
-		if (fields.lastWarmTokens !== undefined) next.lastWarmTokens = fields.lastWarmTokens;
 		if (fields.providerInput !== undefined) next.providerInput = fields.providerInput;
 		if (fields.providerOutput !== undefined) next.providerOutput = fields.providerOutput;
 		if (fields.providerCacheRead !== undefined) next.providerCacheRead = fields.providerCacheRead;
@@ -446,6 +549,16 @@ export function createLedger(options?: { dir?: string; now?: () => number }): Le
 		snapshot(): TokenSavingsSnapshot | null {
 			if (activeId === null) return null;
 			return memory.get(activeId) ?? null;
+		},
+		flush(): Promise<void> {
+			if (asyncWrites) drainDirty();
+			return Promise.resolve();
+		},
+		droppedWrites(): number {
+			return dropped;
+		},
+		writesCompleted(): number {
+			return completed;
 		},
 	};
 }

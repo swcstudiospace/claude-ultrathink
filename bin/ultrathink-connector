@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 SWC Studio
+# Local stdio MCP connector: ultrathink-connector speaks newline-delimited JSON-RPC on stdin/stdout.
+# Windows: bun <repo>\services\ultrathink\stdio\main.ts
+set -eu
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink -- "$self")
+	case $link in
+	/*) self=$link ;;
+	*) self=$(dirname -- "$self")/$link ;;
+	esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd)
+ULTRATHINK_BUN_REQUIRED=1 exec "$root/bin/run-bun" "$root/services/ultrathink/stdio/main.ts" "$@"

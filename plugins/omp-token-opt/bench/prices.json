@@ -1,0 +1,7 @@
+{
+  "estimated": true,
+  "configurable": true,
+  "currency": "USD",
+  "inputUsdPerMillionTokens": 3,
+  "note": "Placeholder rate, not a provider quote. Set inputUsdPerMillionTokens to the input price of the model you use. costUsd = tokens x rate / 1,000,000."
+}

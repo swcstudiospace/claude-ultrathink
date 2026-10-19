@@ -1,0 +1,11 @@
+{
+	"name": "ultrathink-connector",
+	"displayName": "Ultrathink Connector",
+	"version": "0.1.0",
+	"description": "Plans a request with ultrathink from Claude chat: a wave tree, a Graph of Thought diagram and clarifying questions with defaults, through the hosted ultrathink connector. Bundles the /ultrathink commands and the connector entry.",
+	"author": { "name": "SWC Studio", "email": "noreply@swcstudio.space" },
+	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
+	"repository": "https://github.com/swcstudiospace/claude-ultrathink",
+	"license": "AGPL-3.0-or-later",
+	"keywords": ["planning", "prompt", "graph-of-thought", "mcp", "connector"]
+}

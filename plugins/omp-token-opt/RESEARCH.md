@@ -1,8 +1,8 @@
 # Token optimisation for omp
 
-Researched 2026-10-15 against host `omp v18.11.0`. Empty repo; this is the design note, not an implementation.
+Researched 2026-10-15 against host `omp v18.11.0`. The research below is the design note the plugin was built from; the shipped plugin departs from it in a few places, listed under "As built".
 
-Decision: do not build a second compressor, and do not run Obsidian on the VPS. The plugin is a thin orchestrator over three things omp does not already do: RTK on bash output, a scoped Graphify query tool, and a git-synced markdown vault the agent reads as files. Provider prompt cache, snapcompact, hashline edits, and `memory.backend` stay native.
+Decision: do not build a general-purpose compressor, and do not run Obsidian on the VPS. The plugin is a thin orchestrator over three things omp does not already do: RTK on bash output, a scoped Graphify query tool, and a git-synced markdown vault the agent reads as files. Provider prompt cache, snapcompact, hashline edits, and `memory.backend` stay native. The shipped plugin adds one small, measured `tool_result` shrinker of its own (see "As built").
 
 ## How the pieces connect
 
@@ -46,7 +46,7 @@ Do not reimplement these. Confirmed in the installed `@oh-my-pi/*` packages unde
 | `cache_warming_decision` | Keeps the provider prefix warm. Main loop only. | A replacement payload on a warm replay must be byte-identical or the refresh misses. |
 | `before_provider_request` | Can replace the outbound payload. Return the payload itself, not `{ payload }`. | Do not rewrite the stable prefix. `devin-agent` does not fire this hook. |
 | `context` | May return `{ messages }` without rewriting persisted history. | Same rule: do not mutate the prefix. |
-| `tool_call` / `tool_result` | Revise bash input, or patch result content. | This is the RTK hook. One owner only. |
+| `tool_call` / `tool_result` | Revise bash input, or patch result content. | The RTK rewrite lives on `tool_call`. The plugin yields to an installed official `rtk.ts` extension, so only one rewriter runs. See "As built" for the `tool_result` side. |
 | TTSR | Injects a matched rule mid-stream instead of parking it in the prompt. | Prefer this over a long always-on rules blob. |
 | Model roles | Cheap model for consolidation, titles, extraction. | Set an explicit effort on every role. This host already routes `default` to grok-4.7. |
 | `extendedContext` | Clamps premium long-context pricing. This host has it `true`. | Leave off unless a turn actually needs the premium window. |
@@ -133,11 +133,11 @@ Do not run two sync products on the same folder.
 
 ## Other libraries
 
-Use at most one tool-output compressor. Stacking RTK + Headroom + rtk-proxy + billion-context double-compresses and can bust the prefix.
+Use at most one tool-output compressor. Stacking RTK + Headroom + rtk-proxy + billion-context double-compresses and can bust the prefix. The plugin's own `tool_result` shrinker counts as one of them (see "As built").
 
 | Library | Saves | Fit |
 | --- | --- | --- |
-| [headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom) (`headroom-ai`, Apache-2.0) | Input, lossy but reversible via `headroom_retrieve`. `headroom wrap omp` exists. Default cache mode forwards prior turns byte-faithfully. `--mode token` recompresses history and busts the prefix. | Only if RTK's bash-only coverage is not enough and Read/JSON output is the measured cost. Do not also patch `tool_result` in this plugin. |
+| [headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom) (`headroom-ai`, Apache-2.0) | Input, lossy but reversible via `headroom_retrieve`. `headroom wrap omp` exists. Default cache mode forwards prior turns byte-faithfully. `--mode token` recompresses history and busts the prefix. | Only if RTK's bash-only coverage is not enough and Read/JSON output is the measured cost. The plugin already patches `tool_result`, so do not run both. |
 | [microsoft/LLMLingua](https://github.com/microsoft/LLMLingua) 0.2.2 MIT | Input, by deleting tokens. LongLLMLingua can reorder context. | Do not run it on the stable prefix. Domain mismatch vs coding traces. Adds a local model and latency. |
 | [GPTCache](https://github.com/zilliztech/GPTCache), Portkey, LiteLLM, Bifrost, vCache | Skip the provider call on a similar prompt. | Unsafe for multi-turn agent turns. A hit returns someone else's answer. Fine only for identical non-agent side calls, which this host barely has. |
 | [tirth8205/code-review-graph](https://github.com/tirth8205/code-review-graph) | Local tree-sitter graph, MCP, blast radius. Code only. | Companion if review/diff context is the bottleneck. Second graph, second hook set. Do not also instruct the agent to prefer Graphify for the same question. |
@@ -180,14 +180,25 @@ Install with `omp plugin link .` from this repo. A package without an `omp` or `
 - `session_start`: check binaries. Notify if missing. Do not inject a prompt here.
 - `before_agent_start`: append the stable one-line pointer only when the graph exists. Complete replacement if overriding `systemPrompt`; do not patch text the host will rebase.
 - Do not handle `tool_call` for bash if `~/.omp/agent/extensions/rtk.ts` or `./.omp/extensions/rtk.ts` is present. Two rewriters race.
-- Do not handle `tool_result` compression if Headroom's proxy is on.
-- `session_shutdown`: clear timers. Use `ctx.setInterval` for any vault pull; a raw timer throw tears down the session.
+- The plan said not to handle `tool_result` compression if Headroom's proxy is on. The shipped plugin has no such switch; see "As built".
+- `session_shutdown`: clear timers. The plan said to use `ctx.setInterval` for any vault pull; the shipped plugin has no recurring timer and uses guarded raw `setTimeout` (see "As built").
 
 Out of process, not in the extension:
 
 - `graphify hook install` in each code repo.
 - systemd timer: if `graphify-out/needs_update` exists, run semantic `graphify update` with a budget; then `graphify export` only if the installed CLI still has an obsidian target and a human asked to browse it.
 - systemd timer: `git -C "$VAULT" pull --rebase`. Non-zero exit, including conflict markers, pages a human. The agent does not auto-resolve vault conflicts.
+
+## As built
+
+`src/index.ts` ships these behaviours, which differ from the plan above:
+
+- It registers four tools (`graph_query`, `graph_path`, `graph_explain`, `read_span`) and the commands `/token-status` and `/token-opt`. `/token-opt compact` calls `ctx.compact`.
+- RTK on `tool_call` follows the "one rewriter" rule: when `~/.omp/agent/extensions/rtk.ts` or `./.omp/extensions/rtk.ts` exists the plugin does not rewrite bash, otherwise it runs `rtk rewrite` itself (fail-open, 2s timeout). The plugin never installs or replaces the official extension.
+- It does patch `tool_result`, which the plan said not to do. It replaces empty results with a one-line pointer, drops repeated results with the same hash, archives and skims large results, and shrinks oversized text (`compress.ts`). Each replacement is recorded as a measured savings point in the ledger. This is the plugin's own result compressor, so do not stack Headroom or another `tool_result` compressor on top of it. Omp's own tool-result caps still run; the plugin does not claim to replace them.
+- It also hooks `message_end`, `turn_start` and `before_provider_request` for measurement only (usage, timing, payload size, prefix and tool-list drift). It does not rewrite the outbound payload or the stable prefix.
+- `before_agent_start` appends the graph pointer only behind the `graphPointer` flag; `session_shutdown` is registered only when async ledger, remote sink or shared cache is on. The flags in `src/flags.ts` all default off.
+- Timers are plain `setTimeout` calls that are either cleared in `finally` or unref'd, not `ctx.setInterval`. The plugin runs no vault pull loop, so there is no recurring timer to tear down. Vault sync and the graphify timers stay out of process, as planned.
 
 ## What not to build
 

@@ -212,6 +212,8 @@ To plan with Grok instead of Claude, add `"think": { "engine": "grok" }` and run
 
 Start with [Getting started](docs/getting-started.md). The [documentation index](docs/README.md) lists every guide and reference page: install per host, the how-to guides, configuration, commands, tracking, ship, architecture, privacy and troubleshooting.
 
+Want `/ultrathink` in Claude chat, Claude Code or Grok Chat without installing a host plugin? The hosted connector and its local stdio server are covered in [Use /ultrathink in Claude, Claude Code and Grok Chat](docs/how-to/use-ultrathink-in-chat.md); none of it has been connected to those clients in a live session yet, and the guide says which behavior is verified.
+
 ## Contributing, security and conduct
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): development setup, checks and pull requests.

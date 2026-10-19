@@ -48,6 +48,11 @@ jobs:
         if: matrix.bun == 'latest'
         run: bun run check
 
+      # services/ has its own tsconfig because the root one covers only src, hooks and scripts.
+      - name: Type check (services)
+        if: matrix.bun == 'latest'
+        run: bun run check:services
+
       # The runner has no git identity and git refuses to commit without one; set it in case a test shells out to git.
       - name: Configure git identity
         run: |
