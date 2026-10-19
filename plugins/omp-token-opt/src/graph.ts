@@ -115,18 +115,41 @@ function hasLease(l2: GraphL2Cache): l2 is GraphL2Lease {
  * timeout or throw (null), and any other value all spawn at once, so an L2 outage never stalls
  * a query.
  */
-async function singleflight(l2: GraphL2Lease, key: string): Promise<string | null> {
+async function singleflight(l2: GraphL2Lease, key: string, signal?: AbortSignal): Promise<string | null> {
 	// The lease sits beside the result key, so the result key only ever holds graphify output.
 	const outcome = await boundedL2(() => l2.acquire(`${key}:lease`, LEASE_MS));
 	if (outcome !== "held") return null;
 	const until = Date.now() + WAIT_MS;
 	for (;;) {
+		if (signal?.aborted) return null;
 		const shared = await readL2(l2, key);
 		if (shared !== null) return shared;
 		const remaining = until - Date.now();
 		if (remaining <= 0) return null;
-		await Bun.sleep(Math.min(POLL_MS, remaining));
+		await sleepUnlessAborted(Math.min(POLL_MS, remaining), signal);
 	}
+}
+
+/** Sleeps for ms, or until signal aborts, whichever comes first. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) return Bun.sleep(ms);
+	if (signal.aborted) return Promise.resolve();
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const done = () => {
+		clearTimeout(timer);
+		signal.removeEventListener("abort", done);
+		resolve();
+	};
+	const timer = setTimeout(done, ms);
+	signal.addEventListener("abort", done, { once: true });
+	return promise;
+}
+
+/** Same outcome the spawn path reports when the caller's signal aborts a running graphify. */
+function aborted(signal: AbortSignal, started: number): GraphifyResult {
+	const reason: unknown = signal.reason;
+	const message = reason instanceof Error ? reason.message : "The operation was aborted.";
+	return { text: `graphify failed: ${message}`, exitCode: 1, cached: false, ms: elapsed(started) };
 }
 
 /** Fire-and-forget L2 write. Never throws and is never awaited. */
@@ -219,6 +242,7 @@ export async function runGraphify(
 				return { text: hit, exitCode: 0, cached: true, ms: elapsed(started) };
 			}
 			if (l2) {
+				if (signal?.aborted) return aborted(signal, started);
 				const shared = await readL2(l2, key);
 				if (shared !== null) {
 					remember(key, shared);
@@ -247,8 +271,10 @@ export async function runGraphify(
 	if (!bin) {
 		return { text: "graphify: command not found", exitCode: 127, cached: false, ms: elapsed(started) };
 	}
+	if (signal?.aborted) return aborted(signal, started);
 	if (useCache && l2 && hasLease(l2)) {
-		const shared = await singleflight(l2, key);
+		const shared = await singleflight(l2, key, signal);
+		if (signal?.aborted) return aborted(signal, started);
 		if (shared !== null) {
 			remember(key, shared);
 			return { text: shared, exitCode: 0, cached: true, ms: elapsed(started) };

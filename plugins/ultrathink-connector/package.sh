@@ -51,13 +51,20 @@ if command -v zip >/dev/null 2>&1; then
 	# zip -@ reads one path per line, so no -x pattern can catch .claude-plugin/ by accident.
 	printf '%s\n' "$files" | zip -q "$archive" -@
 elif command -v python3 >/dev/null 2>&1; then
-	# python3 -m zipfile -c takes explicit paths, so pass the same list.
-	# One path per line; no globbing, so names with spaces or brackets survive.
-	set -f
-	IFS='
-'
-	# shellcheck disable=SC2086
-	python3 -m zipfile -c "$archive" $files
+	# The zipfile command line (-c) stores each file by its basename and would drop .claude-plugin/, commands/ and skills/,
+	# so write the same list with explicit archive names. The list travels in the environment because stdin carries the program;
+	# it is one path per line, so names with spaces or brackets survive.
+	ULTRATHINK_PACK_FILES="$files" python3 - "$archive" <<'PY'
+import os
+import sys
+import zipfile
+
+archive = sys.argv[1]
+paths = sorted(line for line in os.environ["ULTRATHINK_PACK_FILES"].split("\n") if line)
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+    for path in paths:
+        zf.write(path, arcname=path.replace(os.sep, "/"))
+PY
 else
 	echo "package.sh: needs zip or python3" >&2
 	exit 1

@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { COMMAND_OVERLAY, parseFrontmatter, REPOSITORY_ROOT } from "./commands.ts";
@@ -133,16 +133,7 @@ describe("plugin bundle manifest and connector", () => {
 		});
 	});
 
-	test("package.sh packs an explicit allowlist and names the archive the README names", () => {
-		const script = read("package.sh");
-		expect(script).toContain("set -eu");
-		expect(script).toContain(".claude-plugin/plugin.json");
-		expect(script).toContain("python3 -m zipfile");
-		// The old scan of the whole working tree is gone: only named paths and the commands/ and skills/ trees are packed.
-		expect(script).not.toMatch(/find \./);
-		expect(script).toContain("find commands");
-		expect(script).toContain("find skills");
-		expect(script).toContain("|| true)");
+	test("the built zip stays out of git and the README names it", () => {
 		expect(read(".gitignore").trim()).toBe("dist/");
 		expect(read("README.md")).toContain("ultrathink-connector-<version>.zip");
 	});
@@ -191,6 +182,56 @@ describe("plugin bundle manifest and connector", () => {
 				).toEqual(expected);
 			} finally {
 				rmSync(copy, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// The python3 fallback must keep the directory prefixes; `python3 -m zipfile -c` stores bare basenames.
+	const noZipTools = ["dirname", "mkdir", "rm", "find", "sort", "grep", "sed", "printf", "cat", "python3"];
+	const noZipPaths = noZipTools.map((tool) => [tool, Bun.which(tool)] as const);
+	const canRunWithoutZip = noZipPaths.every(([, found]) => found !== null) && Bun.which("python3") !== null;
+	test.skipIf(!canRunWithoutZip)(
+		"package.sh without zip(1) still keeps the .claude-plugin/, commands/ and skills/ prefixes (skipped without python3 or the POSIX tools it calls)",
+		async () => {
+			const copy = mkdtempSync(join(tmpdir(), "ut-bundle-nozip-"));
+			const tools = mkdtempSync(join(tmpdir(), "ut-bundle-tools-"));
+			try {
+				cpSync(BUNDLE, copy, { recursive: true, filter: (source) => basename(source) !== "dist" });
+				// A PATH holding only the tools package.sh calls, and not zip, forces the python3 branch.
+				for (const [tool, found] of noZipPaths) {
+					if (found !== null) symlinkSync(found, join(tools, tool));
+				}
+				expect(existsSync(join(tools, "zip"))).toBe(false);
+
+				const build = Bun.spawn(["/bin/sh", "package.sh"], { cwd: copy, env: { PATH: tools }, stdout: "pipe", stderr: "pipe" });
+				const [built, failure, code] = await Promise.all([new Response(build.stdout).text(), new Response(build.stderr).text(), build.exited]);
+				expect(code, failure).toBe(0);
+				const archive = built.trim().split("\n").at(-1) ?? "";
+				expect(archive).toMatch(/ultrathink-connector-\d+\.\d+\.\d+\.zip$/);
+
+				const python = Bun.which("python3") ?? "python3";
+				const list = Bun.spawn([python, "-c", "import sys, zipfile; print('\\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))", archive], {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [listed, listFailure, listCode] = await Promise.all([new Response(list.stdout).text(), new Response(list.stderr).text(), list.exited]);
+				expect(listCode, listFailure).toBe(0);
+				const expected = [
+					".claude-plugin/plugin.json",
+					".mcp.json",
+					"README.md",
+					...commandFiles().map((file) => `commands/${file}`),
+					"skills/ultrathink-connector/SKILL.md",
+				].sort();
+				expect(
+					listed
+						.split("\n")
+						.filter((name) => name !== "")
+						.sort(),
+				).toEqual(expected);
+			} finally {
+				rmSync(copy, { recursive: true, force: true });
+				rmSync(tools, { recursive: true, force: true });
 			}
 		},
 	);

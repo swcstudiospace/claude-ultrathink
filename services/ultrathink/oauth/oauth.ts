@@ -689,7 +689,10 @@ export function createOAuth(options: OAuthOptions): OAuth {
 				if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
 				return consentPage(requestId, found.request.nonce, clientName, redirectUri, "Incorrect password.", 200);
 			}
-			if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
+			// Registration or pruning may have dropped the client or its pending entry while the password was checked; a code for a missing client could never be redeemed.
+			if (found.request.approvalState !== "PENDING_APPROVAL" || pending.get(found.key) !== found.request || own(data.clients, found.request.clientId) === undefined) {
+				return expiredResponse(false);
+			}
 			found.request.approvalState = "APPROVED";
 			pending.delete(found.key);
 			const t = now();
@@ -767,11 +770,16 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	function makeRoomForClient(): boolean {
 		prune();
 		if (Object.keys(data.clients).length < maxClients) return true;
-		// Never evict a client that holds a grant. Drop the oldest one that never did.
+		// Never evict a client that holds a grant or whose owner approval is being checked right now. Drop the oldest one that never did.
+		const approvingClients = new Set<string>();
+		for (const key of approving) {
+			const request = pending.get(key);
+			if (request !== undefined) approvingClients.add(request.clientId);
+		}
 		let victim: string | null = null;
 		let oldest = Number.POSITIVE_INFINITY;
 		for (const [id, client] of Object.entries(data.clients)) {
-			if (client.grantedAt === undefined && client.createdAt < oldest) {
+			if (client.grantedAt === undefined && !approvingClients.has(id) && client.createdAt < oldest) {
 				oldest = client.createdAt;
 				victim = id;
 			}

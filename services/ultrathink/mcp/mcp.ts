@@ -77,7 +77,9 @@ const RESOURCE_NOT_FOUND = -32002;
 const INTERNAL_ERROR = -32603;
 
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+// A call without sessionId starts a new session, so repeating it is not free (for uplift it starts another paid plan).
+const START_NEW_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const START_NEW_PAID_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 
 /** Every tool the service can offer. Use toolDefinitions for the list a host actually serves. */
 export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
@@ -98,7 +100,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			required: ["prompt"],
 			additionalProperties: false,
 		},
-		annotations: READ_WRITE_OPEN_WORLD,
+		annotations: START_NEW_PAID_SESSION,
 		_meta: GRAPH_UI_META,
 	},
 	{
@@ -118,7 +120,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			required: ["prompt"],
 			additionalProperties: false,
 		},
-		annotations: READ_WRITE,
+		annotations: START_NEW_SESSION,
 	},
 	{
 		name: "ultrathink_pending",
@@ -355,7 +357,9 @@ async function callTool(
 	serverPlanning: boolean,
 ): Promise<RpcResponse> {
 	const name = isRecord(params) ? params.name : undefined;
-	const args = isRecord(params) ? params.arguments : undefined;
+	// MCP lets tools/call leave arguments out; every tool then runs with an empty object. Only a present non-object is refused.
+	const given = isRecord(params) ? params.arguments : undefined;
+	const args = isRecord(params) && "arguments" in params ? given : {};
 	if (typeof name !== "string" || !toolDefinitions(serverPlanning).some((tool) => tool.name === name)) {
 		return rpcError(id, INVALID_PARAMS, "unknown tool");
 	}

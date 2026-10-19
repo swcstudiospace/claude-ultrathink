@@ -121,6 +121,19 @@ describe("graph app document", () => {
 		expect(Buffer.byteLength(html, "utf8")).toBeLessThan(80 * 1024);
 	});
 
+	test("the defaults message names the plan, with the session id reduced to [A-Za-z0-9-] and cut to 64 characters", () => {
+		const source = /function defaultsText\(\) \{[\s\S]*?\n\t\}/.exec(script)?.[0] ?? "";
+		expect(source).not.toBe("");
+		const defaultsText = (sessionId: string): string =>
+			new Function("S", "DEFAULTS_TEXT", `${source}\nreturn defaultsText();`)({ sessionId }, "Use the defaults for all clarifying questions and go ahead.") as string;
+		expect(defaultsText("0b9d1c7e-5a2f-4c1d-8e3a-6f7a9b0c1d2e")).toBe(
+			"Use the defaults for all clarifying questions of plan 0b9d1c7e-5a2f-4c1d-8e3a-6f7a9b0c1d2e and go ahead.",
+		);
+		expect(defaultsText("a b/../`$x`\n")).toBe("Use the defaults for all clarifying questions of plan abx and go ahead.");
+		expect(defaultsText(`${"a".repeat(80)}`)).toBe(`Use the defaults for all clarifying questions of plan ${"a".repeat(64)} and go ahead.`);
+		expect(defaultsText("")).toBe("Use the defaults for all clarifying questions and go ahead.");
+	});
+
 	test("the script parses as JavaScript", () => {
 		expect(script.length).toBeGreaterThan(1000);
 		const transpiler = new Bun.Transpiler({ loader: "js" });

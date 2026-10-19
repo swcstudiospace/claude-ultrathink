@@ -842,6 +842,67 @@ describe("OAuth client table", () => {
 		expect(refreshed.status).toBe(200);
 	});
 
+	test("a client whose owner approval is being checked is not evicted; another ungranted client is", async () => {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const real = createAuth({ ownerPasswordHash: ownerHash ?? (ownerHash = await Bun.password.hash(password)), sessionSecret: HARNESS_SECRET, cookieSecure: true });
+		const auth = {
+			...real,
+			login: async (input: { password: string; clientIp: string }) => {
+				entered.resolve();
+				await gate.promise;
+				return real.login(input);
+			},
+		};
+		const h = await makeHarness({ maxClients: 2, auth });
+		const approving = await registered(h);
+		h.clock.now += 1000;
+		const bystander = await registered(h);
+		const { verifier, challenge } = pkcePair();
+		const consent = await authorizeCall(h, approving, challenge);
+		expect(consent.status).toBe(200);
+		const approval = approveWith(h, await consent.text(), password);
+		await entered.promise;
+
+		// The approving client is the oldest never-granted one, so without protection it would be the victim.
+		h.clock.now += 1000;
+		const newest = await registered(h);
+		gate.resolve();
+		const approved = await approval;
+		const code = codeFrom(approved);
+		const redeemed = await tokenCall(h, { grant_type: "authorization_code", code, code_verifier: verifier, client_id: approving, redirect_uri: REDIRECT, resource: RESOURCE });
+		expect(redeemed.status).toBe(200);
+
+		const other = pkcePair().challenge;
+		expect((await authorizeCall(h, bystander, other)).status).toBe(400);
+		expect((await authorizeCall(h, newest, other)).status).toBe(200);
+	});
+
+	test("registration reports unavailable while the only ungranted client is being approved", async () => {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const real = createAuth({ ownerPasswordHash: ownerHash ?? (ownerHash = await Bun.password.hash(password)), sessionSecret: HARNESS_SECRET, cookieSecure: true });
+		const auth = {
+			...real,
+			login: async (input: { password: string; clientIp: string }) => {
+				entered.resolve();
+				await gate.promise;
+				return real.login(input);
+			},
+		};
+		const h = await makeHarness({ maxClients: 1, auth });
+		const clientId = await registered(h);
+		const { verifier, challenge } = pkcePair();
+		const consent = await authorizeCall(h, clientId, challenge);
+		const approval = approveWith(h, await consent.text(), password);
+		await entered.promise;
+		expect((await registerCall(h, { redirect_uris: [REDIRECT] })).status).toBe(503);
+		gate.resolve();
+		const code = codeFrom(await approval);
+		const redeemed = await tokenCall(h, { grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: REDIRECT, resource: RESOURCE });
+		expect(redeemed.status).toBe(200);
+	});
+
 	test("registration reports unavailable only when every client holds a grant", async () => {
 		const h = await makeHarness({ maxClients: 1 });
 		await grant(h, await registered(h));

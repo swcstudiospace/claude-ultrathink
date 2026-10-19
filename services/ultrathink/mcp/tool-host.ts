@@ -86,8 +86,11 @@ export function createToolHost(deps: ToolHostDeps): ToolHost {
 
 	async function call(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
 		switch (name) {
-			case "ultrathink_plan":
+			case "ultrathink_plan": {
+				// A server job and a client-driven plan share one session file; the reverse guard lives in headless start.
+				if (planner?.status({ sessionId: args.sessionId }) != null) return { ok: false, code: "session_conflict" };
 				return toOutcome(await startPlan(journalOpts, { prompt: args.prompt, sessionId: args.sessionId }));
+			}
 			case "ultrathink_pending": {
 				const pending = listPendingRequests(journalOpts, { sessionId: args.sessionId });
 				return toOutcome(pending.ok ? { ok: true, data: { pending: pending.data } } : pending);

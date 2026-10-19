@@ -7,18 +7,19 @@
 #   ultrathink-backup.sh run              backup, then prune old backups, then prune old state (what the timer runs)
 #   ultrathink-backup.sh backup           consistent copy of the state into /var/backups/ultrathink/ultrathink-<utc>.tar.gz
 #   ultrathink-backup.sh verify <archive> check checksums, SQLite integrity and oauth.json syntax of an archive
-#   ultrathink-backup.sh prune            remove journal, sessions and jobs entries and SQLite runs older than the retention window
+#   ultrathink-backup.sh prune            remove journal, sessions and jobs entries, the root last.json and last-plan.json copies and SQLite runs older than the retention window
 #
 # What a backup holds: ultrathink.sqlite (a VACUUM INTO copy, consistent while the service runs), oauth.json
-# (registered clients and tokens; losing it logs every connector out) and the jobs/ directory. The archive holds user
-# prompts and OAuth secrets: it is mode 0600 inside a 0700 directory. Encrypt before sending off-host unless the
-# target is trusted.
+# (registered clients and tokens; losing it logs every connector out) and the jobs/, sessions/ and journal/ directories
+# (job status, saved plans and client-driven sessions; jobs/ alone would restore status without the plans). The archive
+# holds user prompts and OAuth secrets: it is mode 0600 inside a 0700 directory. Encrypt before sending off-host unless
+# the target is trusted.
 #
 # Environment (all optional; defaults are read from the service environment file when run as root):
 #   ULTRATHINK_STATE_DIR              state directory (default /var/lib/ultrathink)
 #   ULTRATHINK_BACKUP_DIR             archive directory (default /var/backups/ultrathink)
 #   ULTRATHINK_BACKUP_KEEP            archives to keep (default 14)
-#   ULTRATHINK_RETENTION_DAYS         age limit for journal, sessions and jobs entries (default 30)
+#   ULTRATHINK_RETENTION_DAYS         age limit for journal, sessions and jobs entries and the root plan copies (default 30)
 #   ULTRATHINK_BACKUP_RSYNC_TARGET    rsync destination, for example backup@host:/srv/ultrathink/ (default: none)
 #   ULTRATHINK_BUN                    Bun binary (default /opt/ultrathink/bin/bun)
 #
@@ -168,6 +169,11 @@ bun_tool() {
 		UT_RETENTION_MODULE="$RETENTION_MODULE" "$BUN" -e "$BUN_TOOL"
 }
 
+# State directories a backup copies and retention prunes entry by entry.
+STATE_DATA_DIRS="jobs sessions journal"
+# The planner also writes full plan copies (request text included) next to the state directories.
+STATE_ROOT_COPIES="last.json last-plan.json"
+
 work_dir=""
 verify_dir=""
 cleanup() {
@@ -177,7 +183,7 @@ cleanup() {
 trap cleanup EXIT
 
 do_verify() {
-	local archive="${1:-}" top
+	local archive="${1:-}" top dirs dir
 	[ -n "$archive" ] || usage
 	[ -f "$archive" ] || die "archive not found: $archive"
 	verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/ultrathink-verify.XXXXXX")"
@@ -191,6 +197,13 @@ do_verify() {
 	[ -f "$top/ultrathink.sqlite" ] || die "archive has no ultrathink.sqlite"
 	bun_tool check "$top/ultrathink.sqlite" || die "SQLite integrity check failed"
 	if [ -f "$top/oauth.json" ]; then bun_tool json "$top/oauth.json" || die "oauth.json is not valid JSON"; fi
+	# BACKUP_INFO (covered by the checksums) lists the directories the backup copied; each must still be in the archive.
+	# Archives written before sessions/ and journal/ were included have no dirs= line and are checked as before.
+	dirs="$(sed -n 's/^dirs=//p' "$top/BACKUP_INFO" 2>/dev/null || true)"
+	for dir in $dirs; do
+		case " $STATE_DATA_DIRS " in *" $dir "*) ;; *) die "archive lists an unexpected directory: $dir" ;; esac
+		[ -d "$top/$dir" ] || die "archive is missing $dir/"
+	done
 	say "verified: $archive"
 	rm -rf -- "$verify_dir"
 	verify_dir=""
@@ -207,7 +220,7 @@ prune_archives() {
 }
 
 do_backup() {
-	local stamp name stage archive tmp_archive rsync_failed=0
+	local stamp name stage archive tmp_archive rsync_failed=0 dir copied_dirs=""
 	[ -d "$STATE_DIR" ] || die "state directory not found: $STATE_DIR"
 	[ -f "$STATE_DIR/ultrathink.sqlite" ] || die "database not found: $STATE_DIR/ultrathink.sqlite"
 	install -d -m 0700 "$BACKUP_DIR"
@@ -228,11 +241,15 @@ do_backup() {
 	else
 		warn "no oauth.json in $STATE_DIR (skipped)"
 	fi
-	if [ -d "$STATE_DIR/jobs" ]; then
-		say "copying jobs/"
-		cp -r -- "$STATE_DIR/jobs" "$stage/jobs" || die "cannot copy jobs/"
-	fi
-	printf 'created_utc=%s\nstate_dir=%s\n' "$stamp" "$STATE_DIR" >"$stage/BACKUP_INFO" || die "cannot write BACKUP_INFO"
+	# jobs/ holds status and usage only; the plans themselves live in sessions/ and journal/, so a restore needs all three.
+	for dir in $STATE_DATA_DIRS; do
+		if [ -d "$STATE_DIR/$dir" ]; then
+			say "copying $dir/"
+			cp -r -- "$STATE_DIR/$dir" "$stage/$dir" || die "cannot copy $dir/"
+			copied_dirs="${copied_dirs:+$copied_dirs }$dir"
+		fi
+	done
+	printf 'created_utc=%s\nstate_dir=%s\ndirs=%s\n' "$stamp" "$STATE_DIR" "$copied_dirs" >"$stage/BACKUP_INFO" || die "cannot write BACKUP_INFO"
 
 	say "writing checksums"
 	(cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS) || die "checksum step failed"
@@ -257,8 +274,9 @@ do_backup() {
 	[ "$rsync_failed" -eq 0 ] || return 1
 }
 
-# A journal, sessions or jobs entry is removed only when nothing inside it (or the entry itself) was modified within
-# the retention window, so a session that is still being written is never touched.
+# A journal, sessions or jobs entry (and the root-level last.json and last-plan.json plan copies) is removed only when
+# nothing inside it (or the entry itself) was modified within the retention window, so a session that is still being
+# written is never touched.
 do_prune() {
 	local base entry removed=0 window_minutes=$((RETENTION_DAYS * 1440))
 	case "$STATE_DIR" in
@@ -274,6 +292,14 @@ do_prune() {
 				removed=$((removed + 1))
 			fi
 		done < <(find "$STATE_DIR/$base" -mindepth 1 -maxdepth 1 -print0)
+	done
+	for base in $STATE_ROOT_COPIES; do
+		entry="$STATE_DIR/$base"
+		[ -f "$entry" ] && [ ! -L "$entry" ] || continue
+		if [ -z "$(find "$entry" -mmin "-$window_minutes" -print -quit)" ]; then
+			rm -f -- "$entry"
+			removed=$((removed + 1))
+		fi
 	done
 	say "retention: removed $removed entries older than $RETENTION_DAYS days"
 }

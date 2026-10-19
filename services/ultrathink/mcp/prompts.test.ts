@@ -5,12 +5,12 @@ import { describe, expect, test } from "bun:test";
 import { COMMAND_OVERLAY, MAX_ARGUMENT_CHARS } from "./commands.ts";
 import { type PromptRender, promptDefinitions, renderPrompt } from "./prompts.ts";
 
-/** The `ultrathink` prompt as it was before the command catalog; clients that already use it must see no change. */
+/** The server-mode `ultrathink` prompt, pinned byte for byte: unchanged from before the catalog except step 2 since the review. */
 const SERVER_TEXT = [
 	"Plan the request below with ultrathink before doing anything else. The server does the thinking; you do not write the plan.",
 	"",
 	"1. Call ultrathink_uplift with prompt set to the request, verbatim. Keep the sessionId it returns and reuse it for every later call.",
-	"2. While the status is running, call ultrathink_result with the sessionId. It waits for the plan and reports running again if the plan is not ready yet; call it again.",
+	"2. Call ultrathink_result with the sessionId until the status is planned, also when ultrathink_uplift already reports planned, because only ultrathink_result returns the plan. It waits for the plan and reports running again if the plan is not ready yet; call it again.",
 	"3. When the status is planned, the text of the result is the plan. Ask the user the questions in it that matter, or state the defaults you assume for the rest, then carry out the plan.",
 	"4. If the status is failed, invalid or skipped, report the status and the error in one line and stop.",
 	"",
@@ -106,7 +106,7 @@ describe("the ultrathink prompt", () => {
 		expect(render.ok && render.description).toBe(CLIENT_DESCRIPTION);
 	});
 
-	test("server text is byte-identical to the text before the catalog and ends with the request", () => {
+	test("server text is the pinned text, requires a result call even when the start reports planned, and ends with the request", () => {
 		const render = renderPrompt("ultrathink", { request: REQUEST }, { serverPlanning: true });
 		expect(textOf(render)).toBe(`${SERVER_TEXT}\n${REQUEST}`);
 		expect(render.ok && render.description).toBe(SERVER_DESCRIPTION);

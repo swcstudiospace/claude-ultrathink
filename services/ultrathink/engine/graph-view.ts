@@ -364,12 +364,17 @@ export function fenced(text: string, info = ""): string {
 	return `${fence}${info}\n${text}\n${fence}`;
 }
 
+/** Shown when the caps cut the view, so a client that displays only text can tell it is incomplete. */
+export const TRUNCATED_NOTE =
+	'Note: this view is shortened (some nodes or steps were left out). Call ultrathink_result with detail "full" for the whole plan.';
+
 /** The plan-text block: heading, one instruction for the chat model, the wave tree first and the diagram second. */
 export function renderGraphBlock(view: GraphView): string {
 	return [
 		"## Graph of Thought x Chain of Thought",
 		"Show the user the wave tree below first, unchanged, in a code block. If your interface renders Mermaid, also show the diagram after it as a mermaid code block.",
 		fenced(renderTree(view), "text"),
+		...(view.truncated === true ? [TRUNCATED_NOTE] : []),
 		fenced(renderMermaid(view), "mermaid"),
 	].join("\n\n");
 }

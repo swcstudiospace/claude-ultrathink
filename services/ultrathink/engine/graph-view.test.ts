@@ -419,6 +419,25 @@ describe("renderGraphBlock", () => {
 		expect(mermaid).toBe(`\`\`\`mermaid\n${renderMermaid(built)}\n\`\`\``);
 	});
 
+	test("an uncut graph carries no note", () => {
+		const built = view(SMALL);
+		expect(built.truncated).toBeUndefined();
+		expect(renderGraphBlock(built)).not.toContain("Note:");
+	});
+
+	test("a cut graph gets one note line between the tree and the diagram, outside both fences", () => {
+		const nodes = Array.from({ length: 30 }, (_, i) => node(`n${i + 1}`, "generate", i === 0 ? [] : [`n${i}`]));
+		const built = view({ goal: "g", nodes });
+		expect(built.truncated).toBe(true);
+		const parts = renderGraphBlock(built).split("\n\n");
+		expect(parts).toHaveLength(5);
+		expect(parts[2]).toBe(`\`\`\`text\n${renderTree(built)}\n\`\`\``);
+		expect(parts[3]).toBe(
+			'Note: this view is shortened (some nodes or steps were left out). Call ultrathink_result with detail "full" for the whole plan.',
+		);
+		expect(parts[4]).toBe(`\`\`\`mermaid\n${renderMermaid(built)}\n\`\`\``);
+	});
+
 	test("the tree fence is longer than any backtick run in model text", () => {
 		const built = view({ goal: "goal ````````` end", nodes: [node("n1", "understand", [], { title: "``` x" })] });
 		const text = renderGraphBlock(built);

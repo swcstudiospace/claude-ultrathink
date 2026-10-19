@@ -955,12 +955,17 @@ const SCRIPT = String.raw`
 			D.qs.appendChild(S.qNote);
 		}
 	}
+	// Names the plan so a click on an older card is tied to that plan; the id is cut to what a session id can hold.
+	function defaultsText() {
+		var id = String(S.sessionId || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 64);
+		return id ? "Use the defaults for all clarifying questions of plan " + id + " and go ahead." : DEFAULTS_TEXT;
+	}
 	function sendDefaults() {
 		if (S.sending || S.sent) return;
 		S.sending = true;
 		if (S.defaultsBtn) S.defaultsBtn.disabled = true;
 		// The SDK's AppBridge schema takes an array of content blocks, the spec prose a single block; -32602 means the host wanted the other one.
-		var textBlock = { type: "text", text: DEFAULTS_TEXT };
+		var textBlock = { type: "text", text: defaultsText() };
 		request("ui/message", { role: "user", content: [textBlock] }, 30000).catch(function (e) {
 			if (e && e.code === -32602) return request("ui/message", { role: "user", content: textBlock }, 30000);
 			throw e;

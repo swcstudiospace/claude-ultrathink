@@ -486,4 +486,62 @@ describe("runGraphify options", () => {
 			setGraphifyBinForTests(null);
 		}
 	});
+
+	test("a signal aborted during the lease wait stops the wait and never spawns", async () => {
+		const { cwd, bin, log } = fixture("graphify-abort-lease-");
+		writeGraph(cwd, "graph", 1_700_000_000);
+		const controller = new AbortController();
+		let reads = 0;
+		const l2 = {
+			// Read 1 is the cache read before the lease; read 2 is the first poll while the lease is held.
+			get: async (): Promise<string | null> => {
+				reads += 1;
+				if (reads === 2) controller.abort();
+				return null;
+			},
+			set: async (): Promise<void> => {},
+			acquire: async (): Promise<LeaseOutcome> => "held",
+		};
+		try {
+			setGraphifyBinForTests(bin);
+			const started = Date.now();
+			const result = await runGraphify(cwd, ["query", "cancelled"], controller.signal, { keyedCache: true, l2 });
+			// Without the abort check the waiter would sit out WAIT_MS (2000 ms) and then spawn.
+			expect(Date.now() - started).toBeLessThan(1000);
+			expect(result.exitCode).toBe(1);
+			expect(result.cached).toBe(false);
+			expect(result.text).toStartWith("graphify failed:");
+			expect(spawns(log)).toBe(0);
+		} finally {
+			setGraphifyBinForTests(null);
+		}
+	});
+
+	test("a signal aborted during the L2 cache read never spawns", async () => {
+		const { cwd, bin, log } = fixture("graphify-abort-cache-");
+		writeGraph(cwd, "graph", 1_700_000_000);
+		const controller = new AbortController();
+		let acquires = 0;
+		const l2 = {
+			get: async (): Promise<string | null> => {
+				controller.abort();
+				return null;
+			},
+			set: async (): Promise<void> => {},
+			acquire: async (): Promise<LeaseOutcome> => {
+				acquires += 1;
+				return "granted";
+			},
+		};
+		try {
+			setGraphifyBinForTests(bin);
+			const result = await runGraphify(cwd, ["query", "cancelled"], controller.signal, { keyedCache: true, l2 });
+			expect(result.exitCode).toBe(1);
+			expect(result.text).toStartWith("graphify failed:");
+			expect(acquires).toBe(0);
+			expect(spawns(log)).toBe(0);
+		} finally {
+			setGraphifyBinForTests(null);
+		}
+	});
 });

@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionRecord, writeSession } from "../../../src/claude/state.ts";
@@ -149,6 +149,25 @@ describe("the original tools", () => {
 		planner.serverIds.add(serverId);
 		expect(okOf(await host.call("ultrathink_status", { sessionId: serverId })).data).toMatchObject({ sessionId: serverId, status: "running" });
 		expect(await host.call("ultrathink_status", { sessionId: "../etc" })).toEqual({ ok: false, code: "invalid_session_id" });
+	});
+
+	test("ultrathink_plan refuses a session id owned by a server job and leaves its session and job files alone", async () => {
+		const planner = stubPlanner(true);
+		const { host, stateDir } = setup({ planner });
+		const sessionId = randomUUID();
+		planner.serverIds.add(sessionId);
+		writeSession(stateDir, record(sessionId));
+		const jobPath = join(stateDir, "jobs", `${sessionId}.json`);
+		mkdirSync(join(stateDir, "jobs"), { recursive: true });
+		writeFileSync(jobPath, JSON.stringify({ sessionId, status: "planned", usage: { calls: 3, inputTokens: 10, outputTokens: 5 } }));
+		const sessionPath = join(stateDir, "sessions", `${sessionId}.json`);
+		const before = { session: readFileSync(sessionPath, "utf8"), job: readFileSync(jobPath, "utf8") };
+
+		expect(await host.call("ultrathink_plan", { prompt: "plan the rollout", sessionId })).toEqual({ ok: false, code: "session_conflict" });
+
+		expect(readFileSync(sessionPath, "utf8")).toBe(before.session);
+		expect(readFileSync(jobPath, "utf8")).toBe(before.job);
+		expect(existsSync(journalDir(stateDir, sessionId))).toBe(false);
 	});
 
 	test("ultrathink_uplift needs a planner", async () => {

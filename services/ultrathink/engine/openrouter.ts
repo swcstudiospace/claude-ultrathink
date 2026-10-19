@@ -33,8 +33,9 @@ export class OpenRouterError extends Error {
 }
 
 export interface OpenRouterUsage {
-	promptTokens: number;
-	completionTokens: number;
+	/** Absent when the endpoint did not report a valid count; unknown is not zero. */
+	promptTokens?: number;
+	completionTokens?: number;
 	/** OpenRouter's `usage.cost` in USD when the response carries one. */
 	costUsd?: number;
 }
@@ -121,8 +122,8 @@ function backoffMs(retry: number): number {
 	return BACKOFF_BASE_MS * 2 ** retry + Math.random() * BACKOFF_JITTER_MS;
 }
 
-function count(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+function count(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /** Upstream JSON; every field is checked where it is used. Optional chaining is safe on any JSON value. */
@@ -164,12 +165,14 @@ function parseCompletion(raw: string): Attempt {
 		return { ok: false, error: new OpenRouterError("empty"), retry: false };
 	}
 	const cost = reply?.usage?.cost;
+	const promptTokens = count(reply?.usage?.prompt_tokens);
+	const completionTokens = count(reply?.usage?.completion_tokens);
 	return {
 		ok: true,
 		text,
 		usage: {
-			promptTokens: count(reply?.usage?.prompt_tokens),
-			completionTokens: count(reply?.usage?.completion_tokens),
+			...(promptTokens === undefined ? {} : { promptTokens }),
+			...(completionTokens === undefined ? {} : { completionTokens }),
 			...(typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { costUsd: cost } : {}),
 		},
 	};

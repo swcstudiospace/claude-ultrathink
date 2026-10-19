@@ -153,20 +153,22 @@ describe("usage", () => {
 		expect(seen).toEqual([{ promptTokens: 11, completionTokens: 7, costUsd: 0.0021 }]);
 	});
 
-	test("a response without cost omits costUsd; without usage reports zeros", async () => {
+	test("a response without cost omits costUsd; missing or invalid counts stay unknown, never zero", async () => {
 		const seen: OpenRouterUsage[] = [];
 		const { complete } = setup(
-			[completion("a", { prompt_tokens: 3, completion_tokens: 4 }), completion("b"), completion("c", { prompt_tokens: "x", completion_tokens: -1, cost: "free" })],
+			[
+				completion("a", { prompt_tokens: 3, completion_tokens: 4 }),
+				completion("b"),
+				completion("c", { prompt_tokens: "x", completion_tokens: -1, cost: "free" }),
+				completion("d", { prompt_tokens: 9 }),
+			],
 			{ onUsage: (usage) => seen.push(usage) },
 		);
 		await complete("s", "u");
 		await complete("s", "u");
 		await complete("s", "u");
-		expect(seen).toEqual([
-			{ promptTokens: 3, completionTokens: 4 },
-			{ promptTokens: 0, completionTokens: 0 },
-			{ promptTokens: 0, completionTokens: 0 },
-		]);
+		await complete("s", "u");
+		expect(seen).toEqual([{ promptTokens: 3, completionTokens: 4 }, {}, {}, { promptTokens: 9 }]);
 		expect("costUsd" in (seen[0] as OpenRouterUsage)).toBe(false);
 	});
 

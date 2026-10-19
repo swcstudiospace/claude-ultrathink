@@ -356,6 +356,32 @@ describe("headless planner: limits and lifecycle", () => {
 		}
 	});
 
+	test("a response without usage, or with only some counts, keeps the estimate in the ledger so the ceiling still ends the job", async () => {
+		const shapes: Array<Record<string, unknown> | undefined> = [undefined, { prompt_tokens: 10 }, { completion_tokens: 5, cost: 0.001 }, { prompt_tokens: "x", completion_tokens: -1 }];
+		for (const usage of shapes) {
+			const model = scriptedModel();
+			let seen = 0;
+			const openRouter: OpenRouterFetch = async (_url, init) => {
+				seen += 1;
+				const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+				const content = model(body.messages[0]?.content ?? "", body.messages[1]?.content ?? "");
+				return new Response(JSON.stringify({ choices: [{ message: { content } }], ...(usage ? { usage } : {}) }), { status: 200 });
+			};
+			const h = setup({ runTokenCeiling: 6000 }, { completer: undefined, fetch: openRouter });
+			const sessionId = randomUUID();
+			const started = await h.planner.start({ prompt: PROMPT, sessionId });
+			expect(started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "budget_exceeded" } });
+			// A plan needs at least eight calls; zero-settled calls would have let them all through.
+			expect(seen).toBeGreaterThanOrEqual(1);
+			expect(seen).toBeLessThan(8);
+			const runId = String(jobFile(h.stateDir, sessionId).runId);
+			const spent = createLedger(h.store, { runTokenCeiling: 1, dailyTokenCeiling: 1 }).spentForRun(runId);
+			// Each call held at least its max output tokens (1000) and none was settled to zero.
+			expect(spent).toBeGreaterThanOrEqual(1000 * seen);
+			expect(spent).toBeLessThanOrEqual(6000);
+		}
+	});
+
 	test("the plan timeout aborts the job", async () => {
 		const gate = Promise.withResolvers<void>();
 		const model = fakeModel(gate.promise);

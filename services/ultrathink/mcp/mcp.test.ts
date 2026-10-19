@@ -32,7 +32,8 @@ const SERVER_TOOLS = ["ultrathink_uplift", ...CLIENT_TOOLS];
 const UI_URI = "ui://ultrathink/graph";
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const START_NEW_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const START_NEW_PAID_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const INVALID_REQUEST_REPLY = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } };
 const INTERNAL_ERROR = { code: -32603, message: "internal error" };
 const UNKNOWN_TOOL = { code: -32602, message: "unknown tool" };
@@ -459,7 +460,8 @@ describe("tools/list", () => {
 			expect(schemaOf(tool).type).toBe("object");
 			expect(schemaOf(tool).additionalProperties).toBe(false);
 			expect("outputSchema" in tool).toBe(false);
-			expect(tool.annotations.idempotentHint).toBe(true);
+			// A start call without sessionId makes a new session, so only the two start tools are not idempotent.
+			expect(tool.annotations.idempotentHint).toBe(tool.name !== "ultrathink_uplift" && tool.name !== "ultrathink_plan");
 		}
 	});
 
@@ -470,7 +472,7 @@ describe("tools/list", () => {
 		expect(uplift.description.indexOf("/ultrathink")).toBeLessThan(80);
 		expect(schemaOf(uplift).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(uplift).properties)).toEqual(["prompt", "sessionId"]);
-		expect(uplift.annotations).toEqual(READ_WRITE_OPEN_WORLD);
+		expect(uplift.annotations).toEqual(START_NEW_PAID_SESSION);
 		expect(uplift.description).toContain("followed by a space");
 		expect(uplift.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
 		expect(uplift.description).toContain("ultrathink_command");
@@ -548,7 +550,7 @@ describe("tools/list", () => {
 		expect(plan.description).toContain("/ultrathink");
 		expect(schemaOf(plan).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(plan).properties)).toEqual(["prompt", "sessionId"]);
-		expect(plan.annotations).toEqual(READ_WRITE);
+		expect(plan.annotations).toEqual(START_NEW_SESSION);
 		expect(plan.description).toContain("followed by a space");
 		expect(plan.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
 		expect(plan.description).toContain("ultrathink_command");
@@ -755,8 +757,8 @@ describe("tool results", () => {
 		expect("errors" in result.structuredContent).toBe(false);
 	});
 
-	test("non-object arguments return invalid_arguments without calling the host", async () => {
-		const badArgs: unknown[] = [undefined, null, "prompt", ["prompt"], 7, true];
+	test("present non-object arguments return invalid_arguments without calling the host", async () => {
+		const badArgs: unknown[] = [null, "prompt", ["prompt"], 7, true];
 		for (const name of SERVER_TOOLS) {
 			for (const args of badArgs) {
 				const host = serverHost();
@@ -766,6 +768,15 @@ describe("tool results", () => {
 				expect(result.content).toEqual([{ type: "text", text: "invalid arguments" }]);
 				expect(host.calls).toHaveLength(0);
 			}
+		}
+	});
+
+	test("omitted arguments run the tool with an empty object", async () => {
+		for (const name of ["ultrathink_sessions", "ultrathink_graph"]) {
+			const host = serverHost();
+			const result = await invoke(host, name);
+			expect(result.isError).toBe(false);
+			expect(host.calls).toEqual([{ name, args: {} }]);
 		}
 	});
 });

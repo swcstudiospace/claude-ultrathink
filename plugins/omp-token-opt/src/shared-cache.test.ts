@@ -117,7 +117,8 @@ describe("scopedKey", () => {
 	});
 });
 
-describe("live redis", () => {
+// CI runners have no redis-server; the live suites run only where the binary exists.
+describe.skipIf(!Bun.which("redis-server"))("live redis", () => {
 	let server: Subprocess | undefined;
 	let dir = "";
 	let url = "";
@@ -136,7 +137,7 @@ describe("live redis", () => {
 	});
 
 	afterAll(async () => {
-		await cache.close();
+		await cache?.close();
 		server?.kill();
 		await server?.exited;
 		rmSync(dir, { recursive: true, force: true });
@@ -328,7 +329,8 @@ describe("acquire fails open", () => {
 	});
 });
 
-describe("acquire lease on live redis", () => {
+// CI runners have no redis-server; the live suites run only where the binary exists.
+describe.skipIf(!Bun.which("redis-server"))("acquire lease on live redis", () => {
 	let server: Subprocess | undefined;
 	let dir = "";
 	let url = "";
@@ -347,7 +349,7 @@ describe("acquire lease on live redis", () => {
 	});
 
 	afterAll(async () => {
-		await cache.close();
+		await cache?.close();
 		server?.kill();
 		await server?.exited;
 		rmSync(dir, { recursive: true, force: true });

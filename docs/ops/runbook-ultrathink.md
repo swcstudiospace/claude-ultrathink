@@ -154,10 +154,10 @@ nginx rollback: `rm /etc/nginx/sites-enabled/ultrathink.swcstudio.space && nginx
 
 The daily timer runs `deploy/ultrathink-backup.sh run` as user `ultrathink`:
 
-- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, and `jobs/`, with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file.
+- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, and the `jobs/`, `sessions/` and `journal/` directories (saved plans and client-driven sessions live in the last two), with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file.
 - Archive `/var/backups/ultrathink/ultrathink-<utc>.tar.gz` (mode 0600 in a 0700 directory), 14 kept.
 - Optional rsync when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set in the env file. For ssh targets put a key and `known_hosts` in `/var/lib/ultrathink/home/.ssh`. The archive contains prompts and OAuth secrets: use an encrypted or trusted target.
-- Retention: `journal/`, `sessions/` and `jobs/` entries untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched. SQLite runs not updated within the same window are deleted with their phases and ledger rows in one transaction; the job prints `database retention: removed N runs, M ledger rows`. `deploy/ultrathink-backup.sh prune` runs only the retention part.
+- Retention: `journal/`, `sessions/` and `jobs/` entries, and the root-level `last.json` and `last-plan.json` plan copies, untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched. SQLite runs not updated within the same window are deleted with their phases and ledger rows in one transaction; the job prints `database retention: removed N runs, M ledger rows`. `deploy/ultrathink-backup.sh prune` runs only the retention part.
 
 Manual run and status:
 
@@ -298,11 +298,11 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 |---|---|---|---|
 | Runs, phases, token ledger | `/var/lib/ultrathink/ultrathink.sqlite` | Request text, phase output, token reservations | `ULTRATHINK_RETENTION_DAYS` (default 30) after the run's last update, any status (a run stuck waiting for 30 days is removed too), with every row that references it (phases, ledger rows, and any other table with a foreign key to `runs`: child tables are found through foreign keys, so a new table is covered automatically), deleted in one transaction by the daily maintenance job. The daily token ceiling only counts today's UTC rows, so pruning does not change it; a run with a ledger row dated today is never pruned. Run text includes user prompts, so this is also the privacy window. Covered by backups, which keep older rows for up to 14 days. |
 | OAuth state | `/var/lib/ultrathink/oauth.json` | Registered clients, grants, token records | Pruned by the OAuth module (expired codes and tokens, unused clients). Access tokens live 1 hour, refresh tokens 30 days. |
-| Client-driven sessions | `/var/lib/ultrathink/journal/<session>/` | Prompts, pending questions, answers, metadata | `ULTRATHINK_RETENTION_DAYS` (default 30) after the last change, enforced by the daily maintenance job. |
-| Sessions | `/var/lib/ultrathink/sessions/` | Session records (request, specification) | Same 30 days. |
+| Client-driven sessions | `/var/lib/ultrathink/journal/<session>/` | Prompts, pending questions, answers, metadata | `ULTRATHINK_RETENTION_DAYS` (default 30) after the last change, enforced by the daily maintenance job; included in backups. |
+| Sessions | `/var/lib/ultrathink/sessions/` | Session records (request, specification) | Same 30 days; included in backups. The root `last.json` and `last-plan.json` copies of the latest plan follow the same window. |
 | Server planning jobs | `/var/lib/ultrathink/jobs/` | Job records and plan output | Same 30 days; included in backups. |
 | Scratch | `/var/lib/ultrathink/cwd/`, `home/` | Empty working directory and `$HOME` | Not pruned; hold no user data. |
-| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, `jobs/` | 14 daily archives locally; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
+| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, `jobs/`, `sessions/`, `journal/` | 14 daily archives locally; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
 | Logs and metrics | journald, `/metrics` | Structured access and error logs without prompt text, secrets or tokens; counters | Per journald configuration (`journalctl --disk-usage`; set `SystemMaxUse` if needed). |
 | Provider side | OpenRouter and the model provider | Prompts and outputs of server-side plans | Governed by the provider's policy and your OpenRouter privacy settings. |
 

@@ -80,7 +80,7 @@ const SERVER_INSTRUCTIONS = [
 	"Plan the request below with ultrathink before doing anything else. The server does the thinking; you do not write the plan.",
 	"",
 	"1. Call ultrathink_uplift with prompt set to the request, verbatim. Keep the sessionId it returns and reuse it for every later call.",
-	"2. While the status is running, call ultrathink_result with the sessionId. It waits for the plan and reports running again if the plan is not ready yet; call it again.",
+	"2. Call ultrathink_result with the sessionId until the status is planned, also when ultrathink_uplift already reports planned, because only ultrathink_result returns the plan. It waits for the plan and reports running again if the plan is not ready yet; call it again.",
 	"3. When the status is planned, the text of the result is the plan. Ask the user the questions in it that matter, or state the defaults you assume for the rest, then carry out the plan.",
 	"4. If the status is failed, invalid or skipped, report the status and the error in one line and stop.",
 	"",

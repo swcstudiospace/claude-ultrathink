@@ -356,12 +356,15 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 				job.usage.calls += 1;
 				const { usage } = reported;
 				emit("ok", usage);
+				const known = (usage?.promptTokens ?? 0) + (usage?.completionTokens ?? 0);
 				if (usage) {
-					job.usage.inputTokens += usage.promptTokens;
-					job.usage.outputTokens += usage.completionTokens;
+					job.usage.inputTokens += usage.promptTokens ?? 0;
+					job.usage.outputTokens += usage.completionTokens ?? 0;
 					if (usage.costUsd !== undefined) job.usage.costUsd = (job.usage.costUsd ?? 0) + usage.costUsd;
 				}
-				const actual = usage ? usage.promptTokens + usage.completionTokens : Math.ceil((system.length + user.length + text.length) / CHARS_PER_TOKEN);
+				// An endpoint that omits a count has not said the call was free: the reservation (the worst-case estimate) stays, so the ceilings keep counting.
+				const countsKnown = usage?.promptTokens !== undefined && usage.completionTokens !== undefined;
+				const actual = countsKnown ? known : Math.max(known, estimated);
 				try {
 					ledger.settle(reservationId, Math.max(0, Math.round(actual)));
 				} catch {
