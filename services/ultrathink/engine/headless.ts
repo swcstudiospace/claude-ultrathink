@@ -12,7 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClaudeCompleter } from "../../../src/claude/complete.ts";
-import { readSession, type SessionRecord } from "../../../src/claude/state.ts";
+import { readSession } from "../../../src/claude/state.ts";
 import { defaultConfig, type UltrathinkConfig as PluginConfig } from "../../../src/config.ts";
 import type { ModelResolution, SelectedEngine } from "../../../src/host/engine.ts";
 import { GROKBOT_ENGINE_HOST, checkRecord, journalDir, readMeta } from "../../../src/host/grokbot.ts";
@@ -20,9 +20,11 @@ import { type PlanResponse, planPrompt } from "../../../src/host/plan.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { CeilingError, type Ledger } from "../cost/ledger.ts";
 import type { Store } from "../store/store.ts";
+import type { GraphView } from "./graph-view.ts";
 import { type JournalErrorCode, type JournalResult, type SessionView, cleanText, isSessionId, isolatedConfigEnv } from "./journal.ts";
 import { OpenRouterError, type OpenRouterFetch, type OpenRouterUsage, createOpenRouterCompleter } from "./openrouter.ts";
-import { DEFAULT_MAX_CHARS, type ChatQuestion, renderChatPlan } from "./render.ts";
+import { clientPlanView, serverPlanView } from "./plan-view.ts";
+import type { ChatQuestion } from "./render.ts";
 
 export type JobStatus = "running" | "planned" | "failed" | "invalid" | "skipped";
 
@@ -41,6 +43,8 @@ export interface ResultView {
 	text: string;
 	truncated?: boolean;
 	questions?: ChatQuestion[];
+	/** Structured Graph of Thought x Chain of Thought of a planned session; absent for a fallback or empty graph. */
+	graph?: GraphView;
 	usage?: JobUsage;
 	error?: string;
 }
@@ -189,21 +193,6 @@ function isJobFile(value: unknown): value is JobFile {
 		typeof file.usage === "object" &&
 		file.usage !== null
 	);
-}
-
-function statusLine(status: JobStatus, error?: string): string {
-	switch (status) {
-		case "running":
-			return "The plan is still being prepared. Call ultrathink_result again with the same sessionId; no other work is needed meanwhile.";
-		case "failed":
-			return `Planning failed (${error ?? "engine_error"}). Tell the user, and offer to try again with a new sessionId.`;
-		case "invalid":
-			return `The planner produced an incomplete plan (${error ?? "invalid_plan"}). Offer to try again with a new sessionId, or rephrase the request.`;
-		case "skipped":
-			return `Planning was skipped (${error ?? "skipped"}). Rephrase the request as a plain description of the task, without a leading slash or a raw: prefix, and call ultrathink_uplift again with a new sessionId.`;
-		default:
-			return "";
-	}
 }
 
 export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
@@ -497,55 +486,6 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 		};
 	}
 
-	function renderView(sessionId: string, mode: "server" | "client", detail: "brief" | "full", record: SessionRecord, usage?: JobUsage): ResultView {
-		const rendered = renderChatPlan(record, { detail, maxChars: DEFAULT_MAX_CHARS[detail] });
-		return {
-			sessionId,
-			status: "planned",
-			mode,
-			text: rendered.text,
-			...(rendered.truncated ? { truncated: true } : {}),
-			...(rendered.questions.length > 0 ? { questions: rendered.questions } : {}),
-			...(usage ? { usage: { ...usage } } : {}),
-		};
-	}
-
-	function serverView(file: JobFile, detail: "brief" | "full"): JournalResult<ResultView> {
-		if (file.status === "planned") {
-			const record = readSession(stateDir, file.sessionId);
-			if (!record) return fail("engine_error");
-			return { ok: true, data: renderView(file.sessionId, "server", detail, record, file.usage) };
-		}
-		return {
-			ok: true,
-			data: {
-				sessionId: file.sessionId,
-				status: file.status,
-				mode: "server",
-				text: statusLine(file.status, file.error),
-				usage: { ...file.usage },
-				...(file.error === undefined ? {} : { error: file.error }),
-			},
-		};
-	}
-
-	// A finished session from the client-driven loop: the chat model did the thinking, the record is the same.
-	function clientView(sessionId: string, detail: "brief" | "full"): JournalResult<ResultView> {
-		const meta = readMeta(journalDir(stateDir, sessionId));
-		if (!meta) return fail("not_found");
-		const status: JobStatus = meta.status === "planned" || meta.status === "invalid" || meta.status === "skipped" ? meta.status : "running";
-		if (status === "planned") {
-			const record = readSession(stateDir, sessionId);
-			if (!record) return fail("engine_error");
-			return { ok: true, data: renderView(sessionId, "client", detail, record) };
-		}
-		const text =
-			status === "running"
-				? "This session is driven by the chat model and is not finished: keep answering its pending requests with ultrathink_pending, ultrathink_show and ultrathink_answer."
-				: statusLine(status, status === "skipped" ? "skipped" : undefined);
-		return { ok: true, data: { sessionId, status, mode: "client", text } };
-	}
-
 	recoverInterrupted();
 
 	return {
@@ -627,7 +567,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 				const live = jobs.get(sessionId);
 				if (live) await waitFor(live, waitSeconds * 1000);
 				const file = live ?? readJobFile(sessionId);
-				return file ? serverView(file, detail) : clientView(sessionId, detail);
+				return file ? serverPlanView(stateDir, file, detail) : clientPlanView(stateDir, sessionId, detail);
 			} catch {
 				return fail("engine_error");
 			}

@@ -6,10 +6,12 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ClaudeCompleter } from "../../../src/claude/complete.ts";
+import { readSession, writeSession } from "../../../src/claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../../../src/config.ts";
 import { stageOf } from "../../../src/host/grokbot.ts";
 import { planPrompt } from "../../../src/host/plan.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../../../src/think/prompts.ts";
+import { FALLBACK_GRAPH } from "../../../src/think/types.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../../../src/uplift/prompt.ts";
 import { escapeXml } from "../../../src/uplift/xml.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
@@ -744,5 +746,114 @@ describe("headless planner: isolation", () => {
 				else process.env[key] = saved[key];
 			}
 		}
+	});
+});
+
+/** Drives a session through the client-driven loop (the chat model answers every request) until it is planned. */
+async function finishClientSession(stateDir: string, sessionId: string): Promise<void> {
+	const o = { stateDir, maxPromptChars: 4000, maxAnswerChars: 200_000 };
+	const model = scriptedModel();
+	let status = "needs-model";
+	for (let pass = 0; pass < 12 && status === "needs-model"; pass++) {
+		const plan = await startPlan(o, { prompt: PROMPT, sessionId });
+		if (!plan.ok) throw new Error(`startPlan failed: ${plan.code}`);
+		status = plan.data.status;
+		if (status !== "needs-model") break;
+		const listed = listPendingRequests(o, { sessionId });
+		if (!listed.ok) throw new Error("list failed");
+		for (const entry of listed.data) {
+			const system = showRequest(o, { sessionId, key: entry.key, part: "system" });
+			const user = showRequest(o, { sessionId, key: entry.key, part: "user" });
+			if (!system.ok || !user.ok) throw new Error("show failed");
+			expect(answerRequest(o, { sessionId, key: entry.key, answer: model(system.data.system ?? "", user.data.user ?? "") }).ok).toBe(true);
+		}
+	}
+	expect(status).toBe("planned");
+}
+
+describe("headless planner: graph view", () => {
+	test("a server-planned session carries the structured graph and the diagram in its text", async () => {
+		const h = setup();
+		const sessionId = randomUUID();
+		expect(await h.planner.start({ prompt: PROMPT, sessionId })).toMatchObject({ ok: true, data: { status: "planned" } });
+		for (const detail of ["brief", "full"] as const) {
+			const result = await h.planner.result({ sessionId, detail, waitSeconds: 0 });
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			const graph = result.data.graph;
+			expect(graph).toBeDefined();
+			if (!graph) return;
+			expect(graph.version).toBe(1);
+			expect(graph.goal).toBe("Ship a streaming CSV to JSON CLI");
+			expect(graph.counts).toMatchObject({ nodes: 5, edges: 5, waves: 4 });
+			expect(graph.waves.map((w) => w.ids)).toEqual([["n1"], ["n2", "n3"], ["n4"], ["n5"]]);
+			expect(graph.waves[1]?.parallel).toBe(true);
+			for (const node of graph.nodes) {
+				expect(node.steps).toHaveLength(8);
+				expect(node.conclusion).toContain(`Answer for ${node.id}.`);
+			}
+			expect(JSON.parse(JSON.stringify(result.data)).graph).toEqual(graph);
+			expect(result.data.text).toContain("## Graph of Thought x Chain of Thought");
+			expect(result.data.text).toContain("```mermaid\nflowchart TD\n");
+			expect(result.data.text.indexOf("## Graph of Thought x Chain of Thought")).toBeLessThan(result.data.text.indexOf("## Request"));
+		}
+	});
+
+	test("a client-driven session carries the same structured graph", async () => {
+		const h = setup();
+		const sessionId = randomUUID();
+		await finishClientSession(h.stateDir, sessionId);
+		const result = await h.planner.result({ sessionId, waitSeconds: 0 });
+		expect(result).toMatchObject({ ok: true, data: { status: "planned", mode: "client" } });
+		if (!result.ok) return;
+		expect(result.data.graph).toMatchObject({ version: 1, counts: { nodes: 5, waves: 4 } });
+		expect(result.data.text).toContain("```mermaid\nflowchart TD\n");
+	});
+
+	test("a fallback graph exposes no graph and no diagram", async () => {
+		const h = setup();
+		const sessionId = randomUUID();
+		await h.planner.start({ prompt: PROMPT, sessionId });
+		const record = readSession(h.stateDir, sessionId);
+		if (!record) throw new Error("no session record");
+		writeSession(h.stateDir, { ...record, graph: { goal: FALLBACK_GRAPH.goal, nodes: FALLBACK_GRAPH.nodes.map((n) => ({ ...n, dependsOn: [...n.dependsOn] })) } });
+		const result = await h.planner.result({ sessionId, waitSeconds: 0 });
+		expect(result).toMatchObject({ ok: true, data: { status: "planned", mode: "server" } });
+		if (!result.ok) return;
+		expect("graph" in result.data).toBe(false);
+		expect(result.data.text).not.toContain("## Graph of Thought x Chain of Thought");
+		expect(result.data.text).not.toContain("Show the wave tree first.");
+	});
+
+	test("running and failed views carry no graph and keep their shape", async () => {
+		const gate = Promise.withResolvers<void>();
+		const running = setup({}, { completer: fakeModel(gate.promise).complete });
+		const runningId = randomUUID();
+		await startRunning(running, runningId);
+		const pending = await running.planner.result({ sessionId: runningId, waitSeconds: 0 });
+		expect(pending).toEqual({
+			ok: true,
+			data: { sessionId: runningId, status: "running", mode: "server", text: expect.stringContaining("still being prepared"), usage: expect.any(Object) },
+		});
+		gate.resolve();
+		await running.planner.result({ sessionId: runningId, waitSeconds: 30 });
+
+		const failing: OpenRouterFetch = async () => new Response("nope", { status: 401 });
+		const h = setup({}, { completer: undefined, fetch: failing });
+		const failedId = randomUUID();
+		await h.planner.start({ prompt: PROMPT, sessionId: failedId });
+		expect(await h.planner.result({ sessionId: failedId, waitSeconds: 0 })).toEqual({
+			ok: true,
+			data: { sessionId: failedId, status: "failed", mode: "server", text: expect.stringContaining("Planning failed (auth)"), usage: expect.any(Object), error: "auth" },
+		});
+
+		const client = setup();
+		const clientId = randomUUID();
+		const o = { stateDir: client.stateDir, maxPromptChars: 4000, maxAnswerChars: 200_000 };
+		await startPlan(o, { prompt: PROMPT, sessionId: clientId });
+		expect(await client.planner.result({ sessionId: clientId, waitSeconds: 0 })).toEqual({
+			ok: true,
+			data: { sessionId: clientId, status: "running", mode: "client", text: expect.stringContaining("driven by the chat model") },
+		});
 	});
 });

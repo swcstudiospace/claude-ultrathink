@@ -4,6 +4,7 @@ import type { SessionRecord } from "../../../src/claude/state.ts";
 import type { Clarification } from "../../../src/hitl/types.ts";
 import { dependencyLevels, isFallbackGraph, topoSort } from "../../../src/think/graph.ts";
 import type { ThoughtNode } from "../../../src/think/types.ts";
+import { buildGraphView, fenced, renderGraphBlock } from "./graph-view.ts";
 
 export interface ChatQuestion {
 	question: string;
@@ -28,6 +29,7 @@ export const DEFAULT_MAX_CHARS = { brief: 40_000, full: 80_000 } as const;
 const INDENT = "    ";
 const CLOSING =
 	"Ask the user the clarifying questions that matter, state the defaults you assume for the rest, and carry out the plan.";
+const CLOSING_DIAGRAM = " Show the wave tree first.";
 const TRUNCATION_NOTE =
 	"[This plan was shortened to fit the size limit; later parts were left out. Ask the user for anything you still need.]";
 
@@ -46,6 +48,8 @@ const SPEC_MARKER = "[specification shortened]";
 interface Unit {
 	text: string;
 	optional: boolean;
+	/** The Graph of Thought x Chain of Thought block; the closing sentence refers to it only when it is kept. */
+	diagram?: true;
 }
 
 /** One line, bounded: ids, titles and labels come from model output and must not open a new section. */
@@ -61,14 +65,6 @@ function indent(text: string, prefix = INDENT): string {
 		.split(/\r?\n/)
 		.map((line) => (line.length > 0 ? `${prefix}${line}` : ""))
 		.join("\n");
-}
-
-/** Fenced block whose fence is longer than any backtick run inside, so the content cannot close it. */
-function fenced(text: string, info = ""): string {
-	let longest = 0;
-	for (const run of text.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
-	const fence = "`".repeat(Math.max(3, longest + 1));
-	return `${fence}${info}\n${text}\n${fence}`;
 }
 
 /** The uplifted specification without the original prompt (shown separately) and the injected graph and question blocks. */
@@ -187,9 +183,13 @@ export function renderChatPlan(record: SessionRecord, options: RenderOptions): R
 
 	const original = record.result.original;
 	const spec = specificationText(record.result.xml);
+	const view = buildGraphView(record);
+	// First among the optional units, so the request, specification and questions keep priority when the cap bites.
+	const diagram: Unit[] = view ? [{ text: renderGraphBlock(view), optional: true, diagram: true }] : [];
 	const build = (specBody: string): Unit[] => {
 		const units: Unit[] = [
 			{ text: headerLines.join("\n"), optional: false },
+			...diagram,
 			{ text: `## Request\n${fenced(original)}`, optional: false },
 			{ text: `## Specification\n${specBody ? fenced(specBody, "xml") : "(none)"}`, optional: false },
 			...graphUnits(record, options.detail),
@@ -200,9 +200,10 @@ export function renderChatPlan(record: SessionRecord, options: RenderOptions): R
 	};
 	const questionList = extractQuestions(clarifications);
 	const compose = (units: readonly Unit[], keep: readonly boolean[], note: boolean): string => {
-		const parts = units.filter((_, i) => keep[i]).map((unit) => unit.text);
+		const kept = units.filter((_, i) => keep[i]);
+		const parts = kept.map((unit) => unit.text);
 		if (note) parts.push(TRUNCATION_NOTE);
-		parts.push(CLOSING);
+		parts.push(kept.some((unit) => unit.diagram) ? `${CLOSING}${CLOSING_DIAGRAM}` : CLOSING);
 		return parts.join("\n\n");
 	};
 
