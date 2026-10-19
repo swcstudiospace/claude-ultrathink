@@ -378,6 +378,7 @@ Status: Grok Chat connected to this server live on 2026-10-18 and 2026-10-19, ag
 | Errors | A `resources/read` for an unknown `ui://` uri returns `-32002`; a malformed uri returns `-32602`. `GET` and `DELETE` on `/mcp` return 405 with `Allow: POST`, before authentication. |
 | Command catalog | Read from `commands/` and `skills/` in the release, with the decision per command in `COMMAND_OVERLAY` (`services/ultrathink/mcp/commands.ts`). A release without those directories serves the static overlay and logs a `command_catalog_fallback` warning at start. |
 | Plugin bundle | `plugins/ultrathink-connector/`, built with `sh plugins/ultrathink-connector/package.sh` into a zip for Claude's plugin upload. Its `.mcp.json` points at the production URL and holds no key. |
+| Tool definition check | `services/ultrathink/mcp/definitions.ts` checks every tool definition: name pattern and uniqueness, description length and content (no absolute paths, stack frames or secret-like strings), a hand-checked JSON Schema subset and boolean annotations. `ultrathink-web` and `ultrathink-connector` refuse to start when a definition fails, naming the tool on stderr, and `bun test` runs the same check, so `deploy/ultrathink-release.sh` stops before it switches `current`. |
 
 Metrics: `ultrathink_mcp_tool_calls_total{tool,outcome}` carries the three new tool names.
 
