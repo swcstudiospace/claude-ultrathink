@@ -77,6 +77,24 @@ describe("loadConfig defaults", () => {
 		env.ULTRATHINK_STATE_DIR = "/tmp/ut-state";
 		expect(loadConfig(env).dbPath).toBe("/tmp/ut-state/ultrathink.sqlite");
 	});
+
+	test("strips trailing slashes from stateDir before building dbPath", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_STATE_DIR = "/var/x/";
+		const config = loadConfig(env);
+		expect(config.stateDir).toBe("/var/x");
+		expect(config.dbPath).toBe("/var/x/ultrathink.sqlite");
+	});
+
+	test("rejects a relative stateDir naming the variable", () => {
+		for (const value of ["relative/dir/", "./state", "state"]) {
+			const env = baseEnv();
+			env.ULTRATHINK_STATE_DIR = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_STATE_DIR");
+			expect(message).toContain("absolute");
+		}
+	});
 });
 
 describe("planningModel", () => {
@@ -131,6 +149,26 @@ describe("strict integers", () => {
 		expect(messageOf(() => loadConfig(env))).toContain(
 			"ULTRATHINK_MAX_INPUT_CHARS",
 		);
+	});
+
+	test("rejects maxAnswerChars the 65536-byte body cap cannot carry, naming the variable", () => {
+		for (const value of ["20001", "200000"]) {
+			const env = baseEnv();
+			env.ULTRATHINK_MAX_ANSWER_CHARS = value;
+			const message = messageOf(() => loadConfig(env));
+			expect(message).toContain("ULTRATHINK_MAX_ANSWER_CHARS");
+			expect(message).toContain("20000");
+		}
+	});
+
+	test("accepts input and answer limits up to 20000: 3 UTF-8 bytes per char plus the envelope fit the body cap", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_MAX_INPUT_CHARS = "20000";
+		env.ULTRATHINK_MAX_ANSWER_CHARS = "20000";
+		const config = loadConfig(env);
+		expect(config.maxInputChars).toBe(20000);
+		expect(config.maxAnswerChars).toBe(20000);
+		expect(20000 * 3).toBeLessThanOrEqual(config.maxBodyBytes - 4096);
 	});
 
 	test("rejects a zero token ceiling", () => {
@@ -532,4 +570,103 @@ describe("modelReasoningEffort", () => {
 			expect(message).not.toContain(value);
 		});
 	}
+});
+
+describe("previous session secrets", () => {
+	test("is empty when unset", () => {
+		expect(loadConfig(baseEnv()).sessionSecretPrevious).toEqual([]);
+	});
+
+	test("parses a comma list, trimming entries and dropping empty ones", () => {
+		const env = baseEnv();
+		const older = randomSecret();
+		const oldest = randomSecret();
+		env.ULTRATHINK_SESSION_SECRET_PREVIOUS = ` ${older} ,, ${oldest} , `;
+		expect(loadConfig(env).sessionSecretPrevious).toEqual([older, oldest]);
+	});
+
+	test("accepts up to four entries and rejects a fifth", () => {
+		const env = baseEnv();
+		const four = Array.from({ length: 4 }, () => randomSecret());
+		env.ULTRATHINK_SESSION_SECRET_PREVIOUS = four.join(",");
+		expect(loadConfig(env).sessionSecretPrevious).toEqual(four);
+		env.ULTRATHINK_SESSION_SECRET_PREVIOUS = [...four, randomSecret()].join(",");
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_SESSION_SECRET_PREVIOUS");
+	});
+
+	test("rejects a previous secret shorter than 32 characters without echoing it", () => {
+		const env = baseEnv();
+		const short = randomSecret().slice(0, 31);
+		env.ULTRATHINK_SESSION_SECRET_PREVIOUS = `${randomSecret()},${short}`;
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("ULTRATHINK_SESSION_SECRET_PREVIOUS");
+		expect(message).not.toContain(short);
+	});
+});
+
+describe("operations settings", () => {
+	test("apply documented defaults", () => {
+		const config = loadConfig(baseEnv());
+		expect(config.breakerFailures).toBe(5);
+		expect(config.breakerWindowMs).toBe(60000);
+		expect(config.breakerOpenMs).toBe(30000);
+		expect(config.maxInflight).toBe(256);
+		expect(config.drainMs).toBe(5000);
+		expect(config.retentionDays).toBe(30);
+		expect(config.auditLog).toBe(true);
+	});
+
+	test("zero is valid for the breaker, drain and retention settings where documented", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_BREAKER_FAILURES = "0";
+		env.ULTRATHINK_DRAIN_MS = "0";
+		env.ULTRATHINK_RETENTION_DAYS = "0";
+		const config = loadConfig(env);
+		expect(config.breakerFailures).toBe(0);
+		expect(config.drainMs).toBe(0);
+		expect(config.retentionDays).toBe(0);
+	});
+
+	const ranges = [
+		{ name: "ULTRATHINK_BREAKER_FAILURES", field: "breakerFailures", min: "0", max: "100" },
+		{ name: "ULTRATHINK_BREAKER_WINDOW_MS", field: "breakerWindowMs", min: "1000", max: "3600000" },
+		{ name: "ULTRATHINK_BREAKER_OPEN_MS", field: "breakerOpenMs", min: "1000", max: "600000" },
+		{ name: "ULTRATHINK_MAX_INFLIGHT", field: "maxInflight", min: "1", max: "10000" },
+		{ name: "ULTRATHINK_DRAIN_MS", field: "drainMs", min: "0", max: "60000" },
+		{ name: "ULTRATHINK_RETENTION_DAYS", field: "retentionDays", min: "0", max: "3650" },
+	] as const;
+
+	for (const range of ranges) {
+		test(`${range.name} accepts its bounds`, () => {
+			for (const value of [range.min, range.max]) {
+				const env = baseEnv();
+				env[range.name] = value;
+				expect(loadConfig(env)[range.field]).toBe(Number(value));
+			}
+		});
+
+		test(`${range.name} rejects values outside its bounds, naming the variable`, () => {
+			for (const value of [String(Number(range.max) + 1), "-1", "1.5"]) {
+				const env = baseEnv();
+				env[range.name] = value;
+				const message = messageOf(() => loadConfig(env));
+				expect(message).toContain(range.name);
+				expect(message).not.toContain(value);
+			}
+		});
+	}
+
+	test("ULTRATHINK_AUDIT_LOG=0 turns the audit log off and 1 turns it on", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_AUDIT_LOG = "0";
+		expect(loadConfig(env).auditLog).toBe(false);
+		env.ULTRATHINK_AUDIT_LOG = "1";
+		expect(loadConfig(env).auditLog).toBe(true);
+	});
+
+	test("ULTRATHINK_AUDIT_LOG accepts only 0 or 1", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_AUDIT_LOG = "true";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_AUDIT_LOG");
+	});
 });

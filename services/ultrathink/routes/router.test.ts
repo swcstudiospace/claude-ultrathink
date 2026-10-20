@@ -76,6 +76,14 @@ beforeAll(async () => {
 		planTimeoutMs: 600000,
 		modelMaxOutputTokens: 8000,
 		serverDecisions: false,
+		sessionSecretPrevious: [],
+		breakerFailures: 5,
+		breakerWindowMs: 60000,
+		breakerOpenMs: 30000,
+		maxInflight: 256,
+		drainMs: 5000,
+		retentionDays: 30,
+		auditLog: true,
 	};
 	auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);
@@ -91,7 +99,7 @@ beforeAll(async () => {
 	);
 	expect(login.status).toBe(200);
 	cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-	expect(cookie.startsWith("ut_session=")).toBe(true);
+	expect(cookie.startsWith("__Host-ut_session=")).toBe(true);
 });
 
 afterAll(() => {
@@ -274,6 +282,78 @@ describe("router", () => {
 		expect(await unknown.json()).toEqual({ error: "not_found" });
 	});
 
+	test("HEAD is answered like the GET it stands for without a body, and refused where GET is", async () => {
+		const get = await handler(new Request(`${PUBLIC_ORIGIN}/healthz`), PEER_IP);
+		const head = await handler(new Request(`${PUBLIC_ORIGIN}/healthz`, { method: "HEAD" }), PEER_IP);
+		expect(head.status).toBe(200);
+		expect(await head.text()).toBe("");
+		for (const name of ["content-type", "cache-control", "x-content-type-options", "referrer-policy", "x-frame-options", "content-security-policy", "permissions-policy"]) {
+			expect({ name, value: head.headers.get(name) }).toEqual({ name, value: get.headers.get(name) });
+		}
+
+		// The GET handler sees the request headers: the session cookie still authenticates.
+		const usage = await handler(new Request(`${PUBLIC_ORIGIN}/ultrathink`, { method: "HEAD", headers: { Cookie: cookie } }), PEER_IP);
+		expect(usage.status).toBe(200);
+		expect(await usage.text()).toBe("");
+		const anonymous = await handler(new Request(`${PUBLIC_ORIGIN}/ultrathink`, { method: "HEAD" }), PEER_IP);
+		expect(anonymous.status).toBe(401);
+		expect(await anonymous.text()).toBe("");
+
+		const mcp = await handler(new Request(`${PUBLIC_ORIGIN}/mcp`, { method: "HEAD" }), PEER_IP);
+		expect(mcp.status).toBe(405);
+		expect(mcp.headers.get("allow")).toBe("POST");
+		const login = await handler(new Request(`${PUBLIC_ORIGIN}/login`, { method: "HEAD" }), PEER_IP);
+		expect(login.status).toBe(405);
+		expect(login.headers.get("allow")).toBe("POST");
+		const post = await handler(new Request(`${PUBLIC_ORIGIN}/healthz`, { method: "POST" }), PEER_IP);
+		expect(post.status).toBe(405);
+		expect(post.headers.get("allow")).toBe("GET, HEAD");
+	});
+
+	test("login and POST /ultrathink check the Origin before the content type: 403 for a foreign origin, 415 for a form body", async () => {
+		const FORM = "application/x-www-form-urlencoded";
+		const loginForm = (headers: Record<string, string>): Request =>
+			new Request(`${PUBLIC_ORIGIN}/login`, { method: "POST", headers: { "Content-Type": FORM, ...headers }, body: `password=${password}` });
+
+		const formLogin = await handler(loginForm({ Origin: PUBLIC_ORIGIN }), PEER_IP);
+		expect(formLogin.status).toBe(415);
+		expect(await formLogin.json()).toEqual({ error: "unsupported_media_type" });
+		expect(formLogin.headers.get("set-cookie")).toBeNull();
+
+		const foreignLogin = await handler(loginForm({ Origin: "https://evil.test" }), PEER_IP);
+		expect(foreignLogin.status).toBe(403);
+		expect(await foreignLogin.json()).toEqual({ error: "forbidden" });
+		const originlessLogin = await handler(loginForm({}), PEER_IP);
+		expect(originlessLogin.status).toBe(403);
+
+		const before = runCount();
+		const formRun = await handler(ultrathinkPost("input=plan+the+rollout", { "Content-Type": FORM }), PEER_IP);
+		expect(formRun.status).toBe(415);
+		expect(await formRun.json()).toEqual({ error: "unsupported_media_type" });
+		const foreignRun = await handler(ultrathinkPost("input=plan+the+rollout", { "Content-Type": FORM, Origin: "https://evil.test" }), PEER_IP);
+		expect(foreignRun.status).toBe(403);
+		expect(await foreignRun.json()).toEqual({ error: "forbidden" });
+		expect(runCount()).toBe(before);
+	});
+
+	test("every JSON, 202 and metrics response carries the frame, CSP and permissions headers", async () => {
+		const responses = [
+			await handler(new Request(`${PUBLIC_ORIGIN}/healthz`), PEER_IP),
+			await handler(new Request(`${PUBLIC_ORIGIN}/metrics`), PEER_IP),
+			await handler(new Request(`${PUBLIC_ORIGIN}/nope`), PEER_IP),
+			await handler(new Request(`${PUBLIC_ORIGIN}/login`, { method: "GET" }), PEER_IP),
+			await handler(new Request(`${PUBLIC_ORIGIN}/ultrathink`), PEER_IP),
+			await handler(ultrathinkPost(JSON.stringify({ input: "plan the header rollout" })), PEER_IP),
+		];
+		expect(responses.map((res) => res.status)).toEqual([200, 200, 404, 405, 401, 202]);
+		for (const res of responses) {
+			expect(res.headers.get("x-frame-options")).toBe("DENY");
+			expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+			expect(res.headers.get("permissions-policy")).toBe("camera=(), microphone=(), geolocation=()");
+			expect(res.headers.get("cache-control")).toBe("no-store");
+		}
+	});
+
 	describe("persistence failure", () => {
 		test("POST returns 503 and healthz returns 503 when the store is closed", async () => {
 			const closed = openStore(join(dir, "closed.db"));
@@ -366,6 +446,15 @@ describe("MCP endpoint", () => {
 		const response = await mcp(rpc({ jsonrpc: "2.0", method: "notifications/initialized" }), PEER_IP);
 		expect(response.status).toBe(202);
 		expect(await response.text()).toBe("");
+	});
+
+	test("the 202 notification answer carries the security headers", async () => {
+		const response = await mcp(rpc({ jsonrpc: "2.0", method: "notifications/initialized" }), PEER_IP);
+		expect(response.status).toBe(202);
+		expect(response.headers.get("x-frame-options")).toBe("DENY");
+		expect(response.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+		expect(response.headers.get("permissions-policy")).toBe("camera=(), microphone=(), geolocation=()");
+		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 	});
 
 	test("tools/list returns the six journal tools and the three connector tools when server planning is off", async () => {

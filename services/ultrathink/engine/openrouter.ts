@@ -2,6 +2,9 @@
 // Copyright (C) 2026 SWC Studio
 
 import type { ReasoningEffort } from "../config/config.ts";
+import { currentRequestContext } from "../obs/context.ts";
+import { childSpan, formatTraceparent } from "../obs/trace.ts";
+import type { CircuitBreaker, ReleaseOutcome } from "./breaker.ts";
 
 /**
  * OpenRouter chat completions behind the plugin's `Completer` shape.
@@ -9,6 +12,10 @@ import type { ReasoningEffort } from "../config/config.ts";
  * Failures are classified codes only. The API key, the response body and the
  * underlying fetch error never reach a message, a thrown value or the usage
  * callback, so callers can log or persist `error.message` safely.
+ *
+ * With a `breaker` (Refs SPE-17437) every HTTP attempt first takes a slot; a
+ * refusal fails the call with `upstream_unavailable` without a request, and
+ * each attempt reports back whether the upstream itself failed.
  */
 
 export type OpenRouterErrorCode =
@@ -18,17 +25,22 @@ export type OpenRouterErrorCode =
 	| "timeout"
 	| "aborted"
 	| "bad_response"
-	| "empty";
+	| "empty"
+	/** The circuit breaker refused the call; no request was sent. `retryAfterMs` says when to try again. */
+	| "upstream_unavailable";
 
 export class OpenRouterError extends Error {
 	readonly code: OpenRouterErrorCode;
 	readonly status: number | undefined;
+	/** Set on `upstream_unavailable`: ms until the breaker hands out a slot again. */
+	readonly retryAfterMs: number | undefined;
 
-	constructor(code: OpenRouterErrorCode, status?: number) {
+	constructor(code: OpenRouterErrorCode, status?: number, retryAfterMs?: number) {
 		super(status === undefined ? `openrouter ${code}` : `openrouter ${code} (HTTP ${status})`);
 		this.name = "OpenRouterError";
 		this.code = code;
 		this.status = status;
+		this.retryAfterMs = retryAfterMs;
 	}
 }
 
@@ -64,6 +76,12 @@ export interface OpenRouterCompleterOptions {
 	onUsage?: (usage: OpenRouterUsage) => void;
 	/** Called exactly once per `complete()` after the final outcome; a throwing hook is ignored. */
 	onCall?: (info: OpenRouterCallInfo) => void;
+	/**
+	 * Upstream circuit breaker, shared across completer instances so every call to the same endpoint counts. A slot is
+	 * acquired before each HTTP attempt; a refusal fails the call with `upstream_unavailable` at once, without a retry.
+	 * Absent: no breaker, calls always go out.
+	 */
+	breaker?: CircuitBreaker;
 }
 
 /** Outcome of one `complete()` call, reported once after retries. Carries no key, header or body. */
@@ -82,6 +100,11 @@ const MAX_RETRIES = 2;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_JITTER_MS = 250;
 const MAX_RETRY_AFTER_MS = 20000;
+/**
+ * Largest reply body that is buffered. A completion is `maxOutputTokens` tokens of a few bytes each plus usage,
+ * so 4 MiB leaves ample room while a runaway or hostile reply is cancelled instead of held whole in memory.
+ */
+export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -126,6 +149,26 @@ function count(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/** Decodes the body up to `maxBytes`; `undefined` (with the stream cancelled) once it is longer than that. */
+async function readBounded(response: Response, maxBytes: number): Promise<string | undefined> {
+	const body = response.body;
+	if (body === null) return response.text();
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	let bytes = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return text + decoder.decode();
+		bytes += value.byteLength;
+		if (bytes > maxBytes) {
+			void reader.cancel().catch(() => undefined);
+			return undefined;
+		}
+		text += decoder.decode(value, { stream: true });
+	}
+}
+
 /** Upstream JSON; every field is checked where it is used. Optional chaining is safe on any JSON value. */
 interface CompletionReply {
 	choices?: Array<{ message?: { content?: unknown } | null } | null> | null;
@@ -147,6 +190,22 @@ function contentText(content: unknown): string | undefined {
 type Attempt =
 	| { ok: true; text: string; usage: OpenRouterUsage }
 	| { ok: false; error: OpenRouterError; retry: boolean; retryAfterMs?: number };
+
+/**
+ * What one attempt tells the breaker: a reply counts as a success, an unreachable, slow or overloaded upstream as a
+ * failure, and anything the upstream is not responsible for (our key, its body shape, the caller's abort) as neither.
+ */
+function releaseOutcome(result: Attempt): ReleaseOutcome {
+	if (result.ok) return "success";
+	switch (result.error.code) {
+		case "upstream":
+		case "timeout":
+		case "rate_limited":
+			return "failure";
+		default:
+			return "ignored";
+	}
+}
 
 /** Validates a 200 body; `null` content (tool call, refusal) counts as empty, a missing message or content as malformed. */
 function parseCompletion(raw: string): Attempt {
@@ -200,34 +259,55 @@ export function createOpenRouterCompleter(
 			timedOut = true;
 			controller.abort();
 		}, opts.timeoutMs);
+		const interrupted = (): Attempt | undefined => {
+			if (caller?.aborted === true) {
+				return { ok: false, error: new OpenRouterError("aborted"), retry: false };
+			}
+			if (timedOut) {
+				return { ok: false, error: new OpenRouterError("timeout"), retry: false };
+			}
+			return undefined;
+		};
+		const badResponse = (): Attempt => ({ ok: false, error: new OpenRouterError("bad_response"), retry: false });
+		const ctx = currentRequestContext();
+		// Each attempt is a fresh span of the caller's trace. Only the ids go upstream, never the key or the body.
+		const requestHeaders: Record<string, string> =
+			ctx === undefined
+				? headers
+				: {
+						...headers,
+						traceparent: formatTraceparent(childSpan({ traceId: ctx.traceId, spanId: ctx.spanId, sampled: true })),
+					};
 		try {
 			let response: Response;
-			let raw: string | undefined;
 			try {
 				response = await fetchImpl(url, {
 					method: "POST",
-					headers,
+					headers: requestHeaders,
 					body,
 					signal: controller.signal,
 					redirect: "error",
 				});
-				if (response.ok) {
-					raw = await response.text();
-				} else {
-					void response.body?.cancel().catch(() => undefined);
-				}
 			} catch {
-				if (caller?.aborted === true) {
-					return { ok: false, error: new OpenRouterError("aborted"), retry: false };
-				}
-				if (timedOut) {
-					return { ok: false, error: new OpenRouterError("timeout"), retry: false };
-				}
-				return { ok: false, error: new OpenRouterError("upstream"), retry: true };
+				// No reply was seen, so the request is retried as it would be by any client.
+				return interrupted() ?? { ok: false, error: new OpenRouterError("upstream"), retry: true };
 			}
-			if (raw !== undefined) {
-				return parseCompletion(raw);
+			if (response.ok) {
+				const declared = response.headers.get("content-length");
+				if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
+					void response.body?.cancel().catch(() => undefined);
+					return badResponse();
+				}
+				let raw: string | undefined;
+				try {
+					raw = await readBounded(response, MAX_RESPONSE_BYTES);
+				} catch {
+					// The reply was started and may already be billed: a body that cannot be read is not requested again.
+					return interrupted() ?? badResponse();
+				}
+				return raw === undefined ? badResponse() : parseCompletion(raw);
 			}
+			void response.body?.cancel().catch(() => undefined);
 			const status = response.status;
 			if (status === 429) {
 				return {
@@ -283,8 +363,21 @@ export function createOpenRouterCompleter(
 				report("aborted");
 				throw new OpenRouterError("aborted");
 			}
+			const slot = opts.breaker?.tryAcquire();
+			if (slot !== undefined && !slot.ok) {
+				report("upstream_unavailable");
+				throw new OpenRouterError("upstream_unavailable", undefined, slot.retryAfterMs);
+			}
 			attempts += 1;
-			const result = await attempt(body, signal);
+			let result: Attempt;
+			try {
+				result = await attempt(body, signal);
+			} catch (error) {
+				// An attempt that threw never classified the upstream, so it only frees the slot.
+				slot?.release("ignored");
+				throw error;
+			}
+			slot?.release(releaseOutcome(result));
 			if (result.ok) {
 				try {
 					opts.onUsage?.(result.usage);
@@ -298,6 +391,8 @@ export function createOpenRouterCompleter(
 				report(result.error.code, result.error.status);
 				throw result.error;
 			}
+			// A failure that just opened the breaker is refused on the next pass; backing off first would only delay that.
+			if (opts.breaker?.state() === "open") continue;
 			await sleep(result.retryAfterMs ?? backoffMs(retry), signal);
 		}
 	};

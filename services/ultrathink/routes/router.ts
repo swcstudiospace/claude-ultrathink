@@ -8,16 +8,22 @@ import pkg from "../../../package.json";
 import { type Auth, clientIpFrom } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { type Ledger, createLedger } from "../cost/ledger.ts";
+import { type BreakerState, createCircuitBreaker } from "../engine/breaker.ts";
 import { type HeadlessPlanner, type ResultView, createHeadlessPlanner } from "../engine/headless.ts";
 import type { JournalOptions } from "../engine/journal.ts";
 import type { OpenRouterFetch } from "../engine/openrouter.ts";
+import { createSweeper, sweepStateDir } from "../engine/retention.ts";
 import { defaultGraphResources, loadCatalogWithFallback } from "../mcp/connector-host.ts";
 import { type McpToolHost, type ToolOutcome, handleMcpPayload } from "../mcp/mcp.ts";
 import { createToolHost } from "../mcp/tool-host.ts";
 import type { PlanningInfo } from "../mcp/tools-connector.ts";
 import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "../mcp/transport.ts";
+import { type AuditEvent, type AuditLog, auditPath, createAuditLog } from "../obs/audit.ts";
+import { runWithRequestContext } from "../obs/context.ts";
 import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../obs/log.ts";
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
+import { createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
+import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
@@ -38,11 +44,17 @@ export interface RouterDeps {
 	fetch?: OpenRouterFetch;
 	/** Reaches the default planner's waits. */
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+	/** Test seam. Defaults to the state directory's audit log, which is absent when config.auditLog is off. */
+	audit?: AuditLog;
 }
 
 export interface App {
 	handle(req: Request, peerIp: string): Promise<Response>;
-	/** Stops accepting planner work and ends running jobs. The caller closes the store. */
+	/** Starts the runtime probe and, when retention is on, the sweep; reads store integrity. Idempotent. */
+	start(): void;
+	/** Fails /readyz so the load balancer stops routing here; /healthz keeps answering. Idempotent. */
+	beginDrain(): void;
+	/** Stops the probe and sweep, closes the audit log, then stops accepting planner work and ends running jobs. The caller closes the store. */
 	shutdown(): Promise<void>;
 	planner: HeadlessPlanner;
 	metrics: Metrics;
@@ -54,6 +66,7 @@ type Endpoint =
 	| "readyz"
 	| "metrics"
 	| "login"
+	| "logout"
 	| "ultrathink"
 	| "run"
 	| "mcp"
@@ -84,17 +97,19 @@ interface RequestCtx {
 	tool?: string;
 }
 
+/** HEAD is allowed wherever GET is and is answered as that GET without the body. */
 const METHODS: Record<Endpoint, readonly string[]> = {
-	healthz: ["GET"],
-	readyz: ["GET"],
-	metrics: ["GET"],
+	healthz: ["GET", "HEAD"],
+	readyz: ["GET", "HEAD"],
+	metrics: ["GET", "HEAD"],
 	login: ["POST"],
-	ultrathink: ["GET", "POST"],
-	run: ["GET"],
+	logout: ["POST"],
+	ultrathink: ["GET", "HEAD", "POST"],
+	run: ["GET", "HEAD"],
 	mcp: ["POST"],
-	oauth_protected_resource: ["GET"],
-	oauth_authorization_server: ["GET"],
-	oauth_authorize: ["GET", "POST"],
+	oauth_protected_resource: ["GET", "HEAD"],
+	oauth_authorization_server: ["GET", "HEAD"],
+	oauth_authorize: ["GET", "HEAD", "POST"],
 	oauth_token: ["POST"],
 	oauth_register: ["POST"],
 	oauth_revoke: ["POST"],
@@ -104,16 +119,27 @@ const RUN_PATH = /^\/ultrathink\/runs\/([^/]+)$/;
 
 const CONNECTOR_RATE_OWNER = "connector";
 
+// Probes and scrapes are never shed: an overloaded process must still answer its orchestrator.
+const UNGATED: Partial<Record<Endpoint, true>> = { healthz: true, readyz: true, metrics: true };
+const BREAKER_STATES: readonly BreakerState[] = ["closed", "open", "half_open"];
+const CONNECTOR_OWNER_LIMIT = 240;
+const RUNTIME_SAMPLE_MS = 5000;
+const RETENTION_SWEEP_MS = 60 * 60 * 1000;
+
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 
 const LOG_VALUE_MAX = 64;
 
 const OAUTH_STATE_FILE = "oauth.json";
 
+/** On every JSON, metrics and 202 response. OAuth HTML pages carry their own policy (oauth.ts). */
 const SECURITY_HEADERS: Record<string, string> = {
 	"Cache-Control": "no-store",
 	"X-Content-Type-Options": "nosniff",
 	"Referrer-Policy": "no-referrer",
+	"X-Frame-Options": "DENY",
+	"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+	"Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 };
 
 const USAGE = {
@@ -184,6 +210,7 @@ function matchPath(pathname: string): Target | null {
 	if (pathname === "/oauth/register") return { endpoint: "oauth_register" };
 	if (pathname === "/oauth/revoke") return { endpoint: "oauth_revoke" };
 	if (pathname === "/login") return { endpoint: "login" };
+	if (pathname === "/logout") return { endpoint: "logout" };
 	if (pathname === "/ultrathink") return { endpoint: "ultrathink" };
 	if (pathname === "/mcp") return { endpoint: "mcp" };
 	const match = RUN_PATH.exec(pathname);
@@ -266,14 +293,48 @@ export function createApp(deps: RouterDeps): App {
 	const { config, store, auth } = deps;
 	const logger = deps.logger ?? createLogger();
 	const metrics = deps.metrics ?? createMetrics();
+	// Absent when config.auditLog is off, unless a test injects one.
+	const auditLog =
+		deps.audit ??
+		(config.auditLog
+			? createAuditLog({
+					path: auditPath(config.stateDir),
+					onError: (error) => {
+						metrics.inc("ultrathink_audit_write_failures_total");
+						logger.error("audit_write_failed", { error: error.message });
+					},
+				})
+			: undefined);
+	function record(event: AuditEvent, fields: Record<string, string | number | boolean> = {}): void {
+		auditLog?.record(event, fields);
+	}
 	const oauth = createOAuth({
 		origin: config.publicOrigin,
 		stateDir: config.stateDir,
 		auth,
 		now: deps.now,
 		redirectOrigins: [...DEFAULT_REDIRECT_ORIGINS, ...config.oauthRedirectOrigins],
+		audit: record,
 	});
 	const ledger = deps.ledger ?? lazyLedger(store, config, deps.now);
+	// Repeated upstream failures open the breaker; a threshold of 0 turns it off.
+	const breaker =
+		config.breakerFailures > 0
+			? createCircuitBreaker({
+					failureThreshold: config.breakerFailures,
+					windowMs: config.breakerWindowMs,
+					openMs: config.breakerOpenMs,
+					now: deps.now,
+					onTransition: (from, to) => {
+						publishBreakerState(to);
+						logger.warn("upstream_breaker", { from, to });
+					},
+				})
+			: undefined;
+	const inflight = createInflight(config.maxInflight);
+	const drain = createDrainState(deps.now);
+	// Refreshed by start() and after each retention sweep; openStore already ran quick_check at startup.
+	let integrityOk = true;
 	const planner =
 		deps.planner ??
 		createHeadlessPlanner({
@@ -281,6 +342,8 @@ export function createApp(deps: RouterDeps): App {
 			store,
 			ledger,
 			now: deps.now,
+			logger,
+			...(breaker ? { breaker } : {}),
 			...(deps.fetch ? { fetch: deps.fetch } : {}),
 			...(deps.sleep ? { sleep: deps.sleep } : {}),
 			onCall: (call) => {
@@ -300,6 +363,7 @@ export function createApp(deps: RouterDeps): App {
 	const allowedOrigins = [config.publicOrigin, ...DEFAULT_ALLOWED_ORIGINS, ...config.allowedOrigins];
 
 	metrics.gauge("ultrathink_planner_enabled", planner.enabled ? 1 : 0);
+	if (breaker) publishBreakerState(breaker.state());
 	metrics.gauge("ultrathink_build_info", 1, { version: pkg.version });
 
 	function persistenceUnavailable(ctx: RequestCtx, error?: unknown): Response {
@@ -311,6 +375,7 @@ export function createApp(deps: RouterDeps): App {
 	function rateLimited(ctx: RequestCtx, scope: string, retryAfterSec: number): Response {
 		metrics.inc("ultrathink_rate_limited_total", { scope });
 		logger.warn("rate_limited", { reqId: ctx.reqId, ip: ctx.ip, scope });
+		record("rate_limited", { scope, ip: ctx.ip });
 		return fail(429, "rate_limited", { "Retry-After": String(retryAfterSec) });
 	}
 
@@ -318,21 +383,46 @@ export function createApp(deps: RouterDeps): App {
 		metrics.inc("ultrathink_auth_failures_total", { kind });
 	}
 
-	async function login(req: Request, ctx: RequestCtx): Promise<Response> {
-		if (!isJsonRequest(req) || req.headers.get("origin") !== config.publicOrigin) {
-			return fail(403, "forbidden");
+	function publishBreakerState(state: BreakerState): void {
+		for (const name of BREAKER_STATES) metrics.gauge("ultrathink_upstream_breaker_state", name === state ? 1 : 0, { state: name });
+	}
+
+	function refreshIntegrity(): void {
+		try {
+			integrityOk = store.quickCheck().ok;
+		} catch {
+			integrityOk = false;
 		}
+	}
+
+	async function login(req: Request, ctx: RequestCtx): Promise<Response> {
+		if (req.headers.get("origin") !== config.publicOrigin) return fail(403, "forbidden");
+		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
 		const parsed = await readJson(req, config.maxBodyBytes);
 		if (!parsed.ok) return parsed.response;
 		const password = (parsed.value as { password?: unknown } | null)?.password;
 		if (typeof password !== "string") return fail(400, "invalid_input");
 
 		const result = await auth.login({ password, clientIp: ctx.ip });
-		if (result.ok) return respond(200, { ok: true }, { "Set-Cookie": result.setCookie });
+		if (result.ok) {
+			record("login_ok", { ip: ctx.ip });
+			return respond(200, { ok: true }, { "Set-Cookie": result.setCookie });
+		}
 		if (result.reason === "rate_limited") return rateLimited(ctx, "login", result.retryAfterSec ?? 60);
 		authFailed("login");
 		logger.warn("login_failed", { reqId: ctx.reqId, ip: ctx.ip });
+		record("login_failed", { ip: ctx.ip });
 		return fail(401, "invalid_credentials");
+	}
+
+	function logout(req: Request, ctx: RequestCtx): Response {
+		if (req.headers.get("origin") !== config.publicOrigin) return fail(403, "forbidden");
+		// Clearing the cookie needs no session; a valid session presented here is recorded as it ends.
+		if (auth.sessionFor(req)) {
+			ctx.authKind = "session";
+			record("logout", {});
+		}
+		return respond(200, { ok: true }, { "Set-Cookie": auth.logoutCookie() });
 	}
 
 	function sessionFor(req: Request, ctx: RequestCtx): { ownerId: "owner" } | null {
@@ -357,9 +447,8 @@ export function createApp(deps: RouterDeps): App {
 		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: session.ownerId });
 		if (!limit.ok) return rateLimited(ctx, "run", limit.retryAfterSec);
 
-		if (!isJsonRequest(req) || req.headers.get("origin") !== config.publicOrigin) {
-			return fail(403, "forbidden");
-		}
+		if (req.headers.get("origin") !== config.publicOrigin) return fail(403, "forbidden");
+		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
 
 		const parsed = await readJson(req, config.maxBodyBytes);
 		if (!parsed.ok) return parsed.response;
@@ -448,13 +537,22 @@ export function createApp(deps: RouterDeps): App {
 			oauthOk = code === "ENOENT" && stateDirOk;
 		}
 		const plannerOk = !planner.enabled || (config.openRouterApiKey !== undefined && config.planningModel !== undefined);
-		const checks = { store: storeOk, stateDir: stateDirOk, oauth: oauthOk, planner: plannerOk };
+		const checks = {
+			store: storeOk,
+			stateDir: stateDirOk,
+			oauth: oauthOk,
+			planner: plannerOk,
+			integrity: integrityOk,
+			draining: !drain.draining,
+		};
 		const failed = Object.entries(checks)
 			.filter(([, passed]) => !passed)
 			.map(([name]) => name);
-		if (failed.length === 0) return respond(200, { status: "ready", checks });
+		const upstream = planner.upstream();
+		const upstreamView = upstream === undefined ? {} : { upstream: { state: upstream.state } };
+		if (failed.length === 0) return respond(200, { status: "ready", checks, ...upstreamView });
 		logger.warn("not_ready", { reqId: ctx.reqId, failed });
-		return respond(503, { error: "not_ready", failed, checks });
+		return respond(503, { error: "not_ready", failed, checks, ...upstreamView });
 	}
 
 	function metricsRoute(req: Request, ctx: RequestCtx): Response {
@@ -516,7 +614,9 @@ export function createApp(deps: RouterDeps): App {
 			try {
 				outcome = await toolHost.call(name, args);
 			} catch (error) {
-				logger.error("tool_error", { tool: name, error });
+				// The class only: a message may quote arguments.
+				const correlationId = randomUUID();
+				logger.error("tool_error", { tool: name, error: error instanceof Error ? error.name : "UnknownError", correlationId });
 				outcome = { ok: false, code: "engine_error" };
 			}
 			metrics.inc("ultrathink_mcp_tool_calls_total", { tool: name, outcome: outcome.ok ? "ok" : "error" });
@@ -552,16 +652,25 @@ export function createApp(deps: RouterDeps): App {
 		const expectedKey = config.connectorKey;
 		const presentedKey = req.headers.get("x-connector-key");
 		const keyOk = expectedKey !== undefined && keyMatches(presentedKey, expectedKey);
-		if (keyOk) ctx.authKind = "connector-key";
-		else if (bearer === "valid") ctx.authKind = "bearer";
-		else {
+
+		let principal: string;
+		if (keyOk) {
+			ctx.authKind = "connector-key";
+			principal = "key:connector";
+		} else if (bearer === "valid") {
+			ctx.authKind = "bearer";
+			principal = `bearer:${createHash("sha256").update(presented).digest("hex").slice(0, 16)}`;
+		} else {
 			authFailed(bearer === "invalid" ? "bearer" : presentedKey !== null ? "connector_key" : "missing");
 			const challenge = `Bearer resource_metadata="${oauth.resourceMetadataUrl}"${bearer === "invalid" ? ', error="invalid_token"' : ""}`;
 			return fail(401, "unauthenticated", { "WWW-Authenticate": challenge });
 		}
 
-		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: CONNECTOR_RATE_OWNER });
-		if (!limit.ok) return rateLimited(ctx, "mcp", limit.retryAfterSec);
+		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: CONNECTOR_RATE_OWNER, principal, ownerLimit: CONNECTOR_OWNER_LIMIT });
+		if (!limit.ok) {
+			logger.warn("rate_limit_window", { reqId: ctx.reqId, window: limit.scope });
+			return rateLimited(ctx, "mcp", limit.retryAfterSec);
+		}
 
 		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
 		const version = resolveProtocolVersion(versionHeader);
@@ -583,16 +692,21 @@ export function createApp(deps: RouterDeps): App {
 		return respond(reply.status ?? 200, reply.body);
 	}
 
-	async function dispatch(req: Request, ctx: RequestCtx): Promise<Response> {
-		const target = matchPath(new URL(req.url).pathname);
+	async function dispatch(req: Request, ctx: RequestCtx, target: Target | null): Promise<Response> {
 		if (!target) return fail(404, "not_found");
-		ctx.endpoint = target.endpoint;
 
 		const methods = METHODS[target.endpoint];
 		if (!methods.includes(req.method)) {
 			return fail(405, "method_not_allowed", { Allow: methods.join(", ") });
 		}
+		if (req.method !== "HEAD") return await route(req, ctx, target);
 
+		// Answered as the GET it stands for: that status and those headers, without the body.
+		const response = await route(new Request(req.url, { method: "GET", headers: req.headers }), ctx, target);
+		return new Response(null, { status: response.status, headers: response.headers });
+	}
+
+	async function route(req: Request, ctx: RequestCtx, target: Target): Promise<Response> {
 		switch (target.endpoint) {
 			case "run":
 				return await getRunRoute(req, ctx, target.runId);
@@ -616,6 +730,8 @@ export function createApp(deps: RouterDeps): App {
 				return metricsRoute(req, ctx);
 			case "login":
 				return await login(req, ctx);
+			case "logout":
+				return logout(req, ctx);
 			case "mcp":
 				return await mcpRoute(req, ctx);
 			case "ultrathink":
@@ -623,20 +739,23 @@ export function createApp(deps: RouterDeps): App {
 		}
 	}
 
-	function withRequestId(response: Response, reqId: string): Response {
+	function withHeaders(response: Response, headers: Record<string, string>): Response {
 		try {
-			response.headers.set("X-Request-Id", reqId);
+			for (const [name, value] of Object.entries(headers)) response.headers.set(name, value);
 			return response;
 		} catch {
-			// A response with immutable headers is copied rather than left without an id.
+			// A response with immutable headers is copied rather than left without its headers.
 			const copy = new Response(response.body, response);
-			copy.headers.set("X-Request-Id", reqId);
+			for (const [name, value] of Object.entries(headers)) copy.headers.set(name, value);
 			return copy;
 		}
 	}
 
 	async function handle(req: Request, peerIp: string): Promise<Response> {
 		const started = performance.now();
+		// A valid inbound traceparent is continued under a new span; anything else starts a fresh trace.
+		const inbound = traceContextFor(req.headers.get("traceparent"));
+		const server = inbound.inherited ? childSpan(inbound.ctx) : inbound.ctx;
 		const ctx: RequestCtx = {
 			reqId: sanitizeRequestId(req.headers.get("x-request-id")) ?? newRequestId(),
 			ip: clientIpFrom(req, peerIp),
@@ -644,40 +763,100 @@ export function createApp(deps: RouterDeps): App {
 			endpoint: "not_found",
 			authKind: "none",
 		};
-		let response: Response;
-		try {
-			response = await dispatch(req, ctx);
-		} catch (error) {
-			const correlationId = randomUUID();
-			logger.error("request_error", { reqId: ctx.reqId, correlationId, error, stack: true });
-			response = respond(500, { error: "internal_error", correlationId });
-		}
-		response = withRequestId(response, ctx.reqId);
+		return runWithRequestContext({ reqId: ctx.reqId, traceId: server.traceId, spanId: server.spanId }, async () => {
+			let response: Response;
+			let release: (() => void) | undefined;
+			try {
+				const target = matchPath(new URL(req.url).pathname);
+				if (target) ctx.endpoint = target.endpoint;
+				const ungated = target !== null && UNGATED[target.endpoint] === true;
+				const slot = ungated ? undefined : inflight.enter();
+				if (slot === null) {
+					metrics.inc("ultrathink_overload_total");
+					response = fail(503, "overloaded", { "Retry-After": "1" });
+				} else {
+					release = slot;
+					metrics.gauge("ultrathink_http_inflight", inflight.count);
+					response = await dispatch(req, ctx, target);
+				}
+			} catch (error) {
+				const correlationId = randomUUID();
+				logger.error("request_error", { reqId: ctx.reqId, correlationId, error, stack: true });
+				response = respond(500, { error: "internal_error", correlationId });
+			} finally {
+				release?.();
+				metrics.gauge("ultrathink_http_inflight", inflight.count);
+			}
+			response = withHeaders(response, { "X-Request-Id": ctx.reqId, traceparent: formatTraceparent(server) });
 
-		const elapsedMs = performance.now() - started;
-		metrics.inc("ultrathink_http_requests_total", { endpoint: ctx.endpoint, status_class: `${Math.floor(response.status / 100)}xx` });
-		metrics.observe("ultrathink_http_request_duration_seconds", elapsedMs / 1000, { endpoint: ctx.endpoint });
-		const fields = {
-			reqId: ctx.reqId,
-			method: req.method,
-			path: new URL(req.url).pathname,
-			endpoint: ctx.endpoint,
-			status: response.status,
-			ms: Math.round(elapsedMs),
-			...(ctx.rpcMethod === undefined ? {} : { rpcMethod: ctx.rpcMethod }),
-			...(ctx.mcpVersion === undefined ? {} : { mcpVersion: ctx.mcpVersion }),
-			...(ctx.tool === undefined ? {} : { tool: ctx.tool }),
-			authKind: ctx.authKind,
-			ip: ctx.ip,
-		};
-		if (response.status >= 500) logger.warn("request", fields);
-		else logger.info("request", fields);
-		return response;
+			const elapsedMs = performance.now() - started;
+			metrics.inc("ultrathink_http_requests_total", { endpoint: ctx.endpoint, status_class: `${Math.floor(response.status / 100)}xx` });
+			metrics.observe("ultrathink_http_request_duration_seconds", elapsedMs / 1000, { endpoint: ctx.endpoint });
+			const fields = {
+				reqId: ctx.reqId,
+				traceId: server.traceId,
+				method: req.method,
+				path: new URL(req.url).pathname,
+				endpoint: ctx.endpoint,
+				status: response.status,
+				ms: Math.round(elapsedMs),
+				...(ctx.rpcMethod === undefined ? {} : { rpcMethod: ctx.rpcMethod }),
+				...(ctx.mcpVersion === undefined ? {} : { mcpVersion: ctx.mcpVersion }),
+				...(ctx.tool === undefined ? {} : { tool: ctx.tool }),
+				authKind: ctx.authKind,
+				ip: ctx.ip,
+			};
+			if (response.status >= 500) logger.warn("request", fields);
+			else logger.info("request", fields);
+			return response;
+		});
+	}
+
+	let stopProbe: (() => void) | undefined;
+	let stopSweeper: (() => void) | undefined;
+	let lifecycleStarted = false;
+
+	/** Starts the runtime probe and, when retention is enabled, the sweeper. Runs once; later calls change nothing. */
+	function start(): void {
+		if (lifecycleStarted) return;
+		lifecycleStarted = true;
+		stopProbe = createRuntimeProbe({
+			intervalMs: RUNTIME_SAMPLE_MS,
+			onSample: (sample) => {
+				metrics.gauge("ultrathink_event_loop_lag_seconds", sample.eventLoopLagMs / 1000);
+				metrics.gauge("ultrathink_process_rss_bytes", sample.rssBytes);
+				metrics.gauge("ultrathink_process_heap_used_bytes", sample.heapUsedBytes);
+				metrics.gauge("ultrathink_uptime_seconds", sample.uptimeSec);
+				metrics.gauge("ultrathink_http_inflight", inflight.count);
+				if (breaker) publishBreakerState(breaker.state());
+			},
+		}).start();
+		if (config.retentionDays > 0) {
+			stopSweeper = createSweeper({
+				sweep: () => sweepStateDir({ stateDir: config.stateDir, retentionDays: config.retentionDays, now: deps.now }),
+				intervalMs: RETENTION_SWEEP_MS,
+				onResult: (result) => {
+					for (const kind of ["jobs", "sessions", "journals"] as const) {
+						metrics.inc("ultrathink_retention_removed_total", { kind }, result.removed[kind]);
+					}
+					refreshIntegrity();
+				},
+				onError: (error) => logger.error("retention_failed", { error: error.message }),
+			}).start();
+		}
+		refreshIntegrity();
 	}
 
 	return {
 		handle,
+		start,
+		beginDrain() {
+			drain.begin();
+		},
 		async shutdown() {
+			stopProbe?.();
+			stopSweeper?.();
+			auditLog?.close();
 			await planner.shutdown();
 		},
 		planner,

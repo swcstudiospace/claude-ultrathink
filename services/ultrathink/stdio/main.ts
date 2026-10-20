@@ -92,7 +92,7 @@ export async function main(env: Env = process.env): Promise<number> {
 	process.on("uncaughtException", (error) => {
 		// Exit from the write callback so the line that explains the crash is flushed; the timer covers a stuck stderr.
 		setTimeout(() => process.exit(1), SIGNAL_EXIT_MS);
-		process.stderr.write(`ultrathink-connector: uncaught exception: ${error.name}\n`, () => process.exit(1));
+		process.stderr.write(`ultrathink-connector: uncaught exception: ${error instanceof Error ? error.name : "UnknownError"}\n`, () => process.exit(1));
 	});
 
 	const controller = new AbortController();

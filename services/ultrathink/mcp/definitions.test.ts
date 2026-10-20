@@ -37,6 +37,13 @@ function thrownBy(run: () => void): unknown {
 // Built at runtime so this file holds no secret-shaped literal.
 const SECRET_LIKE = `${"sk-"}${"a1b2c3d4e5f6a7b8c9"}`;
 
+/** A schema whose `properties` nest `levels` deep; definitions.ts has no depth rule, the runtime validator does. */
+function deepSchema(levels: number): Record<string, unknown> {
+	let node: Record<string, unknown> = { type: "string" };
+	for (let level = 0; level < levels; level += 1) node = { type: "object", properties: { next: node }, additionalProperties: false };
+	return { ...node, required: [] };
+}
+
 describe("the real tool definitions", () => {
 	test("the tools served with server planning pass every rule", () => {
 		expect(validateToolDefinitions(toolDefinitions(true))).toEqual([]);
@@ -138,6 +145,18 @@ describe("validateToolDefinitions", () => {
 		{ label: "additionalProperties not false at the root", def: withSchema("bad_extra", { additionalProperties: true }), rule: "schema-additional-properties" },
 		{ label: "a non-boolean annotation", def: tool("bad_annotation", { annotations: { readOnlyHint: "yes" } }), rule: "annotations" },
 		{ label: "an array as _meta", def: tool("bad_meta", { _meta: [] as unknown as Record<string, unknown> }), rule: "meta" },
+		{
+			label: "a keyword the runtime validator cannot enforce",
+			def: withSchema("bad_pattern", { properties: { id: { type: "string", pattern: "^x" } } }),
+			rule: "schema-compile",
+			detail: "pattern",
+		},
+		{
+			label: "a schema nested deeper than the runtime validator follows",
+			def: withSchema("bad_deep", deepSchema(40)),
+			rule: "schema-compile",
+			detail: "nested deeper than",
+		},
 	];
 
 	for (const { label, def, rule, detail } of bad) {
@@ -187,5 +206,21 @@ describe("assertToolDefinitions", () => {
 		expect(failure.message).toContain("bad.first: name (");
 		expect(failure.message).toContain("second_bad: description (");
 		expect(failure.violations.map((violation) => violation.tool)).toEqual(["bad.first", "second_bad"]);
+	});
+
+	test("reports schema-compile for a definitions array with a keyword the runtime validator cannot enforce", () => {
+		const list = [tool("good_tool"), withSchema("bad_anyof_member", { properties: { id: { anyOf: [{ type: "string" }] } } })];
+		const error = thrownBy(() => assertToolDefinitions(list)) as ToolDefinitionError;
+		expect(error).toBeInstanceOf(ToolDefinitionError);
+		const compile = error.violations.filter((violation) => violation.rule === "schema-compile");
+		expect(compile).toHaveLength(1);
+		expect(compile[0]).toMatchObject({ tool: "bad_anyof_member" });
+		expect(compile[0]?.detail).toContain("anyOf");
+		expect(compile[0]?.detail).toContain("inputSchema.properties.id");
+	});
+
+	test("a schema that only the compile rule refuses still stops the list", () => {
+		const error = thrownBy(() => assertToolDefinitions([withSchema("too_deep", deepSchema(40))])) as ToolDefinitionError;
+		expect(error.violations.map((violation) => violation.rule)).toEqual(["schema-compile"]);
 	});
 });

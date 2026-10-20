@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
+import { writeAtomic } from "./atomic.ts";
 
 const STATE_FILE = "STATE.md";
 const MIRROR_RUN_LIMIT = 100;
@@ -106,26 +105,6 @@ function renderState(run: Run, phases: PhaseRecord[], decision: PendingDecision 
 	return lines.join("\n");
 }
 
-/** Writes via a temp file in the same directory, fsyncs, then renames into place. */
-function writeStateFile(runDir: string, content: string): void {
-	mkdirSync(runDir, { recursive: true, mode: 0o700 });
-	const finalPath = join(runDir, STATE_FILE);
-	const tempPath = join(runDir, `.${STATE_FILE}.${randomUUID()}.tmp`);
-	try {
-		const fd = openSync(tempPath, "wx", 0o600);
-		try {
-			writeFileSync(fd, content);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
-		renameSync(tempPath, finalPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
-}
-
 /** Mirrors one run's status (never its request text or phase output) to `${artifactDir}/${runId}/STATE.md`. */
 export function writeRunState(input: { store: Store; runId: string; artifactDir: string }): void {
 	const { store, runId, artifactDir } = input;
@@ -137,7 +116,7 @@ export function writeRunState(input: { store: Store; runId: string; artifactDir:
 
 	const phases = store.listPhases(runId);
 	const decision = readPendingDecision(store, runId);
-	writeStateFile(join(artifactDir, runId), renderState(run, phases, decision));
+	writeAtomic(join(artifactDir, runId), STATE_FILE, renderState(run, phases, decision));
 }
 
 /** Mirrors every run owned by `ownerId` (newest first, capped) and returns how many were written. */

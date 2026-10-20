@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { CEILING_DAY, CEILING_RUN, CeilingError, type Ledger, LedgerWriteError } from "../cost/ledger.ts";
 import type { RunStatus, Store } from "../store/store.ts";
+import { writeAtomic } from "./atomic.ts";
 
 export const PHASES = ["discover", "discuss", "plan", "execute"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -217,25 +217,13 @@ function normalizeAnswer(raw: string): string | null {
 	return cleaned;
 }
 
+function artifactPath(artifactDir: string, runId: string, phase: Phase): string {
+	return join(artifactDir, runId, `${phase}.md`);
+}
+
 /** Writes via a temp file in the same directory, fsyncs, then renames into place. */
 function writeArtifact(artifactDir: string, runId: string, phase: Phase, content: string): void {
-	const runDir = join(artifactDir, runId);
-	mkdirSync(runDir, { recursive: true, mode: 0o700 });
-	const finalPath = join(runDir, `${phase}.md`);
-	const tempPath = join(runDir, `.${phase}.${randomUUID()}.tmp`);
-	try {
-		const fd = openSync(tempPath, "wx", 0o600);
-		try {
-			writeFileSync(fd, content);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
-		renameSync(tempPath, finalPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
+	writeAtomic(join(artifactDir, runId), `${phase}.md`, content);
 }
 
 export function createWorker(options: WorkerOptions): Worker {
@@ -442,7 +430,15 @@ export function createWorker(options: WorkerOptions): Worker {
 	async function runClaimed(run: ClaimedRun, state: ReservationState): Promise<TickResult> {
 		const outputs = completedOutputs(run.id);
 		for (const phase of PHASES) {
-			if (outputs.has(phase)) continue;
+			if (outputs.has(phase)) {
+				// The phase commits before its artifact is written; a crash or write failure in between
+				// leaves it complete in the DB only, so re-materialise the file from the recorded output.
+				const output = outputs.get(phase) ?? "";
+				if (!existsSync(artifactPath(artifactDir, run.id, phase))) {
+					writeArtifact(artifactDir, run.id, phase, output);
+				}
+				continue;
+			}
 			const step = await runPhase(run, phase, outputs, state);
 			if (!step.done) return step.result;
 			outputs.set(phase, step.output);
@@ -460,7 +456,13 @@ export function createWorker(options: WorkerOptions): Worker {
 			return await runClaimed(run, state);
 		} catch (error) {
 			if (error instanceof LeaseLostError) {
-				if (state.reservationId !== null) ledger.abandon(state.reservationId);
+				if (state.reservationId !== null) {
+					try {
+						ledger.abandon(state.reservationId);
+					} catch {
+						// The new lease holder abandons dead reservations on claim, so it may already be gone.
+					}
+				}
 				return "idle";
 			}
 			throw error;

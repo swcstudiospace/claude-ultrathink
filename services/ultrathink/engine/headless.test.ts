@@ -17,7 +17,8 @@ import { escapeXml } from "../../../src/uplift/xml.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { createLedger } from "../cost/ledger.ts";
 import { openStore, type Store } from "../store/store.ts";
-import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner, type PlannerCall } from "./headless.ts";
+import { createCircuitBreaker } from "./breaker.ts";
+import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner, type PlannerCall, UNPERSISTED_JOBS_MAX } from "./headless.ts";
 import { answerRequest, listPendingRequests, showRequest, startPlan } from "./journal.ts";
 import type { OpenRouterFetch } from "./openrouter.ts";
 
@@ -169,6 +170,14 @@ function setup(overrides: Partial<UltrathinkConfig> = {}, options: Partial<Headl
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
 		serverDecisions: false,
+		sessionSecretPrevious: [],
+		breakerFailures: 5,
+		breakerWindowMs: 60000,
+		breakerOpenMs: 30000,
+		maxInflight: 256,
+		drainMs: 5000,
+		retentionDays: 30,
+		auditLog: true,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);
@@ -501,6 +510,58 @@ describe("headless planner: limits and lifecycle", () => {
 		expect(h.store.db.query<{ status: string }, [string]>("SELECT status FROM runs WHERE id = ?").get(run.id)?.status).toBe("failed");
 	});
 
+	test("a job file without a runId is ignored", async () => {
+		const h = setup();
+		const sessionId = randomUUID();
+		mkdirSync(join(h.stateDir, "jobs"), { recursive: true });
+		const file = join(h.stateDir, "jobs", `${sessionId}.json`);
+		writeFileSync(file, JSON.stringify({ sessionId, status: "running", createdAt: 1, updatedAt: 1, usage: { calls: 0, inputTokens: 0, outputTokens: 0 }, promptSha256: "0".repeat(64) }));
+		const reborn = createHeadlessPlanner({ config: h.config, store: h.store, ledger: createLedger(h.store, { runTokenCeiling: 1e9, dailyTokenCeiling: 1e9 }), sleep: h.clock.sleep, completer: fakeModel().complete });
+		// Not recovered on startup, not a server job, not a client session.
+		expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({ status: "running" });
+		expect(reborn.status({ sessionId })).toBeNull();
+		expect(await reborn.result({ sessionId, waitSeconds: 0 })).toEqual({ ok: false, code: "not_found" });
+	});
+
+	test("settled jobs whose file cannot be written are kept in memory only up to the cap, and each failure is logged once", async () => {
+		const total = UNPERSISTED_JOBS_MAX + 5;
+		const gate = Promise.withResolvers<void>();
+		const completer: ClaudeCompleter = async (_system, _user, signal) => {
+			await (signal ? Promise.race([gate.promise, aborted(signal)]) : gate.promise);
+			throw new Error("model down");
+		};
+		const events: Array<{ level: string; event: string; fields?: Record<string, unknown> }> = [];
+		const logger = {
+			info: (event: string, fields?: Record<string, unknown>) => events.push({ level: "info", event, fields }),
+			warn: (event: string, fields?: Record<string, unknown>) => events.push({ level: "warn", event, fields }),
+			error: (event: string, fields?: Record<string, unknown>) => events.push({ level: "error", event, fields }),
+		};
+		const h = setup({ maxConcurrentPlans: total + 1 }, { completer, logger });
+		const ids = Array.from({ length: total }, () => randomUUID());
+		for (const sessionId of ids) {
+			expect(await startRunning(h, sessionId)).toEqual({ ok: true, data: { sessionId, status: "running", pollAfterSec: expect.any(Number) } });
+		}
+		// The running file is on disk; the settled write fails because its temp path is now a directory.
+		for (const sessionId of ids) mkdirSync(join(h.stateDir, "jobs", `${sessionId}.json.${process.pid}.tmp`));
+		gate.resolve();
+		for (const sessionId of ids) await h.planner.result({ sessionId, waitSeconds: 30 });
+
+		// In memory the job is failed; once dropped, only the stale running file on disk is left.
+		const seen = { failed: 0, running: 0 };
+		for (const sessionId of ids) {
+			const status = h.planner.status({ sessionId });
+			if (!status?.ok) throw new Error("job vanished");
+			if (status.data.status === "failed") seen.failed += 1;
+			else if (status.data.status === "running") seen.running += 1;
+		}
+		expect(seen).toEqual({ failed: UNPERSISTED_JOBS_MAX, running: total - UNPERSISTED_JOBS_MAX });
+		expect(events).toHaveLength(total);
+		expect(new Set(events.map((e) => e.fields?.sessionId)).size).toBe(total);
+		for (const entry of events) expect(entry).toMatchObject({ level: "error", event: "job_persist_failed", fields: { status: "failed", error: expect.any(Error) } });
+		expect(JSON.stringify(events)).not.toContain(FAKE_KEY);
+		expect(JSON.stringify(events)).not.toContain(PROMPT);
+	});
+
 	test("result waits at most the clamped time and then reports running", async () => {
 		const gate = Promise.withResolvers<void>();
 		const h = setup({}, { completer: fakeModel(gate.promise).complete });
@@ -556,7 +617,7 @@ describe("headless planner: client-mode fallback", () => {
 		const sessionId = randomUUID();
 		const o = { stateDir: h.stateDir, maxPromptChars: 4000, maxAnswerChars: 200_000 };
 		expect(await startPlan(o, { prompt: PROMPT, sessionId })).toMatchObject({ ok: true, data: { status: "needs-model" } });
-		expect(await h.planner.result({ sessionId, waitSeconds: 0 })).toMatchObject({ ok: true, data: { status: "running", mode: "client" } });
+		expect(await h.planner.result({ sessionId, waitSeconds: 0 })).toMatchObject({ ok: true, data: { status: "running", mode: "client", pollAfterSec: 10 } });
 		expect(await h.planner.result({ sessionId: randomUUID(), waitSeconds: 0 })).toEqual({ ok: false, code: "not_found" });
 	});
 });
@@ -616,6 +677,64 @@ describe("headless planner: call telemetry", () => {
 			expect(call.outputTokens).toBe(0);
 			expect("costUsd" in call).toBe(false);
 		}
+	});
+});
+
+describe("headless planner: upstream breaker", () => {
+	test("a tripped breaker fails the job with upstream_unavailable before any request, and upstream() reports open", async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 1, windowMs: 60_000, openMs: 30_000 });
+		const slot = breaker.tryAcquire();
+		if (!slot.ok) throw new Error("expected a closed breaker");
+		slot.release("failure");
+		expect(breaker.state()).toBe("open");
+		let requests = 0;
+		const never: OpenRouterFetch = async () => {
+			requests += 1;
+			return new Response(JSON.stringify({ choices: [{ message: { content: "unreachable" } }] }), { status: 200 });
+		};
+		const calls: PlannerCall[] = [];
+		const h = setup({}, { completer: undefined, fetch: never, breaker, onCall: (call) => calls.push(call) });
+		const sessionId = randomUUID();
+		expect(await h.planner.start({ prompt: PROMPT, sessionId })).toEqual({ ok: true, data: { sessionId, status: "failed", error: "upstream_unavailable" } });
+		expect(await h.planner.result({ sessionId, waitSeconds: 0 })).toMatchObject({ ok: true, data: { status: "failed", mode: "server", error: "upstream_unavailable" } });
+		expect(jobFile(h.stateDir, sessionId)).toMatchObject({ status: "failed", error: "upstream_unavailable", usage: { calls: 0 } });
+		expect(requests).toBe(0);
+		expect(calls.length).toBeGreaterThanOrEqual(1);
+		for (const call of calls) expect(call).toMatchObject({ outcome: "upstream_unavailable", attempts: 0, inputTokens: 0, outputTokens: 0 });
+		expect(h.planner.upstream()).toEqual({ state: "open", failures: 1 });
+		// Every reservation made for the refused calls was abandoned, none left reserved or settled.
+		const states = h.store.db.query<{ state: string; n: number }, []>("SELECT state, COUNT(*) AS n FROM token_ledger GROUP BY state").all();
+		expect(states).toEqual([{ state: "abandoned", n: calls.length }]);
+		const run = h.store.db.query<{ status: string; reason: string | null }, []>("SELECT status, reason FROM runs").get();
+		expect(run).toEqual({ status: "failed", reason: "upstream_unavailable" });
+	});
+
+	test("upstream failures seen through the planner trip the shared breaker", async () => {
+		const breaker = createCircuitBreaker({ failureThreshold: 2, windowMs: 60_000, openMs: 30_000 });
+		let requests = 0;
+		const down: OpenRouterFetch = async () => {
+			requests += 1;
+			return new Response("down", { status: 503, headers: { "retry-after": "1" } });
+		};
+		const h = setup({}, { completer: undefined, fetch: down, breaker });
+		const sessionId = randomUUID();
+		const started = h.planner.start({ prompt: PROMPT, sessionId });
+		// The completer backs off (Retry-After: 1 s) through the planner's clock between the two 503s.
+		await flush();
+		expect(h.clock.has(1000)).toBe(true);
+		h.clock.fire(1000);
+		expect(await started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "upstream_unavailable" } });
+		// Two 503s open the breaker; the completer then stops retrying and no later call reaches the upstream.
+		expect(requests).toBe(2);
+		expect(h.planner.upstream()).toEqual({ state: "open", failures: 2 });
+	});
+
+	test("a planner without a breaker reports upstream() as undefined and keeps today's behaviour", async () => {
+		const h = setup();
+		expect(h.planner.upstream()).toBeUndefined();
+		const sessionId = randomUUID();
+		expect(await h.planner.start({ prompt: PROMPT, sessionId })).toMatchObject({ ok: true, data: { sessionId, status: "planned" } });
+		expect(h.planner.upstream()).toBeUndefined();
 	});
 });
 
@@ -879,7 +998,7 @@ describe("headless planner: graph view", () => {
 		await startPlan(o, { prompt: PROMPT, sessionId: clientId });
 		expect(await client.planner.result({ sessionId: clientId, waitSeconds: 0 })).toEqual({
 			ok: true,
-			data: { sessionId: clientId, status: "running", mode: "client", text: expect.stringContaining("driven by the chat model") },
+			data: { sessionId: clientId, status: "running", mode: "client", text: expect.stringContaining("driven by the chat model"), pollAfterSec: 10 },
 		});
 	});
 });

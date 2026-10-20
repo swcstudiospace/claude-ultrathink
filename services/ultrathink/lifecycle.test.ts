@@ -26,6 +26,7 @@ interface RigOptions {
 	stop?: () => Promise<void> | void;
 	appShutdown?: () => Promise<void>;
 	close?: () => void;
+	drainMs?: number;
 }
 
 function rig(options: RigOptions = {}): Rig {
@@ -54,6 +55,10 @@ function rig(options: RigOptions = {}): Rig {
 		},
 		logger: createLogger({ write: (line) => logs.push(JSON.parse(line) as LogLine) }),
 		timeoutMs: 5000,
+		beginDrain: () => {
+			steps.push("drain");
+		},
+		drainMs: options.drainMs ?? 0,
 		// The guard is driven by hand: the test fires it instead of waiting for it.
 		schedule: (run, ms) => {
 			const guard: Guard = { ms, cancelled: false, fire: run };
@@ -71,10 +76,10 @@ function rig(options: RigOptions = {}): Rig {
 }
 
 describe("createShutdown", () => {
-	test("stops the server, ends the planner, closes the store, logs and exits 0, in that order", async () => {
+	test("begins draining, then stops the server, ends the planner, closes the store, logs and exits 0, in that order", async () => {
 		const r = rig();
 		await r.shutdown("SIGTERM");
-		expect(r.steps).toEqual(["stop", "app", "close", "exit"]);
+		expect(r.steps).toEqual(["drain", "stop", "app", "close", "exit"]);
 		expect(r.exits).toEqual([0]);
 		expect(r.logs.map((line) => line.event)).toEqual(["shutdown", "stopped"]);
 		expect(r.logs[0]).toMatchObject({ reason: "SIGTERM" });
@@ -85,11 +90,11 @@ describe("createShutdown", () => {
 		const r = rig({ stop: () => drain.promise });
 		const done = r.shutdown("SIGTERM");
 		// The planner is told to stop while the server drains: that is what releases long-polling requests.
-		expect(r.steps).toEqual(["stop", "app"]);
+		expect(r.steps).toEqual(["drain", "stop", "app"]);
 		expect(r.exits).toEqual([]);
 		drain.resolve();
 		await done;
-		expect(r.steps).toEqual(["stop", "app", "close", "exit"]);
+		expect(r.steps).toEqual(["drain", "stop", "app", "close", "exit"]);
 	});
 
 	test("runs once however often it is called", async () => {
@@ -115,7 +120,7 @@ describe("createShutdown", () => {
 			},
 		});
 		await r.shutdown("SIGTERM");
-		expect(r.steps).toEqual(["stop", "app", "close", "exit"]);
+		expect(r.steps).toEqual(["drain", "stop", "app", "close", "exit"]);
 		expect(r.exits).toEqual([1]);
 		const failure = r.logs.find((line) => line.event === "shutdown_error");
 		expect(failure).toMatchObject({ step: "planner", error: { name: "Error", message: "planner would not stop" } });
@@ -151,6 +156,39 @@ describe("createShutdown", () => {
 		await r.shutdown("SIGTERM");
 		expect(r.guards).toHaveLength(1);
 		expect(r.guards[0]?.cancelled).toBe(true);
+	});
+
+	test("holds the server stop until drainMs has elapsed", async () => {
+		const r = rig({ drainMs: 1500 });
+		const done = r.shutdown("SIGTERM");
+		// guards[0] is the timeout guard; guards[1] is the drain wait.
+		expect(r.steps).toEqual(["drain"]);
+		expect(r.guards[1]?.ms).toBe(1500);
+		r.guards[1]?.fire();
+		await done;
+		expect(r.guards[1]?.cancelled).toBe(true);
+		expect(r.steps).toEqual(["drain", "stop", "app", "close", "exit"]);
+		expect(r.exits).toEqual([0]);
+	});
+
+	test("a zero drainMs adds no wait", async () => {
+		const r = rig({ drainMs: 0 });
+		const done = r.shutdown("SIGTERM");
+		expect(r.guards).toHaveLength(1);
+		expect(r.steps).toEqual(["drain", "stop", "app"]);
+		await done;
+		expect(r.exits).toEqual([0]);
+	});
+
+	test("a second call during the drain returns the first promise without draining again", async () => {
+		const r = rig({ drainMs: 1000 });
+		const first = r.shutdown("SIGTERM", 0);
+		const second = r.shutdown("SIGINT", 1);
+		expect(second).toBe(first);
+		expect(r.steps.filter((step) => step === "drain")).toHaveLength(1);
+		r.guards[1]?.fire();
+		await first;
+		expect(r.exits).toEqual([0]);
 	});
 });
 

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { type PendingRequest, journalDir, listPending, readMeta, runGrokbotPlan, storeAnswer } from "../../../src/host/grokbot.ts";
+import type { planPrompt } from "../../../src/host/plan.ts";
 
 export const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -15,6 +16,8 @@ export interface JournalOptions {
 	stateDir: string;
 	maxPromptChars: number;
 	maxAnswerChars: number;
+	/** Plugin entry point; defaults to `planPrompt`. A test seam, never a behavior switch. */
+	plan?: typeof planPrompt;
 }
 
 export interface PendingView {
@@ -116,12 +119,24 @@ export function isolatedConfigEnv(stateDir: string): Record<"HOME" | "XDG_CONFIG
 	return env;
 }
 
+/** Client-driven plans in flight, by journal dir: a concurrent start for the same session joins the first instead of racing it. */
+const inFlight = new Map<string, { prompt: string; result: Promise<JournalResult<PlanView>> }>();
+
 export async function startPlan(opts: JournalOptions, input: { prompt: unknown; sessionId?: unknown }): Promise<JournalResult<PlanView>> {
 	const sessionId = input.sessionId === undefined ? randomUUID() : input.sessionId;
 	if (!isSessionId(sessionId)) return fail("invalid_session_id");
 	if (typeof input.prompt !== "string") return fail("invalid_input");
 	const prompt = cleanText(input.prompt);
 	if (prompt.length === 0 || prompt.length > opts.maxPromptChars) return fail("invalid_input");
+	const key = journalDir(opts.stateDir, sessionId);
+	const live = inFlight.get(key);
+	if (live) return live.prompt === prompt ? live.result : fail("session_conflict");
+	const result = runPlan(opts, sessionId, prompt).finally(() => inFlight.delete(key));
+	inFlight.set(key, { prompt, result });
+	return result;
+}
+
+async function runPlan(opts: JournalOptions, sessionId: string, prompt: string): Promise<JournalResult<PlanView>> {
 	try {
 		const cwd = join(opts.stateDir, "cwd");
 		mkdirSync(cwd, { recursive: true });
@@ -139,6 +154,7 @@ export async function startPlan(opts: JournalOptions, input: { prompt: unknown; 
 				...isolatedConfigEnv(opts.stateDir),
 			},
 			debounceMs: DEBOUNCE_MS,
+			...(opts.plan ? { plan: opts.plan } : {}),
 		});
 		return ok({ sessionId, status: run.status, pending: run.pending.map(pendingView) });
 	} catch (error) {

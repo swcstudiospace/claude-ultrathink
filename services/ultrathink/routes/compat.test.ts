@@ -75,6 +75,14 @@ function harness(overrides: Partial<UltrathinkConfig> = {}): Harness {
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
 		serverDecisions: false,
+		sessionSecretPrevious: [],
+		breakerFailures: 5,
+		breakerWindowMs: 60000,
+		breakerOpenMs: 30000,
+		maxInflight: 256,
+		drainMs: 5000,
+		retentionDays: 30,
+		auditLog: true,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);
