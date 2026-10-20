@@ -233,18 +233,22 @@ export class ObjectValidator<T extends Record<string, unknown>> extends BaseVali
 
 		const obj = value as Record<string, unknown>;
 		const errors: ValidationError[] = [];
+		// Copy so accepted unknown keys pass through; schema keys are replaced with their converted values.
+		const out: Record<string, unknown> = { ...obj };
 
 		// Validate required fields
 		for (const [key, validator] of Object.entries(this.schema)) {
 			const result = validator.validate(obj[key]);
 			if (!result.valid) {
 				errors.push(...result.errors.map((e) => ({ ...e, field: e.field ? `${e.field}` : key })));
+			} else if (result.value !== undefined) {
+				out[key] = result.value;
 			}
 		}
 
 		// Check for extra keys
 		if (!this.options.allowExtraKeys) {
-			const extraKeys = Object.keys(obj).filter((k) => !this.schema[k]);
+			const extraKeys = Object.keys(obj).filter((k) => !Object.prototype.hasOwnProperty.call(this.schema, k));
 			if (extraKeys.length > 0 && this.options.strict) {
 				for (const key of extraKeys) {
 					errors.push({ field: key, code: 'UNEXPECTED_FIELD', message: `Unexpected field: ${key}`, received: obj[key] });
@@ -256,7 +260,7 @@ export class ObjectValidator<T extends Record<string, unknown>> extends BaseVali
 			return { valid: false, errors };
 		}
 
-		return { valid: true, value: obj as T, errors: [] };
+		return { valid: true, value: out as T, errors: [] };
 	}
 }
 
@@ -324,24 +328,63 @@ export async function validateRequestBody(
 	options: { maxBodySize?: number; allowExtraKeys?: boolean } = {}
 ): Promise<ValidationResult<Record<string, unknown>>> {
 	const maxSize = options.maxBodySize ?? 1024 * 1024; // 1MB default
-	// For Request, we need to read the body differently
-	let text: string;
+	const tooLarge: ValidationResult<Record<string, unknown>> = {
+		valid: false,
+		errors: [{ field: 'body', code: 'BODY_TOO_LARGE', message: 'Request body exceeds maximum size' }],
+	};
+
+	// Reject on the declared length before reading anything; the streamed count below is the real guard.
+	const declared = request.headers.get('content-length');
+	if (declared !== null && Number(declared) > maxSize) return tooLarge;
+
+	let bytes: Uint8Array | null;
 	try {
-		text = await request.text();
+		bytes = await readRequestBytes(request, maxSize);
 	} catch {
 		return { valid: false, errors: [{ field: 'body', code: 'READ_ERROR', message: 'Failed to read request body' }] };
 	}
-	if (text.length > maxSize) {
-		return { valid: false, errors: [{ field: 'body', code: 'BODY_TOO_LARGE', message: 'Request body exceeds maximum size' }] };
-	}
+	if (bytes === null) return tooLarge;
 
 	try {
-		const body = JSON.parse(text);
-		const validator = new ObjectValidator(schema, { allowExtraKeys: options.allowExtraKeys ?? false });
+		const body = JSON.parse(new TextDecoder().decode(bytes));
+		// Unknown fields are rejected unless the caller opts out with allowExtraKeys.
+		const validator = new ObjectValidator(schema, { allowExtraKeys: options.allowExtraKeys ?? false, strict: true });
 		return validator.validate(body);
 	} catch {
 		return { valid: false, errors: [{ field: 'body', code: 'INVALID_JSON', message: 'Request body must be valid JSON' }] };
 	}
+}
+
+/**
+ * Streams the request body and returns null as soon as it exceeds `maxSize` bytes.
+ * The stream is cancelled at that point, so nothing past the limit is buffered.
+ */
+async function readRequestBytes(request: Request, maxSize: number): Promise<Uint8Array | null> {
+	if (!request.body) return new Uint8Array(0);
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > maxSize) {
+				await reader.cancel().catch(() => {});
+				return null;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
 }
 
 /**

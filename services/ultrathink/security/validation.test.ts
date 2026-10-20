@@ -11,6 +11,7 @@ import {
 	UuidValidator,
 	ObjectValidator,
 	ArrayValidator,
+	validateRequestBody,
 	commonValidators,
 } from "./validation.ts";
 
@@ -133,6 +134,90 @@ describe("Validation", () => {
 			});
 			expect(validator.validate({ name: "John", age: 30 }).valid).toBe(true);
 			expect(validator.validate({ name: "", age: 30 }).valid).toBe(false);
+		});
+
+		test("returns converted child values instead of the input object", () => {
+			const validator = new ObjectValidator<{ n: number; name: string }>({
+				n: { validate: (v) => ({ valid: true, value: Number(v) * 2, errors: [] }) },
+				name: new StringValidator({ minLength: 1 }),
+			});
+			const result = validator.validate({ n: "21", name: "Ada" });
+			expect(result.valid).toBe(true);
+			expect(result.value).toEqual({ n: 42, name: "Ada" });
+		});
+
+		test("rejects unknown fields when strict is set", () => {
+			const validator = new ObjectValidator({ name: new StringValidator() }, { strict: true });
+			const result = validator.validate({ name: "Ada", extra: 1 });
+			expect(result.valid).toBe(false);
+			expect(result.errors[0]).toMatchObject({ field: "extra", code: "UNEXPECTED_FIELD" });
+		});
+
+		test("treats inherited Object.prototype names as unknown fields when strict", () => {
+			const validator = new ObjectValidator({ name: new StringValidator() }, { strict: true });
+			expect(validator.validate(JSON.parse('{"name":"Ada","constructor":1}')).valid).toBe(false);
+		});
+
+		test("passes unknown fields through when allowExtraKeys is set", () => {
+			const validator = new ObjectValidator({ name: new StringValidator() }, { allowExtraKeys: true, strict: true });
+			const result = validator.validate({ name: "Ada", extra: 1 });
+			expect(result.valid).toBe(true);
+			expect(result.value).toEqual({ name: "Ada", extra: 1 });
+		});
+	});
+
+	describe("validateRequestBody", () => {
+		const schema = { name: new StringValidator({ minLength: 1 }) };
+		const jsonRequest = (body: string, headers: Record<string, string> = {}) =>
+			new Request("http://localhost/test", { method: "POST", body, headers });
+
+		test("returns the validated body", async () => {
+			const result = await validateRequestBody(jsonRequest(JSON.stringify({ name: "Ada" })), schema);
+			expect(result.valid).toBe(true);
+			expect(result.value).toEqual({ name: "Ada" });
+		});
+
+		test("rejects unknown fields by default", async () => {
+			const result = await validateRequestBody(jsonRequest(JSON.stringify({ name: "Ada", extra: true })), schema);
+			expect(result.valid).toBe(false);
+			expect(result.errors[0]).toMatchObject({ field: "extra", code: "UNEXPECTED_FIELD" });
+		});
+
+		test("accepts unknown fields when allowExtraKeys is set", async () => {
+			const result = await validateRequestBody(jsonRequest(JSON.stringify({ name: "Ada", extra: true })), schema, { allowExtraKeys: true });
+			expect(result.valid).toBe(true);
+		});
+
+		test("rejects invalid JSON", async () => {
+			const result = await validateRequestBody(jsonRequest("{nope"), schema);
+			expect(result.errors[0]?.code).toBe("INVALID_JSON");
+		});
+
+		test("rejects a declared Content-Length over the limit without reading the body", async () => {
+			const body = JSON.stringify({ name: "Ada", pad: "x".repeat(200) });
+			const request = jsonRequest(body, { "content-length": String(body.length) });
+			const result = await validateRequestBody(request, schema, { maxBodySize: 100 });
+			expect(result.errors[0]?.code).toBe("BODY_TOO_LARGE");
+			expect(request.bodyUsed).toBe(false);
+		});
+
+		test("stops reading a streamed body once it exceeds the limit", async () => {
+			let pulls = 0;
+			let cancelled = false;
+			const stream = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					pulls++;
+					controller.enqueue(new TextEncoder().encode("x".repeat(10)));
+				},
+				cancel() {
+					cancelled = true;
+				},
+			});
+			const request = new Request("http://localhost/test", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+			const result = await validateRequestBody(request, schema, { maxBodySize: 25 });
+			expect(result.errors[0]?.code).toBe("BODY_TOO_LARGE");
+			expect(pulls).toBeLessThan(10);
+			expect(cancelled).toBe(true);
 		});
 	});
 
