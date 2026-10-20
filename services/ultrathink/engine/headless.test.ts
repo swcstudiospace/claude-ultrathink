@@ -406,6 +406,36 @@ describe("headless planner: limits and lifecycle", () => {
 		expect(result).toMatchObject({ ok: true, data: { status: "failed", error: "timeout" } });
 	});
 
+	test("decision holds stay on the daily ceiling after their plans end, so a third plan runs without decisions", async () => {
+		const gate = Promise.withResolvers<void>();
+		const seen: Array<{ decisions: boolean; env: Record<string, string | undefined> }> = [];
+		const plan: typeof planPrompt = async (_request, env, options) => {
+			if (!options?.config) throw new Error("planPrompt was called without a config");
+			seen.push({ decisions: options.config.decisions.enabled, env: { ...env } });
+			await gate.promise;
+			throw new Error("held open by the test");
+		};
+		// Each hold is modelMaxOutputTokens x 18 (9 decision calls, two requests each) = 18000. The daily ceiling fits two, not three.
+		const h = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 1_000_000, dailyTokenCeiling: 40_000 }, { plan });
+		const first = randomUUID();
+		const second = randomUUID();
+		const starts = [h.planner.start({ prompt: PROMPT, sessionId: first }), h.planner.start({ prompt: PROMPT, sessionId: second })];
+		await flush();
+		h.clock.fire(15_000);
+		for (const start of await Promise.all(starts)) expect(start).toMatchObject({ ok: true, data: { status: "running" } });
+		expect(seen.map((call) => call.decisions)).toEqual([true, true]);
+		expect(seen[0]?.env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
+
+		// Both plans end. Their holds stay on the day at the reserved worst case, so a third hold would exceed the daily ceiling.
+		gate.resolve();
+		await h.planner.result({ sessionId: first, waitSeconds: 30 });
+		await h.planner.result({ sessionId: second, waitSeconds: 30 });
+		await h.planner.start({ prompt: PROMPT, sessionId: randomUUID() });
+		expect(seen.map((call) => call.decisions)).toEqual([true, true, false]);
+		expect(seen[2]?.env.ULTRATHINK_DECISIONS).toBe("0");
+		expect(seen[2]?.env.OPENROUTER_API_KEY).toBeUndefined();
+	});
+
 	test("an engine failure ends the job as failed with the code, never the response body", async () => {
 		const failing: OpenRouterFetch = async () => new Response("secret upstream body", { status: 401 });
 		const h = setup({}, { completer: undefined, fetch: failing });
