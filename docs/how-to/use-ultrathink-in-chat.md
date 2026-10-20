@@ -280,10 +280,11 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_PUBLIC_ORIGIN` | none (required) | Public origin of the service, `https://ultrathink.swcstudio.space`. `http://` is allowed only for localhost and 127.0.0.1. |
 | `ULTRATHINK_OWNER_PASSWORD_HASH` | none (required) | Argon2id hash of the owner password. |
 | `ULTRATHINK_SESSION_SECRET` | none (required) | Secret for web login sessions, at least 32 characters. |
-| `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | State directory: database, `oauth.json`, `journal/`, `sessions/`, `jobs/`. |
+| `ULTRATHINK_SESSION_SECRET_PREVIOUS` | unset | Earlier session secrets: a comma list of at most 4, each at least 32 characters. They verify existing sessions and pending consents during a rotation; remove them after 12 hours (sessions) and 10 minutes (pending consents) and restart. |
+| `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | Absolute path to the state directory: database, `oauth.json`, `audit.jsonl`, `journal/`, `sessions/`, `jobs/`. Trailing slashes are removed. |
 | `ULTRATHINK_PORT` | `8795` | Listen port, 1024 to 65535. |
 | `ULTRATHINK_MAX_INPUT_CHARS` | `8000` | Longest request, 1 to 20000 characters. |
-| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 200000 characters. |
+| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 20000 characters. The request body cap is 64 KiB, so a larger value fails startup. |
 | `ULTRATHINK_RUN_TOKEN_CEILING` | `150000` | Token limit for one plan. A plan over it stops with `budget_exceeded`. |
 | `ULTRATHINK_DAILY_TOKEN_CEILING` | `1000000` | Token limit per UTC day across all plans. |
 | `ULTRATHINK_PLANNING_MODEL` | unset | OpenRouter model id for server-side planning, for example `x-ai/grok-4.7`. Server-side mode needs it. |
@@ -299,8 +300,17 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
 | `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | none | Comma list of extra https origins allowed in client redirect URIs. |
+| `ULTRATHINK_BREAKER_FAILURES` | `5` | Upstream failures (errors, timeouts, rate limits) in one window before planning is refused as `upstream_unavailable`. `0` disables the upstream breaker. 0 to 100. |
+| `ULTRATHINK_BREAKER_WINDOW_MS` | `60000` | Length of the window in which upstream failures are counted, 1000 to 3600000 ms. |
+| `ULTRATHINK_BREAKER_OPEN_MS` | `30000` | How long planning stays refused before one probe is let through, 1000 to 600000 ms. |
+| `ULTRATHINK_MAX_INFLIGHT` | `256` | Requests in flight at once, 1 to 10000. Further requests, except `/healthz`, `/readyz` and `/metrics`, get 503 `overloaded`. |
+| `ULTRATHINK_DRAIN_MS` | `5000` | On SIGTERM or SIGINT, how long `/readyz` reports `draining` before the listener stops, 0 to 60000 ms. |
+| `ULTRATHINK_RETENTION_DAYS` | `30` | Age in days after which finished session records, job files and journal directories are removed by the hourly sweep. `0` disables it. 0 to 3650. |
+| `ULTRATHINK_AUDIT_LOG` | `1` | `1` writes the audit log `audit.jsonl` in the state directory; `0` turns it off. Only `0` and `1` are accepted. |
 
 Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 65,536 bytes and is not configurable. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
+
+Web login sessions use the cookie `__Host-ut_session` when the public origin is https and `ut_session` otherwise. Sessions issued before this release no longer validate, so every browser session ends at deploy (at most 12 hours). `POST /logout` clears the cookie and needs the exact public origin.
 
 ## Troubleshooting
 
