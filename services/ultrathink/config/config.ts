@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
+import { isAbsolute } from "node:path";
+
 export class ConfigError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -14,6 +16,8 @@ export interface UltrathinkConfig {
 	publicOrigin: string;
 	ownerPasswordHash: string;
 	sessionSecret: string;
+	/** Earlier session secrets still accepted for existing cookies, so a rotation does not sign everyone out. */
+	sessionSecretPrevious: string[];
 	stateDir: string;
 	dbPath: string;
 	port: number;
@@ -36,6 +40,20 @@ export interface UltrathinkConfig {
 	serverDecisions: boolean;
 	/** Absent means the `reasoning` request parameter is not sent. */
 	modelReasoningEffort?: ReasoningEffort;
+	/** Failures counted within `breakerWindowMs` that open the upstream breaker; 0 disables it. */
+	breakerFailures: number;
+	/** Window in which upstream failures are counted. */
+	breakerWindowMs: number;
+	/** How long the upstream breaker stays open before it lets a trial request through. */
+	breakerOpenMs: number;
+	/** Upper bound on concurrent HTTP requests the router admits. */
+	maxInflight: number;
+	/** Wait after shutdown begins, before the server stops, so in-flight work can finish. */
+	drainMs: number;
+	/** Days of finished jobs, sessions and journals to keep; 0 disables the sweep. */
+	retentionDays: number;
+	/** Whether the append-only audit log is written. */
+	auditLog: boolean;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -43,10 +61,19 @@ const DEFAULT_PORT = 8795;
 const DEFAULT_MAX_INPUT_CHARS = 8000;
 const DEFAULT_MAX_ANSWER_CHARS = 20000;
 const MAX_BODY_BYTES = 65536;
+// Prompts and answers travel inside a JSON request body that Bun caps at MAX_BODY_BYTES, so both
+// char limits must fit it or Bun answers 413 before the app can say input_too_long/answer_too_long.
+// A length counts UTF-16 code units; each encodes to at most 3 UTF-8 bytes (an astral code point is
+// two units for four bytes). The rest is the allowance for the JSON-RPC envelope and JSON escaping,
+// sized so the ceiling is 20000 chars: the documented maximum, and the default answer limit.
+const MAX_UTF8_BYTES_PER_CHAR = 3;
+const BODY_ENVELOPE_BYTES = 5536;
+const MAX_BODY_CHARS = Math.floor((MAX_BODY_BYTES - BODY_ENVELOPE_BYTES) / MAX_UTF8_BYTES_PER_CHAR);
 const DEFAULT_RUN_TOKEN_CEILING = 150000;
 const DEFAULT_DAILY_TOKEN_CEILING = 1000000;
 const MIN_SESSION_SECRET_LENGTH = 32;
 const MIN_CONNECTOR_KEY_LENGTH = 32;
+const MAX_PREVIOUS_SESSION_SECRETS = 4;
 const INTEGER_PATTERN = /^[0-9]+$/;
 const PLANNING_MODEL_PATTERN = /^[A-Za-z0-9._:\/-]{1,80}$/;
 const MIN_OPENROUTER_KEY_LENGTH = 20;
@@ -149,6 +176,28 @@ function readSessionSecret(env: Record<string, string | undefined>): string {
 		);
 	}
 	return secret;
+}
+
+function readPreviousSessionSecrets(env: Record<string, string | undefined>): string[] {
+	const raw = readOptional(env, "ULTRATHINK_SESSION_SECRET_PREVIOUS");
+	if (raw === undefined) {
+		return [];
+	}
+	const secrets = raw
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry !== "");
+	if (secrets.some((secret) => secret.length < MIN_SESSION_SECRET_LENGTH)) {
+		throw new ConfigError(
+			`ULTRATHINK_SESSION_SECRET_PREVIOUS entries must be at least ${MIN_SESSION_SECRET_LENGTH} characters`,
+		);
+	}
+	if (secrets.length > MAX_PREVIOUS_SESSION_SECRETS) {
+		throw new ConfigError(
+			`ULTRATHINK_SESSION_SECRET_PREVIOUS may list at most ${MAX_PREVIOUS_SESSION_SECRETS} secrets`,
+		);
+	}
+	return secrets;
 }
 
 function readPlanningModel(
@@ -295,16 +344,29 @@ function readOriginList(
 	return [...origins];
 }
 
+/** Absolute, without trailing slashes: `dbPath` appends `/ultrathink.sqlite`. */
+function readStateDir(env: Record<string, string | undefined>): string {
+	const raw = readOptional(env, "ULTRATHINK_STATE_DIR");
+	if (raw === undefined) {
+		return DEFAULT_STATE_DIR;
+	}
+	if (!isAbsolute(raw)) {
+		throw new ConfigError("ULTRATHINK_STATE_DIR must be an absolute path");
+	}
+	return raw.replace(/(?<=.)\/+$/, "");
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
-	const stateDir = readOptional(env, "ULTRATHINK_STATE_DIR") ?? DEFAULT_STATE_DIR;
+	const stateDir = readStateDir(env);
 	const planningModel = readPlanningModel(env);
 	const openRouterApiKey = readOpenRouterApiKey(env);
 	return {
 		publicOrigin: readPublicOrigin(env),
 		ownerPasswordHash: readOwnerPasswordHash(env),
 		sessionSecret: readSessionSecret(env),
+		sessionSecretPrevious: readPreviousSessionSecrets(env),
 		stateDir,
 		dbPath: `${stateDir}/ultrathink.sqlite`,
 		port: readInteger(env, "ULTRATHINK_PORT", DEFAULT_PORT, 1024, 65535),
@@ -313,14 +375,14 @@ export function loadConfig(
 			"ULTRATHINK_MAX_INPUT_CHARS",
 			DEFAULT_MAX_INPUT_CHARS,
 			1,
-			20000,
+			MAX_BODY_CHARS,
 		),
 		maxAnswerChars: readInteger(
 			env,
 			"ULTRATHINK_MAX_ANSWER_CHARS",
 			DEFAULT_MAX_ANSWER_CHARS,
 			1,
-			200000,
+			MAX_BODY_CHARS,
 		),
 		maxBodyBytes: MAX_BODY_BYTES,
 		runTokenCeiling: readInteger(
@@ -374,6 +436,13 @@ export function loadConfig(
 		),
 		serverDecisions: readFlag(env, "ULTRATHINK_SERVER_DECISIONS") === true,
 		modelReasoningEffort: readReasoningEffort(env),
+		breakerFailures: readInteger(env, "ULTRATHINK_BREAKER_FAILURES", 5, 0, 100),
+		breakerWindowMs: readInteger(env, "ULTRATHINK_BREAKER_WINDOW_MS", 60000, 1000, 3600000),
+		breakerOpenMs: readInteger(env, "ULTRATHINK_BREAKER_OPEN_MS", 30000, 1000, 600000),
+		maxInflight: readInteger(env, "ULTRATHINK_MAX_INFLIGHT", 256, 1, 10000),
+		drainMs: readInteger(env, "ULTRATHINK_DRAIN_MS", 5000, 0, 60000),
+		retentionDays: readInteger(env, "ULTRATHINK_RETENTION_DAYS", 30, 0, 3650),
+		auditLog: readFlag(env, "ULTRATHINK_AUDIT_LOG") ?? true,
 	};
 }
 

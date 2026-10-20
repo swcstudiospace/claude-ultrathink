@@ -19,7 +19,9 @@ import { GROKBOT_ENGINE_HOST, checkRecord, journalDir, readMeta } from "../../..
 import { type PlanResponse, planPrompt } from "../../../src/host/plan.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { CeilingError, type Ledger } from "../cost/ledger.ts";
+import type { Logger } from "../obs/log.ts";
 import type { Store } from "../store/store.ts";
+import type { BreakerState, CircuitBreaker } from "./breaker.ts";
 import type { GraphView } from "./graph-view.ts";
 import { type JournalErrorCode, type JournalResult, type SessionView, cleanText, isSessionId, isolatedConfigEnv } from "./journal.ts";
 import { OpenRouterError, type OpenRouterFetch, type OpenRouterUsage, createOpenRouterCompleter } from "./openrouter.ts";
@@ -46,6 +48,8 @@ export interface ResultView {
 	/** Structured Graph of Thought x Chain of Thought of a planned session; absent for a fallback or empty graph. */
 	graph?: GraphView;
 	usage?: JobUsage;
+	/** Seconds a poller should wait before asking again; present while running. */
+	pollAfterSec?: number;
 	error?: string;
 }
 
@@ -65,6 +69,8 @@ export interface HeadlessPlanner {
 	status(input: { sessionId: unknown }): JournalResult<SessionView> | null;
 	/** Aborts running jobs, waits up to 5 s, then marks what is left failed with error "interrupted". */
 	shutdown(): Promise<void>;
+	/** Upstream circuit breaker state and failure count for health reporting; undefined when the planner has no breaker. */
+	upstream(): { state: BreakerState; failures: number } | undefined;
 }
 
 export interface PlannerCall {
@@ -94,6 +100,10 @@ export interface HeadlessOptions {
 	plan?: typeof planPrompt;
 	/** One event per model call; counts and timings only, never keys, prompts or response text. A throwing hook is ignored. */
 	onCall?: (call: PlannerCall) => void;
+	/** Receives one `job_persist_failed` event per settled job whose file could not be written; never prompts or keys. */
+	logger?: Logger;
+	/** Upstream circuit breaker handed to every OpenRouter completer; a refused call fails the job with `upstream_unavailable`. */
+	breaker?: CircuitBreaker;
 }
 
 interface JobFile {
@@ -133,6 +143,8 @@ const POLL_AFTER_SEC = 5;
 const CHARS_PER_TOKEN = 3;
 const MAX_ERROR_CHARS = 300;
 const PLANNER_OWNER = "ultrathink-server-planner";
+/** Settled jobs whose file could not be written stay readable in memory up to this many; the oldest are dropped. */
+export const UNPERSISTED_JOBS_MAX = 50;
 const JOB_STATUSES: Record<string, true> = { running: true, planned: true, failed: true, invalid: true, skipped: true };
 /** Skips that mean the engine failed rather than that the request was declined. */
 const ENGINE_SKIPS: Record<string, true> = { "uplift-failed": true, "engine-error": true };
@@ -196,6 +208,7 @@ function isJobFile(value: unknown): value is JobFile {
 	const file = value as Record<string, unknown>;
 	return (
 		typeof file.sessionId === "string" &&
+		typeof file.runId === "string" &&
 		typeof file.status === "string" &&
 		Object.hasOwn(JOB_STATUSES, file.status) &&
 		typeof file.createdAt === "number" &&
@@ -215,6 +228,8 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 	const jobsDir = join(stateDir, "jobs");
 	const cwd = join(stateDir, "cwd");
 	const jobs = new Map<string, Job>();
+	/** Session ids of settled jobs kept only in memory, oldest first. */
+	const unpersisted: string[] = [];
 	const enabled = config.serverPlanning;
 	let closed = false;
 
@@ -356,6 +371,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 						...(config.modelReasoningEffort === undefined ? {} : { reasoningEffort: config.modelReasoningEffort }),
 						sleep,
 						...(opts.fetch ? { fetch: opts.fetch } : {}),
+						...(opts.breaker ? { breaker: opts.breaker } : {}),
 						onUsage: (usage) => {
 							reported.usage = usage;
 						},
@@ -426,6 +442,20 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 		return { status: "invalid", error: detail.length > MAX_ERROR_CHARS ? `${detail.slice(0, MAX_ERROR_CHARS)}...` : detail };
 	}
 
+	/** A settled job without a file is served from memory for a while; the map must not grow for the process lifetime. */
+	function retainUnpersisted(job: Job, error: unknown): void {
+		try {
+			opts.logger?.error("job_persist_failed", { sessionId: job.sessionId, status: job.status, error });
+		} catch {
+			// logging must never affect the job
+		}
+		unpersisted.push(job.sessionId);
+		while (unpersisted.length > UNPERSISTED_JOBS_MAX) {
+			const oldest = unpersisted.shift();
+			if (oldest !== undefined) jobs.delete(oldest);
+		}
+	}
+
 	function finalize(job: Job, outcome: Outcome): void {
 		if (job.settled) return;
 		job.settled = true;
@@ -433,11 +463,13 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 		if (outcome.error === undefined) delete job.error;
 		else job.error = outcome.error;
 		job.updatedAt = now();
+		let persistError: unknown;
 		let written = true;
 		try {
 			persist(job);
-		} catch {
+		} catch (error) {
 			written = false;
+			persistError = error;
 		}
 		try {
 			store.updateRun(job.runId, outcome.status === "planned" ? { status: "complete", reason: null } : { status: "failed", reason: outcome.error ?? outcome.status });
@@ -445,6 +477,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			// bookkeeping only
 		}
 		if (written) jobs.delete(job.sessionId);
+		else retainUnpersisted(job, persistError);
 		job.finish();
 	}
 
@@ -593,6 +626,12 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			const file = jobs.get(sessionId) ?? readJobFile(sessionId);
 			if (!file) return null;
 			return { ok: true, data: { sessionId, status: file.status, pendingCount: 0, pending: [] } };
+		},
+
+		upstream() {
+			if (opts.breaker === undefined) return undefined;
+			const snapshot = opts.breaker.snapshot();
+			return { state: snapshot.state, failures: snapshot.failures };
 		},
 
 		async shutdown() {

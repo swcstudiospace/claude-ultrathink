@@ -21,6 +21,9 @@ export interface ServerJobSnapshot {
 
 type Detail = "brief" | "full";
 
+/** A client-driven session only moves when the chat model answers, so a poller has nothing to gain from asking sooner. */
+const CLIENT_POLL_AFTER_SEC = 10;
+
 export function statusLine(status: JobStatus, error?: string): string {
 	switch (status) {
 		case "running":
@@ -82,9 +85,17 @@ export function clientPlanView(stateDir: string, sessionId: string, detail: Deta
 		if (!record) return { ok: false, code: "engine_error" };
 		return { ok: true, data: renderPlanView(sessionId, "client", detail, record) };
 	}
-	const text =
-		status === "running"
-			? "This session is driven by the chat model and is not finished: keep answering its pending requests with ultrathink_pending, ultrathink_show and ultrathink_answer."
-			: statusLine(status, status === "skipped" ? "skipped" : undefined);
-	return { ok: true, data: { sessionId, status, mode: "client", text } };
+	if (status === "running") {
+		return {
+			ok: true,
+			data: {
+				sessionId,
+				status,
+				mode: "client",
+				text: "This session is driven by the chat model and is not finished: keep answering its pending requests with ultrathink_pending, ultrathink_show and ultrathink_answer.",
+				pollAfterSec: CLIENT_POLL_AFTER_SEC,
+			},
+		};
+	}
+	return { ok: true, data: { sessionId, status, mode: "client", text: statusLine(status, status === "skipped" ? "skipped" : undefined) } };
 }
