@@ -37,7 +37,7 @@
  * unless the caller passes `ownerLimit`.
  */
 
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
 export interface AuthOptions {
@@ -223,9 +223,8 @@ export function createAuth(options: AuthOptions): Auth {
 	const now = options.now ?? (() => Date.now());
 	const secretsByKid = buildKeyRing(sessionSecret, options.previousSessionSecrets ?? []);
 	const signingKid = keyIdOf(sessionSecret);
-	// Covered by every session MAC so an owner password change ends all sessions. A KDF, not a bare hash: its input is a
-	// password hash, and the fixed salt keeps the value stable across restarts.
-	const passwordBinding = scryptSync(ownerPasswordHash, "ut-session-binding-v1", 32).toString("hex");
+	// Covered by every session MAC so an owner password change ends all sessions.
+	const passwordBinding = createHash("sha256").update(ownerPasswordHash).digest("hex");
 	const cookieName = sessionCookieName(cookieSecure);
 	const dummyHash = Bun.password.hashSync(randomBytes(32).toString("base64url"));
 	const loginsByIp = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);

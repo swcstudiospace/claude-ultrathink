@@ -94,12 +94,14 @@ const aborted = (signal: AbortSignal): Promise<never> => {
 function fakeModel(gate?: Promise<void>, honorAbort = true) {
 	const script = scriptedModel();
 	const stages: string[] = [];
+	const firstCall = Promise.withResolvers<void>();
 	const complete: ClaudeCompleter = async (system, user, signal) => {
 		stages.push(stageOf(system));
+		firstCall.resolve();
 		if (gate) await (honorAbort && signal ? Promise.race([gate, aborted(signal)]) : gate);
 		return script(system, user);
 	};
-	return { complete, stages };
+	return { complete, stages, firstCall: firstCall.promise };
 }
 
 interface FakeClock {
@@ -397,7 +399,8 @@ describe("headless planner: limits and lifecycle", () => {
 		const h = setup({ planTimeoutMs: 60_000 }, { completer: model.complete });
 		const sessionId = randomUUID();
 		await startRunning(h, sessionId);
-		expect(model.stages.length).toBeGreaterThan(0);
+		// The job has reached the model once its first stage is recorded; await that event, not a timer.
+		await model.firstCall;
 		h.clock.fire(60_000);
 		const result = await h.planner.result({ sessionId, waitSeconds: 30 });
 		expect(result).toMatchObject({ ok: true, data: { status: "failed", error: "timeout" } });
