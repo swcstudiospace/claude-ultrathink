@@ -17,6 +17,13 @@ export function stepKey(nodeId: string, step: number): string {
 	return `${nodeId}.${step}`;
 }
 
+/** A prototype-free copy of a tracking map: node ids come from the model and from tracker rows, so `constructor` or `__proto__` must act as plain keys. */
+function trackingMap<T>(entries: Readonly<Record<string, T>> | undefined): Record<string, T> {
+	const out = Object.create(null) as Record<string, T>;
+	for (const [key, value] of Object.entries(entries ?? {})) out[key] = value;
+	return out;
+}
+
 export interface CreateTrackingDeps {
 	linear?: ToolCaller;
 	notion?: ToolCaller;
@@ -303,8 +310,8 @@ export async function createTracking(
 		graphId: plan.graphId,
 		status: "failed",
 		...(deps.linearTeam ? { linearTeam: deps.linearTeam } : {}),
-		linear: { nodes: { ...existing?.linear.nodes }, steps: { ...existing?.linear.steps } },
-		notion: { taskUrl: existing?.notion.taskUrl, nodes: { ...existing?.notion.nodes }, steps: { ...existing?.notion.steps } },
+		linear: { nodes: trackingMap(existing?.linear.nodes), steps: trackingMap(existing?.linear.steps) },
+		notion: { taskUrl: existing?.notion.taskUrl, nodes: trackingMap(existing?.notion.nodes), steps: trackingMap(existing?.notion.steps) },
 		errors: [],
 		updatedAt: now(),
 	};
