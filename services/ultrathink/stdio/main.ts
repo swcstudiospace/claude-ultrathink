@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { detectHost } from "../../../src/host/detect.ts";
 import { isPlanningPath, stateDirForHost } from "../../../src/host/paths.ts";
 import { defaultGraphResources, loadCatalogWithFallback } from "../mcp/connector-host.ts";
-import type { McpToolHost, ToolOutcome } from "../mcp/mcp.ts";
+import { assertToolDefinitions } from "../mcp/definitions.ts";
+import { type McpToolHost, TOOL_DEFINITIONS, type ToolOutcome } from "../mcp/mcp.ts";
 import { createToolHost } from "../mcp/tool-host.ts";
 import { type LogLevel, type Logger, createLogger } from "../obs/log.ts";
 import { serveStdio } from "./server.ts";
@@ -76,6 +77,8 @@ export async function main(env: Env = process.env): Promise<number> {
 	const stateDir = resolveConnectorStateDir(env);
 	let host: McpToolHost;
 	try {
+		// Before the first byte of protocol: a bad definition ends the process with the tool named, on stderr only.
+		assertToolDefinitions(TOOL_DEFINITIONS);
 		mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 		host = createStdioHost(stateDir, logger);
 	} catch (error) {
@@ -89,7 +92,7 @@ export async function main(env: Env = process.env): Promise<number> {
 	process.on("uncaughtException", (error) => {
 		// Exit from the write callback so the line that explains the crash is flushed; the timer covers a stuck stderr.
 		setTimeout(() => process.exit(1), SIGNAL_EXIT_MS);
-		process.stderr.write(`ultrathink-connector: uncaught exception: ${error.name}\n`, () => process.exit(1));
+		process.stderr.write(`ultrathink-connector: uncaught exception: ${error instanceof Error ? error.name : "UnknownError"}\n`, () => process.exit(1));
 	});
 
 	const controller = new AbortController();
