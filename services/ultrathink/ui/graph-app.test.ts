@@ -42,6 +42,55 @@ function capViolations(graph: GraphView): string[] {
 	return bad;
 }
 
+interface IngestState {
+	status: string;
+	sessionId: string;
+	pollAfter: number;
+	canTools: boolean;
+	gaveUp: boolean;
+	startedAt: number;
+	note: string;
+}
+interface IngestCalls {
+	ensure: number[];
+	gaveUp: (string | undefined)[];
+}
+
+/** Runs the app's `ingest` (with `pollDelay`) against a state object, recording what it asked the poller to do. */
+function runIngest(state: Partial<IngestState>, result: unknown): { S: IngestState; calls: IngestCalls } {
+	const ingestSource = /function ingest\(result\) \{[\s\S]*?\n\t\}/.exec(script)?.[0] ?? "";
+	const delaySource = /function pollDelay\(\) \{[^\n]*\}/.exec(script)?.[0] ?? "";
+	expect(ingestSource).not.toBe("");
+	expect(delaySource).not.toBe("");
+	const S: IngestState = { status: "idle", sessionId: "", pollAfter: 0, canTools: true, gaveUp: false, startedAt: 0, note: "", ...state };
+	const calls: IngestCalls = { ensure: [], gaveUp: [] };
+	new Function(
+		"S",
+		"calls",
+		"result",
+		[
+			"var STATUSES = { running: 1, planned: 1, failed: 1, invalid: 1, skipped: 1 };",
+			"var LABELS = {};",
+			"function has(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }",
+			"function num(v) { return typeof v === 'number' && isFinite(v) ? v : 0; }",
+			"function firstText() { return ''; }",
+			"function normalizeGraph() { return null; }",
+			"function normalizeQuestions() { return []; }",
+			"function plural() { return ''; }",
+			"function announce() {}",
+			"function render() {}",
+			"function fetchFinal() {}",
+			"function stopPolling() {}",
+			"function ensurePolling(ms) { calls.ensure.push(ms); }",
+			"function giveUp(note) { S.gaveUp = true; S.note = note || 'Stopped checking. Ask the assistant for the result.'; calls.gaveUp.push(note); }",
+			delaySource,
+			ingestSource,
+			"ingest(result);",
+		].join("\n"),
+	)(S, calls, result);
+	return { S, calls };
+}
+
 describe("graph app document", () => {
 	test("is one HTML5 document with charset and viewport", () => {
 		expect(html.startsWith("<!DOCTYPE html>")).toBe(true);
@@ -107,6 +156,52 @@ describe("graph app document", () => {
 	test("mentions no http(s) URL except the SVG namespace", () => {
 		const urls = html.match(/https?:\/\/[^\s"'<>)]*/g) ?? [];
 		expect(urls).toEqual(["http://www.w3.org/2000/svg"]);
+	});
+
+	test("embeds the spec CSP as a meta tag so a host that renders the text as-is still gets it", () => {
+		expect(html).toContain(`<meta http-equiv="Content-Security-Policy" content="${APP_CSP}">`);
+		expect(APP_CSP).toContain("default-src 'none'");
+		expect(APP_CSP).toContain("connect-src 'none'");
+		expect(APP_CSP).not.toContain('"');
+	});
+
+	test("re-polls on the server's hint, clamped to 1..10 s, never on a fixed sub-second delay", () => {
+		expect(/ensurePolling\(\s*\d/.test(script)).toBe(false);
+		expect(script).not.toContain("fromPoll");
+		const running = (pollAfterSec?: number) => ({ structuredContent: { sessionId: "s-1", status: "running", pollAfterSec } });
+		expect(runIngest({ sessionId: "s-1" }, running()).calls.ensure).toEqual([2000]);
+		expect(runIngest({ sessionId: "s-1" }, running(10)).calls.ensure).toEqual([10_000]);
+		expect(runIngest({ sessionId: "s-1" }, running(60)).calls.ensure).toEqual([10_000]);
+		expect(runIngest({ sessionId: "s-1" }, running(0.2)).calls.ensure).toEqual([1000]);
+		// The hint from the result just ingested is what counts, not a stale one.
+		expect(runIngest({ sessionId: "s-1", pollAfter: 10 }, running(3)).calls.ensure).toEqual([3000]);
+	});
+
+	test("stops polling a client-mode plan and says the assistant is driving it", () => {
+		const { S, calls } = runIngest({}, { structuredContent: { sessionId: "s-1", status: "running", mode: "client" } });
+		expect(calls.ensure).toEqual([]);
+		expect(calls.gaveUp).toHaveLength(1);
+		expect(S.gaveUp).toBe(true);
+		expect(S.status).toBe("running");
+		expect(S.note).toContain("assistant");
+		expect(S.note).not.toContain("Stopped checking");
+	});
+
+	test("gives up on a running result it cannot poll: no session id or no server tools", () => {
+		const noSession = runIngest({}, { structuredContent: { status: "running" } });
+		expect(noSession.calls.ensure).toEqual([]);
+		expect(noSession.calls.gaveUp).toEqual([undefined]);
+		expect(noSession.S.note).toBe("Stopped checking. Ask the assistant for the result.");
+		const noTools = runIngest({ canTools: false }, { structuredContent: { sessionId: "s-1", status: "running" } });
+		expect(noTools.calls.ensure).toEqual([]);
+		expect(noTools.calls.gaveUp).toEqual([undefined]);
+		// A pollable running result is left to the poller.
+		const ok = runIngest({}, { structuredContent: { sessionId: "s-1", status: "running" } });
+		expect(ok.calls.gaveUp).toEqual([]);
+		expect(ok.calls.ensure).toEqual([2000]);
+		// Anything but running neither polls nor gives up.
+		const done = runIngest({}, { structuredContent: { sessionId: "s-1", status: "planned" } });
+		expect(done.calls).toEqual({ ensure: [], gaveUp: [] });
 	});
 
 	test("interprets only messages from the parent window and listens before it initializes", () => {
@@ -238,7 +333,7 @@ describe("harness", () => {
 		expect(/https?:\/\//i.test(page)).toBe(false);
 		expect(/<script[^>]*\ssrc=/i.test(page)).toBe(false);
 		expect(/<link\b/i.test(page)).toBe(false);
-		expect(page).toContain("allow-scripts allow-same-origin");
+		expect(page).toContain('frame.setAttribute("sandbox", "allow-scripts");');
 		expect(page).toContain("/app.html");
 		expect(page).toContain("window.__log");
 		expect(page).toContain('param("msgform", "array")');
