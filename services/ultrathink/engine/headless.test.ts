@@ -436,6 +436,35 @@ describe("headless planner: limits and lifecycle", () => {
 		expect(seen[2]?.env.OPENROUTER_API_KEY).toBeUndefined();
 	});
 
+	test("a decision hold is granted only while the run keeps half its ceiling free for planning", async () => {
+		// The hold is modelMaxOutputTokens x 18 = 18000. Half the run ceiling must stay free, so the ceiling must be at least 36000.
+		const seen: Array<{ decisions: boolean; env: Record<string, string | undefined> }> = [];
+		const plan: typeof planPrompt = async (_request, env, options) => {
+			if (!options?.config) throw new Error("planPrompt was called without a config");
+			seen.push({ decisions: options.config.decisions.enabled, env: { ...env } });
+			throw new Error("stop after the decision hold is recorded");
+		};
+		const spentOn = (h: Harness, sessionId: string): number =>
+			createLedger(h.store, { runTokenCeiling: 1, dailyTokenCeiling: 1 }).spentForRun(String(jobFile(h.stateDir, sessionId).runId));
+
+		// 18000 is more than half of 30000: the plan runs with decisions off and no hold is recorded on its run.
+		const tight = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 30_000 }, { plan });
+		const tightId = randomUUID();
+		expect(await tight.planner.start({ prompt: PROMPT, sessionId: tightId })).toMatchObject({ ok: true });
+		expect(seen.at(-1)).toMatchObject({ decisions: false });
+		expect(seen.at(-1)?.env.ULTRATHINK_DECISIONS).toBe("0");
+		expect(seen.at(-1)?.env.OPENROUTER_API_KEY).toBeUndefined();
+		expect(spentOn(tight, tightId)).toBe(0);
+
+		// 18000 fits within half of 40000: the plan runs with decisions on and the hold is settled to its worst case on its run.
+		const roomy = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 40_000 }, { plan });
+		const roomyId = randomUUID();
+		expect(await roomy.planner.start({ prompt: PROMPT, sessionId: roomyId })).toMatchObject({ ok: true });
+		expect(seen.at(-1)).toMatchObject({ decisions: true });
+		expect(seen.at(-1)?.env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
+		expect(spentOn(roomy, roomyId)).toBe(18_000);
+	});
+
 	test("an engine failure ends the job as failed with the code, never the response body", async () => {
 		const failing: OpenRouterFetch = async () => new Response("secret upstream body", { status: 401 });
 		const h = setup({}, { completer: undefined, fetch: failing });

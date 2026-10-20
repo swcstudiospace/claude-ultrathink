@@ -287,13 +287,16 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 
 	/**
 	 * Holds the decisions headroom for one plan on the plan's own run, atomically with the run and daily ceilings. Jev calls
-	 * OpenRouter from the plugin subprocess, so this hold is the only thing the ceilings can see. A refused or unwritable
-	 * hold turns decisions off for this plan.
+	 * OpenRouter from the plugin subprocess, so this hold is the only thing the ceilings can see. A hold is granted only if,
+	 * after reserving it, the run still has at least half of runTokenCeiling free for planning; otherwise, or when the
+	 * ledger refuses it, this plan runs without decisions.
 	 */
 	function holdDecisions(job: Job): void {
 		if (!config.serverDecisions) return;
 		const tokens = config.modelMaxOutputTokens * DECISION_REQUEST_CAP;
 		try {
+			// Runs before the plan's first model call, so this run's spend is still zero and nothing else writes to it.
+			if (ledger.spentForRun(job.runId) + tokens > config.runTokenCeiling / 2) return;
 			const { reservationId } = ledger.reserve({ runId: job.runId, phase: `decisions-${job.sessionId}`, attempt: 1, estimatedTokens: tokens });
 			job.decisionsHold = { reservationId, tokens };
 		} catch {
