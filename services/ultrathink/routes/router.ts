@@ -309,6 +309,7 @@ export function createApp(deps: RouterDeps): App {
 						auditLoggedMessage = error.message;
 						logger.error("audit_write_failed", { error: error.message });
 					},
+					onNotice: (message) => logger.info("audit_chain_notice", { message }),
 				})
 			: undefined);
 	function record(event: AuditEvent, fields: Record<string, string | number | boolean> = {}): void {

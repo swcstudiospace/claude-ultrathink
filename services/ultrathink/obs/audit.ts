@@ -67,11 +67,16 @@ export interface AuditLogOptions {
 	/** Clock in epoch milliseconds; defaults to `Date.now`. */
 	now?: () => number;
 	/**
-	 * Receives every failure the log swallows: a quarantined file on open or on a later change, a file adopted after an
-	 * outside change, and each dropped record. Every drop is reported; a caller that writes log lines deduplicates them. The callback must not throw;
+	 * Receives every failure that loses or may lose an event: each dropped record, and a file that cannot be verified or
+	 * quarantined. Every drop is reported; a caller that writes log lines deduplicates them. The callback must not throw;
 	 * if it does, the error is discarded.
 	 */
 	onError?: (error: Error) => void;
+	/**
+	 * Receives changes that lose nothing: a broken file moved aside (its records are kept in the moved copy) and a file
+	 * adopted after an outside change. A caller logs these; they are not counted as lost events.
+	 */
+	onNotice?: (message: string) => void;
 	/** File-system hooks; defaults to `node:fs`. */
 	fs?: AuditFs;
 }
@@ -91,7 +96,7 @@ export interface AuditLog {
 	readonly path: string;
 	/**
 	 * Appends one record and fsyncs it. Never throws: on I/O failure the record is dropped (fail-open: the request
-	 * that caused the event continues) and `onError` is called once per distinct failure message. Unknown values in
+	 * that caused the event continues) and `onError` is called for each dropped record. Unknown values in
 	 * `fields` are dropped (only finite numbers, booleans and strings are kept), keys that look like secrets are
 	 * dropped, strings are clipped to 256 characters with control characters removed, and at most 32 keys are kept.
 	 */
@@ -295,7 +300,7 @@ function sizeOf(path: string, fs: AuditFs): number | undefined {
 
 /**
  * Opens (or creates, `0600`) the audit file and continues its chain. An existing file is verified first; a broken
- * one (truncated by a crash, edited, reordered) is moved to `${path}.corrupt-<now>` and reported through `onError`,
+ * one (truncated by a crash, edited, reordered) is moved to `${path}.corrupt-<now>` and reported through `onNotice`,
  * and a fresh chain starts at seq 1. Throws only for invalid options and for the cases where the process would run
  * without an audit trail: the file cannot be opened for append (missing or non-writable directory), an existing
  * file cannot be read, or a broken file cannot be quarantined. Startup fails fast instead of silently losing events.
@@ -305,10 +310,12 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	if (typeof options.path !== "string" || options.path.trim().length === 0) throw new Error("audit log: path must be a non-empty string");
 	if (options.now !== undefined && typeof options.now !== "function") throw new Error("audit log: now must be a function");
 	if (options.onError !== undefined && typeof options.onError !== "function") throw new Error("audit log: onError must be a function");
+	if (options.onNotice !== undefined && typeof options.onNotice !== "function") throw new Error("audit log: onNotice must be a function");
 	const path = options.path;
 	const now = options.now ?? Date.now;
 	const fs = options.fs ?? nodeFs;
 	const onError = options.onError;
+	const onNotice = options.onNotice;
 	let closed = false;
 
 	const report = (error: Error): void => {
@@ -317,6 +324,15 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			onError(error);
 		} catch {
 			// The error sink is best effort.
+		}
+	};
+
+	const notify = (message: string): void => {
+		if (!onNotice) return;
+		try {
+			onNotice(message);
+		} catch {
+			// The notice sink is best effort.
 		}
 	};
 
@@ -336,7 +352,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		} catch (error) {
 			throw new Error(`audit log: ${path} is broken at record ${scan.brokenAt} (${scan.reason}) and cannot be quarantined: ${errorOf(error).message}`);
 		}
-		report(new Error(`audit log: ${path} broken at record ${scan.brokenAt} (${scan.reason}); moved to ${quarantine}, starting a new chain`));
+		notify(`audit log: ${path} broken at record ${scan.brokenAt} (${scan.reason}); moved to ${quarantine}, starting a new chain`);
 	}
 
 	// Open for append once: the directory is writable (or startup fails), the file exists and is private.
@@ -365,7 +381,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		const check = scanChain(path, fs);
 		if (check.ok) {
 			if (check.records !== seq || check.lastHash !== prev) {
-				report(new Error(`audit log: ${path} changed outside the service; continuing from the file on disk`));
+				notify(`audit log: ${path} changed outside the service; continuing from the file on disk`);
 			}
 			seq = check.records;
 			prev = check.lastHash;
@@ -385,7 +401,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			expectedSize = undefined;
 			return false;
 		}
-		report(new Error(`audit log: ${path} broken at record ${check.brokenAt} (${check.reason}); moved to ${quarantine}, starting a new chain`));
+		notify(`audit log: ${path} broken at record ${check.brokenAt} (${check.reason}); moved to ${quarantine}, starting a new chain`);
 		seq = 0;
 		prev = GENESIS_HASH;
 		expectedSize = 0;

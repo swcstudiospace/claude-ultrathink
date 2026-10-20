@@ -210,7 +210,7 @@ describe("sweepStateDir", () => {
 		expect(second.removed.sessions).toBe(3);
 	});
 
-	test("entries past one sweep's cap are reached by later sweeps, wrapping around the directory", () => {
+	test("entries past one sweep's cap are reached by later sweeps, each entry once", () => {
 		const stateDir = tmp();
 		for (let i = 0; i < 7; i += 1) writeRecord(stateDir, randomUUID(), OLD);
 		let removed = 0;

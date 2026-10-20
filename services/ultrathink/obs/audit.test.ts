@@ -327,13 +327,15 @@ describe("failure handling", () => {
 	test("a file removed between appends is started again from genesis", () => {
 		const path = auditPath(tempDir());
 		const errors: Error[] = [];
-		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		const notices: string[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
 		log.record("login_ok", { n: 1 });
 		rmSync(path);
 		log.record("login_ok", { n: 2 });
 		expect(records(path).map((r) => [r.seq, r.fields.n])).toEqual([[1, 2]]);
 		expect(log.verify().ok).toBe(true);
-		expect(errors.some((e) => /changed outside the service/.test(e.message))).toBe(true);
+		expect(notices.some((m) => /changed outside the service/.test(m))).toBe(true);
+		expect(errors).toEqual([]);
 	});
 
 	test.skipIf(IS_ROOT)("a read-only directory reports every dropped record and the process keeps going", () => {
@@ -400,9 +402,11 @@ describe("quarantine on open", () => {
 		const out = lines(path);
 		out.splice(1, 1);
 		rewrite(path, out);
-		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e) });
-		expect(errors.length).toBe(1);
-		expect(errors[0]?.message).toMatch(/broken at record 2 \(seq 3 where 2 was expected\); moved to .*audit\.jsonl\.corrupt-/);
+		const notices: string[] = [];
+		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		expect(errors).toEqual([]);
+		expect(notices.length).toBe(1);
+		expect(notices[0]).toMatch(/broken at record 2 \(seq 3 where 2 was expected\); moved to .*audit\.jsonl\.corrupt-/);
 		const names = readdirSync(join(path, "..")).sort();
 		expect(names.length).toBe(2);
 		expect(names.some((n) => n.startsWith("audit.jsonl.corrupt-"))).toBe(true);
@@ -420,8 +424,10 @@ describe("quarantine on open", () => {
 		log.close();
 		const text = readFileSync(path, "utf8");
 		writeFileSync(path, text.slice(0, text.length - 3));
-		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e) });
-		expect(errors[0]?.message).toMatch(/broken at record 2 \(truncated last record/);
+		const notices: string[] = [];
+		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		expect(errors).toEqual([]);
+		expect(notices[0]).toMatch(/broken at record 2 \(truncated last record/);
 		reopened.record("logout");
 		expect(records(path).map((r) => r.seq)).toEqual([1]);
 		expect(reopened.verify().ok).toBe(true);

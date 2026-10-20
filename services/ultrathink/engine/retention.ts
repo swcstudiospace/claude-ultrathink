@@ -94,66 +94,42 @@ function realSetTimer(run: () => void, intervalMs: number): object {
 	return timer;
 }
 
-/** Where each directory's next sweep starts, so entries past one sweep's cap are reached by a later sweep. */
-const scanOffsets = new Map<string, number>();
+/** Open directory scans, kept between sweeps: each sweep resumes where the previous one stopped, so no entry is re-read. */
+const scans = new Map<string, Dir>();
 
-interface ScanRange {
-	names: string[];
-	/** Entries stepped over before the range began. */
-	skipped: number;
-	/** True when the directory ended before the range was full. */
-	ended: boolean;
-}
-
-/** Up to `limit` names of a directory, starting after `from` entries. Throws when the directory cannot be opened. */
-function readRange(dir: string, from: number, limit: number): ScanRange {
-	const names: string[] = [];
-	let handle: Dir | undefined;
+function closeScan(dir: string): void {
+	const handle = scans.get(dir);
+	scans.delete(dir);
 	try {
-		handle = opendirSync(dir);
-		let entry = handle.readSync();
-		let skipped = 0;
-		while (entry !== null && skipped < from) {
-			entry = handle.readSync();
-			skipped += 1;
-		}
-		for (; entry !== null && names.length < limit; entry = handle.readSync()) names.push(entry.name);
-		return { names, skipped, ended: entry === null };
-	} finally {
-		try {
-			handle?.closeSync();
-		} catch {
-			// Nothing left to release.
-		}
+		handle?.closeSync();
+	} catch {
+		// Nothing left to release.
 	}
 }
 
 /**
- * Names of a directory, at most `max`, from where the previous sweep stopped. When the directory ends before the cap is
- * full, the entries that were stepped over are taken too, so one sweep covers as much as the cap allows. `undefined` when
- * the directory cannot be opened.
+ * Up to `max` names of a directory, continuing where the previous sweep stopped. When the directory ends, its scan is
+ * closed and the next sweep starts again from the top, so every entry is visited once per cycle. `undefined` when the
+ * directory cannot be read.
  */
 function listNames(dir: string, max: number): string[] | undefined {
-	const start = scanOffsets.get(dir) ?? 0;
-	let first: ScanRange;
+	const names: string[] = [];
 	try {
-		first = readRange(dir, start, max);
+		const handle = scans.get(dir) ?? opendirSync(dir);
+		scans.set(dir, handle);
+		while (names.length < max) {
+			const entry = handle.readSync();
+			if (entry === null) {
+				closeScan(dir);
+				break;
+			}
+			names.push(entry.name);
+		}
+		return names;
 	} catch {
+		closeScan(dir);
 		return undefined;
 	}
-	const names = first.names;
-	let cursor = start + names.length;
-	if (first.ended && first.skipped > 0 && names.length < max) {
-		try {
-			const wrapped = readRange(dir, 0, Math.min(first.skipped, max - names.length));
-			names.push(...wrapped.names);
-			cursor = wrapped.names.length === first.skipped ? 0 : wrapped.names.length;
-		} catch {
-			// The stepped-over entries wait for the next sweep.
-		}
-	}
-	scanOffsets.set(dir, cursor);
-	return names;
 }
 
 type Kind = "file" | "directory" | "other" | "missing";
