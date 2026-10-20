@@ -36,9 +36,10 @@ describe("readBodyPrefix", () => {
 		expect(pulled()).toBeLessThan(4);
 	});
 
-	test("a body of exactly the limit is incomplete only when more follows", async () => {
-		expect(await readBodyPrefix(chunked(["abcd"]).response, 4)).toEqual({ text: "abcd", complete: false });
+	test("a body of exactly the limit is complete, and one byte more is incomplete", async () => {
+		expect(await readBodyPrefix(chunked(["abcd"]).response, 4)).toEqual({ text: "abcd", complete: true });
 		expect(await readBodyPrefix(chunked(["abc"]).response, 4)).toEqual({ text: "abc", complete: true });
+		expect(await readBodyPrefix(chunked(["abcde"]).response, 4)).toEqual({ text: "abcd", complete: false });
 	});
 
 	test("decodes multi-byte characters split across chunks", async () => {

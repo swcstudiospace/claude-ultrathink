@@ -70,7 +70,7 @@ export async function requestJson(url: string, request: HttpRequest): Promise<Ht
 			}),
 			signal,
 		);
-		const body = await abortable(readBodyPrefix(response, MAX_RESPONSE_CHARS + 1, signal), signal);
+		const body = await abortable(readBodyPrefix(response, MAX_RESPONSE_CHARS, signal), signal);
 		const ms = Date.now() - started;
 		if (!body.complete) return { kind: "network", message: "response too large", ms };
 		return { kind: "response", status: response.status, json: parseJson(body.text), text: body.text, ms };

@@ -58,11 +58,11 @@ function isHttps(url: unknown): boolean {
 	}
 }
 
-/** A JSON object from a bounded read: undefined when the body is longer than the cap or is not a JSON object. */
+/** A JSON object from a bounded read: undefined when the body is unreadable, longer than the cap, or not a JSON object. */
 async function readJsonObject(response: Response): Promise<Record<string, unknown> | undefined> {
-	const prefix = await readBodyPrefix(response, MAX_AUTH_BODY_BYTES);
-	if (!prefix.complete) return undefined;
 	try {
+		const prefix = await readBodyPrefix(response, MAX_AUTH_BODY_BYTES);
+		if (!prefix.complete) return undefined;
 		const value: unknown = JSON.parse(prefix.text);
 		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 	} catch {

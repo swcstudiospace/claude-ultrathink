@@ -32,7 +32,7 @@ export function createSseParser(
 		let value = colon === -1 ? "" : line.slice(colon + 1);
 		if (value.startsWith(" ")) value = value.slice(1);
 		data.push(value);
-		dataChars += value.length + 1;
+		dataChars += value.length + (data.length > 1 ? 1 : 0);
 		if (dataChars > maxLineChars) throw new Error("SSE event too large");
 	};
 	return {

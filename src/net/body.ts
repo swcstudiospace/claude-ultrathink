@@ -26,16 +26,20 @@ export async function readBodyPrefix(response: Response, limit: number, signal?:
 	let complete = false;
 	try {
 		if (signal?.aborted) throw signal.reason;
-		while (size < limit) {
+		for (;;) {
 			const { done, value } = await reader.read();
 			if (signal?.aborted) throw signal.reason;
 			if (done) {
 				complete = true;
 				break;
 			}
-			const chunk = value.subarray(0, limit - size);
-			size += chunk.length;
-			text += decoder.decode(chunk, { stream: true });
+			// Past the limit: keep the part that fits; the rest is left unread and the stream is cancelled below.
+			if (size + value.length > limit) {
+				text += decoder.decode(value.subarray(0, limit - size), { stream: true });
+				break;
+			}
+			size += value.length;
+			text += decoder.decode(value, { stream: true });
 		}
 		return { text: text + decoder.decode(), complete };
 	} finally {

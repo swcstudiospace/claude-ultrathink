@@ -26,6 +26,7 @@ import { createDrainState, createInflight, createRuntimeProbe } from "../obs/run
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
+import { createWalCheckpointer } from "../store/checkpoint.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
 
 export interface RouterDeps {
@@ -858,11 +859,11 @@ export function createApp(deps: RouterDeps): App {
 				onError: (error) => logger.error("retention_failed", { error: error.message }),
 			}).start();
 		}
-		const checkpointTimer = setInterval(() => {
-			if (!store.checkpoint().ok) logger.warn("wal_checkpoint_blocked", {});
-		}, WAL_CHECKPOINT_MS);
-		checkpointTimer.unref();
-		stopCheckpoint = () => clearInterval(checkpointTimer);
+		stopCheckpoint = createWalCheckpointer({
+			checkpoint: () => store.checkpoint(),
+			intervalMs: WAL_CHECKPOINT_MS,
+			onBlocked: () => logger.warn("wal_checkpoint_blocked", {}),
+		}).start();
 		refreshIntegrity();
 	}
 
