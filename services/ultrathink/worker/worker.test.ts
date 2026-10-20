@@ -465,6 +465,30 @@ describe("worker", () => {
 		expect(holder?.holder).toBe("thief");
 	});
 
+	test("a takeover during the last model attempt cannot overwrite the new holder's status", async () => {
+		const env = makeEnv();
+		const run = newRun(env);
+		const model = fakeModel((_call, index) => {
+			if (index === 0) {
+				// The new holder takes the expired lease and finishes the run while this call is in flight.
+				env.store.db
+					.query("UPDATE run_leases SET holder = 'thief', expires_at = ? WHERE run_id = ?")
+					.run(Date.now() + 60_000, run.id);
+				env.store.updateRun(run.id, { status: "complete", currentPhase: null });
+				throw new Error("provider unavailable");
+			}
+			return { text: "unused", tokensUsed: 1 };
+		});
+		const { worker } = makeWorker(env, model, { maxModelAttempts: 1 });
+
+		// The old worker's model_unavailable pause is refused; its reservation is abandoned by tickOnce.
+		expect(await worker.tickOnce()).toBe("idle");
+		expect(model.calls.length).toBe(1);
+		expect(reload(env, run).status).toBe("complete");
+		expect(reload(env, run).currentPhase).toBeNull();
+		expect(ledgerRows(env, run.id).map((row) => [row.phase, row.state])).toEqual([["discover", "abandoned"]]);
+	});
+
 	test("a completed phase whose artifact is missing is re-materialised on the next tick", async () => {
 		const env = makeEnv();
 		const run = newRun(env);

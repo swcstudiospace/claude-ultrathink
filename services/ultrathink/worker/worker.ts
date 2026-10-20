@@ -298,6 +298,19 @@ export function createWorker(options: WorkerOptions): Worker {
 		}).immediate();
 	}
 
+	/**
+	 * Writes a pause or terminal status only while this worker still holds the lease. Fixes the Greptile P1
+	 * "Old workers overwrite finished status" (PR #44, head bf0628f): a worker whose lease expired could finish a
+	 * model call and overwrite the status the new holder had written. The lease check and the status write share
+	 * one IMMEDIATE transaction, so a lost lease throws LeaseLostError and writes nothing.
+	 */
+	function setTerminalStatus(runId: string, patch: Parameters<Store["updateRun"]>[1]): void {
+		db.transaction(() => {
+			renewLease(runId);
+			store.updateRun(runId, patch);
+		}).immediate();
+	}
+
 	function abandonDeadReservations(runId: string): void {
 		const rows = db
 			.query<{ id: number }, [string]>(
@@ -381,7 +394,7 @@ export function createWorker(options: WorkerOptions): Worker {
 			)
 			.get(run.id, phase);
 		if (pending) {
-			store.updateRun(run.id, { status: "paused-for-decision", reason: pending.question });
+			setTerminalStatus(run.id, { status: "paused-for-decision", reason: pending.question });
 			return { done: false, result: "paused" };
 		}
 
@@ -396,14 +409,14 @@ export function createWorker(options: WorkerOptions): Worker {
 		} catch (error) {
 			if (error instanceof CeilingError) {
 				if (error.reason === CEILING_RUN) {
-					store.updateRun(run.id, { status: "failed", reason: CEILING_RUN });
+					setTerminalStatus(run.id, { status: "failed", reason: CEILING_RUN });
 					return { done: false, result: "failed" };
 				}
-				store.updateRun(run.id, { status: "paused-for-blocker", reason: CEILING_DAY });
+				setTerminalStatus(run.id, { status: "paused-for-blocker", reason: CEILING_DAY });
 				return { done: false, result: "paused" };
 			}
 			if (error instanceof LedgerWriteError) {
-				store.updateRun(run.id, { status: "paused-for-blocker", reason: "ledger_unavailable" });
+				setTerminalStatus(run.id, { status: "paused-for-blocker", reason: "ledger_unavailable" });
 				return { done: false, result: "paused" };
 			}
 			throw error;
@@ -413,9 +426,10 @@ export function createWorker(options: WorkerOptions): Worker {
 
 		const reply = await callModel(run.id, { system, prompt, maxOutputTokens: MAX_OUTPUT_TOKENS });
 		if (reply === null) {
+			// The fenced status write goes first, so a lost lease leaves the reservation for tickOnce to abandon.
+			setTerminalStatus(run.id, { status: "paused-for-blocker", reason: "model_unavailable" });
 			abandonReservation(reservationId);
 			state.reservationId = null;
-			store.updateRun(run.id, { status: "paused-for-blocker", reason: "model_unavailable" });
 			return { done: false, result: "paused" };
 		}
 
@@ -471,7 +485,7 @@ export function createWorker(options: WorkerOptions): Worker {
 			if (!step.done) return step.result;
 			outputs.set(phase, step.output);
 		}
-		store.updateRun(run.id, { status: "complete", currentPhase: null });
+		setTerminalStatus(run.id, { status: "complete", currentPhase: null });
 		return "complete";
 	}
 
