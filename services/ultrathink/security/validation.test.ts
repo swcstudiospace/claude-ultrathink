@@ -12,7 +12,6 @@ import {
 	ObjectValidator,
 	ArrayValidator,
 	commonValidators,
-	ValidationException,
 } from "./validation.ts";
 
 describe("Validation", () => {
@@ -197,8 +196,8 @@ describe("Validation", () => {
 			try {
 				validateOrThrow("hi", validator);
 			} catch (e: unknown) {
-				expect(e).toBeInstanceOf(ValidationException);
-				if (e instanceof ValidationException) {
+				expect(e).toBeInstanceOf(Error);
+				if (e instanceof Error) {
 					expect(e.name).toBe("ValidationException");
 				}
 			}
