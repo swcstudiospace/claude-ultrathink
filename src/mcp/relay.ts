@@ -91,7 +91,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		if (sessionUsed !== undefined) headers["Mcp-Session-Id"] = sessionUsed;
 		if (protocolVersion !== undefined) headers["MCP-Protocol-Version"] = protocolVersion;
 		try {
-			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal });
+			// A redirect would resend the bearer token to wherever it points, so it is an error.
+			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal, redirect: "error" });
 			return { response, header, sessionUsed, rateLimit: await detectRateLimit(response) };
 		} catch {
 			return { header, sessionUsed };

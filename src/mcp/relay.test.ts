@@ -63,6 +63,12 @@ describe("createSseParser", () => {
 		parser.push("data: 12");
 		expect(() => parser.push("3")).toThrow("SSE line too long");
 	});
+
+	test("an event whose data outgrows the cap is refused, even when each line is short", () => {
+		const parser = createSseParser(() => {}, 8);
+		parser.push("data: 1234\n");
+		expect(() => parser.push("data: 5678\n")).toThrow("SSE event too large");
+	});
 });
 
 describe("createRelay", () => {

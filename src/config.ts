@@ -434,7 +434,9 @@ function httpUrl(value: unknown, fallback: string): string {
 	if (!trimmed) return fallback;
 	try {
 		const url = new URL(trimmed);
-		return url.protocol === "http:" || url.protocol === "https:" ? trimmed : fallback;
+		if (url.protocol === "https:") return trimmed;
+		// Cleartext is allowed only to loopback and private (RFC 1918) addresses, which do not route on the public internet.
+		return url.protocol === "http:" && /^(localhost|127(\.\d{1,3}){3}|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}|\[::1\])$/.test(url.hostname) ? trimmed : fallback;
 	} catch {
 		return fallback;
 	}

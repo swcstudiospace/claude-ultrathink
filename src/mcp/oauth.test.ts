@@ -236,12 +236,24 @@ describe("login", () => {
 		expect(await resolveAuthHeader("notion", deps)).toBe("Bearer at-1");
 	});
 
+	test("discovered metadata that does not name its issuer is refused", async () => {
+		const fake = fakeFetch({
+			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
+				json({ authorization_servers: ["https://mcp.linear.app"] }),
+			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
+				json({ authorization_endpoint: "https://mcp.linear.app/authorize", token_endpoint: "https://mcp.linear.app/token" }),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		await expect(beginLogin("linear", { ...deps, redirectUri: REDIRECT })).rejects.toThrow("issuer mismatch");
+	});
+
 	test("beginLogin keeps an existing api key or live tokens usable", async () => {
 		const linearRoutes = {
 			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
 				json({ authorization_servers: ["https://mcp.linear.app"] }),
 			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
 				json({
+					issuer: "https://mcp.linear.app",
 					authorization_endpoint: "https://mcp.linear.app/authorize",
 					token_endpoint: "https://mcp.linear.app/token",
 					registration_endpoint: "https://mcp.linear.app/register",
