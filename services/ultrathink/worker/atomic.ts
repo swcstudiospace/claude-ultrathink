@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fsyncDirectory } from "./durable.ts";
 
 /**
  * Writes `${dir}/${name}` via a temp file in the same directory, fsyncs it, renames it into
@@ -26,10 +27,5 @@ export function writeAtomic(dir: string, name: string, content: string): void {
 		rmSync(tempPath, { force: true });
 		throw error;
 	}
-	const dirFd = openSync(dir, "r");
-	try {
-		fsyncSync(dirFd);
-	} finally {
-		closeSync(dirFd);
-	}
+	fsyncDirectory(dir);
 }
