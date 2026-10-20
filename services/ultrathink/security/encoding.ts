@@ -208,7 +208,8 @@ export function sanitizeInput(input: string): string {
  * Strips HTML tags from input (for plain text contexts)
  */
 export function stripHtmlTags(input: string): string {
-  return input.replace(/<[^>]*>/g, '');
+  // Drop well-formed tags, then strip any remaining angle brackets (e.g. partial `<script`).
+  return input.replace(/<[^>]*>/g, '').replace(/[<>]/g, '');
 }
 
 /**
@@ -267,7 +268,7 @@ export function encodeForContext(input: string, context: OutputContext): string 
     case OutputContext.JAVASCRIPT:
       return encodeJavaScript(input);
     case OutputContext.JAVASCRIPT_TEMPLATE:
-      return input.replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+      return input.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
     case OutputContext.JSON:
       return encodeJson(input);
     case OutputContext.URL:

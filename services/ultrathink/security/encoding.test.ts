@@ -229,6 +229,10 @@ describe("Encoding", () => {
 			expect(stripHtmlTags("<b>bold</b>")).toBe("bold");
 			expect(stripHtmlTags("<script>alert(1)</script>")).toBe("alert(1)");
 		});
+
+		test("strips partial tag openers", () => {
+			expect(stripHtmlTags("before<scriptafter")).toBe("beforescriptafter");
+		});
 	});
 
 	describe("truncateString", () => {
