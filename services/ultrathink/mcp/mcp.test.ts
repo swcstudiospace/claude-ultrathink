@@ -531,10 +531,13 @@ describe("tools/list", () => {
 	test("ultrathink_sessions takes an optional limit of 1 to 20 and is read-only", async () => {
 		const sessions = await toolDef("ultrathink_sessions");
 		expect(sessions.description).toContain("/ultrathink-status");
-		expect(sessions.description).toContain("wave tree first");
+		expect(sessions.description).not.toContain("first step of /ultrathink-last");
 		expect(schemaOf(sessions).required).toBeUndefined();
 		expect(schemaOf(sessions).properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 20 });
 		expect(sessions.annotations).toEqual(READ_ONLY);
+		const graph = await toolDef("ultrathink_graph");
+		expect(graph.description).toContain("/ultrathink-last");
+		expect(graph.description).toContain("wave tree first");
 	});
 
 	test("ultrathink_command requires command, takes args and is read-only", async () => {
