@@ -43,7 +43,7 @@ async function registerClient(redirect = REDIRECT): Promise<string> {
 		new Request(`${ORIGIN}/oauth/register`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ client_name: "Grok", redirect_uris: [redirect] }),
+			body: JSON.stringify({ client_name: "Grok", redirect_uris: [redirect], grant_types: ["authorization_code", "refresh_token"] }),
 		}),
 		freshIp(),
 	);
@@ -178,6 +178,14 @@ beforeAll(async () => {
 		planTimeoutMs: 600000,
 		modelMaxOutputTokens: 8000,
 		serverDecisions: false,
+		sessionSecretPrevious: [],
+		breakerFailures: 5,
+		breakerWindowMs: 60000,
+		breakerOpenMs: 30000,
+		maxInflight: 256,
+		drainMs: 5000,
+		retentionDays: 30,
+		auditLog: true,
 	};
 	const auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);
@@ -586,7 +594,7 @@ function registerCall(h: Harness, body: Record<string, unknown>, ip = freshIp())
 }
 
 async function registered(h: Harness, overrides: Record<string, unknown> = {}): Promise<string> {
-	const response = await registerCall(h, { client_name: "Test client", redirect_uris: [REDIRECT], ...overrides });
+	const response = await registerCall(h, { client_name: "Test client", redirect_uris: [REDIRECT], grant_types: ["authorization_code", "refresh_token"], ...overrides });
 	expect(response.status).toBe(201);
 	const id = (await bodyOf(response)).client_id;
 	if (typeof id !== "string") throw new Error("registration has no client id");
@@ -614,6 +622,18 @@ function approveWith(h: Harness, html: string, owner: string, ip = freshIp()): P
 			method: "POST",
 			headers: { "content-type": "application/x-www-form-urlencoded" },
 			body: form({ req: requestId, nonce, password: owner }),
+		}),
+		ip,
+	);
+}
+
+function pollWith(h: Harness, html: string, ip = freshIp()): Promise<Response> {
+	const { requestId, nonce } = consentFrom(html);
+	return h.oauth.authorize(
+		new Request(`${ORIGIN}/oauth/authorize`, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: form({ req: requestId, nonce, action: "poll" }),
 		}),
 		ip,
 	);
@@ -809,6 +829,80 @@ describe("OAuth per-IP rate limits", () => {
 		expect((await revokeCall(h, { token: "ut_at_unknown" })).status).toBe(200);
 		h.clock.now += 61_000;
 		expect((await revokeCall(h, { token: "ut_at_unknown" }, ip)).status).toBe(200);
+	});
+
+	test("authorize polls share the per-IP budget and a pending poll does not rewrite the state file", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const consent = await authorizeCall(h, clientId, challenge);
+		expect(consent.status).toBe(200);
+		const html = await consent.text();
+		const ip = "203.0.113.13";
+		rmSync(h.statePath);
+		for (let i = 0; i < 30; i += 1) {
+			const polled = await pollWith(h, html, ip);
+			expect(polled.status).toBe(200);
+			expect((await bodyOf(polled)).state).toBe("PENDING_APPROVAL");
+		}
+		expect(existsSync(h.statePath)).toBe(false);
+		const limited = await pollWith(h, html, ip);
+		expect(limited.status).toBe(429);
+		expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+		expect((await pollWith(h, html)).status).toBe(200);
+		h.clock.now += 61_000;
+		expect((await pollWith(h, html, ip)).status).toBe(200);
+		expect(existsSync(h.statePath)).toBe(false);
+	});
+
+	test("token allows 30 a minute per client, and another client on the same IP still passes", async () => {
+		const h = await makeHarness();
+		const ip = "203.0.113.14";
+		const busy = await registered(h);
+		const quiet = await registered(h);
+		const attempt = (clientId: string) => tokenCall(h, { grant_type: "refresh_token", refresh_token: "ut_rt_unknown", client_id: clientId }, ip);
+		for (let i = 0; i < 30; i += 1) expect((await attempt(busy)).status).toBe(400);
+		const limited = await attempt(busy);
+		expect(limited.status).toBe(429);
+		expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+		expect((await bodyOf(limited)).error).toBe("temporarily_unavailable");
+		expect((await attempt(quiet)).status).toBe(400);
+		h.clock.now += 61_000;
+		expect((await attempt(busy)).status).toBe(400);
+	});
+});
+
+describe("OAuth grant types", () => {
+	test("a client registered for authorization_code only cannot refresh", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h, { grant_types: ["authorization_code"] });
+		const tokens = await grant(h, clientId);
+		const refreshed = await tokenCall(h, { grant_type: "refresh_token", refresh_token: tokens.refresh, client_id: clientId });
+		expect(refreshed.status).toBe(400);
+		expect((await bodyOf(refreshed)).error).toBe("unauthorized_client");
+		expect(h.oauth.verifyAccessToken(tokens.access)).toBe(true);
+	});
+
+	test("a client registered for both grants still refreshes", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h, { grant_types: ["authorization_code", "refresh_token"] });
+		const tokens = await grant(h, clientId);
+		const refreshed = await tokenCall(h, { grant_type: "refresh_token", refresh_token: tokens.refresh, client_id: clientId });
+		expect(refreshed.status).toBe(200);
+	});
+
+	test("a persisted client without grantTypes keeps refreshing", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-oauth-legacy-"));
+		harnessDirs.push(dir);
+		const clientId = "ut_client_legacy";
+		const legacy = { name: "Legacy", redirectUris: [REDIRECT], createdAt: HARNESS_START, lastUsedAt: HARNESS_START };
+		writeFileSync(join(dir, "oauth.json"), JSON.stringify({ clients: { [clientId]: legacy }, grants: {}, codes: {}, tokens: {}, pending: {} }));
+		const h = await makeHarness({}, { dir, clock: { now: HARNESS_START } });
+		const tokens = await grant(h, clientId);
+		expect(h.oauth.verifyAccessToken(tokens.access)).toBe(true);
+		const refreshed = await tokenCall(h, { grant_type: "refresh_token", refresh_token: tokens.refresh, client_id: clientId });
+		expect(refreshed.status).toBe(200);
+		expect(typeof (await bodyOf(refreshed)).refresh_token).toBe("string");
 	});
 });
 
@@ -1036,6 +1130,119 @@ describe("OAuth consent page and CSP", () => {
 	});
 });
 
+describe("OAuth audit trail and response headers", () => {
+	test("the audit sink records the grant lifecycle in order and never a secret", async () => {
+		const events: { event: string; fields: Record<string, string | number | boolean> }[] = [];
+		const h = await makeHarness({ audit: (event, fields) => events.push({ event, fields }) });
+		const clientId = await registered(h);
+		const { code, verifier, redirect } = await authorizedCode(h, clientId);
+		const exchanged = await tokenCall(h, { grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirect, resource: RESOURCE });
+		expect(exchanged.status).toBe(200);
+		const first = await bodyOf(exchanged);
+		const firstAccess = String(first.access_token);
+		const firstRefresh = String(first.refresh_token);
+		const refreshed = await tokenCall(h, { grant_type: "refresh_token", refresh_token: firstRefresh, client_id: clientId, resource: RESOURCE });
+		expect(refreshed.status).toBe(200);
+		const second = await bodyOf(refreshed);
+		expect((await tokenCall(h, { grant_type: "refresh_token", refresh_token: firstRefresh, client_id: clientId })).status).toBe(400);
+		const next = await grant(h, clientId);
+		expect((await revokeCall(h, { token: next.access, client_id: clientId })).status).toBe(200);
+		expect(events.map((entry) => entry.event)).toEqual([
+			"client_registered",
+			"login_ok",
+			"consent_approved",
+			"code_exchanged",
+			"token_refreshed",
+			"refresh_reuse_detected",
+			"login_ok",
+			"consent_approved",
+			"code_exchanged",
+			"token_revoked",
+		]);
+		for (const entry of events) expect(entry.fields).toEqual(entry.event === "login_ok" ? { ip: expect.any(String) } : { clientId });
+		const serialised = JSON.stringify(events);
+		for (const secret of [code, verifier, firstAccess, firstRefresh, String(second.access_token), String(second.refresh_token), next.access, next.refresh]) {
+			expect(serialised).not.toContain(secret);
+		}
+	});
+
+	test("a failing audit sink never changes an OAuth response", async () => {
+		const h = await makeHarness({
+			audit: () => {
+				throw new Error("sink unavailable");
+			},
+		});
+		const clientId = await registered(h);
+		const { code, verifier, redirect } = await authorizedCode(h, clientId);
+		const exchanged = await tokenCall(h, { grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirect, resource: RESOURCE });
+		expect(exchanged.status).toBe(200);
+		expect(typeof (await bodyOf(exchanged)).access_token).toBe("string");
+	});
+
+	test("OAuth JSON responses carry the framing and permissions headers", async () => {
+		const h = await makeHarness();
+		const responses = [
+			h.oauth.protectedResourceMetadata(),
+			h.oauth.authorizationServerMetadata(),
+			await registerCall(h, { redirect_uris: [REDIRECT] }),
+			await tokenCall(h, { grant_type: "unsupported" }),
+			await revokeCall(h, { token: "ut_at_unknown" }),
+		];
+		for (const response of responses) {
+			expect(response.headers.get("x-frame-options")).toBe("DENY");
+			expect(response.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+			expect(response.headers.get("permissions-policy")).toBe("camera=(), microphone=(), geolocation=()");
+		}
+	});
+
+	test("HTML pages keep their own CSP", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const consent = await authorizeCall(h, clientId, challenge);
+		const policy = consent.headers.get("content-security-policy") ?? "";
+		expect(policy).toContain("form-action 'self' https://claude.ai");
+		expect(policy).toContain("style-src 'unsafe-inline'");
+		expect(policy).not.toBe("default-src 'none'; frame-ancestors 'none'");
+	});
+
+	test("a wrong consent password records login_failed and a correct one records login_ok", async () => {
+		const events: { event: string; fields: Record<string, string | number | boolean> }[] = [];
+		const h = await makeHarness({ audit: (event, fields) => events.push({ event, fields }) });
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const html = await (await authorizeCall(h, clientId, challenge)).text();
+		const ip = "203.0.113.70";
+		const wrong = await approveWith(h, html, "not-the-password", ip);
+		expect(await wrong.text()).toContain("Incorrect password.");
+		const right = await approveWith(h, html, password, ip);
+		expect(new URL(right.headers.get("location") ?? "").searchParams.get("code")).not.toBeNull();
+		expect(events.map((entry) => entry.event)).toEqual(["client_registered", "login_failed", "login_ok", "consent_approved"]);
+		expect(events[1]?.fields).toEqual({ ip });
+		expect(events[2]?.fields).toEqual({ ip });
+		expect(JSON.stringify(events)).not.toContain(password);
+	});
+
+	test("exhausting the login window records rate_limited and no login_failed for the refused attempt", async () => {
+		const events: { event: string; fields: Record<string, string | number | boolean> }[] = [];
+		const h = await makeHarness({ audit: (event, fields) => events.push({ event, fields }) });
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const html = await (await authorizeCall(h, clientId, challenge)).text();
+		const ip = "203.0.113.71";
+		// Each attempt waits out the one-minute approval window, so only the login window can refuse.
+		for (let i = 0; i < 5; i += 1) {
+			h.clock.now += 61_000;
+			expect(await (await approveWith(h, html, "not-the-password", ip)).text()).toContain("Incorrect password.");
+		}
+		h.clock.now += 61_000;
+		const refused = await approveWith(h, html, "not-the-password", ip);
+		expect(refused.status).toBe(429);
+		expect(events.map((entry) => entry.event)).toEqual(["client_registered", "login_failed", "login_failed", "login_failed", "login_failed", "login_failed", "rate_limited"]);
+		expect(events.at(-1)?.fields).toEqual({ scope: "login", ip });
+	});
+});
+
 describe("OAuth resource, scope, client and issuer handling", () => {
 	test("authorize accepts a trailing slash on the resource", async () => {
 		const h = await makeHarness();
@@ -1228,6 +1435,46 @@ describe("OAuth state file", () => {
 		const second = await makeHarness({}, first);
 		const { challenge } = pkcePair();
 		expect((await authorizeCall(second, clientId, challenge)).status).toBe(200);
+	});
+
+	async function rotate(h: Harness, clientId: string, refresh: string): Promise<Granted> {
+		const rotated = await tokenCall(h, { grant_type: "refresh_token", refresh_token: refresh, client_id: clientId });
+		expect(rotated.status).toBe(200);
+		const body = await bodyOf(rotated);
+		const { access_token: access, refresh_token: next } = body;
+		if (typeof access !== "string" || typeof next !== "string") throw new Error("rotation has no tokens");
+		return { access, refresh: next, body };
+	}
+
+	test("a spent refresh token still revokes the grant inside the detection window", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		const first = await grant(h, clientId);
+		h.clock.now += HOUR_MS;
+		const second = await rotate(h, clientId, first.refresh);
+		// Live access + live refresh + the spent refresh kept for reuse detection.
+		expect(savedKeys(h, "tokens")).toHaveLength(3);
+		h.clock.now += 60_000;
+		const reused = await tokenCall(h, { grant_type: "refresh_token", refresh_token: first.refresh, client_id: clientId });
+		expect(reused.status).toBe(400);
+		expect(h.oauth.verifyAccessToken(second.access)).toBe(false);
+		expect(savedKeys(h, "tokens")).toEqual([]);
+	});
+
+	test("hourly refresh rotation does not accumulate spent tokens", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		let current = await grant(h, clientId);
+		for (let i = 0; i < 50; i += 1) {
+			h.clock.now += HOUR_MS;
+			current = await rotate(h, clientId, current.refresh);
+		}
+		expect(savedKeys(h, "tokens").length).toBeLessThanOrEqual(3);
+		h.clock.now += 5 * 60 * 1000 + 1;
+		// Registration prunes and writes the store.
+		await registered(h);
+		expect(savedKeys(h, "tokens")).toHaveLength(2);
+		expect(h.oauth.verifyAccessToken(current.access)).toBe(true);
 	});
 
 	for (const [label, content] of [

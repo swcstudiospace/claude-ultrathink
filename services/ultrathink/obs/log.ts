@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { randomUUID } from "node:crypto";
+import { currentRequestContext } from "./context.ts";
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -114,10 +115,16 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
 		if (RANK[level] < threshold) return;
 		try {
 			const withStack = fields !== undefined && fields !== null && fields.stack === true;
-			const body =
+			const body: Record<string, unknown> =
 				fields !== undefined && fields !== null && typeof fields === "object"
 					? serializeFields(fields, 1, new WeakSet<object>(), withStack)
 					: {};
+			// Request ids fill only what the caller left unset; a value the caller set always wins.
+			const ctx = currentRequestContext();
+			if (ctx !== undefined) {
+				body.reqId ??= ctx.reqId;
+				body.traceId ??= ctx.traceId;
+			}
 			// Reserved keys come last so a field can never overwrite them.
 			const line = JSON.stringify({ ...body, ts: stamp(now), level, event: clip(String(event)) });
 			write(line);

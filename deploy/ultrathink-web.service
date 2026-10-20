@@ -63,6 +63,10 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# Bun needs neither the hostname nor SysV IPC; both are flagged by systemd-analyze security. PrivateUsers is not set:
+# it needs a smoke check against the live unit before it can be adopted.
+ProtectHostname=true
+RemoveIPC=true
 # MemoryDenyWriteExecute is deliberately NOT set: Bun's JavaScriptCore JIT maps writable and executable memory.
 CapabilityBoundingSet=
 AmbientCapabilities=

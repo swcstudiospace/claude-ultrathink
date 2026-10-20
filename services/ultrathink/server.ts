@@ -48,6 +48,7 @@ const store = openStore(config.dbPath);
 const auth = createAuth({
 	ownerPasswordHash: config.ownerPasswordHash,
 	sessionSecret: config.sessionSecret,
+	previousSessionSecrets: config.sessionSecretPrevious,
 	cookieSecure: config.publicOrigin.startsWith("https://"),
 });
 const app = createApp({ config, store, auth, logger });
@@ -61,13 +62,16 @@ const server = Bun.serve({
 		return app.handle(req, bunServer.requestIP(req)?.address ?? "");
 	},
 });
+app.start();
 
 const shutdown = createShutdown({
 	server: { stop: () => server.stop() },
 	app,
 	store,
 	logger,
-	timeoutMs: SHUTDOWN_TIMEOUT_MS,
+	timeoutMs: SHUTDOWN_TIMEOUT_MS + config.drainMs,
+	beginDrain: () => app.beginDrain(),
+	drainMs: config.drainMs,
 	exit: (code) => process.exit(code),
 });
 installProcessHandlers(shutdown, logger, process);

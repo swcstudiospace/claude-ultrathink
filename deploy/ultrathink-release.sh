@@ -37,6 +37,7 @@ REPO=""
 SMOKE_PID=""
 SMOKE_STATE=""
 SMOKE_LOG=""
+TEST_STATE=""
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -44,6 +45,11 @@ die() {
 	printf 'ERROR: %s\n' "$*" >&2
 	exit 1
 }
+
+# Validated before anything else runs: a non-integer KEEP makes `[ "$count" -le "$KEEP" ]` false for every release,
+# and prune_releases would then delete everything except current/previous. Same check as ultrathink-backup.sh.
+case "$KEEP" in '' | *[!0-9]*) die "ULTRATHINK_KEEP_RELEASES must be a positive integer" ;; esac
+[ "$KEEP" -ge 1 ] || die "ULTRATHINK_KEEP_RELEASES must be at least 1"
 
 usage() {
 	cat >&2 <<'EOF'
@@ -65,7 +71,19 @@ cleanup_smoke() {
 	fi
 	SMOKE_STATE=""
 }
-trap cleanup_smoke EXIT
+
+cleanup_test() {
+	if [ -n "$TEST_STATE" ] && [ -d "$TEST_STATE" ]; then
+		rm -rf -- "$TEST_STATE"
+	fi
+	TEST_STATE=""
+}
+
+cleanup_all() {
+	cleanup_smoke
+	cleanup_test
+}
+trap cleanup_all EXIT
 
 require_root() {
 	[ "$(id -u)" -eq 0 ] || die "must run as root (it writes under $ROOT and restarts $UNIT)"
@@ -184,6 +202,32 @@ prune_releases() {
 	)
 }
 
+# The test suite of the archived commit is untrusted code (whatever the operator's ref contains), so it must never run
+# as root: drop to the service user exactly like smoke_test, with HOME and TMPDIR in a throwaway directory outside the
+# release tree so no root-owned artefacts (bun cache, test state) ship inside what becomes $CURRENT. The release tree is
+# already root-owned and world-readable (see do_release), so the service user can read it but not modify it.
+run_tests() {
+	local release="$1" test_home
+	TEST_STATE="$(mktemp -d /var/tmp/ultrathink-test.XXXXXX)"
+	chown "$SERVICE_USER": "$TEST_STATE"
+	chmod 0700 "$TEST_STATE"
+	test_home="$TEST_STATE/home"
+	mkdir "$test_home"
+	chown "$SERVICE_USER": "$test_home"
+	say "running tests in $release as $SERVICE_USER"
+	if ! (
+		cd "$release"
+		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
+			env -i PATH=/usr/bin:/bin HOME="$test_home" TMPDIR="$TEST_STATE" \
+			GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.com GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.com \
+			"$BUN" test services/ultrathink
+	); then
+		cleanup_test
+		return 1
+	fi
+	cleanup_test
+}
+
 smoke_test() {
 	local release="$1" smoke_home
 	SMOKE_STATE="$(mktemp -d /var/tmp/ultrathink-smoke.XXXXXX)"
@@ -244,10 +288,7 @@ do_release() {
 	chown -R root:root "$release"
 	chmod -R go+rX,go-w "$release"
 
-	say "running tests in $release"
-	if ! (cd "$release" && env -i PATH=/usr/bin:/bin HOME="$release/.test-home" \
-		GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.com GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.com \
-		"$BUN" test services/ultrathink); then
+	if ! run_tests "$release"; then
 		rm -rf -- "$release"
 		die "tests failed; release discarded, nothing was switched"
 	fi

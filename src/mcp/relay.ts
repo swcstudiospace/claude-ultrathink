@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import { readBodyPrefix } from "../net/body.ts";
 import { createSseParser } from "./sse.ts";
 
 export interface RelayAuth {
@@ -15,6 +16,10 @@ export interface RelayOptions {
 	userAgent: string;
 	loginHint: string;
 	log?: (message: string) => void;
+	/** Budget for a message whose caller passes no signal (serve mode); default REQUEST_TIMEOUT_MS. */
+	requestTimeoutMs?: number;
+	/** Budget for the shared re-initialize after a stale session; default REINIT_TIMEOUT_MS. */
+	reinitTimeoutMs?: number;
 }
 
 interface RateLimit {
@@ -36,30 +41,12 @@ function asRpc(message: unknown): JsonRpc {
 
 const RATE_LIMIT_BODY_BYTES = 4096;
 const RATE_LIMIT_TEXT = /rate[\s_-]?limit/i;
-
-/** Reads at most `limit` bytes of the body, then cancels the rest of the stream. */
-async function readBodyPrefix(response: Response, limit: number): Promise<string> {
-	if (!response.body) return "";
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let text = "";
-	let size = 0;
-	try {
-		while (size < limit) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const chunk = value.subarray(0, limit - size);
-			size += chunk.length;
-			text += decoder.decode(chunk, { stream: true });
-		}
-		return text + decoder.decode();
-	} catch {
-		return text;
-	} finally {
-		await reader.cancel().catch(() => {});
-		reader.releaseLock();
-	}
-}
+/** A JSON response or one SSE line larger than this is refused rather than buffered. */
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+/** Serve mode has no per-call timer of its own; without this a stalled upstream would pin a task forever. */
+const REQUEST_TIMEOUT_MS = 120_000;
+/** Every later message waits on the shared re-initialize, so it must settle on its own. */
+const REINIT_TIMEOUT_MS = 30_000;
 
 function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 	const header = headers.get("retry-after")?.trim();
@@ -75,7 +62,7 @@ function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 async function detectRateLimit(response: Response): Promise<RateLimit | undefined> {
 	const { status, headers } = response;
 	if (status !== 429 && status !== 401 && status !== 403) return undefined;
-	const body = await readBodyPrefix(response, RATE_LIMIT_BODY_BYTES);
+	const body = await readBodyPrefix(response, RATE_LIMIT_BODY_BYTES).then((prefix) => prefix.text, () => "");
 	const limited =
 		status === 429 || headers.has("retry-after") || headers.get("x-ratelimit-remaining")?.trim() === "0" || RATE_LIMIT_TEXT.test(body);
 	return limited ? { retryAfter: retryAfterSeconds(headers, body) } : undefined;
@@ -89,6 +76,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 	let protocolVersion: string | undefined;
 	let initMessage: unknown;
 	let reinitializing: Promise<void> | undefined;
+	const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+	const reinitTimeoutMs = options.reinitTimeoutMs ?? REINIT_TIMEOUT_MS;
 
 	const post = async (message: unknown, withSession: boolean, signal?: AbortSignal): Promise<Posted> => {
 		const header = await options.auth.header();
@@ -141,21 +130,35 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 					return;
 				}
 				observe(parsed, initId, emit);
-			});
+			}, MAX_BODY_BYTES);
+			const reader = response.body.getReader();
+			const onAbort = (): void => {
+				reader.cancel(signal?.reason).catch(() => {});
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
 			const decoder = new TextDecoder();
-			for await (const chunk of response.body) {
-				if (signal?.aborted) throw new Error("aborted");
-				parser.push(decoder.decode(chunk, { stream: true }));
+			try {
+				for (;;) {
+					const { done, value } = await reader.read();
+					if (signal?.aborted) throw new Error("aborted");
+					if (done) break;
+					parser.push(decoder.decode(value, { stream: true }));
+				}
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+				await reader.cancel().catch(() => {});
+				reader.releaseLock();
 			}
 			parser.push(decoder.decode());
 			parser.end();
 			return;
 		}
-		const text = await response.text();
-		if (text.trim() === "") return;
+		const body = await readBodyPrefix(response, MAX_BODY_BYTES, signal);
+		if (!body.complete) throw new Error("response too large");
+		if (body.text.trim() === "") return;
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(text);
+			parsed = JSON.parse(body.text);
 		} catch {
 			log("skipping unparsable JSON response");
 			return;
@@ -168,7 +171,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 			sessionId = undefined;
 			return;
 		}
-		const posted = await postWithAuth(initMessage, false);
+		const signal = AbortSignal.timeout(reinitTimeoutMs);
+		const posted = await postWithAuth(initMessage, false, signal);
 		if (!posted.response?.ok) {
 			log(`re-initialize failed: ${posted.response ? `HTTP ${posted.response.status}` : "unreachable"}`);
 			await posted.response?.body?.cancel().catch(() => {});
@@ -176,8 +180,14 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 			return;
 		}
 		sessionId = posted.response.headers.get("mcp-session-id") ?? undefined;
-		await consume(posted.response, asRpc(initMessage).id, () => {});
-		const notified = await postWithAuth({ jsonrpc: "2.0", method: "notifications/initialized" });
+		try {
+			await consume(posted.response, asRpc(initMessage).id, () => {}, signal);
+		} catch {
+			log(`re-initialize failed: ${signal.aborted ? "timed out" : "stream failed"}`);
+			sessionId = undefined;
+			return;
+		}
+		const notified = await postWithAuth({ jsonrpc: "2.0", method: "notifications/initialized" }, true, signal);
 		await notified.response?.body?.cancel().catch(() => {});
 	};
 
@@ -191,7 +201,7 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		isRequest: boolean,
 		emit: (line: string) => void,
 		answered: () => boolean,
-		signal: AbortSignal | undefined,
+		signal: AbortSignal,
 	): Promise<void> => {
 		const isInitialize = rpc.method === "initialize";
 		if (isInitialize) initMessage = message;
@@ -236,8 +246,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		}
 		try {
 			await consume(response, isInitialize ? rpc.id : undefined, emit, signal);
-		} catch {
-			log("upstream stream failed");
+		} catch (error) {
+			log(`upstream stream failed: ${error instanceof Error ? error.message : String(error)}`);
 			if (isRequest && !answered()) writeError(rpc.id, -32000, "upstream unreachable");
 			return;
 		}
@@ -259,7 +269,7 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 				options.write(line);
 			};
 			try {
-				await relay(message, rpc, isRequest, emit, () => replied, signal);
+				await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
 			} catch (error) {
 				log("relay error");
 				if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);

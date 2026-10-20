@@ -27,7 +27,11 @@ const json = (value: unknown, headers: Record<string, string> = {}): Response =>
 
 const staticAuth = (header?: string): RelayAuth => ({ header: async () => header, unauthorized: async () => false });
 
-function setup(respond: (call: Call, index: number) => Response, auth: RelayAuth = staticAuth("Bearer t")) {
+function setup(
+	respond: (call: Call, index: number) => Response,
+	auth: RelayAuth = staticAuth("Bearer t"),
+	timeouts: { requestTimeoutMs?: number; reinitTimeoutMs?: number } = {},
+) {
 	const { fetch, calls } = fakeFetch(respond);
 	const lines: string[] = [];
 	const relay = createRelay({
@@ -37,6 +41,7 @@ function setup(respond: (call: Call, index: number) => Response, auth: RelayAuth
 		userAgent: "ua/1",
 		loginHint: "run: login",
 		write: (line) => lines.push(line),
+		...timeouts,
 	});
 	return { relay, calls, lines, out: () => lines.map((line) => JSON.parse(line)) };
 }
@@ -50,6 +55,13 @@ describe("createSseParser", () => {
 		parser.push("\ndata: tail");
 		parser.end();
 		expect(got).toEqual(['{"a":\n1}', "tail"]);
+	});
+
+	test("an unterminated line beyond the cap throws instead of growing the buffer", () => {
+		const parser = createSseParser(() => {}, 8);
+		parser.push("data: ok\n");
+		parser.push("data: 12");
+		expect(() => parser.push("3")).toThrow("SSE line too long");
 	});
 });
 
@@ -136,7 +148,7 @@ describe("createRelay", () => {
 		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, result: {} }]);
 	});
 
-	test("caller signal reaches every fetch for the message, including the 401 retry, but not the shared re-initialize", async () => {
+	test("caller signal reaches every fetch for the message, including the 401 retry, but the shared re-initialize has its own budget", async () => {
 		let token = "Bearer old";
 		const auth: RelayAuth = {
 			header: async () => token,
@@ -162,7 +174,7 @@ describe("createRelay", () => {
 		expect(toolCalls.every((call) => call.signal === controller.signal)).toBe(true);
 		const reinit = calls.slice(1).filter((call) => call.body.method !== "tools/call");
 		expect(reinit.map((call) => call.body.method)).toEqual(["initialize", "notifications/initialized"]);
-		expect(reinit.every((call) => call.signal === undefined)).toBe(true);
+		expect(reinit.every((call) => call.signal !== undefined && call.signal !== controller.signal)).toBe(true);
 	});
 
 	test("401 twice yields -32001 with login hint; notification writes nothing", async () => {
@@ -299,6 +311,78 @@ describe("createRelay", () => {
 		const retried = calls.filter((c) => c.body.method === "tools/list" && c.headers.get("mcp-session-id") !== "s1");
 		expect(retried.every((c) => c.headers.get("mcp-session-id") === "s2")).toBe(true);
 		expect(lines.map((line) => JSON.parse(line).id).sort()).toEqual([0, 1, 2, 3]);
+	});
+
+	test("re-initialize whose upstream never closes the stream fails within its own budget", async () => {
+		let cancelled = false;
+		const { relay, out } = setup(
+			(call, index) => {
+				if (index === 0) return json({ jsonrpc: "2.0", id: 0, result: {} }, { "mcp-session-id": "s1" });
+				if (call.body.method === "initialize") {
+					const stream = new ReadableStream<Uint8Array>({
+						pull: () => new Promise<void>(() => {}),
+						cancel() {
+							cancelled = true;
+						},
+					});
+					return new Response(stream, { headers: { "content-type": "text/event-stream", "mcp-session-id": "s2" } });
+				}
+				return new Response("gone", { status: 404 });
+			},
+			staticAuth("Bearer t"),
+			{ reinitTimeoutMs: 50 },
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+		const started = Date.now();
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/list" }, AbortSignal.timeout(5000));
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(cancelled).toBe(true);
+		expect(out()).toEqual([
+			{ jsonrpc: "2.0", id: 0, result: {} },
+			{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream HTTP 404" } },
+		]);
+	});
+
+	test("a request without a caller signal gives up on a stalled upstream after the default budget", async () => {
+		let cancelled = false;
+		const { relay, out } = setup(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull: () => new Promise<void>(() => {}),
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+			staticAuth("Bearer t"),
+			{ requestTimeoutMs: 50 },
+		);
+		const started = Date.now();
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/call" });
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(cancelled).toBe(true);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream unreachable" } }]);
+	});
+
+	test("a JSON response larger than the cap is refused without buffering it", async () => {
+		let pulled = 0;
+		const { relay, out } = setup(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulled++;
+							controller.enqueue(new Uint8Array(1024 * 1024).fill(32));
+						},
+					}),
+					{ headers: { "content-type": "application/json" } },
+				),
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/call" });
+		expect(pulled).toBeLessThan(20);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream unreachable" } }]);
 	});
 
 	test("SSE without the response yields -32000 after forwarded notifications", async () => {

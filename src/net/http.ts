@@ -7,7 +7,9 @@
  */
 import { redactSecrets } from "../grok/auth.ts";
 import { USER_AGENT } from "../mcp/providers.ts";
+import { readBodyPrefix } from "./body.ts";
 
+/** Bytes buffered from a response before it is refused as too large; the rest of the stream is cancelled unread. */
 export const MAX_RESPONSE_CHARS = 4_000_000;
 /** setTimeout/AbortSignal.timeout reject delays above the signed 32-bit range. */
 const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -68,10 +70,10 @@ export async function requestJson(url: string, request: HttpRequest): Promise<Ht
 			}),
 			signal,
 		);
-		const text = await abortable(response.text(), signal);
+		const body = await abortable(readBodyPrefix(response, MAX_RESPONSE_CHARS + 1, signal), signal);
 		const ms = Date.now() - started;
-		if (text.length > MAX_RESPONSE_CHARS) return { kind: "network", message: "response too large", ms };
-		return { kind: "response", status: response.status, json: parseJson(text), text, ms };
+		if (!body.complete) return { kind: "network", message: "response too large", ms };
+		return { kind: "response", status: response.status, json: parseJson(body.text), text: body.text, ms };
 	} catch (error) {
 		if (request.signal?.aborted) throw error;
 		const ms = Date.now() - started;

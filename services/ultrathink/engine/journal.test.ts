@@ -6,7 +6,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { claudeConfigPaths, loadConfig } from "../../../src/config.ts";
-import { journalDir, stageOf } from "../../../src/host/grokbot.ts";
+import { journalDir, listPending, stageOf } from "../../../src/host/grokbot.ts";
+import { planPrompt } from "../../../src/host/plan.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../../../src/think/prompts.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../../../src/uplift/prompt.ts";
 import { escapeXml } from "../../../src/uplift/xml.ts";
@@ -102,6 +103,24 @@ function firstKey(o: JournalOptions, sessionId: string): string {
 	return key;
 }
 
+/** The real plugin entry point behind a gate: every call waits until `open()` before planning; `calls()` counts them. */
+function gatedPlan(): { plan: typeof planPrompt; open: () => void; calls: () => number } {
+	let open = (): void => undefined;
+	const gate = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	let calls = 0;
+	return {
+		plan: async (request, env, options) => {
+			calls++;
+			await gate;
+			return planPrompt(request, env, options);
+		},
+		open: () => open(),
+		calls: () => calls,
+	};
+}
+
 describe("grok-bot journal service", () => {
 	test("drives a plan to planned through the journal API and leaves the cwd empty", async () => {
 		const stateDir = newState();
@@ -131,6 +150,47 @@ describe("grok-bot journal service", () => {
 			globalThis.fetch = realFetch;
 		}
 		expect(urls.join(" | ")).toBe("");
+	});
+
+	test("a concurrent start for the same session joins the first plan instead of racing it", async () => {
+		const real = globalThis.fetch;
+		const stateDir = newState();
+		const sessionId = randomUUID();
+		const { plan, open, calls } = gatedPlan();
+		const o = { ...opts(stateDir), plan };
+		const first = startPlan(o, { prompt: PROMPT, sessionId });
+		const second = startPlan(o, { prompt: PROMPT, sessionId });
+		const other = await startPlan(o, { prompt: `${PROMPT} Also a changelog.`, sessionId });
+		expect(other).toEqual({ ok: false, code: "session_conflict" });
+		open();
+		const [a, b] = await Promise.all([first, second]);
+		expect(calls()).toBe(1);
+		expect(a).toMatchObject({ ok: true, data: { sessionId, status: "needs-model" } });
+		expect(b).toEqual(a);
+		if (!a.ok) throw new Error("unexpected failure");
+		const keys = a.data.pending.map((entry) => entry.key);
+		expect(keys.length).toBeGreaterThan(0);
+		expect(listPending(journalDir(stateDir, sessionId)).map((entry) => entry.key)).toEqual(keys);
+		expect(globalThis.fetch).toBe(real);
+		expect((await startPlan(o, { prompt: PROMPT, sessionId })).ok).toBe(true);
+		expect(calls()).toBe(2);
+	});
+
+	test("concurrent starts for different sessions both complete and leave the global fetch restored", async () => {
+		const real = globalThis.fetch;
+		const stateDir = newState();
+		const ids = [randomUUID(), randomUUID()];
+		const { plan, open, calls } = gatedPlan();
+		const o = { ...opts(stateDir), plan };
+		const runs = ids.map((sessionId) => startPlan(o, { prompt: PROMPT, sessionId }));
+		open();
+		const results = await Promise.all(runs);
+		expect(calls()).toBe(2);
+		for (const [i, sessionId] of ids.entries()) {
+			expect(results[i]).toMatchObject({ ok: true, data: { sessionId, status: "needs-model" } });
+			expect(listPending(journalDir(stateDir, sessionId)).length).toBeGreaterThan(0);
+		}
+		expect(globalThis.fetch).toBe(real);
 	});
 
 	test("rejects a bad answer with invalid_answer and keeps the pending request", async () => {

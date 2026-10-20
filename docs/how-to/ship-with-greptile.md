@@ -85,7 +85,7 @@ The three switches are separate, and all default to `false`:
 |---|---|
 | `ship.enabled` | The plan gets a `## Ship` section and the agent is nudged to ship at the end of a matching skill run. Pushing and opening the PR are part of this. |
 | `ship.autoMerge` | `merge` may merge the PR once the gate passes. Off, the flow stops with the PR ready for you. On, in gate mode, the done assessment also needs a usable verdict from the engine judge: neither the rules alone nor a Jev answer stands in for it. |
-| `ship.deleteBranch` | After a confirmed merge, delete the remote and local branch and fast-forward the base branch. |
+| `ship.deleteBranch` | After a confirmed merge, delete the remote branch with an explicit refspec (`git push origin :refs/heads/<branch>`), check out and fast-forward the base branch, then delete the local branch with `git branch -d`. It uses `-D` only when the local branch's tip is exactly the merged head, which is what a squash or rebase merge leaves. When `false`, branches are left alone. |
 
 Check it from the project directory:
 
@@ -115,6 +115,7 @@ How ship uses GSD, when the repository has `.planning/ROADMAP.md`:
 
 - The done assessment runs `node <gsd-tools.cjs> query roadmap.analyze` and treats incomplete phases as not done, so `node` must be on `PATH`. If `node` cannot be started, the task is not done, with the gap `GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd`. If the script runs but fails, the roadmap counts as 0 of 0 phases and the other checks still run. The latest `.planning/phases/*/*-VERIFICATION.md` must have `status: passed`. When `.planning/phases` has none (for example after `gsd-autonomous` archived the milestone), every `*-VERIFICATION.md` of the latest `.planning/milestones/<version>-phases/` must have `status: passed`.
 - `gsd-tools.cjs` is found through `GSD_TOOLS` when set. Otherwise ship takes the first one that exists, in this order: `<repo>/gsd-core/bin/`, `<repo>/.claude/gsd-core/bin/`, `<repo>/.codex/gsd-core/bin/`, the older `<repo>/.claude/get-shit-done/bin/`, `$CLAUDE_CONFIG_DIR/gsd-core/bin/` (when set), `~/.claude/gsd-core/bin/`, `~/.agents/gsd-core/bin/`, `${HERMES_HOME:-~/.hermes}/gsd-core/bin/`, `${CODEX_HOME:-~/.codex}/gsd-core/bin/`, `${GEMINI_CONFIG_DIR:-~/.gemini}/gsd-core/bin/`, `~/.cursor/gsd-core/bin/`, `${XDG_CONFIG_HOME:-~/.config}/opencode/gsd-core/bin/`, and last the older `~/.claude/get-shit-done/bin/`.
+- A `gsd-tools.cjs` that the repository commits is never run. The four repository locations at the start of that list are skipped when git tracks the file, and the lookup moves on to the next location. An untracked copy in those locations still runs. When a tracked copy is skipped, the assess gap says a `gsd-tools.cjs` committed in this repository was not run, and suggests installing GSD outside it or setting `GSD_TOOLS`.
 - If the roadmap exists but no `gsd-tools.cjs` is found, the task is not done, with the gap `GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd`.
 - `assess --ignore-gsd` leaves the roadmap and verification out. Use it only when you decided the repository's `.planning/` roadmap is separate work from this change. The agent adds it only on your explicit say-so, and the PR body records the exclusion.
 
@@ -160,7 +161,7 @@ What it does to a ship run:
 Invoke a matching skill as usual. When the run ends with committed work on a feature branch (at least one commit ahead of the default branch), the agent invokes the `ultrathink-ship` skill. It:
 
 1. runs `assess`. When the task is not done, in gate mode it hands the gaps back to you and opens no PR; in advisory mode it fixes the gaps itself and hands back only decisions it cannot make. A Jev veto (when the Jev check is on) is handled the same way: handed back in gate mode, fixed and assessed again in advisory mode;
-2. commits only the files it edited, pushes, and opens (or reuses) a PR into the default branch;
+2. commits only the files it edited, pushes (a branch name starting with `-` is refused, so git cannot read it as an option), and opens (or reuses) a PR into the default branch;
 3. runs Greptile review rounds, fixing findings and pushing, until the review is 5/5 with no open comments. After `ship.maxRounds` (5) completed reviews below 5/5 or with open threads it stops, comments on the PR and leaves it for you;
 4. merges, only with `ship.autoMerge`, and keeps retrying the merge until the 5/5-reviewed PR merges;
 5. runs `ultrathink-sync` so tracked Linear and Notion rows get the PR link and status;

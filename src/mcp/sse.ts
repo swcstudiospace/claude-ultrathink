@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-export function createSseParser(onMessage: (data: string) => void): { push(chunk: string): void; end(): void } {
+/**
+ * `maxLineChars` bounds the unterminated remainder kept between pushes: a stream that never sends "\n" would otherwise
+ * grow the buffer without limit. Exceeding it throws from `push`.
+ */
+export function createSseParser(
+	onMessage: (data: string) => void,
+	maxLineChars = 16 * 1024 * 1024,
+): { push(chunk: string): void; end(): void } {
 	let buffer = "";
 	let data: string[] = [];
 	const dispatch = (): void => {
@@ -33,6 +40,7 @@ export function createSseParser(onMessage: (data: string) => void): { push(chunk
 				buffer = buffer.slice(index + 1);
 				index = buffer.indexOf("\n");
 			}
+			if (buffer.length > maxLineChars) throw new Error("SSE line too long");
 		},
 		end(): void {
 			if (buffer !== "") {

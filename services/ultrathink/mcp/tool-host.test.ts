@@ -70,6 +70,7 @@ function stubPlanner(enabled: boolean, view: (sessionId: string) => ResultView =
 		starts: [],
 		results: [],
 		serverIds: new Set(),
+		upstream: () => undefined,
 		async start(input) {
 			stub.starts.push(input);
 			return { ok: true, data: { sessionId: String(input.sessionId), status: "planned" } };
