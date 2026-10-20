@@ -19,7 +19,7 @@
 #   ULTRATHINK_STATE_DIR              state directory (default /var/lib/ultrathink)
 #   ULTRATHINK_BACKUP_DIR             archive directory (default /var/backups/ultrathink)
 #   ULTRATHINK_BACKUP_KEEP            archives to keep (default 14)
-#   ULTRATHINK_RETENTION_DAYS         age limit for journal, sessions and jobs entries and the root plan copies (default 30)
+#   ULTRATHINK_RETENTION_DAYS         age limit for journal, sessions, jobs entries, root plan copies and database runs (default 30; 0 turns retention off)
 #   ULTRATHINK_BACKUP_RSYNC_TARGET    rsync destination, for example backup@host:/srv/ultrathink/ (default: none)
 #   ULTRATHINK_BUN                    Bun binary (default /opt/ultrathink/bin/bun)
 #
@@ -102,8 +102,7 @@ fi
 [ -x "$BUN" ] || die "Bun not found at $BUN"
 case "$KEEP" in '' | *[!0-9]*) die "ULTRATHINK_BACKUP_KEEP must be a positive integer" ;; esac
 [ "$KEEP" -ge 1 ] || die "ULTRATHINK_BACKUP_KEEP must be at least 1"
-case "$RETENTION_DAYS" in '' | *[!0-9]*) die "ULTRATHINK_RETENTION_DAYS must be a positive integer" ;; esac
-[ "$RETENTION_DAYS" -ge 1 ] || die "ULTRATHINK_RETENTION_DAYS must be at least 1"
+case "$RETENTION_DAYS" in '' | *[!0-9]*) die "ULTRATHINK_RETENTION_DAYS must be a whole number of days (0 turns retention off)" ;; esac
 
 RETENTION_MODULE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/services/ultrathink/store/retention.ts"
 
@@ -295,6 +294,10 @@ do_backup() {
 # nothing inside it (or the entry itself) was modified within the retention window, so a session that is still being
 # written is never touched.
 do_prune() {
+	if [ "$RETENTION_DAYS" -eq 0 ]; then
+		say "retention: disabled (ULTRATHINK_RETENTION_DAYS=0)"
+		return 0
+	fi
 	local base entry removed=0 window_minutes=$((RETENTION_DAYS * 1440))
 	case "$STATE_DIR" in
 	/?*) ;;
@@ -326,6 +329,10 @@ do_prune() {
 # store/retention.ts discovers them). `request` holds user prompts, so this is the database half of the retention policy. Runs with a ledger row dated today (UTC) are kept, so the daily ceiling,
 # which sums token_ledger by day, never loses today's spend. Runs inside one transaction: all or nothing.
 prune_database() {
+	if [ "$RETENTION_DAYS" -eq 0 ]; then
+		say "retention: disabled (ULTRATHINK_RETENTION_DAYS=0)"
+		return 0
+	fi
 	[ -f "$STATE_DIR/ultrathink.sqlite" ] || {
 		warn "no database in $STATE_DIR (skipped)"
 		return 0

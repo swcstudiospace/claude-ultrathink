@@ -12,11 +12,14 @@ import * as nodeFs from "node:fs";
 import { chmodSync, existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import type { ApprovalProof, Auth } from "../auth/auth.ts";
+import type { AuditEvent } from "../obs/audit.ts";
 
 export const DEFAULT_REDIRECT_ORIGINS: readonly string[] = ["https://claude.ai", "https://claude.com", "https://grok.com", "https://console.x.ai"];
 
 const ACCESS_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// A rotated refresh token stays on record only long enough to detect reuse.
+const SPENT_REFRESH_TTL_MS = 5 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30 * 1000;
@@ -37,11 +40,14 @@ const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const SCOPE_PATTERN = /^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/;
 const STATE_FILE = "oauth.json";
 const SUPPORTED_GRANTS = ["authorization_code", "refresh_token"] as const;
+// RFC 7591 §2: a registration that omits grant_types may only use the authorization code grant.
+const DEFAULT_GRANT_TYPES: readonly string[] = ["authorization_code"];
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 const REGISTER_LIMIT = { max: 10, windowMs: 60 * 60 * 1000 };
 const AUTHORIZE_LIMIT = { max: 30, windowMs: 60 * 1000 };
 const TOKEN_LIMIT = { max: 60, windowMs: 60 * 1000 };
+const TOKEN_CLIENT_LIMIT = { max: 30, windowMs: 60 * 1000 };
 const REVOKE_LIMIT = { max: 60, windowMs: 60 * 1000 };
 const MAX_LIMITER_KEYS = 10_000;
 const UNKNOWN_IP = "unknown";
@@ -50,6 +56,8 @@ interface ClientRecord {
 	name: string;
 	redirectUris: string[];
 	createdAt: number;
+	/** Grant types accepted at registration; the token endpoint refuses any other. */
+	grantTypes: string[];
 	/** Set on the first approved grant. A client without it is disposable. */
 	grantedAt?: number;
 	lastUsedAt?: number;
@@ -122,6 +130,8 @@ export interface OAuthOptions {
 	 * setInterval in production and to nothing when a test supplies a clock.
 	 */
 	schedule?: (run: () => void, intervalMs: number) => () => void;
+	/** Receives one call per security event. A throwing sink never changes an OAuth response. */
+	audit?: (event: AuditEvent, fields: Record<string, string | number | boolean>) => void;
 }
 
 export interface OAuth {
@@ -144,6 +154,14 @@ const NO_STORE = {
 	"Referrer-Policy": "no-referrer",
 };
 
+// Every JSON response from the OAuth endpoints, and the revocation acknowledgement, refuses framing and turns off powerful features.
+const API_HEADERS: Record<string, string> = {
+	...NO_STORE,
+	"X-Frame-Options": "DENY",
+	"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+	"Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+};
+
 // form-action must allow the registered redirect. Chrome applies it to the
 // redirect that follows a form post, so 'self' alone cancels the jump back to
 // the client. The origin is added per response, never as a wildcard.
@@ -159,7 +177,7 @@ function htmlHeaders(formAction: string): Record<string, string> {
 function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { ...NO_STORE, "Content-Type": "application/json; charset=utf-8", ...headers },
+		headers: { ...API_HEADERS, "Content-Type": "application/json; charset=utf-8", ...headers },
 	});
 }
 
@@ -405,6 +423,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	const registerLimiter = createLimiter(REGISTER_LIMIT, now);
 	const authorizeLimiter = createLimiter(AUTHORIZE_LIMIT, now);
 	const tokenLimiter = createLimiter(TOKEN_LIMIT, now);
+	const tokenClientLimiter = createLimiter(TOKEN_CLIENT_LIMIT, now);
 	const revokeLimiter = createLimiter(REVOKE_LIMIT, now);
 	let cancelSweep: (() => void) | null = null;
 
@@ -412,6 +431,10 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	for (const grant of Object.values(data.grants)) {
 		const client = own(data.clients, grant.clientId);
 		if (client !== undefined && client.grantedAt === undefined) client.grantedAt = grant.createdAt;
+	}
+	// Clients saved before grantTypes existed could refresh unconditionally; keep that so existing connections are not forced to re-consent on deploy.
+	for (const client of Object.values(data.clients)) {
+		if (!Array.isArray(client.grantTypes)) client.grantTypes = [...SUPPORTED_GRANTS];
 	}
 
 	function proofOf(key: string, request: PendingRequest): ApprovalProof {
@@ -591,6 +614,14 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		return { "Retry-After": String(retryAfterSec) };
 	}
 
+	function audit(event: AuditEvent, fields: Record<string, string | number | boolean>): void {
+		try {
+			options.audit?.(event, fields);
+		} catch {
+			// The decision is already made; the sink owns its own failures.
+		}
+	}
+
 	function consentPage(requestId: string, nonce: string, clientName: string, redirectUri: string, message: string, status: number): Response {
 		const redirectOrigin = new URL(redirectUri).origin;
 		const alert = message === "" ? "" : `<p class="err">${escapeHtml(message)}</p>`;
@@ -677,11 +708,14 @@ export function createOAuth(options: OAuthOptions): OAuth {
 			persist();
 			return expiredResponse(polling);
 		}
-		persist();
 		if (polling) {
+			// The refreshed timestamp and signature only matter in memory and the sweeper flushes them;
+			// an unauthenticated poll must not cost a full fsync unless pruning removed something.
+			if (prune()) flush();
 			const remaining = Math.max(0, Math.ceil((found.request.expiresAt - now()) / 1000));
 			return jsonResponse(200, { state: "PENDING_APPROVAL", expires_in: remaining, refreshed_at: found.request.refreshedAt });
 		}
+		persist();
 		const clientName = own(data.clients, found.request.clientId)?.name ?? "MCP client";
 		const redirectUri = found.request.redirectUri;
 		if (approving.has(found.key)) {
@@ -693,10 +727,15 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		try {
 			const login = await options.auth.login({ password: form.get("password") ?? "", clientIp: ip });
 			if (!login.ok) {
-				if (login.reason === "rate_limited") return errorPage(429, "Too many attempts. Wait and try again.");
+				if (login.reason === "rate_limited") {
+					audit("rate_limited", { scope: "login", ip });
+					return errorPage(429, "Too many attempts. Wait and try again.");
+				}
+				audit("login_failed", { ip });
 				if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
 				return consentPage(requestId, found.request.nonce, clientName, redirectUri, "Incorrect password.", 200);
 			}
+			audit("login_ok", { ip });
 			// Registration or pruning may have dropped the client or its pending entry while the password was checked; a code for a missing client could never be redeemed.
 			if (found.request.approvalState !== "PENDING_APPROVAL" || pending.get(found.key) !== found.request || own(data.clients, found.request.clientId) === undefined) {
 				return expiredResponse(false);
@@ -720,6 +759,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 				used: false,
 			};
 			persist();
+			audit("consent_approved", { clientId: found.request.clientId });
 			return redirectWith(found.request.redirectUri, { code }, found.request.state);
 		} finally {
 			approving.delete(found.key);
@@ -756,6 +796,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 			restoreStore(snapshot);
 			return oauthError(500, "server_error", "OAuth state could not be saved.");
 		}
+		audit("code_exchanged", { clientId });
 		return jsonResponse(200, body);
 	}
 
@@ -767,6 +808,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 			// Refresh rotation: presenting a spent refresh token revokes the whole grant.
 			revokeGrant(record.grantId);
 			persist();
+			audit("refresh_reuse_detected", { clientId });
 			return invalidGrant("The refresh token was already used.");
 		}
 		if (record.expiresAt <= now()) return invalidGrant("The refresh token expired.");
@@ -777,6 +819,8 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		}
 		const snapshot = snapshotStore();
 		record.used = true;
+		// Keep the spent token only for the reuse-detection window so prune() reclaims it.
+		record.expiresAt = Math.min(record.expiresAt, now() + SPENT_REFRESH_TTL_MS);
 		const body = issueTokens(record.grantId, record.clientId, record.resource, record.scope ?? null);
 		try {
 			persist();
@@ -784,6 +828,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 			restoreStore(snapshot);
 			return oauthError(500, "server_error", "OAuth state could not be saved.");
 		}
+		audit("token_refreshed", { clientId });
 		return jsonResponse(200, body);
 	}
 
@@ -836,7 +881,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		if (body.token_endpoint_auth_method !== undefined && body.token_endpoint_auth_method !== "none") {
 			return oauthError(400, "invalid_client_metadata", "Only token_endpoint_auth_method none is supported (PKCE public clients).");
 		}
-		const grants = body.grant_types ?? ["authorization_code"];
+		const grants = body.grant_types ?? [...DEFAULT_GRANT_TYPES];
 		if (!Array.isArray(grants) || grants.length === 0 || !grants.every((g) => (SUPPORTED_GRANTS as readonly unknown[]).includes(g))) {
 			return oauthError(400, "invalid_client_metadata", "Supported grant types: authorization_code, refresh_token.");
 		}
@@ -852,8 +897,9 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		const name = rawName.trim() === "" ? "MCP client" : rawName.trim();
 		const clientId = `ut_client_${randomBytes(16).toString("base64url")}`;
 		const issuedAt = now();
-		data.clients[clientId] = { name, redirectUris, createdAt: issuedAt, lastUsedAt: issuedAt };
+		data.clients[clientId] = { name, redirectUris, grantTypes, createdAt: issuedAt, lastUsedAt: issuedAt };
 		persist();
+		audit("client_registered", { clientId });
 		return jsonResponse(201, {
 			client_id: clientId,
 			client_id_issued_at: Math.floor(issuedAt / 1000),
@@ -871,15 +917,23 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		const text = await readBodyText(req, MAX_FORM_BYTES);
 		if (text === null) return oauthError(400, "invalid_request", "The request body is too large.");
 		const form = new URLSearchParams(text);
+		// The per-client budget keys on the client_id the body names, so it runs once the body is read.
+		const clientId = form.get("client_id") ?? "";
+		if (clientId !== "") {
+			const clientLimit = tokenClientLimiter.hit(`client:${clientId}`);
+			if (!clientLimit.ok) return oauthError(429, "temporarily_unavailable", "Too many token requests. Try again later.", rateLimited(clientLimit.retryAfterSec));
+		}
 		const grantType = form.get("grant_type");
 		if (grantType !== "authorization_code" && grantType !== "refresh_token") {
 			return oauthError(400, "unsupported_grant_type", "Use authorization_code or refresh_token.");
 		}
 		// An unknown client gets 401 so the client registers again instead of looping on invalid_grant.
-		const clientId = form.get("client_id") ?? "";
 		const client = own(data.clients, clientId);
 		if (!client) return invalidClient();
 		client.lastUsedAt = now();
+		if (!client.grantTypes.includes(grantType)) {
+			return oauthError(400, "unauthorized_client", `The client was not registered for grant_type ${grantType}.`);
+		}
 		if (grantType === "authorization_code") return await exchangeCode(form, clientId);
 		return refreshGrant(form, clientId);
 	}
@@ -899,10 +953,11 @@ export function createOAuth(options: OAuthOptions): OAuth {
 			if (clientId === "" || clientId === record.clientId) {
 				revokeGrant(record.grantId);
 				persist();
+				audit("token_revoked", { clientId: record.clientId });
 			}
 		}
 		// RFC 7009: the answer never reveals whether the token existed.
-		return new Response(null, { status: 200, headers: NO_STORE });
+		return new Response(null, { status: 200, headers: API_HEADERS });
 	}
 
 	function verifyAccessToken(presented: string): boolean {
@@ -946,11 +1001,10 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		},
 		register,
 		async authorize(req, ip) {
-			if (req.method === "GET") {
-				const limit = authorizeLimiter.hit(ip);
-				if (!limit.ok) return errorPage(429, "Too many requests. Wait and try again.", rateLimited(limit.retryAfterSec));
-				return authorizeGet(new URL(req.url).searchParams);
-			}
+			// GET and POST (approve or poll) share one budget: every hit reaches the consent machinery.
+			const limit = authorizeLimiter.hit(ip);
+			if (!limit.ok) return errorPage(429, "Too many requests. Wait and try again.", rateLimited(limit.retryAfterSec));
+			if (req.method === "GET") return authorizeGet(new URL(req.url).searchParams);
 			return await authorizePost(req, ip);
 		},
 		token,

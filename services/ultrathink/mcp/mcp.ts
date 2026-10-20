@@ -5,6 +5,7 @@ import pkg from "../../../package.json";
 import { promptDefinitions, renderPrompt } from "./prompts.ts";
 import type { ResourceRegistry } from "./resources.ts";
 import { CONNECTOR_TOOL_DEFINITIONS, GRAPH_UI_META, LARGE_RESULT_META, READ_ONLY } from "./tools-connector.ts";
+import { compileSchema, type Validator } from "./validate.ts";
 
 /** Newest first: initialize answers with the requested version when listed here, otherwise the first. */
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
@@ -14,6 +15,13 @@ export const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 
 /** Versions from this one on forbid batches. Versions are ISO dates, so string order is date order. */
 const BATCH_REMOVED_IN = "2025-06-18";
+
+/**
+ * Most messages accepted in one JSON-RPC batch. The connector rate limit and the long-poll bound of
+ * `ultrathink_result` apply per HTTP request, so a batch multiplies both; a 64 KiB body could otherwise
+ * carry hundreds of tool calls. Eight keeps batching clients working without that amplification.
+ */
+export const MAX_BATCH_MESSAGES = 8;
 
 export interface ToolDefinition {
 	name: string;
@@ -35,7 +43,10 @@ export type ToolOutcome =
 	| { ok: true; data: Record<string, unknown>; text?: string }
 	| { ok: false; code: string; errors?: string[] };
 
-/** The domain side. The host runs each tool; this module only speaks MCP. */
+/**
+ * The domain side. The host runs each tool; this module only speaks MCP. `args` has already passed the tool's
+ * inputSchema: required keys present, declared types, enums and bounds respected, no unknown keys.
+ */
 export interface McpToolHost {
 	call(name: string, args: Record<string, unknown>): ToolOutcome | Promise<ToolOutcome>;
 	/** Absent means { serverPlanning: false }. */
@@ -218,6 +229,23 @@ export function toolDefinitions(serverPlanning: boolean): readonly ToolDefinitio
 	return serverPlanning ? TOOL_DEFINITIONS : CLIENT_TOOL_DEFINITIONS;
 }
 
+/**
+ * One compiled validator per tool definition, keyed by the definition object itself: the lists are module constants
+ * that share their entries, so each schema compiles once per process and the request path only looks it up. A
+ * schema compileSchema refuses throws on the first call of that tool (-32603); assertToolDefinitions reports the
+ * same schema at boot, so a running process never meets one.
+ */
+const validators = new WeakMap<ToolDefinition, Validator>();
+
+function validatorFor(tool: ToolDefinition): Validator {
+	let validate = validators.get(tool);
+	if (validate === undefined) {
+		validate = compileSchema(tool.inputSchema);
+		validators.set(tool, validate);
+	}
+	return validate;
+}
+
 type RpcResponse =
 	| { jsonrpc: "2.0"; id: unknown; result: unknown }
 	| { jsonrpc: "2.0"; id: unknown; error: { code: number; message: string } };
@@ -238,8 +266,9 @@ interface Handled {
  * Handles one parsed JSON-RPC payload.
  * Returns null when nothing should be sent back (notifications and client responses only).
  * A batch is refused with 400 from 2025-06-18 on and handled for 2025-03-26, one message at a time in
- * payload order, so host side effects follow the batch order. A request id that is not a string or an
- * integer is refused with 400.
+ * payload order, so host side effects follow the batch order. A batch longer than MAX_BATCH_MESSAGES is
+ * refused with 400 before any element runs. A request id that is not a string or an integer is refused
+ * with 400; in a batch, that element gets its own error reply and the batch answers 400.
  */
 export async function handleMcpPayload(
 	host: McpToolHost,
@@ -257,12 +286,17 @@ export async function handleMcpPayload(
 		return { body: invalidRequest(), status: 400 };
 	}
 	if (payload.length === 0) return { body: invalidRequest() };
+	if (payload.length > MAX_BATCH_MESSAGES) return { body: invalidRequest(), status: 400 };
 	const replies: RpcResponse[] = [];
+	let status: number | undefined;
 	for (const message of payload) {
 		const handled = await handleMessage(host, message);
-		if (handled !== null) replies.push(handled.reply);
+		if (handled === null) continue;
+		replies.push(handled.reply);
+		if (handled.status !== undefined) status = handled.status;
 	}
-	return replies.length === 0 ? null : { body: replies };
+	if (replies.length === 0) return null;
+	return status === undefined ? { body: replies } : { body: replies, status };
 }
 
 async function handleMessage(host: McpToolHost, message: unknown): Promise<Handled | null> {
@@ -350,6 +384,12 @@ function getPrompt(id: unknown, params: unknown, serverPlanning: boolean): RpcRe
 	return rpcResult(id, { description: prompt.description, messages: prompt.messages });
 }
 
+/**
+ * Runs one tool after enforcing its inputSchema. Arguments that fail the schema are an `invalid_arguments` tool
+ * result (the same code a non-object `arguments` gets) whose single error reads `<path>: <reason>`, for example
+ * `arguments.foo: unknown property`; the host is not called. Every inputSchema sets `additionalProperties: false`,
+ * so an argument key the schema does not declare is refused rather than forwarded.
+ */
 async function callTool(
 	host: McpToolHost,
 	id: unknown,
@@ -360,9 +400,9 @@ async function callTool(
 	// MCP lets tools/call leave arguments out; every tool then runs with an empty object. Only a present non-object is refused.
 	const given = isRecord(params) ? params.arguments : undefined;
 	const args = isRecord(params) && "arguments" in params ? given : {};
-	if (typeof name !== "string" || !toolDefinitions(serverPlanning).some((tool) => tool.name === name)) {
-		return rpcError(id, INVALID_PARAMS, "unknown tool");
-	}
+	const tool =
+		typeof name === "string" ? toolDefinitions(serverPlanning).find((candidate) => candidate.name === name) : undefined;
+	if (tool === undefined) return rpcError(id, INVALID_PARAMS, "unknown tool");
 	if (!isRecord(args)) {
 		return rpcResult(id, {
 			content: [{ type: "text", text: "invalid arguments" }],
@@ -370,7 +410,11 @@ async function callTool(
 			isError: true,
 		});
 	}
-	return rpcResult(id, toolResult(await host.call(name, args)));
+	const verdict = validatorFor(tool)(args);
+	if (!verdict.ok) {
+		return rpcResult(id, toolResult({ ok: false, code: "invalid_arguments", errors: [`${verdict.path}: ${verdict.reason}`] }));
+	}
+	return rpcResult(id, toolResult(await host.call(tool.name, args)));
 }
 
 /** Maps a host outcome to an MCP tool result. Throws on a malformed outcome, which becomes -32603. */
