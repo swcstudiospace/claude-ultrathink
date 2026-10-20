@@ -317,7 +317,7 @@ Without a path it checks `${ULTRATHINK_STATE_DIR}/audit.jsonl`, with `ULTRATHINK
 
 The chain detects edits and removals inside the file. Removing the last records is only visible against a `lastHash` kept off the host, so if you need that guarantee, copy the verify output off the host on a schedule.
 
-Quarantine: at startup the service verifies the file. A broken file is renamed to `audit.jsonl.corrupt-<timestamp>` in the same directory and a new chain starts at record 1; the old records are kept in the renamed file. The rename is logged as `audit_write_failed` with a message that says `moved to`, and it increments `ultrathink_audit_write_failures_total` once, so that counter reads 1 after a quarantine although nothing failed to write. If the file cannot be opened or read, or cannot be renamed, startup fails rather than run without an audit trail. A crash during a write can leave a truncated last line; verify reports that as BROKEN too.
+Quarantine: at startup the service verifies the file. A broken file is renamed to `audit.jsonl.corrupt-<timestamp>` in the same directory and a new chain starts at record 1; the old records are kept in the renamed file, so nothing is lost. The rename is logged at info as `audit_chain_notice` and does not increment `ultrathink_audit_write_failures_total`. A file changed outside the service (rotated or removed) is adopted the same way and logs the same notice. If the file cannot be opened or read, or cannot be renamed, startup fails rather than run without an audit trail. A crash during a write can leave a truncated last line; verify reports that as BROKEN too.
 
 While the service runs, a failed write drops the affected record and the request continues. Each distinct failure message is logged once until a later append succeeds, and every drop increments `ultrathink_audit_write_failures_total`.
 
@@ -352,7 +352,7 @@ Scrape `127.0.0.1:8795/metrics` (loopback only; nginx does not proxy it). List t
 | `ultrathink_http_inflight` | none | Requests in flight now (gauge, sampled every 5 s) |
 | `ultrathink_overload_total` | none | Requests refused with 503 `overloaded` because `ULTRATHINK_MAX_INFLIGHT` was reached |
 | `ultrathink_upstream_breaker_state` | `state` (`closed`, `open`, `half_open`) | 1 for the current breaker state, 0 for the others; absent when `ULTRATHINK_BREAKER_FAILURES` is 0 |
-| `ultrathink_audit_write_failures_total` | none | Audit records dropped on a write failure, plus one count for a startup quarantine (section 7, Audit log) |
+| `ultrathink_audit_write_failures_total` | none | Audit records dropped on a write failure (section 7, Audit log). A quarantine or an outside change does not count |
 | `ultrathink_retention_removed_total` | `kind` (`jobs`, `sessions`, `journals`) | Entries removed by the hourly retention sweep |
 | `ultrathink_event_loop_lag_seconds` | none | Event-loop lag at the last sample (gauge, sampled every 5 s) |
 
@@ -374,7 +374,7 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 | Dropped series | `increase(ultrathink_metrics_dropped_total[1h]) > 0` (label cardinality abuse). | Ticket |
 | Overload (suggested) | `increase(ultrathink_overload_total[10m]) > 0` for 10 minutes, or `ultrathink_http_inflight` held at the `ULTRATHINK_MAX_INFLIGHT` value for 5 minutes. A few refusals in a burst are expected. A sustained count means requests arrive faster than they finish, usually from a slow upstream call or a flood. Find the slow endpoint in the request log. | Ticket |
 | Upstream breaker (suggested) | `ultrathink_upstream_breaker_state{state="open"} == 1` for more than 5 minutes. Planning is refused while it is open; check OpenRouter's status and your key credit (section 7). Repeated short `half_open` periods mean the probe keeps failing. | Ticket |
-| Audit writes (suggested) | `increase(ultrathink_audit_write_failures_total[1h]) > 0`. Each count is an audit record that was not written, so the trail has a gap. A startup quarantine also counts once, so an alert right after a restart needs a look at the journal (section 7, Audit log). | Ticket |
+| Audit writes (suggested) | `increase(ultrathink_audit_write_failures_total[1h]) > 0`. Each count is an audit record that was not written, so the trail has a gap. | Ticket |
 | Event-loop lag (suggested) | `ultrathink_event_loop_lag_seconds` above 0.2 for 5 minutes. Sustained lag means the process is CPU-bound or blocked, which slows every endpoint and can lead to overload refusals. | Ticket |
 | Retention sweep (no alert) | `increase(ultrathink_retention_removed_total[1d]) or vector(0)` shows what the hourly sweep removed. The counter appears only after its first removal. A sweep that never removes anything while old entries exist is not running: check the service journal for errors. | None |
 | Backups | Newest file in `/var/backups/ultrathink` older than 36 hours; `ultrathink-maintenance.service` in `failed`. | Ticket |

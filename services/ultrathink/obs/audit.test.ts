@@ -342,16 +342,18 @@ describe("failure handling", () => {
 		const dir = tempDir();
 		const path = auditPath(dir);
 		const errors: Error[] = [];
-		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		const notices: string[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
 		log.record("login_ok", { n: 1 });
 		rmSync(path);
 		chmodSync(dir, 0o500);
 		log.record("login_ok", { n: 2 });
 		log.record("login_ok", { n: 3 });
-		expect(errors.map((e) => e.message.includes("record dropped"))).toEqual([false, true, true]);
+		expect(errors.map((e) => e.message.includes("record dropped"))).toEqual([true, true]);
+		expect(notices.some((m) => /changed outside the service/.test(m))).toBe(true);
 		chmodSync(dir, 0o700);
 		log.record("login_ok", { n: 4 });
-		expect(errors.length).toBe(3);
+		expect(errors.length).toBe(2);
 		expect(existsSync(path)).toBe(true);
 	});
 
