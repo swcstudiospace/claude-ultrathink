@@ -153,7 +153,7 @@ describe("definitions", () => {
 		expect(graph?.description).toContain("/ultrathink-think");
 		expect(graph?.description).toContain("ultrathink_result");
 		expect(sessions?.description).toContain("/ultrathink-status");
-		expect(sessions?.description).toContain("/ultrathink-last");
+		expect(graph?.description).toContain("/ultrathink-last");
 		expect(command?.description).toContain("/ultrathink-quick");
 		expect(command?.description).toContain("help");
 	});
