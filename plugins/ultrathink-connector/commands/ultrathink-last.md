@@ -9,6 +9,3 @@ Show the newest planned ultrathink plan with its diagram.
 3. Show the wave tree from `ultrathink_graph` first, unchanged, in a code block, and the mermaid diagram too only if your interface renders Mermaid. Then give the plan from `ultrathink_result`: what it decides and the questions in it that matter.
 
 Use only tool results. Never invent a `sessionId`. Do not start a plan.
-
-
-[You have received this identical output 4 times. Re-reading '/root/src/worktrees/claude-ultrathink-connector/plugins/ultrathink-connector/commands/ultrathink-last.md:raw' will not change it — use a narrower selector (path:A-B), or proceed with the edit.]

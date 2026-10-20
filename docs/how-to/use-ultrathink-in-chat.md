@@ -276,7 +276,7 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | State directory: database, `oauth.json`, `journal/`, `sessions/`, `jobs/`. |
 | `ULTRATHINK_PORT` | `8795` | Listen port, 1024 to 65535. |
 | `ULTRATHINK_MAX_INPUT_CHARS` | `8000` | Longest request, 1 to 20000 characters. |
-| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 200000 characters. |
+| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 20000 characters. |
 | `ULTRATHINK_RUN_TOKEN_CEILING` | `150000` | Token limit for one plan. A plan over it stops with `budget_exceeded`. |
 | `ULTRATHINK_DAILY_TOKEN_CEILING` | `1000000` | Token limit per UTC day across all plans. |
 | `ULTRATHINK_PLANNING_MODEL` | unset | OpenRouter model id for server-side planning, for example `x-ai/grok-4.7`. Server-side mode needs it. |
