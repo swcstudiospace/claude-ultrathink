@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { MCP_PROVIDERS, PROVIDERS, USER_AGENT } from "./providers.ts";
 import type { McpProviderId, ProviderId } from "./providers.ts";
 import { readStore, withStoreLock, writeStore } from "./store.ts";
+import { readBodyPrefix } from "../net/body.ts";
 import type { CredentialStore, OAuthClient, OAuthTokens } from "./store.ts";
 
 export interface AuthDeps {
@@ -33,6 +34,8 @@ export interface ProviderStatus {
 const REFRESH_SKEW_MS = 60_000;
 /** Bounds every request made while the store lock is held so a hung endpoint cannot outlive the lock. */
 const LOCKED_FETCH_TIMEOUT_MS = 15_000;
+/** Every OAuth metadata, token and registration body is read up to this many bytes; a larger one is unreadable. */
+const MAX_AUTH_BODY_BYTES = 1024 * 1024;
 
 class TokenEndpointError extends Error {
 	constructor(
@@ -55,6 +58,18 @@ function isHttps(url: unknown): boolean {
 	}
 }
 
+/** A JSON object from a bounded read: undefined when the body is unreadable, longer than the cap, or not a JSON object. */
+async function readJsonObject(response: Response): Promise<Record<string, unknown> | undefined> {
+	try {
+		const prefix = await readBodyPrefix(response, MAX_AUTH_BODY_BYTES);
+		if (!prefix.complete) return undefined;
+		const value: unknown = JSON.parse(prefix.text);
+		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function getJson(url: string, deps: AuthDeps): Promise<Record<string, unknown> | undefined> {
 	const response = await (deps.fetch ?? fetch)(url, {
 		headers: { Accept: "application/json", "User-Agent": USER_AGENT },
@@ -62,11 +77,7 @@ async function getJson(url: string, deps: AuthDeps): Promise<Record<string, unkn
 		redirect: "error",
 	});
 	if (!response.ok) return undefined;
-	try {
-		return (await response.json()) as Record<string, unknown>;
-	} catch {
-		return undefined;
-	}
+	return readJsonObject(response);
 }
 
 /** Store mutations always re-read inside the lock so a stale snapshot is never written. */
@@ -97,12 +108,8 @@ async function tokenRequest(client: OAuthClient, params: Record<string, string>,
 		signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
 		redirect: "error",
 	});
-	let json: Record<string, unknown> = {};
-	try {
-		json = (await response.json()) as Record<string, unknown>;
-	} catch {
-		// non-JSON body; status alone decides
-	}
+	// A body that is not a JSON object, or is longer than the cap, leaves json empty: the status decides.
+	const json = (await readJsonObject(response)) ?? {};
 	if (!response.ok || typeof json.access_token !== "string") {
 		throw new TokenEndpointError(response.status, typeof json.error === "string" ? json.error : undefined);
 	}
@@ -176,8 +183,8 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 	) {
 		throw new Error(`${provider}: authorization server metadata at ${issuer} must use https`);
 	}
-	// RFC 8414 §3.3: metadata served for an issuer must name that issuer, or it could be another server's.
-	if (asMeta.issuer !== undefined && (typeof asMeta.issuer !== "string" || asMeta.issuer.replace(/\/$/, "") !== issuer)) {
+	// RFC 8414 §2 and §3.3: the metadata must name the issuer it was fetched for, or it could be another server's.
+	if (typeof asMeta.issuer !== "string" || asMeta.issuer.replace(/\/$/, "") !== issuer) {
 		throw new Error(`${provider}: authorization server metadata issuer mismatch at ${issuer}`);
 	}
 
@@ -207,7 +214,7 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 			signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
 			redirect: "error",
 		});
-		const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+		const json = (await readJsonObject(response)) ?? {};
 		if (!response.ok || typeof json.client_id !== "string") {
 			throw new Error(
 				`${provider}: client registration failed: HTTP ${response.status}${typeof json.error === "string" ? ` (${json.error})` : ""}`,

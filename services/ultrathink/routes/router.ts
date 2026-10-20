@@ -26,6 +26,7 @@ import { createDrainState, createInflight, createRuntimeProbe } from "../obs/run
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
+import { createWalCheckpointer } from "../store/checkpoint.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
 
 export interface RouterDeps {
@@ -125,6 +126,8 @@ const BREAKER_STATES: readonly BreakerState[] = ["closed", "open", "half_open"];
 const CONNECTOR_OWNER_LIMIT = 240;
 const RUNTIME_SAMPLE_MS = 5000;
 const RETENTION_SWEEP_MS = 60 * 60 * 1000;
+/** The WAL is folded into the main file this often, so a busy host does not grow it between sweeps. */
+const WAL_CHECKPOINT_MS = 10 * 60 * 1000;
 
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 
@@ -824,6 +827,7 @@ export function createApp(deps: RouterDeps): App {
 
 	let stopProbe: (() => void) | undefined;
 	let stopSweeper: (() => void) | undefined;
+	let stopCheckpoint: (() => void) | undefined;
 	let lifecycleStarted = false;
 
 	/** Starts the runtime probe and, when retention is enabled, the sweeper. Runs once; later calls change nothing. */
@@ -855,6 +859,11 @@ export function createApp(deps: RouterDeps): App {
 				onError: (error) => logger.error("retention_failed", { error: error.message }),
 			}).start();
 		}
+		stopCheckpoint = createWalCheckpointer({
+			checkpoint: () => store.checkpoint(),
+			intervalMs: WAL_CHECKPOINT_MS,
+			onBlocked: () => logger.warn("wal_checkpoint_blocked", {}),
+		}).start();
 		refreshIntegrity();
 	}
 
@@ -867,6 +876,7 @@ export function createApp(deps: RouterDeps): App {
 		async shutdown() {
 			stopProbe?.();
 			stopSweeper?.();
+			stopCheckpoint?.();
 			auditLog?.close();
 			await planner.shutdown();
 		},

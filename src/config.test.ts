@@ -146,6 +146,8 @@ describe("mergeConfig", () => {
 		expect(bad.shuntModel).toBe(base.grok.shuntModel);
 		expect(bad.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
 		expect(mergeConfig({ grok: { shuntBaseUrl: "ftp://x" } }, base).grok.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(mergeConfig({ grok: { shuntBaseUrl: "http://shunt.example.com:3001" } }, base).grok.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(mergeConfig({ grok: { shuntBaseUrl: "https://shunt.example.com/" } }, base).grok.shuntBaseUrl).toBe("https://shunt.example.com");
 		expect(mergeConfig({ grok: { shuntMaxTokens: 1.5 } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
 		expect(mergeConfig({ grok: { shuntMaxTokens: "8192" } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
 	});

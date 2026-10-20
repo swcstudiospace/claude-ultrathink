@@ -236,12 +236,65 @@ describe("login", () => {
 		expect(await resolveAuthHeader("notion", deps)).toBe("Bearer at-1");
 	});
 
+	test("discovered metadata that does not name its issuer is refused", async () => {
+		const fake = fakeFetch({
+			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
+				json({ authorization_servers: ["https://mcp.linear.app"] }),
+			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
+				json({ authorization_endpoint: "https://mcp.linear.app/authorize", token_endpoint: "https://mcp.linear.app/token" }),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		await expect(beginLogin("linear", { ...deps, redirectUri: REDIRECT })).rejects.toThrow("issuer mismatch");
+	});
+
+	test("a token response of exactly the body cap is read", async () => {
+		const body = (padding: number) => JSON.stringify({ access_token: "at-1", pad: "x".repeat(padding) });
+		const cap = 1024 * 1024;
+		const fake = fakeFetch(notionRoutes(() => new Response(body(cap - body(0).length), { headers: { "content-type": "application/json" } })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await completeLogin(pending, "X", deps);
+		expect(await resolveAuthHeader("notion", deps)).toBe("Bearer at-1");
+	});
+
+	test("a token response one byte over the body cap is refused", async () => {
+		const body = (padding: number) => JSON.stringify({ access_token: "at-1", pad: "x".repeat(padding) });
+		const cap = 1024 * 1024;
+		const fake = fakeFetch(notionRoutes(() => new Response(body(cap - body(0).length + 1), { headers: { "content-type": "application/json" } })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await expect(completeLogin(pending, "X", deps)).rejects.toThrow();
+	});
+
+	test("an unreadable metadata body falls back to the next discovery document", async () => {
+		const broken = new Response(new ReadableStream({ pull: (controller) => controller.error(new Error("connection reset")) }), {
+			headers: { "content-type": "application/json" },
+		});
+		const fake = fakeFetch({
+			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
+				json({ authorization_servers: ["https://mcp.linear.app"] }),
+			"https://mcp.linear.app/.well-known/oauth-authorization-server": () => broken,
+			"https://mcp.linear.app/.well-known/openid-configuration": () =>
+				json({
+					issuer: "https://mcp.linear.app",
+					authorization_endpoint: "https://mcp.linear.app/authorize",
+					token_endpoint: "https://mcp.linear.app/token",
+					registration_endpoint: "https://mcp.linear.app/register",
+				}),
+			"https://mcp.linear.app/register": () => json({ client_id: "lin-cid" }, 201),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("linear", { ...deps, redirectUri: REDIRECT });
+		expect(pending.client.clientId).toBe("lin-cid");
+	});
+
 	test("beginLogin keeps an existing api key or live tokens usable", async () => {
 		const linearRoutes = {
 			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
 				json({ authorization_servers: ["https://mcp.linear.app"] }),
 			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
 				json({
+					issuer: "https://mcp.linear.app",
 					authorization_endpoint: "https://mcp.linear.app/authorize",
 					token_endpoint: "https://mcp.linear.app/token",
 					registration_endpoint: "https://mcp.linear.app/register",

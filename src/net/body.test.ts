@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
-import { readBodyPrefix } from "./body.ts";
+import { readBodyPrefix, readBodyText } from "./body.ts";
 
 const encoder = new TextEncoder();
 
@@ -36,9 +36,20 @@ describe("readBodyPrefix", () => {
 		expect(pulled()).toBeLessThan(4);
 	});
 
-	test("a body of exactly the limit is incomplete only when more follows", async () => {
-		expect(await readBodyPrefix(chunked(["abcd"]).response, 4)).toEqual({ text: "abcd", complete: false });
+	test("a body of exactly the limit is complete, and one byte more is incomplete", async () => {
+		expect(await readBodyPrefix(chunked(["abcd"]).response, 4)).toEqual({ text: "abcd", complete: true });
 		expect(await readBodyPrefix(chunked(["abc"]).response, 4)).toEqual({ text: "abc", complete: true });
+		expect(await readBodyPrefix(chunked(["abcde"]).response, 4)).toEqual({ text: "abcd", complete: false });
+	});
+
+	test("the text-only read returns at the limit without waiting for a stream that never ends", async () => {
+		const encoder = new TextEncoder();
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				controller.enqueue(encoder.encode("abcd"));
+			},
+		});
+		expect(await readBodyText(new Response(stream), 4)).toBe("abcd");
 	});
 
 	test("decodes multi-byte characters split across chunks", async () => {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { readBodyPrefix } from "../net/body.ts";
+import { readBodyPrefix, readBodyText } from "../net/body.ts";
 import { createSseParser } from "./sse.ts";
 
 export interface RelayAuth {
@@ -62,7 +62,7 @@ function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 async function detectRateLimit(response: Response): Promise<RateLimit | undefined> {
 	const { status, headers } = response;
 	if (status !== 429 && status !== 401 && status !== 403) return undefined;
-	const body = await readBodyPrefix(response, RATE_LIMIT_BODY_BYTES).then((prefix) => prefix.text, () => "");
+	const body = await readBodyText(response, RATE_LIMIT_BODY_BYTES).catch(() => "");
 	const limited =
 		status === 429 || headers.has("retry-after") || headers.get("x-ratelimit-remaining")?.trim() === "0" || RATE_LIMIT_TEXT.test(body);
 	return limited ? { retryAfter: retryAfterSeconds(headers, body) } : undefined;
@@ -91,7 +91,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		if (sessionUsed !== undefined) headers["Mcp-Session-Id"] = sessionUsed;
 		if (protocolVersion !== undefined) headers["MCP-Protocol-Version"] = protocolVersion;
 		try {
-			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal });
+			// A redirect would resend the bearer token to wherever it points, so it is an error.
+			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal, redirect: "error" });
 			return { response, header, sessionUsed, rateLimit: await detectRateLimit(response) };
 		} catch {
 			return { header, sessionUsed };

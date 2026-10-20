@@ -10,14 +10,25 @@ interface Call {
 	headers: Headers;
 	body: { id?: unknown; method?: string };
 	signal?: AbortSignal;
+	redirect?: RequestInit["redirect"];
 }
 
 function fakeFetch(respond: (call: Call, index: number) => Response): { fetch: typeof fetch; calls: Call[] } {
 	const calls: Call[] = [];
 	const impl = async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
-		const call = { headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined };
+		const call: Call = {
+			headers: new Headers(init?.headers),
+			body: JSON.parse(String(init?.body)),
+			signal: init?.signal ?? undefined,
+			redirect: init?.redirect,
+		};
 		calls.push(call);
-		return respond(call, calls.length - 1);
+		const response = respond(call, calls.length - 1);
+		// As the real fetch does, a redirect is a network error when the caller asked for redirect: "error".
+		if (init?.redirect === "error" && response.status >= 300 && response.status < 400) {
+			throw new TypeError("fetch failed: redirect is not allowed");
+		}
+		return response;
 	};
 	return { fetch: impl as unknown as typeof fetch, calls };
 }
@@ -62,6 +73,42 @@ describe("createSseParser", () => {
 		parser.push("data: ok\n");
 		parser.push("data: 12");
 		expect(() => parser.push("3")).toThrow("SSE line too long");
+	});
+
+	test("an event whose data outgrows the cap is refused, even when each line is short", () => {
+		const parser = createSseParser(() => {}, 8);
+		parser.push("data: 1234\n");
+		expect(() => parser.push("data: 5678\n")).toThrow("SSE event too large");
+	});
+
+	test("an event whose data is exactly the cap is delivered", () => {
+		const got: string[] = [];
+		const parser = createSseParser((data) => got.push(data), 8);
+		parser.push("data:12\ndata:34\ndata:56\n\n");
+		expect(got).toEqual(["12\n34\n56"]);
+	});
+});
+
+describe("createRelay redirects", () => {
+	test("every POST refuses redirects, including the retry after a 401", async () => {
+		const auth: RelayAuth = { header: async () => "Bearer t", unauthorized: async () => true };
+		const { relay, calls, out } = setup(
+			(_call, index) => (index === 0 ? new Response("", { status: 401 }) : json({ jsonrpc: "2.0", id: 1, result: {} })),
+			auth,
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "a" });
+		expect(calls.map((call) => call.redirect)).toEqual(["error", "error"]);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, result: {} }]);
+	});
+
+	test("a refused redirect is one transport error, and the POST is not repeated", async () => {
+		const { relay, calls, out } = setup(
+			() => new Response(null, { status: 302, headers: { location: "https://elsewhere.example.com/mcp" } }),
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 2, method: "a" });
+		expect(calls).toHaveLength(1);
+		expect(out()).toHaveLength(1);
+		expect(out()[0]).toHaveProperty("error");
 	});
 });
 
