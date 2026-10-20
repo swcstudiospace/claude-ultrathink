@@ -3,7 +3,7 @@
 
 /**
  * The three connector tools that give the chat client the plugin's slash commands: ultrathink_graph
- * (/ultrathink-think), ultrathink_sessions (/ultrathink-status, first step of /ultrathink-last) and
+ * (/ultrathink-think, /ultrathink-last), ultrathink_sessions (/ultrathink-status) and
  * ultrathink_command (every other /ultrathink-<name>). The handlers take their dependencies explicitly so the HTTP
  * host and a stdio host can build them the same way; none of them reads the clock or the environment.
  *
@@ -49,7 +49,7 @@ export const CONNECTOR_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		name: GRAPH_TOOL,
 		title: "Show the Graph of Thought of a plan",
 		description:
-			"The tool behind the /ultrathink-think command: a message that starts with /ultrathink-think and a command name is this command, not a request to plan. When the user's message starts with /ultrathink-think, call this with the sessionId that follows it (omit sessionId to use the newest planned session) and node when a node id follows. Returns the plan's Graph of Thought x Chain of Thought as a wave tree and a Mermaid diagram; node adds that node's question, steps and conclusion, and detail full adds every node's. Show the user the wave tree first, unchanged, in a code block, and the Mermaid diagram too only if your interface renders Mermaid. With server planning the plan card already shows the graph, so do not call this after ultrathink_result for the same session unless the user asks; with a client-answered plan, call it once when the plan is ready.",
+			"The tool behind the /ultrathink-think and /ultrathink-last commands. When the user's message starts with /ultrathink-last, call this with no arguments to resolve the newest planned session, show its wave tree first, then call ultrathink_result with that sessionId. When the message starts with /ultrathink-think, call this with the sessionId that follows it (omit sessionId to use the newest planned session) and node when a node id follows. Returns the plan's Graph of Thought x Chain of Thought as a wave tree and a Mermaid diagram; node adds that node's question, steps and conclusion, and detail full adds every node's. Show the user the wave tree first, unchanged, in a code block, and the Mermaid diagram too only if your interface renders Mermaid. With server planning the plan card already shows the graph, so do not call this after ultrathink_result for the same session unless the user asks; with a client-answered plan, call it once when the plan is ready.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -74,7 +74,7 @@ export const CONNECTOR_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		name: SESSIONS_TOOL,
 		title: "List recent planning sessions",
 		description:
-			"The tool behind the /ultrathink-status command and the first step of /ultrathink-last. When the user's message starts with /ultrathink-status, call this with no arguments and tell the user the planning mode, the token ceilings and today's usage when the result has them, and one line per recent session. For /ultrathink-last, call this with limit 5, then call ultrathink_graph and ultrathink_result with the sessionId of the newest session whose status is planned, and show the user its wave tree first, unchanged, in a code block. Lists the newest sessions first with their sessionId, status, mode, goal and node count.",
+			"The tool behind the /ultrathink-status command. When the user's message starts with /ultrathink-status, call this with no arguments and tell the user the planning mode, the token ceilings and today's usage when the result has them, and one line per recent session. For /ultrathink-last, call ultrathink_graph with no arguments and ultrathink_result with that sessionId instead. Lists the newest sessions first with their sessionId, status, mode, goal and node count.",
 		inputSchema: {
 			type: "object",
 			properties: {

@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -209,10 +209,11 @@ function breakStale(lockPath: string, seen: LockObservation): void {
 	const claimed = observeLock(claim);
 	if (claimed === null || claimed.ino !== seen.ino || claimed.token !== seen.token) {
 		try {
-			linkSync(claim, lockPath);
+			renameSync(claim, lockPath);
 		} catch {
-			// someone else already created a new lock; the owner's token check keeps its release safe
+			rmSync(claim, { recursive: true, force: true });
 		}
+		return;
 	}
 	rmSync(claim, { recursive: true, force: true });
 }

@@ -157,8 +157,19 @@ const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
 	return promise;
 };
 
+/** Whether Jev may call OpenRouter directly for this job (counts against the same ceilings as model calls). */
+function decisionsAllowed(service: UltrathinkConfig, job: Job, ledger: Ledger, at: number): boolean {
+	if (!service.serverDecisions) return false;
+	const headroom = service.modelMaxOutputTokens;
+	const day = new Date(at).toISOString().slice(0, 10);
+	return (
+		ledger.spentForRun(job.runId) + headroom <= service.runTokenCeiling &&
+		ledger.spentForDay(day) + headroom <= service.dailyTokenCeiling
+	);
+}
+
 /** The plugin config a server plan runs with: planning on, everything that reaches outside the model off. */
-function pluginConfig(service: UltrathinkConfig): PluginConfig {
+function pluginConfig(service: UltrathinkConfig, job: Job, ledger: Ledger, at: number): PluginConfig {
 	const config = defaultConfig();
 	config.uplift = { ...config.uplift, enabled: true, skipTrivial: false, echo: false };
 	config.claude = { ...config.claude, concurrency: 3, callTimeoutMs: 0, budgetMs: 0, echo: false };
@@ -169,7 +180,7 @@ function pluginConfig(service: UltrathinkConfig): PluginConfig {
 	config.hindsight = { ...config.hindsight, enabled: false, url: "" };
 	config.ragflow = { ...config.ragflow, enabled: false, ground: false, url: "" };
 	config.teach = { ...config.teach, enabled: false, recall: false };
-	config.decisions = { ...config.decisions, enabled: service.serverDecisions };
+	config.decisions = { ...config.decisions, enabled: decisionsAllowed(service, job, ledger, at) };
 	config.substrate = { ...config.substrate, url: "" };
 	config.gateway = { ...config.gateway, url: "" };
 	config.notion = { dataSourceUrl: "" };
@@ -261,7 +272,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 		}
 	}
 
-	function plannerEnv(): Record<string, string | undefined> {
+	function plannerEnv(job: Job): Record<string, string | undefined> {
 		const base = opts.env ?? process.env;
 		const env: Record<string, string | undefined> = {};
 		for (const key of PASS_THROUGH_ENV) if (base[key] !== undefined) env[key] = base[key];
@@ -275,8 +286,8 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			ULTRATHINK_GATEWAY: "0",
 			SUBSTRATE_DISABLED: "1",
 		});
-		if (config.serverDecisions) {
-			// Jev reads its key from the env; this is the one place the key is handed to the plugin.
+		if (decisionsAllowed(config, job, ledger, now())) {
+			// Jev reads its key from the env; only hand it over when the ledger still has headroom.
 			if (config.openRouterApiKey !== undefined) env.OPENROUTER_API_KEY = config.openRouterApiKey;
 		} else {
 			env.ULTRATHINK_DECISIONS = "0";
@@ -448,10 +459,10 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			.catch(() => {});
 		let outcome: Outcome;
 		try {
-			const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(), {
+			const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(job), {
 				stateDir,
 				signal: job.controller.signal,
-				config: pluginConfig(config),
+				config: pluginConfig(config, job, ledger, now()),
 				control: { enabled: true },
 				createTracker: () => undefined,
 				selectEngine: async (): Promise<SelectedEngine> => ({

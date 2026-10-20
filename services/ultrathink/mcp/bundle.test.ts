@@ -85,18 +85,17 @@ describe("plugin bundle commands", () => {
 		}
 	});
 
-	test("every statement of how /ultrathink-last reads the sessions agrees on limit 5", () => {
-		expect(read("commands/ultrathink-last.md")).toContain("`ultrathink_sessions` with `limit` 5");
-		expect(read("commands/ultrathink-last.md")).toContain("newest session whose status is planned");
-		expect(read("skills/ultrathink-connector/SKILL.md")).toContain("`ultrathink_sessions` with `limit` 5");
+	test("every statement of how /ultrathink-last resolves the newest planned session agrees", () => {
+		expect(read("commands/ultrathink-last.md")).toContain("`ultrathink_graph` with no arguments");
+		expect(read("skills/ultrathink-connector/SKILL.md")).toContain("`ultrathink_graph` with no arguments");
 		const rendered = renderPrompt("ultrathink-last", {});
 		if (!rendered.ok) throw new Error("expected the ultrathink-last prompt");
 		const promptText = rendered.messages.map((message) => message.content.text).join("\n");
-		expect(promptText).toContain("ultrathink_sessions with limit 5");
+		expect(promptText).toContain("ultrathink_graph with no arguments");
 		const routing = readFileSync(join(REPOSITORY_ROOT, "services", "ultrathink", "mcp", "mcp.ts"), "utf8");
-		expect(routing).toContain("/ultrathink-last calls ultrathink_sessions with limit 5");
-		const sessionsTool = CONNECTOR_TOOL_DEFINITIONS.find((tool) => tool.name === "ultrathink_sessions");
-		expect(sessionsTool?.description).toContain("call this with limit 5");
+		expect(routing).toContain("/ultrathink-last calls ultrathink_graph with no arguments");
+		const graphTool = CONNECTOR_TOOL_DEFINITIONS.find((tool) => tool.name === "ultrathink_graph");
+		expect(graphTool?.description).toContain("/ultrathink-last");
 	});
 
 	test("plan commands show the wave tree first and stop on failed, invalid or skipped", () => {

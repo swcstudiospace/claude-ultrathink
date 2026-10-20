@@ -483,6 +483,14 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		flush();
 	}
 
+	function snapshotStore(): string {
+		return JSON.stringify(data);
+	}
+
+	function restoreStore(snapshot: string): void {
+		Object.assign(data, JSON.parse(snapshot) as typeof data);
+	}
+
 	// One timer for every pending request. It stops itself when nothing is pending.
 	function ensureSweeper(): void {
 		if (schedule === undefined || cancelSweep !== null) return;
@@ -739,9 +747,15 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		if (!pkceMatches(form.get("code_verifier") ?? "", record.codeChallenge)) {
 			return invalidGrant("PKCE verification failed.");
 		}
+		const snapshot = snapshotStore();
 		record.used = true;
 		const body = issueTokens(record.grantId, record.clientId, record.resource, record.scope ?? null);
-		persist();
+		try {
+			persist();
+		} catch {
+			restoreStore(snapshot);
+			return oauthError(500, "server_error", "OAuth state could not be saved.");
+		}
 		return jsonResponse(200, body);
 	}
 
@@ -761,9 +775,15 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		if (presented !== null && presented !== "" && !sameResource(presented)) {
 			return oauthError(400, "invalid_target", "resource must be the ultrathink MCP endpoint.");
 		}
+		const snapshot = snapshotStore();
 		record.used = true;
 		const body = issueTokens(record.grantId, record.clientId, record.resource, record.scope ?? null);
-		persist();
+		try {
+			persist();
+		} catch {
+			restoreStore(snapshot);
+			return oauthError(500, "server_error", "OAuth state could not be saved.");
+		}
 		return jsonResponse(200, body);
 	}
 
