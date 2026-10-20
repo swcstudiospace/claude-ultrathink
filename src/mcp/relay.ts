@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
-import { readBodyPrefix } from "../net/body.ts";
+import { readBodyPrefix, readBodyText } from "../net/body.ts";
 import { createSseParser } from "./sse.ts";
 
 export interface RelayAuth {
@@ -62,7 +62,7 @@ function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 async function detectRateLimit(response: Response): Promise<RateLimit | undefined> {
 	const { status, headers } = response;
 	if (status !== 429 && status !== 401 && status !== 403) return undefined;
-	const body = await readBodyPrefix(response, RATE_LIMIT_BODY_BYTES).then((prefix) => prefix.text, () => "");
+	const body = await readBodyText(response, RATE_LIMIT_BODY_BYTES).catch(() => "");
 	const limited =
 		status === 429 || headers.has("retry-after") || headers.get("x-ratelimit-remaining")?.trim() === "0" || RATE_LIMIT_TEXT.test(body);
 	return limited ? { retryAfter: retryAfterSeconds(headers, body) } : undefined;

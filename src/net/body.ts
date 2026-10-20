@@ -12,8 +12,9 @@ export interface BodyPrefix {
 /**
  * Reads at most `limit` bytes of `response.body`, then cancels the rest of the stream. An abort of `signal` cancels a
  * pending read and rejects with the signal's reason; a stream error is rethrown. The reader lock is always released.
+ * `needComplete` decides whether a body of exactly `limit` bytes is awaited to its end (complete) or returned at once.
  */
-export async function readBodyPrefix(response: Response, limit: number, signal?: AbortSignal): Promise<BodyPrefix> {
+async function readPrefix(response: Response, limit: number, signal: AbortSignal | undefined, needComplete: boolean): Promise<BodyPrefix> {
 	if (!response.body) return { text: "", complete: true };
 	const reader = response.body.getReader();
 	const onAbort = (): void => {
@@ -27,6 +28,7 @@ export async function readBodyPrefix(response: Response, limit: number, signal?:
 	try {
 		if (signal?.aborted) throw signal.reason;
 		for (;;) {
+			if (!needComplete && size === limit) break;
 			const { done, value } = await reader.read();
 			if (signal?.aborted) throw signal.reason;
 			if (done) {
@@ -47,4 +49,17 @@ export async function readBodyPrefix(response: Response, limit: number, signal?:
 		await reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
+}
+
+/** Reads a body up to `limit` bytes and reports whether the whole body fit (waits for the stream to end at the limit). */
+export function readBodyPrefix(response: Response, limit: number, signal?: AbortSignal): Promise<BodyPrefix> {
+	return readPrefix(response, limit, signal, true);
+}
+
+/**
+ * The first `limit` bytes as text, returned as soon as they are read. Use when only the text matters: a body that
+ * ends exactly at the limit is not awaited, so a stalled upstream cannot hold the caller past the first `limit` bytes.
+ */
+export async function readBodyText(response: Response, limit: number, signal?: AbortSignal): Promise<string> {
+	return (await readPrefix(response, limit, signal, false)).text;
 }
