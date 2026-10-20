@@ -206,10 +206,29 @@ export function sanitizeInput(input: string): string {
 
 /**
  * Strips HTML tags from input (for plain text contexts)
+ *
+ * Single left-to-right pass over the input, as a two-state machine. Outside a tag, '<' opens
+ * a tag and emits nothing, '>' is dropped, and any other character is emitted. Inside a tag,
+ * every character is dropped until a '>' closes the tag. If the input ends while still inside
+ * a tag, the remainder is dropped: an unterminated tag opener swallows the rest of the input.
+ * This is the conservative choice for plain-text output. The result never contains '<' or '>',
+ * and each input character is visited once, so the cost is linear.
  */
 export function stripHtmlTags(input: string): string {
-  // Drop well-formed tags, then strip any remaining angle brackets (e.g. partial `<script`).
-  return input.replace(/<[^>]*>/g, '').replace(/[<>]/g, '');
+  let output = '';
+  let inTag = false;
+  for (const char of input) {
+    if (inTag) {
+      if (char === '>') {
+        inTag = false;
+      }
+    } else if (char === '<') {
+      inTag = true;
+    } else if (char !== '>') {
+      output += char;
+    }
+  }
+  return output;
 }
 
 /**
@@ -299,27 +318,29 @@ export function encodeForContext(input: string, context: OutputContext): string 
 }
 
 /**
- * Encodes all string values in an object for the given context
+ * Encodes a value for the given context, recursing through arrays and objects
+ */
+function encodeValueForContext(value: unknown, context: OutputContext): unknown {
+  if (typeof value === 'string') return encodeForContext(value, context);
+  if (Array.isArray(value)) return value.map((item) => encodeValueForContext(item, context));
+  if (typeof value === 'object' && value !== null) {
+    return encodeObjectForContext(value as Record<string, unknown>, context);
+  }
+  return value;
+}
+
+/**
+ * Encodes all string values in an object for the given context, at any depth
  */
 export function encodeObjectForContext<T extends Record<string, unknown>>(
   obj: T,
   context: OutputContext
 ): T {
-  const result = {} as T;
+  const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
-    if (typeof value === 'string') {
-      (result as Record<string, unknown>)[key] = encodeForContext(value, context);
-    } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      (result as Record<string, unknown>)[key] = encodeObjectForContext(value as Record<string, unknown>, context);
-    } else if (Array.isArray(value)) {
-      (result as Record<string, unknown>)[key] = value.map((v) =>
-        typeof v === 'string' ? encodeForContext(v, context) : v
-      );
-    } else {
-      (result as Record<string, unknown>)[key] = value;
-    }
+    result[key] = encodeValueForContext(value, context);
   }
-  return result;
+  return result as T;
 }
 
 export default {

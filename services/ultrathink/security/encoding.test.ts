@@ -230,8 +230,32 @@ describe("Encoding", () => {
 			expect(stripHtmlTags("<script>alert(1)</script>")).toBe("alert(1)");
 		});
 
-		test("strips partial tag openers", () => {
-			expect(stripHtmlTags("before<scriptafter")).toBe("beforescriptafter");
+		test("an unterminated tag opener swallows the rest of the input", () => {
+			expect(stripHtmlTags("before<scriptafter")).toBe("before");
+		});
+
+		test("removes nested and partial markup until no angle brackets remain", () => {
+			expect(stripHtmlTags("<<script>script>")).toBe("script");
+			expect(stripHtmlTags("<<script>>alert(1)<</script>>")).toBe("alert(1)");
+			expect(stripHtmlTags("<scr<b>ipt>alert(1)</scr<b>ipt>")).toBe("iptalert(1)ipt");
+			expect(stripHtmlTags("a<b")).toBe("a");
+			expect(stripHtmlTags("a>b")).toBe("ab");
+			expect(stripHtmlTags("a<b>c</b>d")).toBe("acd");
+		});
+
+		test("output never contains angle brackets", () => {
+			const inputs = ["<<<>>>", "<<", ">>", "<a<b>c", "<<script>script>", "x<y>z>w<", "<\u0000<b>>"];
+			for (const input of inputs) {
+				const output = stripHtmlTags(input);
+				expect(output).not.toContain("<");
+				expect(output).not.toContain(">");
+			}
+		});
+
+		test("handles 100000 repeated nested openers without leaving angle brackets", () => {
+			const output = stripHtmlTags("<a".repeat(100000) + ">");
+			expect(output).not.toContain("<");
+			expect(output).not.toContain(">");
 		});
 	});
 
@@ -317,6 +341,32 @@ describe("Encoding", () => {
 			expect(result.a).toBe(123);
 			expect(result.b).toBe(true);
 			expect(result.c).toBe(null);
+		});
+
+		test("encodes strings inside arrays of objects", () => {
+			const obj = { items: [{ name: "<b>", tags: ["<i>", "ok"] }, { name: "safe" }] };
+			const result = encodeObjectForContext(obj, OutputContext.HTML);
+			expect(result).toEqual({
+				items: [{ name: "&lt;b&gt;", tags: ["&lt;i&gt;", "ok"] }, { name: "safe" }],
+			});
+		});
+
+		test("encodes strings inside nested arrays", () => {
+			const obj = { grid: [["<a>", ["<b>"]]] };
+			const result = encodeObjectForContext(obj, OutputContext.HTML);
+			expect(result).toEqual({ grid: [["&lt;a&gt;", ["&lt;b&gt;"]]] });
+		});
+
+		test("encodes strings at any depth through mixed arrays and objects", () => {
+			const obj = { a: [{ b: [{ c: "<d>" }] }] };
+			const result = encodeObjectForContext(obj, OutputContext.HTML);
+			expect(result).toEqual({ a: [{ b: [{ c: "&lt;d&gt;" }] }] });
+		});
+
+		test("preserves non-strings inside arrays", () => {
+			const obj = { items: [1, null, true, { n: 2 }, ["x", 3]] };
+			const result = encodeObjectForContext(obj, OutputContext.HTML);
+			expect(result).toEqual({ items: [1, null, true, { n: 2 }, ["x", 3]] });
 		});
 	});
 });
