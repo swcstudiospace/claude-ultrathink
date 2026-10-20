@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterAll, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DuplicatePhaseError, openStore, type Store } from "./store.ts";
@@ -141,5 +141,55 @@ describe("ultrathink store", () => {
 		} finally {
 			store.close();
 		}
+	});
+
+	test("quickCheck is ok on a fresh store and reports instead of throwing once closed", () => {
+		const store = openStore(tempDbPath());
+		expect(store.quickCheck()).toEqual({ ok: true });
+		store.close();
+		const after = store.quickCheck();
+		expect(after.ok).toBe(false);
+		if (!after.ok) expect(after.detail.length).toBeGreaterThan(0);
+	});
+
+	test("checkpoint is ok on an open store and false once closed", () => {
+		const store = openStore(tempDbPath());
+		try {
+			store.createRun({ ownerId: "owner", request: "plan it", route: "default" });
+			expect(store.checkpoint()).toEqual({ ok: true });
+		} finally {
+			store.close();
+		}
+		expect(store.checkpoint()).toEqual({ ok: false });
+	});
+
+	test("journal_size_limit is 64 MiB and WAL mode is on", () => {
+		const store = openStore(tempDbPath());
+		try {
+			const limit = store.db.query<{ journal_size_limit: number }, []>("PRAGMA journal_size_limit").get();
+			expect(limit?.journal_size_limit).toBe(67108864);
+			const mode = store.db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+			expect(mode?.journal_mode).toBe("wal");
+		} finally {
+			store.close();
+		}
+	});
+
+	test("a corrupt database fails fast at open with the quick_check detail", () => {
+		const path = tempDbPath();
+		const store = openStore(path);
+		for (let i = 0; i < 40; i += 1) store.createRun({ ownerId: `owner-${i}`, request: "x".repeat(400), route: "default" });
+		expect(store.checkpoint()).toEqual({ ok: true });
+		store.close();
+
+		// Page 1 (the header and schema) stays intact so the file still opens; the b-tree pages after it are shredded.
+		const pageSize = 4096;
+		const fd = openSync(path, "r+");
+		try {
+			writeSync(fd, Buffer.alloc(pageSize * 2, 0xff), 0, pageSize * 2, pageSize + 8);
+		} finally {
+			closeSync(fd);
+		}
+		expect(() => openStore(path)).toThrow(/^sqlite quick_check failed: /);
 	});
 });
