@@ -366,6 +366,11 @@ describe("assessDone rules", () => {
 			"GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd",
 		],
 		[
+			"gsd tools tracked by the repository",
+			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true, toolsTracked: true }),
+			"a gsd-tools.cjs committed in this repository was not run (repository code is never executed); install GSD outside the repository or set GSD_TOOLS",
+		],
+		[
 			"node missing",
 			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, nodeMissing: true }),
 			"GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd",

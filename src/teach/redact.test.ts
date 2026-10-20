@@ -84,6 +84,36 @@ describe("redactText: secrets", () => {
 		expect(redactText("TOKEN=$TOKEN")).toBe("TOKEN=$TOKEN");
 		expect(redactText("Key: use import type for type-only imports")).toBe("Key: use import type for type-only imports");
 	});
+
+	test("API key, auth token and cookie headers lose their value, in any case and in JSON form", () => {
+		expect(redactText("X-API-Key: sk_live_1234567890abcdef")).toBe("X-API-Key: [redacted]");
+		expect(redactText("x-api-key=sk_live_1234567890abcdef")).toBe("x-api-key=[redacted]");
+		expect(redactText("Api-Key: abc")).toBe("Api-Key: [redacted]");
+		expect(redactText("X-Auth-Token: t0k3n")).toBe("X-Auth-Token: [redacted]");
+		expect(redactText("Proxy-Authorization: Basic dXNlcjpwYXNz")).toBe("Proxy-Authorization: [redacted]");
+		expect(redactText("Cookie: session=abcdef0123456789")).toBe("Cookie: [redacted]");
+		expect(redactText("Set-Cookie: auth=abcdef0123456789; Path=/; HttpOnly")).toBe("Set-Cookie: [redacted]; Path=/; HttpOnly");
+		expect(redactText('{"cookie": "session=abcdef0123456789"}')).toBe('{"cookie": "[redacted]"}');
+		for (const text of ["X-API-Key: sk_live_1234567890abcdef", "Cookie: session=abcdef0123456789"]) {
+			const once = redactText(text);
+			expect(redactText(once)).toBe(once);
+		}
+	});
+
+	test("YAML, header and .env style `name: value` lines are redacted; sentences with a colon are prose", () => {
+		expect(redactText("password: hunter2")).toBe("password: [redacted]");
+		expect(redactText("db:\n  password: hunter2\n  user: bob")).toBe("db:\n  password: [redacted]\n  user: bob");
+		expect(redactText('password: "hunter2"')).toBe('password: "[redacted]"');
+		expect(redactText("API_KEY=abcdef")).toBe("API_KEY=[redacted]");
+		expect(redactText("API_KEY: abc")).toBe("API_KEY: [redacted]");
+		expect(redactText("api_key: abc and more")).toBe("api_key: [redacted] and more");
+		expect(redactText("client-secret: abc")).toBe("client-secret: [redacted]");
+		expect(redactText("db.password: abc")).toBe("db.password: [redacted]");
+		expect(redactText("the password: abcdef123 is set")).toBe("the password: [redacted] is set");
+		for (const prose of ["Note: the password field is required", "the password: is required", "token: rotate it weekly"]) {
+			expect(redactText(prose)).toBe(prose);
+		}
+	});
 });
 
 describe("redactText: paths", () => {

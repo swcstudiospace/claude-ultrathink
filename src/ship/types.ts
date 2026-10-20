@@ -91,6 +91,8 @@ export interface GsdSignals {
 	verification?: { phase: string; status: string };
 	/** A roadmap exists but gsd-tools.cjs was found neither via `GSD_TOOLS` nor in any standard GSD install location. */
 	toolsMissing?: boolean;
+	/** A project-local gsd-tools.cjs exists but is tracked by the repository being shipped, so it was skipped (never run). */
+	toolsTracked?: boolean;
 	/** gsd-tools.cjs resolved but `node` could not be spawned to run it (exit 127 / ENOENT). */
 	nodeMissing?: boolean;
 	/** Latest archived milestone; set only when no active phase under `.planning/phases/` has a `*-VERIFICATION.md`. */

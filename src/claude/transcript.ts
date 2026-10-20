@@ -5,7 +5,7 @@
  * so Prompt Uplift can recover product and prior-decision facts, mirroring the
  * OMP `recentConversation` helper.
  */
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 
 const DEFAULT_CONVERSATION_CHARS = 3500;
 const MAX_SNIPPETS = 8;
@@ -60,14 +60,33 @@ export function conversationFromJsonl(jsonl: string, maxChars = DEFAULT_CONVERSA
 
 export function recentConversationFromTranscript(path: string | undefined, maxChars = DEFAULT_CONVERSATION_CHARS): string {
 	if (!path) return "";
+	let fd: number | undefined;
 	try {
-		const buffer = readFileSync(path);
-		const slice = buffer.length > TAIL_BYTES ? buffer.subarray(buffer.length - TAIL_BYTES) : buffer;
-		const text = slice.toString("utf8");
-		// Drop a possibly truncated first line when we sliced mid-file.
-		const jsonl = buffer.length > TAIL_BYTES ? text.slice(text.indexOf("\n") + 1) : text;
+		// Bounded tail read: transcripts of long sessions can reach hundreds of MB.
+		fd = openSync(path, "r");
+		const size = fstatSync(fd).size;
+		const length = Math.min(size, TAIL_BYTES);
+		if (length === 0) return "";
+		const buffer = Buffer.alloc(length);
+		let read = 0;
+		while (read < length) {
+			const n = readSync(fd, buffer, read, length - read, size - length + read);
+			if (n === 0) break;
+			read += n;
+		}
+		const text = buffer.subarray(0, read).toString("utf8");
+		// Drop a possibly truncated first line when we started mid-file.
+		const jsonl = size > length ? text.slice(text.indexOf("\n") + 1) : text;
 		return conversationFromJsonl(jsonl, maxChars);
 	} catch {
 		return "";
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				// already closed or never opened
+			}
+		}
 	}
 }

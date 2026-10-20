@@ -26,7 +26,8 @@ const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9
 /** A block cut off by a length cap has no END line: everything after BEGIN goes. */
 const PEM_OPEN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/g;
 const URL_USERINFO = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/]+@/g;
-const AUTH_HEADER = /(authorization["']?\s*[:=]\s*["']?)(?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s"',;]+/gi;
+const AUTH_HEADER =
+	/((?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)["']?\s*[:=]\s*["']?)(?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s"',;]+/gi;
 const BEARER = /\bBearer(\s+)([A-Za-z0-9._~+/-]+=*)/gi;
 const JWT = /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g;
 const TOKEN_PATTERNS: RegExp[] = [
@@ -38,7 +39,7 @@ const TOKEN_PATTERNS: RegExp[] = [
 	/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
 	/\bAIza[0-9A-Za-z_-]{30,}/g,
 ];
-const ASSIGNMENT = /(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*[:=]\s*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"',;&|]+))/g;
+const ASSIGNMENT = /(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1([ \t]*[:=][ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"',;&|]+))/g;
 const SECRET_WORDS = ["key", "token", "secret", "password", "passwd"];
 
 /** Name tokens (split on non-alphanumerics and camelCase) that end in a secret word: API_KEY, apiKey, client-secret. "keyboard" is not. */
@@ -51,29 +52,41 @@ function isSecretName(name: string): boolean {
 	return tokens.some((token) => SECRET_WORDS.some((word) => token.endsWith(word) || token.endsWith(`${word}s`)));
 }
 
+/** A value is credential-shaped when it is long or carries a digit: "abcdef123456" is, "key" and "rotation" are not. */
+function isCredentialShaped(value: string): boolean {
+	return value.length >= 16 || (value.length >= 6 && /\d/.test(value));
+}
+
 /** `Bearer <word>` is a credential only when the word looks like one; "the Bearer key" and "Bearer token rotation" are prose. */
 function redactBearer(text: string): string {
 	return text.replace(BEARER, (match, _space: string, value: string) => {
 		const dots = /\.+$/.exec(value)?.[0] ?? "";
 		const core = dots ? value.slice(0, -dots.length) : value;
-		const credential = core.length >= 16 || (core.length >= 6 && /\d/.test(core));
-		if (!credential) return match;
+		if (!isCredentialShaped(core)) return match;
 		return `${REDACTED}${dots}`;
 	});
 }
 
 function redactAssignments(text: string): string {
-	return text.replace(ASSIGNMENT, (match, quote: string, name: string, sep: string, dq?: string, sq?: string, bare?: string) => {
-		if (!isSecretName(name)) return match;
-		// `key: value` is prose or YAML-ish prose; only the quoted JSON form `"key": "value"` is taken as an assignment.
-		if (sep.includes(":") && quote === "") return match;
-		const head = `${quote}${name}${quote}${sep}`;
-		if (dq !== undefined) return `${head}"${REDACTED}"`;
-		if (sq !== undefined) return `${head}'${REDACTED}'`;
-		// Template references and JSX props (`key={id}`, `TOKEN=$TOKEN`) hold no secret.
-		if (bare !== undefined && /^[$({<%]/.test(bare)) return match;
-		return `${head}${REDACTED}`;
-	});
+	return text.replace(
+		ASSIGNMENT,
+		(match, quote: string, name: string, sep: string, dq: string | undefined, sq: string | undefined, bare: string | undefined, offset: number) => {
+			if (!isSecretName(name)) return match;
+			// `the password: is required` and `Key: use import type` are prose: a plain-word name (not an env or header name
+			// like `API_KEY`, `X-API-Key`, `db.password`), an unquoted `:`, an unquoted value that neither fills the rest of
+			// the line (YAML, header and .env lines do) nor looks like a credential. `password: hunter2` is redacted.
+			if (sep.includes(":") && quote === "" && bare !== undefined && !/[-_.]/.test(name) && name !== name.toUpperCase()) {
+				const fillsLine = /^[ \t]*(?:\r?\n|$)/.test(text.slice(offset + match.length));
+				if (!fillsLine && !isCredentialShaped(bare.replace(/[.,:;!?]+$/, ""))) return match;
+			}
+			const head = `${quote}${name}${quote}${sep}`;
+			if (dq !== undefined) return `${head}"${REDACTED}"`;
+			if (sq !== undefined) return `${head}'${REDACTED}'`;
+			// Template references and JSX props (`key={id}`, `TOKEN=$TOKEN`) hold no secret.
+			if (bare !== undefined && /^[$({<%]/.test(bare)) return match;
+			return `${head}${REDACTED}`;
+		},
+	);
 }
 
 function redactPaths(text: string, home: string, repoRoot: string | undefined): string {

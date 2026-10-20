@@ -6,7 +6,7 @@
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { defaultRun } from "./run.ts";
 import type { GitSignals, GsdSignals, MilestoneEvidence, Run, ShipSignals } from "./types.ts";
@@ -174,6 +174,9 @@ export function latestMilestone(cwd: string): MilestoneEvidence | undefined {
 
 type Env = Record<string, string | undefined>;
 
+/** The project-local install locations (the first candidates); a copy tracked by the repository is repository code, never run. */
+const LOCAL_CANDIDATES = 4;
+
 /** Where GSD installs gsd-tools.cjs, in lookup order: project-local installs (incl. legacy), then each host's config dir, then the legacy home path. */
 export function gsdToolsCandidates(cwd: string, env: Env, home: string): string[] {
 	const tool = (dir: string): string => join(dir, "gsd-core", "bin", "gsd-tools.cjs");
@@ -194,20 +197,52 @@ export function gsdToolsCandidates(cwd: string, env: Env, home: string): string[
 	];
 }
 
-/** `GSD_TOOLS` when set, else the first installed gsd-tools.cjs; undefined when GSD is not installed anywhere known. */
-export function resolveGsdTools(input: {
+export interface GsdToolsLookup {
+	/** `GSD_TOOLS` when set, else the first installed gsd-tools.cjs that is not repository code; undefined when none. */
+	path?: string;
+	/** Project-local copies that exist but are tracked by the repository being shipped, so were skipped. */
+	tracked: string[];
+}
+
+export interface GsdToolsInput {
 	cwd: string;
 	env?: Env;
 	home?: string;
 	exists?: (path: string) => boolean;
-}): string | undefined {
-	const env = input.env ?? process.env;
-	if (env.GSD_TOOLS) return env.GSD_TOOLS;
-	const exists = input.exists ?? existsSync;
-	return gsdToolsCandidates(input.cwd, env, input.home ?? homedir()).find((path) => exists(path));
+	/** Whether a project-local candidate is tracked by the repository; defaults to `git ls-files --error-unmatch` via `run`. */
+	isTracked?: (path: string) => boolean;
+	run?: Run;
 }
 
-function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSignals | undefined {
+/**
+ * Finds gsd-tools.cjs. A project-local candidate is used only when the repository does not track it: a committed copy
+ * is code controlled by whoever authored the repository and would otherwise run on `ship assess|pr`.
+ */
+export function lookupGsdTools(input: GsdToolsInput): GsdToolsLookup {
+	const env = input.env ?? process.env;
+	if (env.GSD_TOOLS) return { path: env.GSD_TOOLS, tracked: [] };
+	const exists = input.exists ?? existsSync;
+	const run = input.run ?? defaultRun;
+	const isTracked =
+		input.isTracked ??
+		((path: string) => run(["git", "ls-files", "--error-unmatch", relative(input.cwd, path)], { cwd: input.cwd }).exitCode === 0);
+	const tracked: string[] = [];
+	const candidates = gsdToolsCandidates(input.cwd, env, input.home ?? homedir());
+	const path = candidates.find((candidate, index) => {
+		if (!exists(candidate)) return false;
+		if (index >= LOCAL_CANDIDATES || !isTracked(candidate)) return true;
+		tracked.push(candidate);
+		return false;
+	});
+	return { path, tracked };
+}
+
+/** `GSD_TOOLS` when set, else the first installed gsd-tools.cjs; undefined when GSD is not installed anywhere known. */
+export function resolveGsdTools(input: GsdToolsInput): string | undefined {
+	return lookupGsdTools(input).path;
+}
+
+function collectGsd(run: Run, cwd: string, tools: GsdToolsLookup): GsdSignals | undefined {
 	if (!existsSync(join(cwd, ".planning", "ROADMAP.md"))) return undefined;
 	const trusted =
 		run(["git", "ls-files", "--error-unmatch", ".planning/ROADMAP.md"], { cwd }).exitCode === 0 ||
@@ -225,10 +260,15 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	// Archived milestone evidence only stands in when no active phase has a verification.
 	const milestone = verification ? undefined : latestMilestone(cwd);
 	const archived = milestone ? { milestone } : {};
-	if (!gsdTools) return { phaseCount, completedPhases, trusted, state, verification, ...archived, toolsMissing: true };
+	// A tracked project-local copy is reported so the operator sees why it was not used.
+	const skipped = tools.tracked.length ? { toolsTracked: true } : {};
+	const gsdTools = tools.path;
+	if (!gsdTools) {
+		return { phaseCount, completedPhases, trusted, state, verification, ...archived, ...skipped, toolsMissing: true };
+	}
 	const analyzed = run(["node", gsdTools, "query", "roadmap.analyze", "--cwd", cwd], { cwd });
 	if (analyzed.exitCode === 127 || /ENOENT/.test(analyzed.stderr)) {
-		return { phaseCount, completedPhases, trusted, state, verification, ...archived, nodeMissing: true };
+		return { phaseCount, completedPhases, trusted, state, verification, ...archived, ...skipped, nodeMissing: true };
 	}
 	const text = analyzed.exitCode === 0 ? analyzed.stdout.trim() : "";
 	try {
@@ -238,7 +278,7 @@ function collectGsd(run: Run, cwd: string, gsdTools: string | undefined): GsdSig
 	} catch {
 		phaseCount = 0;
 	}
-	return { phaseCount, completedPhases, trusted, state, verification, ...archived };
+	return { phaseCount, completedPhases, trusted, state, verification, ...archived, ...skipped };
 }
 
 function collectGraph(record: SessionRecord): ShipSignals["graph"] {
@@ -258,10 +298,13 @@ export function collectSignals(input: {
 	home?: string;
 }): ShipSignals {
 	const run = input.run ?? defaultRun;
-	const gsdTools = input.gsdTools ?? resolveGsdTools({ cwd: input.cwd, env: input.env, home: input.home });
+	const tools =
+		input.gsdTools === undefined
+			? lookupGsdTools({ cwd: input.cwd, env: input.env, home: input.home, run })
+			: { path: input.gsdTools, tracked: [] };
 	return {
 		git: collectGit(run, input.cwd),
-		gsd: collectGsd(run, input.cwd, gsdTools),
+		gsd: collectGsd(run, input.cwd, tools),
 		graph: collectGraph(input.record),
 	};
 }

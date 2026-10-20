@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMcpClient, createMcpClientIfCredentialed, hasUsableCredential, loginHint } from "./client.ts";
+import { createMcpClient, createMcpClientIfCredentialed, hasUsableCredential, loginHint, MAX_TOOL_PAGES } from "./client.ts";
 import type { McpProviderId } from "./providers.ts";
 import { writeStore } from "./store.ts";
 
@@ -233,6 +233,35 @@ describe("createMcpClient", () => {
 		await expect(pending).rejects.toThrow("client closed");
 		await expect(client.call("again", {})).rejects.toThrow("client closed");
 		never.resolve();
+	});
+
+	test("listTools follows nextCursor across pages", async () => {
+		const fake = fakeFetch((rpc) => {
+			const cursor = (rpc.params as { cursor?: string } | undefined)?.cursor;
+			if (cursor === undefined) return { tools: [{ name: "a" }], nextCursor: "p2" };
+			return { tools: [{ name: "b" }] };
+		});
+		const client = createMcpClient("linear", { storePath: store(), fetch: fake.fetch });
+		expect((await client.listTools()).map((tool) => tool.name)).toEqual(["a", "b"]);
+		expect(fake.methods.filter((m) => m === "tools/list")).toHaveLength(2);
+		client.close();
+	});
+
+	test("listTools rejects when the server repeats a nextCursor", async () => {
+		const fake = fakeFetch(() => ({ tools: [], nextCursor: "x" }));
+		const client = createMcpClient("linear", { storePath: store(), fetch: fake.fetch });
+		await expect(client.listTools()).rejects.toThrow("tools/list: pagination did not terminate");
+		expect(fake.methods.filter((m) => m === "tools/list")).toHaveLength(2);
+		client.close();
+	});
+
+	test("listTools rejects after the page cap when every cursor is new", async () => {
+		let page = 0;
+		const fake = fakeFetch(() => ({ tools: [{ name: `t${page}` }], nextCursor: `c${++page}` }));
+		const client = createMcpClient("linear", { storePath: store(), fetch: fake.fetch });
+		await expect(client.listTools()).rejects.toThrow("tools/list: pagination did not terminate");
+		expect(fake.methods.filter((m) => m === "tools/list")).toHaveLength(MAX_TOOL_PAGES);
+		client.close();
 	});
 });
 

@@ -30,6 +30,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 interface Call {
 	url: string;
 	body?: string;
+	redirect?: RequestInit["redirect"];
 }
 
 function fakeFetch(routes: Record<string, (body: string | undefined) => Response>): {
@@ -40,7 +41,7 @@ function fakeFetch(routes: Record<string, (body: string | undefined) => Response
 	const impl = async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
 		const body = typeof init?.body === "string" ? init.body : undefined;
-		calls.push({ url, body });
+		calls.push({ url, body, redirect: init?.redirect });
 		const route = routes[url];
 		return route ? route(body) : new Response("nf", { status: 404 });
 	};
@@ -271,6 +272,86 @@ describe("login", () => {
 		expect((error as Error).message).toContain("invalid_request");
 		expect((error as Error).message).not.toContain("SECRETCODE");
 		expect((error as Error).message).not.toContain(pending.verifier);
+	});
+
+	test("discovery, token and registration fetches never follow redirects", async () => {
+		const fake = fakeFetch(notionRoutes(() => json({ access_token: "at-1" })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await completeLogin(pending, "X", deps);
+		expect(fake.calls.length).toBeGreaterThanOrEqual(4);
+		expect(fake.calls.every(c => c.redirect === "error")).toBe(true);
+	});
+
+	test("metadata with an http token endpoint is rejected before any registration or token request", async () => {
+		const fake = fakeFetch({
+			...notionRoutes(() => json({ access_token: "at-1" })),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					issuer: "https://mcp.notion.com",
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "http://mcp.notion.com/token",
+					registration_endpoint: "https://mcp.notion.com/register",
+				}),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", deps)).rejects.toThrow("must use https");
+		expect(fake.calls.some(c => c.url.endsWith("/register") || c.url.endsWith("/token"))).toBe(false);
+		expect(readStore(path).providers.notion).toBeUndefined();
+	});
+
+	test("an http authorization server or registration endpoint is rejected", async () => {
+		const httpAs = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-protected-resource/mcp": () =>
+				json({ resource: "https://mcp.notion.com/mcp", authorization_servers: ["http://mcp.notion.com"] }),
+		});
+		const deps = { now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", { ...deps, fetch: httpAs.fetch })).rejects.toThrow("must use https");
+		expect(httpAs.calls.some(c => c.url.startsWith("http://"))).toBe(false);
+
+		const httpDcr = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "https://mcp.notion.com/token",
+					registration_endpoint: "http://mcp.notion.com/register",
+				}),
+		});
+		await expect(beginLogin("notion", { ...deps, fetch: httpDcr.fetch })).rejects.toThrow("must use https");
+		expect(httpDcr.calls.some(c => c.url.startsWith("http://"))).toBe(false);
+	});
+
+	test("metadata naming a different issuer is rejected", async () => {
+		const fake = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					issuer: "https://evil.example",
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "https://mcp.notion.com/token",
+					registration_endpoint: "https://mcp.notion.com/register",
+				}),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", deps)).rejects.toThrow("issuer mismatch");
+		expect(fake.calls.some(c => c.url.endsWith("/register"))).toBe(false);
+	});
+
+	test("a stored client with an http token endpoint is re-registered instead of reused", async () => {
+		writeStore(path, {
+			version: 1,
+			providers: {
+				notion: { kind: "oauth", client: { ...client, tokenEndpoint: "http://mcp.notion.com/token" }, updatedAt: NOW },
+			},
+		});
+		const fake = fakeFetch(notionRoutes());
+		const pending = await beginLogin("notion", { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT });
+		expect(fake.calls.filter(c => c.url.endsWith("/register"))).toHaveLength(1);
+		expect(pending.client.tokenEndpoint).toBe("https://mcp.notion.com/token");
+		const cred = readStore(path).providers.notion;
+		expect(cred?.kind === "oauth" && cred.client.tokenEndpoint).toBe("https://mcp.notion.com/token");
 	});
 });
 

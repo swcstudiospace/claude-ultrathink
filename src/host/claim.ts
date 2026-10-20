@@ -7,7 +7,7 @@
  * The first hook to create the claim file wins. Fail-open: a broken claim store
  * must never block planning.
  */
-import { closeSync, mkdirSync, openSync, opendirSync, statSync, unlinkSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, opendirSync, statSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
@@ -40,10 +40,18 @@ function pruneStaleClaims(dir: string, now: number): void {
 export function claimTurn(stateDir: string, key: string, now = Date.now()): boolean {
 	try {
 		const dir = join(stateDir, "claims");
-		mkdirSync(dir, { recursive: true });
+		const createsStateDir = !existsSync(stateDir);
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		if (createsStateDir) {
+			try {
+				chmodSync(stateDir, 0o700);
+			} catch {
+				// a directory we do not own keeps its mode
+			}
+		}
 		pruneStaleClaims(dir, now);
 		const name = createHash("sha256").update(key).digest("hex").slice(0, 32);
-		closeSync(openSync(join(dir, name), "wx"));
+		closeSync(openSync(join(dir, name), "wx", 0o600));
 		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST";

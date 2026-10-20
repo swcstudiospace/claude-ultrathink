@@ -46,10 +46,20 @@ class TokenEndpointError extends Error {
 	}
 }
 
+/** Discovered endpoints receive codes, verifiers and secrets, so anything but https is refused (RFC 8414 §2). */
+function isHttps(url: unknown): boolean {
+	try {
+		return typeof url === "string" && new URL(url).protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
 async function getJson(url: string, deps: AuthDeps): Promise<Record<string, unknown> | undefined> {
 	const response = await (deps.fetch ?? fetch)(url, {
 		headers: { Accept: "application/json", "User-Agent": USER_AGENT },
 		signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+		redirect: "error",
 	});
 	if (!response.ok) return undefined;
 	try {
@@ -85,6 +95,7 @@ async function tokenRequest(client: OAuthClient, params: Record<string, string>,
 		},
 		body: body.toString(),
 		signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+		redirect: "error",
 	});
 	let json: Record<string, unknown> = {};
 	try {
@@ -144,6 +155,7 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 		Array.isArray(prm?.scopes_supported) && prm.scopes_supported.length > 0
 			? (prm.scopes_supported as string[])
 			: info.scopes;
+	if (!isHttps(issuer)) throw new Error(`${provider}: authorization server ${issuer} must use https`);
 	const asMeta =
 		(await getJson(`${issuer}/.well-known/oauth-authorization-server`, deps)) ??
 		(await getJson(`${issuer}/.well-known/openid-configuration`, deps));
@@ -157,13 +169,25 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 	const authorizationEndpoint = asMeta.authorization_endpoint;
 	const tokenEndpoint = asMeta.token_endpoint;
 	const registrationEndpoint = asMeta.registration_endpoint;
+	if (
+		!isHttps(authorizationEndpoint) ||
+		!isHttps(tokenEndpoint) ||
+		(typeof registrationEndpoint === "string" && !isHttps(registrationEndpoint))
+	) {
+		throw new Error(`${provider}: authorization server metadata at ${issuer} must use https`);
+	}
+	// RFC 8414 §3.3: metadata served for an issuer must name that issuer, or it could be another server's.
+	if (asMeta.issuer !== undefined && (typeof asMeta.issuer !== "string" || asMeta.issuer.replace(/\/$/, "") !== issuer)) {
+		throw new Error(`${provider}: authorization server metadata issuer mismatch at ${issuer}`);
+	}
 
 	const client = await mutateStore(deps, async store => {
 		const existing = store.providers[provider];
 		if (
 			existing?.kind === "oauth" &&
 			existing.client.redirectUri === deps.redirectUri &&
-			existing.client.authorizationEndpoint === authorizationEndpoint
+			existing.client.authorizationEndpoint === authorizationEndpoint &&
+			isHttps(existing.client.tokenEndpoint)
 		) {
 			return existing.client;
 		}
@@ -181,6 +205,7 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 				token_endpoint_auth_method: "none",
 			}),
 			signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+			redirect: "error",
 		});
 		const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
 		if (!response.ok || typeof json.client_id !== "string") {

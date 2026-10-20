@@ -7,6 +7,9 @@ import { createRelay } from "./relay.ts";
 import { readStore } from "./store.ts";
 import type { ToolCaller } from "../track/create.ts";
 
+/** A server that keeps handing out cursors (or repeats one) must not keep a tools/list loop running. */
+export const MAX_TOOL_PAGES = 100;
+
 export interface McpClient extends ToolCaller {
 	listTools(signal?: AbortSignal): Promise<Array<{ name: string; inputSchema?: unknown }>>;
 	close(): void;
@@ -161,13 +164,17 @@ export function createMcpClient(provider: McpProviderId, deps: McpClientDeps): M
 			await ensureInitialized(signal);
 			const tools: Array<{ name: string; inputSchema?: unknown }> = [];
 			let cursor: string | undefined;
-			do {
+			for (let page = 0; ; page++) {
+				if (page >= MAX_TOOL_PAGES) throw new Error("tools/list: pagination did not terminate");
 				const result = (await request("tools/list", cursor ? { cursor } : {}, signal)) as
 					| { tools?: Array<{ name: string; inputSchema?: unknown }>; nextCursor?: string }
 					| undefined;
 				tools.push(...(result?.tools ?? []));
-				cursor = result?.nextCursor;
-			} while (cursor);
+				const next = result?.nextCursor;
+				if (!next) break;
+				if (next === cursor) throw new Error("tools/list: pagination did not terminate");
+				cursor = next;
+			}
 			return tools;
 		},
 		close() {
