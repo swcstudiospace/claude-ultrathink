@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { describe, expect, test } from "bun:test";
+import { runWithRequestContext } from "./context.ts";
 import { createLogger, newRequestId, sanitizeRequestId } from "./log.ts";
 
 function capture(opts: Parameters<typeof createLogger>[0] = {}) {
@@ -197,5 +198,39 @@ describe("newRequestId", () => {
 			ids.add(id);
 		}
 		expect(ids.size).toBe(500);
+	});
+});
+
+describe("request context", () => {
+	const CTX = { reqId: "req-log-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+
+	test("a line emitted inside a request carries its reqId and traceId", () => {
+		const { logger, parsed } = capture();
+		runWithRequestContext(CTX, () => logger.info("planner.start", { status: 200 }));
+		expect(parsed()[0]).toMatchObject({
+			event: "planner.start",
+			status: 200,
+			reqId: CTX.reqId,
+			traceId: CTX.traceId,
+		});
+	});
+
+	test("a traceId the caller supplies is not overwritten", () => {
+		const { logger, parsed } = capture();
+		runWithRequestContext(CTX, () => logger.info("upstream", { traceId: "caller-trace" }));
+		expect(parsed()[0]).toMatchObject({ traceId: "caller-trace", reqId: CTX.reqId });
+	});
+
+	test("a reqId the caller supplies is not overwritten", () => {
+		const { logger, parsed } = capture();
+		runWithRequestContext(CTX, () => logger.info("upstream", { reqId: "caller-req" }));
+		expect(parsed()[0]).toMatchObject({ reqId: "caller-req", traceId: CTX.traceId });
+	});
+
+	test("a line outside a request has neither key", () => {
+		const { logger, parsed } = capture();
+		logger.info("boot");
+		expect(parsed()[0]).not.toHaveProperty("reqId");
+		expect(parsed()[0]).not.toHaveProperty("traceId");
 	});
 });
