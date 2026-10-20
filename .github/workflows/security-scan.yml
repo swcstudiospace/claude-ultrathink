@@ -31,3 +31,7 @@ jobs:
 
       - name: bun audit (high severity gate)
         run: bun audit --audit-level=high
+
+      - name: bun audit, omp-token-opt plugin (high severity gate)
+        working-directory: plugins/omp-token-opt
+        run: bun audit --audit-level=high
