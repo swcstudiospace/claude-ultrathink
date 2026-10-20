@@ -20,6 +20,7 @@ import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../o
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
+import { buildSecurityHeaders, ULTRATHINK_SECURITY_HEADERS } from "../security/headers.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
 
 export interface RouterDeps {
@@ -111,9 +112,8 @@ const LOG_VALUE_MAX = 64;
 const OAUTH_STATE_FILE = "oauth.json";
 
 const SECURITY_HEADERS: Record<string, string> = {
+	...buildSecurityHeaders(ULTRATHINK_SECURITY_HEADERS),
 	"Cache-Control": "no-store",
-	"X-Content-Type-Options": "nosniff",
-	"Referrer-Policy": "no-referrer",
 };
 
 const USAGE = {

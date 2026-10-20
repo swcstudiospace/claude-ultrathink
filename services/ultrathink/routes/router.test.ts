@@ -106,7 +106,9 @@ describe("router", () => {
 		expect(await res.json()).toEqual({ ok: true });
 		expect(res.headers.get("cache-control")).toBe("no-store");
 		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
-		expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+		expect(res.headers.get("referrer-policy")).toBe("strict-origin-when-cross-origin");
+		expect(res.headers.get("x-frame-options")).toBe("DENY");
+		expect(res.headers.get("content-security-policy-report-only")).toContain("default-src 'self'");
 	});
 
 	test("login with a wrong password returns 401 and sets no cookie", async () => {
