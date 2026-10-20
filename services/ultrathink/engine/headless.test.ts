@@ -723,7 +723,7 @@ describe("headless planner: upstream breaker", () => {
 		const sessionId = randomUUID();
 		const started = h.planner.start({ prompt: PROMPT, sessionId });
 		// The completer backs off (Retry-After: 1 s) through the planner's clock between the two 503s.
-		await flush();
+		for (let i = 0; i < 20 && !h.clock.has(1000); i++) await flush();
 		expect(h.clock.has(1000)).toBe(true);
 		h.clock.fire(1000);
 		expect(await started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "upstream_unavailable" } });
