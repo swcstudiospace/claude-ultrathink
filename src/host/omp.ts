@@ -9,14 +9,14 @@
  * each flight owns its own cancellation and outer time limit. A tool result that opens a PR for a planned session gets
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, AssistantMessage, Context, Effort, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { resolvePstack } from "../cursor/pstack.ts";
 import type { ClaudeCompleter } from "../claude/complete.ts";
-import { type ControlState, readControl, readSession, type SessionRecord, sessionPath } from "../claude/state.ts";
+import { type ControlState, readControl, readSession, type SessionRecord, sessionPath, updateSession } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
 import type { LegacyModelProvenance, UltrathinkConfig } from "../config.ts";
 import { DEFAULT_GROK_CONFIG } from "../grok/types.ts";
@@ -47,6 +47,7 @@ import {
 	TEAMS_USAGE,
 } from "../swarm/teams.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
+import { resolveRepoSlug } from "../track/git.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
 import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
@@ -492,6 +493,72 @@ export function createNativeEnginePlanner(deps: Omit<NativeEngineDeps, "isCurren
 
 /** The default Omp planner: native, in-process, on the flight's live Model snapshot. */
 export const nativeEnginePlanner: OmpPlanner = createNativeEnginePlanner();
+
+/** A hashline header at a line start: `[<path>#<4-hex TAG>]`. Its path group is the edited file. */
+const EDIT_HEADER_RE = /^\[(.+?)#[0-9A-Fa-f]{4}\]/gm;
+
+/**
+ * Files a tool call changed, as absolute paths. `write` names its file in `path`; `edit` names each file in a hashline
+ * header of its `input` string. Other tools, and input without a usable path, name none. Never throws.
+ */
+export function editTargets(toolName: string, input: Record<string, unknown>, cwd: string): string[] {
+	if (toolName === "write") {
+		const path = typeof input.path === "string" ? input.path.trim() : "";
+		return path ? [resolve(cwd, path)] : [];
+	}
+	const text = input.input;
+	if (toolName !== "edit" || typeof text !== "string") return [];
+	const files: string[] = [];
+	for (const match of text.matchAll(EDIT_HEADER_RE)) {
+		const path = (match[1] ?? "").trim();
+		if (path) files.push(resolve(cwd, path));
+	}
+	return files;
+}
+
+function isDirectory(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** Repo slug of the nearest existing directory at or above `file`; undefined outside a git repo with an origin. */
+export function repoOfPath(file: string): string | undefined {
+	let dir = dirname(file);
+	while (!isDirectory(dir)) {
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+	return resolveRepoSlug(dir);
+}
+
+/**
+ * Records the repo an edit touched on the session's record and returns a warning when that repo is not the plan's
+ * labelled repo, once per distinct edited set. Attribution only: the label and the edit itself are never changed.
+ * A session with no record (never planned) or a file outside any repo changes nothing.
+ */
+export function recordEditAttribution(dir: string, sessionId: string, file: string): string | undefined {
+	const edited = repoOfPath(file);
+	if (edited === undefined) return undefined;
+	let warning: string | undefined;
+	updateSession(dir, sessionId, (record) => {
+		const previous = record.workRepos ?? [];
+		if (previous.includes(edited)) return undefined;
+		const workRepos = [...previous, edited].sort();
+		if (!record.plan) return { ...record, workRepos };
+		const labelled = record.plan.task.repo ?? null;
+		if (workRepos.every((repo) => repo === labelled)) return { ...record, workRepos };
+		const before = record.repoMismatch;
+		if (!before || before.edited.join("\n") !== workRepos.join("\n")) {
+			warning = `Ultrathink: this session edited ${workRepos.join(", ")}, but its plan is labelled ${labelled ?? "with no repo"}. The tracked task row may name the wrong repository.`;
+		}
+		return { ...record, workRepos, repoMismatch: { labelled, edited: workRepos } };
+	});
+	return warning;
+}
 
 /** Credential readiness from the local store only (no network). */
 export function readMcpState(): McpState {
@@ -1273,6 +1340,21 @@ export function createOmpExtension(
 			});
 		});
 
+		// Edit attribution: each file a successful edit or write changed is attributed to its repo, and a warning fires when
+		// that repo is not the plan's labelled repo. A warning only; the edit and the label are left alone.
+		pi.on("tool_result", (event, ctx) => {
+			guard(() => {
+				if (event.isError) return;
+				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				if (!sessionId) return;
+				const cwd = ctx?.cwd || process.cwd();
+				for (const file of editTargets(event.toolName, event.input ?? {}, cwd)) {
+					const warning = recordEditAttribution(stateDir(cwd), sessionId, file);
+					if (warning) ctx?.ui?.notify?.(warning, "warning");
+				}
+			});
+		});
+
 		// PR-sync parity with hooks/pr-sync.ts: once a planned session opens a PR, nudge the agent to run
 		// ultrathink-sync, once per PR URL. Omp's own `github` tool opens PRs with `op: "pr_create"`; every
 		// other tool follows the shared rule. Device calls (`write xd://<tool>`) emit the inner tool's result too.
@@ -1397,6 +1479,7 @@ export function createOmpExtension(
 									cwd,
 									host: "omp",
 									...(observed ? { modelResolution: observed } : {}),
+									sessionId: ctx?.sessionManager?.getSessionId?.() || undefined,
 								});
 								ctx?.ui?.notify?.(reply, "info");
 							} catch {}

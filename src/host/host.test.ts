@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { readControl, readSession, sessionPath, writeControl } from "../claude/state.ts";
+import { armSkipOnce, newTurnSessionId, readSession, readSkipOnce, sessionPath, writeControl } from "../claude/state.ts";
 import { defaultConfig } from "../config.ts";
 import type { DecisionsErrorKind } from "../decisions/types.ts";
 import type { Tracker } from "../track/gateway.ts";
@@ -175,7 +175,7 @@ describe("writePlanCarrier", () => {
 	test("writes a subordinate pointer and refuses an unknown session id", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ultrathink-carrier-"));
 		try {
-			expect(writePlanCarrier({ host: "grok-build", stateDir: dir, sessionId: "unknown", specPath: "/s.xml" })).toBeUndefined();
+			expect(writePlanCarrier({ host: "grok-build", stateDir: dir, sessionId: newTurnSessionId(), specPath: "/s.xml" })).toBeUndefined();
 			const path = writePlanCarrier({
 				host: "grok-build",
 				stateDir: dir,
@@ -423,19 +423,19 @@ describe("planPrompt", () => {
 			const hostEnv = { ...env, PI_CODING_AGENT_DIR: join(root, "omp") };
 			try {
 				for (const prompt of ["ok", HERMES_SKILL]) {
-					writeControl(stateDir, { skipOnce: true });
-					expect(await planPrompt({ host, prompt, cwd: root }, hostEnv, options)).toEqual({ context: "", skipped: "precheck-skip" });
-					expect(readControl(stateDir).skipOnce).toBe(false);
+					armSkipOnce(stateDir, "s1");
+					expect(await planPrompt({ host, session_id: "s1", prompt, cwd: root }, hostEnv, options)).toEqual({ context: "", skipped: "precheck-skip" });
+					expect(readSkipOnce(stateDir, "s1")).toBe(false);
 				}
 				// Consumed before engine selection, so an engine that is unavailable (e.g. a Grok login) cannot leave it armed.
 				expect(calls.engine).toBe(0);
 				// Stateless skips that never consume the skip on Claude leave it armed here too.
-				writeControl(stateDir, { skipOnce: true });
-				expect(await planPrompt({ host, prompt: "<BUILD_PROMPT>x</BUILD_PROMPT>", cwd: root }, hostEnv, options)).toEqual({
+				armSkipOnce(stateDir, "s1");
+				expect(await planPrompt({ host, session_id: "s1", prompt: "<BUILD_PROMPT>x</BUILD_PROMPT>", cwd: root }, hostEnv, options)).toEqual({
 					context: "",
 					skipped: "precheck-skip",
 				});
-				expect(readControl(stateDir).skipOnce).toBe(true);
+				expect(readSkipOnce(stateDir, "s1")).toBe(true);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
@@ -1222,7 +1222,7 @@ describe("planPrompt flight context, cancellation and the resolution record", ()
 			label: "unknown:unresolved [unsupported-host]",
 		};
 		try {
-			writeControl(stateDir, { skipOnce: true });
+			armSkipOnce(stateDir, "s1");
 			const response = await planPrompt({ invalidHost: true, session_id: "s1", prompt: "add a widget", cwd: root }, env, {
 				...options,
 				progress: (event) => events.push(event),
@@ -1236,7 +1236,7 @@ describe("planPrompt flight context, cancellation and the resolution record", ()
 			expect(events).toEqual([{ type: "end", at: expect.any(Number), outcome: "skipped", detail: "unsupported-host", modelResolution: record }]);
 			expect(calls).toEqual({ engine: 0, createTracker: 0, track: 0 });
 			// No detected host's control is read or consumed, and nothing is written.
-			expect(readControl(stateDir).skipOnce).toBe(true);
+			expect(readSkipOnce(stateDir, "s1")).toBe(true);
 			expect(existsSync(sessionPath(stateDir, "s1"))).toBe(false);
 			// Stateless skips still decide first; a captured named engine is reported as the control's request.
 			expect(await planPrompt({ invalidHost: true, prompt: "  ", cwd: root }, env, options)).toEqual({ context: "", skipped: "empty" });
@@ -1478,14 +1478,14 @@ describe("planPrompt flight context, cancellation and the resolution record", ()
 			expect(record?.graph).toBeUndefined();
 			expect(record?.clarifications).toEqual([]);
 			// A captured control is a value, not a store: an armed skip-once is consumed and saved in the state directory.
+			armSkipOnce(stateDir, "s1");
 			const skipped = await planPrompt({ host: "hermes", session_id: "s1", prompt: "add a widget", cwd: root }, env, {
 				...options,
 				config,
-				control: { skipOnce: true },
 				stateDir,
 			});
 			expect(skipped).toEqual({ context: "", skipped: "precheck-skip" });
-			expect(readControl(stateDir).skipOnce).toBe(false);
+			expect(readSkipOnce(stateDir, "s1")).toBe(false);
 			expect(seen).toHaveLength(1);
 		} finally {
 			rmSync(root, { recursive: true, force: true });

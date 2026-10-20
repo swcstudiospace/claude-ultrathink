@@ -24,7 +24,7 @@ Some details:
 
 - Nothing changes unless you use a command. Planning stays on by default.
 - The state is per host. Each host has its own state directory (see [State directories](configuration.md#state-directories)), so `/ultrathink-off` in Omp leaves Claude Code planning. Within a host the setting applies to every session and project on the machine.
-- `/ultrathink-skip` sets a one-shot flag. The next message that reaches the planner uses it up, even a trivial one such as `ok` or a skill invocation. Built-in slash commands and `raw:` messages do not use it up. `/ultrathink-status` shows `(skipping next prompt)` while it is armed.
+- `/ultrathink-skip` sets a one-shot flag for the session it is typed in; other sessions are not affected. The next message of that session that reaches the planner uses it up, even a trivial one such as `ok` or a skill invocation. Built-in slash commands and `raw:` messages do not use it up. `/ultrathink-status` shows `(skipping next prompt)` while it is armed. A prompt with no session id cannot arm a skip.
 - `/ultrathink-track off` stops every row: the planner creates none, and `ultrathink-kickoff` and `bin/ultrathink-mcp track complete` create none either. If neither `notion.dataSourceUrl` nor `linear.team` is configured, no rows are created whatever this setting says. See [Tracking](tracking.md).
 - Commands are case-insensitive, and unknown verbs are not treated as commands.
 

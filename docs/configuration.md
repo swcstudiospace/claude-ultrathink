@@ -759,7 +759,7 @@ A value in the control state beats the config value until you change it again:
 | Command | Control field | Overrides |
 |---|---|---|
 | `/ultrathink-off`, `/ultrathink-on`, `bin/ultrathink off`, `bin/ultrathink on` | `enabled` | `uplift.enabled` |
-| `/ultrathink-skip`, `bin/ultrathink skip` | `skipOnce` | Skips the next prompt once, then clears itself. |
+| `/ultrathink-skip` (Omp, and Claude Code via `${CLAUDE_SESSION_ID}`), `bin/ultrathink skip --session <id>`, `ctl skip --session <id>` (grok-bot) | per-session flag `sessions/<id>.skip` | Skips the next prompt of that session once, then clears itself. Not a `control.json` field. A skip with no session id is refused and arms nothing. |
 | `/ultrathink-track off`, `/ultrathink-track on`, `bin/ultrathink track off`, `bin/ultrathink track on` | `trackEnabled` | `track.enabled`. `off` also stops the kickoff skill and `track complete` from creating rows. |
 | `bin/ultrathink think on`, `bin/ultrathink think off` | `thinkEnabled` | `think.enabled` |
 | `bin/ultrathink hitl on`, `bin/ultrathink hitl off` | `hitlEnabled` | `hitl.enabled` |

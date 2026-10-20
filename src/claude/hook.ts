@@ -43,7 +43,7 @@ import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
 import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
-import { type ControlState, readSession, type SessionRecord, sessionPath, writeControl, writeSession } from "./state.ts";
+import { clearSkipOnce, type ControlState, isTurnSessionId, newTurnSessionId, readSession, readSkipOnce, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 
 export interface PromptSubmitInput {
 	session_id?: string;
@@ -428,17 +428,19 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	const started = now();
 	const log = deps.log ?? (() => {});
 	const cwd = input.cwd?.trim() || process.cwd();
-	const sessionId = input.session_id?.trim() || "unknown";
+	const sessionId = input.session_id?.trim() || newTurnSessionId();
 
+	// The armed skip belongs to this session alone; the global control file never carries one.
+	const skipArmed = readSkipOnce(deps.stateDir, sessionId);
 	const state: UpliftState = {
 		enabled: deps.control.enabled ?? deps.config.uplift.enabled,
-		skipOnce: deps.control.skipOnce === true,
+		skipOnce: skipArmed,
 		skipTrivial: deps.config.uplift.skipTrivial,
 	};
 	const decision = decideUplift({ text: input.prompt ?? "", source: "user", idle: true }, state);
-	if (deps.control.skipOnce && !state.skipOnce) {
+	if (skipArmed && !state.skipOnce) {
 		try {
-			writeControl(deps.stateDir, { skipOnce: false });
+			clearSkipOnce(deps.stateDir, sessionId);
 		} catch {
 			// fail-open
 		}
@@ -453,7 +455,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	// looks exactly like a deterministic one: no event, engine, brief, knowledge or tracker call, and no state write.
 	const decisions = createDecisions({
 		config: deps.config.decisions,
-		...(sessionId === "unknown" ? {} : { sessionId }),
+		...(isTurnSessionId(sessionId) ? {} : { sessionId }),
 		...deps.decisionsDeps,
 	});
 	// Keep cancellation separate from the hook's partial-result budget, whose timer starts after the gate as before.
@@ -853,9 +855,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			},
 		};
 		// One event, after every fallible step, for a plan that exists and whose record is on disk, in a session the
-		// substrate can chain on: a skip, a fallback spec, a failed state write or an unknown session leaves nothing behind.
+		// substrate can chain on: a skip, a fallback spec, a failed state write or a turn with no session id leaves nothing behind.
 		// Bounded by the planning budget, and ahead of the summary so the elapsed time it shows includes the attempt.
-		if (plan?.graphId && statePath && sessionId !== "unknown") {
+		if (plan?.graphId && statePath && !isTurnSessionId(sessionId)) {
 			await announcePlan(deps, {
 				plan,
 				sessionId,

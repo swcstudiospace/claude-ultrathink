@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeConfigPaths, defaultConfig, loadConfig, type UltrathinkConfig } from "../config.ts";
-import { readControl, type SessionRecord, writeSession } from "../claude/state.ts";
+import { readControl, readSkipOnce, type SessionRecord, writeSession } from "../claude/state.ts";
 import type { DoctorReport } from "../doctor/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
 import type { HostId } from "../host/types.ts";
@@ -197,12 +197,17 @@ describe("runControl", () => {
 		expect(await runControl(["off"], io)).toBe("Prompt Uplift off");
 		expect(readControl(io.stateDir)).toEqual({ enabled: false });
 		expect(await runControl(["on"], io)).toBe("Prompt Uplift on");
-		expect(await runControl(["skip"], io)).toBe("Prompt Uplift will skip the next prompt");
+		expect(await runControl(["skip"], io)).toBe("Prompt Uplift skip needs a session id (--session <id>); none was given, so nothing was armed.");
+		expect(readSkipOnce(io.stateDir, "s1")).toBe(false);
+		expect(await runControl(["skip"], { ...io, sessionId: "s1" })).toBe("Prompt Uplift will skip the next prompt in this session");
+		expect(readSkipOnce(io.stateDir, "s1")).toBe(true);
+		expect(readSkipOnce(io.stateDir, "s2")).toBe(false);
 		expect(await runControl(["track", "off"], io)).toStartWith("Tracking: off (Linear/Notion rows)");
-		expect(readControl(io.stateDir)).toEqual({ enabled: true, skipOnce: true, trackEnabled: false });
+		expect(readControl(io.stateDir)).toEqual({ enabled: true, trackEnabled: false });
 		expect(await runControl(["Track", "ON"], io)).toStartWith("Tracking: on");
-		expect(readControl(io.stateDir)).toEqual({ enabled: true, skipOnce: true, trackEnabled: true });
-		expect(await runControl(["status"], io)).toStartWith("Prompt Uplift on (skipping next prompt)");
+		expect(readControl(io.stateDir)).toEqual({ enabled: true, trackEnabled: true });
+		expect(await runControl(["status"], { ...io, sessionId: "s1" })).toStartWith("Prompt Uplift on (skipping next prompt)");
+		expect(await runControl(["status"], io)).not.toContain("skipping next prompt");
 	});
 
 	test("status reports tracking and names what is not configured", async () => {

@@ -4,6 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
+import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
@@ -22,7 +23,6 @@ import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
 export interface ControlState {
 	enabled?: boolean;
-	skipOnce?: boolean;
 	thinkEnabled?: boolean;
 	hitlEnabled?: boolean;
 	/** Create Linear/Notion rows; overrides `track.enabled` from config. `false` also stops kickoff from creating them. */
@@ -73,6 +73,13 @@ export interface SessionRecord {
 	docs?: DocsLookup;
 	/** Jev decisions made while planning this prompt (plan, knowledge, blocking), in call order. Absent on older records and when none ran. */
 	decisions?: DecisionRecord[];
+	/** Repos of the files this session's edit/write tools changed (omp), sorted and unique. Attribution only; never changes the label. */
+	workRepos?: string[];
+	/**
+	 * Set when an edited repo differs from the plan's labelled repo (`plan.task.repo`; null when the plan has none).
+	 * `edited` is the full `workRepos` at that point, so a warning fires once per distinct edited set.
+	 */
+	repoMismatch?: { labelled: string | null; edited: string[] } | null;
 }
 
 export function defaultStateDir(env: Record<string, string | undefined> = process.env): string {
@@ -103,7 +110,6 @@ export function readControl(dir: string): ControlState {
 	const rec = raw as Record<string, unknown>;
 	const out: ControlState = {};
 	if (typeof rec.enabled === "boolean") out.enabled = rec.enabled;
-	if (typeof rec.skipOnce === "boolean") out.skipOnce = rec.skipOnce;
 	if (typeof rec.thinkEnabled === "boolean") out.thinkEnabled = rec.thinkEnabled;
 	if (typeof rec.hitlEnabled === "boolean") out.hitlEnabled = rec.hitlEnabled;
 	if (typeof rec.trackEnabled === "boolean") out.trackEnabled = rec.trackEnabled;
@@ -132,6 +138,42 @@ function safeSessionId(id: string): string {
 
 export function sessionPath(dir: string, sessionId: string): string {
 	return join(dir, "sessions", `${safeSessionId(sessionId)}.json`);
+}
+
+/** A fresh id for a turn whose host gave no session id: unique to that prompt, so no turn reads or writes another's state. */
+export function newTurnSessionId(): string {
+	return `turn-${randomUUID()}`;
+}
+
+const TURN_SESSION_RE = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function isTurnSessionId(id: string): boolean {
+	return TURN_SESSION_RE.test(id);
+}
+
+/**
+ * Path of a session's armed /ultrathink-skip. A flag file beside the session's record, not part of it: a session can be
+ * skipped before its first plan writes a record. The `.skip` suffix keeps it out of the `sessions/*.json` record count.
+ */
+export function skipOncePath(dir: string, sessionId: string): string {
+	return join(dir, "sessions", `${safeSessionId(sessionId)}.skip`);
+}
+
+export function readSkipOnce(dir: string, sessionId: string): boolean {
+	return existsSync(skipOncePath(dir, sessionId));
+}
+
+export function armSkipOnce(dir: string, sessionId: string): void {
+	writeFileAtomic(skipOncePath(dir, sessionId), "skip\n");
+}
+
+/** Clears the session's armed skip; an already clear session is left as it is. */
+export function clearSkipOnce(dir: string, sessionId: string): void {
+	try {
+		unlinkSync(skipOncePath(dir, sessionId));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
 }
 
 export function readSession(dir: string, sessionId: string): SessionRecord | undefined {

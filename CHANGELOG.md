@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prompts no longer share state across sessions. An edit or write in Omp is attributed to the git repo it touched: a session whose edits land in a repo other than its plan's labelled repo records `repoMismatch` on its session record and shows one warning per distinct edited set. The label itself is unchanged.
+- `/ultrathink-skip` arms the skip for the session it is typed in, not for every session on the machine. Claude Code passes its session id (`${CLAUDE_SESSION_ID}`); `bin/ultrathink skip --session <id>` and grok-bot `ctl skip --session <id>` take one explicitly. Without an id it is refused with a message and arms nothing.
+- A prompt with no session id gets its own `turn-<uuid>` id instead of the shared `unknown` record, so no turn reads another turn's clarifications and no carrier names a turn.
 - OAuth consent: a pending approval stays valid for 10 minutes, approve attempts are limited, and the consent page policy lets the browser follow the redirect back to the client. Before, Chrome cancelled the redirect to grok.com, the page did not move, and the second click showed "This authorization request expired".
 - Client registration is rate limited per address and no longer fills up for good: clients that never received a grant expire after 24 hours, and the oldest is evicted when the table is full.
 - Token-opt no longer records a second graph saving when a graph query is served from cache. A cache hit replays text whose saving was already recorded.

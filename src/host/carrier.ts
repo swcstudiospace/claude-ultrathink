@@ -8,6 +8,7 @@
  */
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { isTurnSessionId } from "../claude/state.ts";
 import { writeFileAtomic } from "../claude/atomic.ts";
 import type { HostId } from "./types.ts";
 
@@ -39,7 +40,8 @@ export function clearPlanCarrier(stateDir: string): void {
 
 /** Returns the carrier path, or undefined when there is nothing safe to point at. */
 export function writePlanCarrier(input: CarrierInput): string | undefined {
-	if (!input.sessionId.trim() || input.sessionId === "unknown") return undefined;
+	// A turn id names one prompt the host never repeats, so a carrier pointing at it could never be matched to a turn.
+	if (!input.sessionId.trim() || isTurnSessionId(input.sessionId)) return undefined;
 	if (!input.specPath && !input.context) return undefined;
 	const path = carrierPath(input.stateDir);
 	const body = {

@@ -760,7 +760,7 @@ describe("substrate plan event", () => {
 		try {
 			for (const session_id of [undefined, "  "]) {
 				const result = await runPromptSubmit({ ...input, session_id }, deps);
-				expect(result.record?.sessionId).toBe("unknown");
+				expect(result.record?.sessionId).toStartWith("turn-");
 				expect(result.record?.plan?.graphId).toBeDefined();
 			}
 			expect(sent).toEqual([]);

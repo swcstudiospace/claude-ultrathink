@@ -47,8 +47,8 @@ describe("control state", () => {
 		const dir = tempDir();
 		expect(readControl(dir)).toEqual({});
 		expect(writeControl(dir, { enabled: false })).toEqual({ enabled: false });
-		expect(writeControl(dir, { skipOnce: true })).toEqual({ enabled: false, skipOnce: true });
-		expect(readControl(dir)).toEqual({ enabled: false, skipOnce: true });
+		expect(writeControl(dir, { hitlEnabled: true })).toEqual({ enabled: false, hitlEnabled: true });
+		expect(readControl(dir)).toEqual({ enabled: false, hitlEnabled: true });
 	});
 
 	test("hitlEnabled and engine persist; unknown engine values are dropped", () => {
