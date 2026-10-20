@@ -17,6 +17,7 @@ import type { UltrathinkConfig } from "../config/config.ts";
 import type { HeadlessPlanner, ResultView } from "../engine/headless.ts";
 import type { OpenRouterFetch } from "../engine/openrouter.ts";
 import { auditPath, verifyAuditFile } from "../obs/audit.ts";
+import { type RequestContext, currentRequestContext } from "../obs/context.ts";
 import { createLogger } from "../obs/log.ts";
 import { type Store, openStore } from "../store/store.ts";
 import { type App, type RouterDeps, createApp } from "./router.ts";
@@ -1170,30 +1171,69 @@ describe("hardening wiring", () => {
 			.map((line) => JSON.parse(line));
 	}
 
-	test("POST /logout needs the publicOrigin, clears the cookie with or without a session, and records a presented session", async () => {
+	test("POST /ultrathink/logout needs the publicOrigin, clears the cookie with or without a session, and records a presented session", async () => {
 		const h = harness();
 		const login = await h.app.handle(loginRequest(OWNER_PASSWORD), PEER);
 		expect(login.status).toBe(200);
 		const session = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
 
 		const foreign = await h.app.handle(
-			new Request(`${ORIGIN}/logout`, { method: "POST", headers: { Origin: "https://evil.test", Cookie: session } }),
+			new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: "https://evil.test", Cookie: session } }),
 			PEER,
 		);
 		expect(foreign.status).toBe(403);
 		expect(await json<Json>(foreign)).toEqual({ error: "forbidden" });
 
-		const out = await h.app.handle(new Request(`${ORIGIN}/logout`, { method: "POST", headers: { Origin: ORIGIN, Cookie: session } }), PEER);
+		const out = await h.app.handle(new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: ORIGIN, Cookie: session } }), PEER);
 		expect(out.status).toBe(200);
 		expect(await json<Json>(out)).toEqual({ ok: true });
 		const cleared = out.headers.get("set-cookie") ?? "";
 		expect(cleared.startsWith("__Host-ut_session=;")).toBe(true);
 		expect(cleared).toContain("Max-Age=0");
 
-		const bare = await h.app.handle(new Request(`${ORIGIN}/logout`, { method: "POST", headers: { Origin: ORIGIN } }), PEER);
+		const bare = await h.app.handle(new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: ORIGIN } }), PEER);
 		expect(bare.status).toBe(200);
 		expect(bare.headers.get("set-cookie") ?? "").toContain("Max-Age=0");
+		// The old path is not routed; nginx only forwards /ultrathink, so /logout is an unknown path.
+		expect((await h.app.handle(new Request(`${ORIGIN}/logout`, { method: "POST", headers: { Origin: ORIGIN } }), PEER)).status).toBe(404);
 		expect(auditRecords(h.dir).map((record) => record.event)).toEqual(["login_ok", "logout"]);
+	});
+
+	test("every dropped audit record is counted, and the failure is logged once per distinct message", async () => {
+		const h = harness();
+		// Closing the audit log makes every later record a drop.
+		await h.app.shutdown();
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		}
+		expect(sample(h, "ultrathink_audit_write_failures_total")).toBe(3);
+		expect(logsOf(h, "audit_write_failed")).toHaveLength(1);
+	});
+
+	test("an unsampled inbound traceparent stays unsampled: echoed as -00 and seen by the request context", async () => {
+		const seen: Array<RequestContext | undefined> = [];
+		const planner = stubPlanner(true, {
+			result: async (input) => {
+				seen.push(currentRequestContext());
+				return { ok: true, data: viewOf(String(input.sessionId)) };
+			},
+		});
+		const h = harness({ deps: { planner } });
+		const resultCall = {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: { name: "ultrathink_result", arguments: { sessionId: randomSessionId(), waitSeconds: 0, detail: "full" } },
+		};
+
+		const unsampled = await rpc(h, resultCall, { traceparent: `00-${TRACE_ID}-${PARENT_SPAN}-00` });
+		expect(unsampled.status).toBe(200);
+		expect(unsampled.headers.get("traceparent")).toMatch(new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-00$`));
+		expect(seen[0]).toMatchObject({ traceId: TRACE_ID, sampled: false });
+
+		const fresh = await rpc(h, resultCall);
+		expect(fresh.headers.get("traceparent")).toMatch(/-01$/);
+		expect(seen[1]).toMatchObject({ sampled: true });
 	});
 
 	test("a failed login is written to the audit log, which verifies, and auditLog off writes no file", async () => {

@@ -4,9 +4,9 @@
  * Deterministic ship signals: git branch state, GSD roadmap progress and the
  * plan's graph shape. Every probe fails open (missing -> undefined/0).
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
 import { defaultRun } from "./run.ts";
 import type { GitSignals, GsdSignals, MilestoneEvidence, Run, ShipSignals } from "./types.ts";
@@ -214,6 +214,15 @@ export interface GsdToolsInput {
 	run?: Run;
 }
 
+/** `path` with symlinks resolved; `path` itself when it cannot be resolved. */
+function realOrSelf(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
 /**
  * Finds gsd-tools.cjs. A project-local candidate is used only when the repository does not track it: a committed copy
  * is code controlled by whoever authored the repository and would otherwise run on `ship assess|pr`.
@@ -225,7 +234,13 @@ export function lookupGsdTools(input: GsdToolsInput): GsdToolsLookup {
 	const run = input.run ?? defaultRun;
 	const isTracked =
 		input.isTracked ??
-		((path: string) => run(["git", "ls-files", "--error-unmatch", relative(input.cwd, path)], { cwd: input.cwd }).exitCode === 0);
+		((path: string) => {
+			// A tracked symlink must not hide the code it leads to, so the check runs on the resolved path.
+			const root = realOrSelf(input.cwd);
+			const target = relative(root, realOrSelf(path));
+			if (target === "" || target === ".." || target.startsWith(`..${sep}`) || isAbsolute(target)) return false;
+			return run(["git", "ls-files", "--error-unmatch", target], { cwd: input.cwd }).exitCode === 0;
+		});
 	const tracked: string[] = [];
 	const candidates = gsdToolsCandidates(input.cwd, env, input.home ?? homedir());
 	const path = candidates.find((candidate, index) => {

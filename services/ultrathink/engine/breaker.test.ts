@@ -124,6 +124,21 @@ describe("closed state", () => {
 	});
 });
 
+describe("closed slot generations", () => {
+	test("a slot admitted before the breaker opened and closed again does not count", () => {
+		const { breaker, clock: c } = harness({ failureThreshold: 2, openMs: 5_000 });
+		const stale = [acquired(breaker.tryAcquire()), acquired(breaker.tryAcquire()), acquired(breaker.tryAcquire())];
+		fail(breaker);
+		fail(breaker);
+		expect(breaker.state()).toBe("open");
+		c.advance(5_000);
+		acquired(breaker.tryAcquire()).release("success");
+		expect(breaker.state()).toBe("closed");
+		for (const slot of stale) slot.release("failure");
+		expect(breaker.snapshot()).toMatchObject({ state: "closed", failures: 0 });
+	});
+});
+
 describe("open state", () => {
 	test("refuses with decreasing retryAfterMs until openMs elapses", () => {
 		const { breaker, clock: c } = harness({ failureThreshold: 1, openMs: 5_000 });

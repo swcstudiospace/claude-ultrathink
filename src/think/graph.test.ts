@@ -120,6 +120,24 @@ describe("normalizeGraph", () => {
 		expect(out.nodes[4]?.dependsOn).toEqual([]);
 		for (const node of out.nodes) expect(Object.hasOwn(Object.prototype, node.id)).toBe(false);
 	});
+
+	test("a positional fallback skips valid ids written later in the list, so no node is dropped", () => {
+		const out = normalizeGraph(
+			{
+				goal: "g",
+				nodes: [
+					{ id: "n2", title: "A", kind: "understand", question: "q1", depends_on: [] },
+					{ id: "bad id", title: "B", kind: "decompose", question: "q2", depends_on: ["n2"] },
+					{ id: "n3", title: "C", kind: "generate", question: "q3", depends_on: ["bad id"] },
+				],
+			},
+			"fb",
+			3,
+			8,
+		);
+		expect(out.nodes.map((node) => node.id)).toEqual(["n2", "n4", "n3"]);
+		expect(out.nodes[2]?.dependsOn).toEqual(["n4"]);
+	});
 });
 
 describe("topoSort", () => {

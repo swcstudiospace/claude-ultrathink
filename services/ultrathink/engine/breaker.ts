@@ -148,6 +148,7 @@ export function createCircuitBreaker(options: CircuitBreakerOptions): CircuitBre
 	}
 
 	function closedAcquire(): Acquire {
+		const admitted = generation;
 		let released = false;
 		return {
 			ok: true,
@@ -156,9 +157,9 @@ export function createCircuitBreaker(options: CircuitBreakerOptions): CircuitBre
 					return;
 				}
 				released = true;
-				// Only failures observed while still closed count; once the breaker
-				// has opened, probes decide the next state.
-				if (outcome === "failure" && state === "closed") {
+				// A slot admitted before the last transition is stale: a failure from before the breaker opened
+				// and closed again must not count against the new healthy period.
+				if (outcome === "failure" && state === "closed" && admitted === generation) {
 					recordClosedFailure(now());
 				}
 			},

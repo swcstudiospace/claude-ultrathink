@@ -276,7 +276,7 @@ export function createOpenRouterCompleter(
 				? headers
 				: {
 						...headers,
-						traceparent: formatTraceparent(childSpan({ traceId: ctx.traceId, spanId: ctx.spanId, sampled: true })),
+						traceparent: formatTraceparent(childSpan({ traceId: ctx.traceId, spanId: ctx.spanId, sampled: ctx.sampled ?? true })),
 					};
 		try {
 			let response: Response;

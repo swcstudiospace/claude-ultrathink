@@ -75,7 +75,7 @@ The service reads its variables in `services/ultrathink/config/config.ts`; if th
 
 | Variable | Default | Allowed values | Effect |
 |---|---|---|---|
-| `ULTRATHINK_PUBLIC_ORIGIN` | none (required) | An origin without path, query or credentials; a trailing slash is dropped | The public origin. `POST /logout` needs this exact `Origin`. An https origin makes the session cookie `__Host-ut_session` with `Secure`. |
+| `ULTRATHINK_PUBLIC_ORIGIN` | none (required) | An origin without path, query or credentials; a trailing slash is dropped | The public origin. `POST /ultrathink/logout` needs this exact `Origin`. An https origin makes the session cookie `__Host-ut_session` with `Secure`. |
 | `ULTRATHINK_SESSION_SECRET` | none (required) | At least 32 characters | Signs web session cookies and approval proofs (section 6). |
 | `ULTRATHINK_SESSION_SECRET_PREVIOUS` | empty | Comma-separated, newest first; each at least 32 characters; at most 4 entries | Earlier secrets that still verify sessions and pending consents during a rotation (section 6). |
 | `ULTRATHINK_OWNER_PASSWORD_HASH` | none (required) | An argon2id or bcrypt hash; other values are refused at startup | Owner login. Changing it ends every web session. |

@@ -719,10 +719,15 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		try {
 			const login = await options.auth.login({ password: form.get("password") ?? "", clientIp: ip });
 			if (!login.ok) {
-				if (login.reason === "rate_limited") return errorPage(429, "Too many attempts. Wait and try again.");
+				if (login.reason === "rate_limited") {
+					audit("rate_limited", { scope: "login", ip });
+					return errorPage(429, "Too many attempts. Wait and try again.");
+				}
+				audit("login_failed", { ip });
 				if (found.request.approvalState !== "PENDING_APPROVAL") return expiredResponse(false);
 				return consentPage(requestId, found.request.nonce, clientName, redirectUri, "Incorrect password.", 200);
 			}
+			audit("login_ok", { ip });
 			// Registration or pruning may have dropped the client or its pending entry while the password was checked; a code for a missing client could never be redeemed.
 			if (found.request.approvalState !== "PENDING_APPROVAL" || pending.get(found.key) !== found.request || own(data.clients, found.request.clientId) === undefined) {
 				return expiredResponse(false);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionRecord } from "../claude/state.ts";
@@ -127,5 +127,21 @@ describe("collectSignals with a repository-tracked gsd-tools.cjs", () => {
 		expect(s.gsd).toMatchObject({ phaseCount: 3, completedPhases: 1, trusted: true });
 		expect(s.gsd?.toolsMissing).toBeUndefined();
 		expect(s.gsd?.toolsTracked).toBeUndefined();
+	});
+});
+
+describe("default tracked check follows symlinks", () => {
+	test("a tracked symlink into tracked code does not hide the copy it leads to", () => {
+		const cwd = tempDir();
+		const git = (...args: string[]) => Bun.spawnSync(["git", ...args], { cwd, stdout: "ignore", stderr: "ignore" });
+		git("init", "-q");
+		mkdirSync(join(cwd, "other", "bin"), { recursive: true });
+		writeFileSync(join(cwd, "other", "bin", "gsd-tools.cjs"), "// committed\n");
+		symlinkSync("other", join(cwd, "gsd-core"));
+		git("add", "-A");
+		git("-c", "user.name=ship", "-c", "user.email=ship@example.invalid", "commit", "-q", "-m", "fixture");
+		const lookup = lookupGsdTools({ cwd, env: {}, home: tempDir() });
+		expect(lookup.path).toBeUndefined();
+		expect(lookup.tracked).toEqual([join(cwd, "gsd-core", "bin", "gsd-tools.cjs")]);
 	});
 });

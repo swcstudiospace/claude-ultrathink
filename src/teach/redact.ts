@@ -28,6 +28,8 @@ const PEM_OPEN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/g;
 const URL_USERINFO = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/]+@/g;
 const AUTH_HEADER =
 	/((?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)["']?\s*[:=]\s*["']?)(?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s"',;]+/gi;
+/** A Cookie or Set-Cookie header value runs to the end of its line or to a quote: every pair in it is a credential, not only the first. */
+const COOKIE_HEADER = /((?:set-)?cookie["']?\s*[:=]\s*["']?)[^\r\n"']+/gi;
 const BEARER = /\bBearer(\s+)([A-Za-z0-9._~+/-]+=*)/gi;
 const JWT = /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g;
 const TOKEN_PATTERNS: RegExp[] = [
@@ -112,6 +114,7 @@ export function redactText(text: string, options: RedactOptions = {}): string {
 		if (typeof text !== "string" || text === "") return "";
 		let out = text.replace(PEM_BLOCK, REDACTED).replace(PEM_OPEN, REDACTED);
 		out = out.replace(URL_USERINFO, `$1${REDACTED}@`);
+		out = out.replace(COOKIE_HEADER, `$1${REDACTED}`);
 		out = out.replace(AUTH_HEADER, `$1${REDACTED}`);
 		out = redactBearer(out).replace(JWT, REDACTED);
 		for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);

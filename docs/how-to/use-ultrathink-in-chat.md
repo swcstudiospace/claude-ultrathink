@@ -310,7 +310,7 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 
 Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 65,536 bytes and is not configurable. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
 
-Web login sessions use the cookie `__Host-ut_session` when the public origin is https and `ut_session` otherwise. Sessions issued before this release no longer validate, so every browser session ends at deploy (at most 12 hours). `POST /logout` clears the cookie and needs the exact public origin.
+Web login sessions use the cookie `__Host-ut_session` when the public origin is https and `ut_session` otherwise. Sessions issued before this release no longer validate, so every browser session ends at deploy (at most 12 hours). `POST /ultrathink/logout` clears the cookie and needs the exact public origin.
 
 ## Troubleshooting
 

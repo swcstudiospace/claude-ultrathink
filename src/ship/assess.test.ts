@@ -400,6 +400,15 @@ describe("assessDone rules", () => {
 		});
 	}
 
+	test("a tracked local copy with a working install reports no tools gap", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsTracked: true }),
+			diff: DIFF,
+		});
+		expect(a.gaps.some((g) => g.startsWith("a gsd-tools.cjs committed"))).toBe(false);
+	});
+
 	test("rules pass without judge -> done at 0.5", async () => {
 		const a = await assessDone({ record: RECORD, signals: signals(), diff: DIFF, now: () => 7 });
 		expect(a).toMatchObject({ done: true, confidence: 0.5, source: "rules", at: 7 });

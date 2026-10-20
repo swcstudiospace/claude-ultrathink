@@ -273,7 +273,7 @@ describe("failure handling", () => {
 		return fs;
 	}
 
-	test("a write failure drops the record, reports once per message, and reports again after a recovery", () => {
+	test("a write failure drops the record and reports every drop; the chain resumes after a recovery", () => {
 		const path = auditPath(tempDir());
 		const errors: Error[] = [];
 		const fs = failingFs();
@@ -282,7 +282,7 @@ describe("failure handling", () => {
 		fs.failing = true;
 		log.record("login_ok", { n: 2 });
 		log.record("login_ok", { n: 3 });
-		expect(errors.length).toBe(1);
+		expect(errors.length).toBe(2);
 		expect(errors[0]?.message).toMatch(/record dropped: EACCES/);
 		fs.failing = false;
 		log.record("login_ok", { n: 4 });
@@ -293,10 +293,50 @@ describe("failure handling", () => {
 		expect(log.verify().ok).toBe(true);
 		fs.failing = true;
 		log.record("login_ok", { n: 5 });
-		expect(errors.length).toBe(2);
+		expect(errors.length).toBe(3);
 	});
 
-	test.skipIf(IS_ROOT)("a read-only directory makes record report once and the process keeps going", () => {
+	test("a failed fsync rolls the record back, and the next record continues the chain", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		let failNextSync = false;
+		const fs: AuditFs = {
+			...nodeFs,
+			fsyncSync: ((fd: number) => {
+				if (failNextSync) {
+					failNextSync = false;
+					throw Object.assign(new Error("EIO: fsync"), { code: "EIO" });
+				}
+				return nodeFs.fsyncSync(fd);
+			}) as typeof nodeFs.fsyncSync,
+		};
+		const log = createAuditLog({ path, now: clock(), fs, onError: (e) => errors.push(e) });
+		log.record("login_ok", { n: 1 });
+		failNextSync = true;
+		log.record("login_ok", { n: 2 });
+		log.record("login_ok", { n: 3 });
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.message).toMatch(/record dropped: EIO/);
+		expect(records(path).map((r) => [r.seq, r.fields.n])).toEqual([
+			[1, 1],
+			[2, 3],
+		]);
+		expect(log.verify().ok).toBe(true);
+	});
+
+	test("a file removed between appends is started again from genesis", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		log.record("login_ok", { n: 1 });
+		rmSync(path);
+		log.record("login_ok", { n: 2 });
+		expect(records(path).map((r) => [r.seq, r.fields.n])).toEqual([[1, 2]]);
+		expect(log.verify().ok).toBe(true);
+		expect(errors.some((e) => /changed outside the service/.test(e.message))).toBe(true);
+	});
+
+	test.skipIf(IS_ROOT)("a read-only directory reports every dropped record and the process keeps going", () => {
 		const dir = tempDir();
 		const path = auditPath(dir);
 		const errors: Error[] = [];
@@ -306,11 +346,10 @@ describe("failure handling", () => {
 		chmodSync(dir, 0o500);
 		log.record("login_ok", { n: 2 });
 		log.record("login_ok", { n: 3 });
-		expect(errors.length).toBe(1);
-		expect(errors[0]?.message).toMatch(/record dropped/);
+		expect(errors.map((e) => e.message.includes("record dropped"))).toEqual([false, true, true]);
 		chmodSync(dir, 0o700);
 		log.record("login_ok", { n: 4 });
-		expect(errors.length).toBe(1);
+		expect(errors.length).toBe(3);
 		expect(existsSync(path)).toBe(true);
 	});
 
@@ -328,14 +367,14 @@ describe("failure handling", () => {
 		expect(() => log.record("logout")).not.toThrow();
 	});
 
-	test("records after close are dropped and reported once", () => {
+	test("records after close are dropped and each one is reported", () => {
 		const { log, path, errors } = filled(1);
 		log.close();
 		log.close();
 		log.record("logout");
 		log.record("logout");
 		expect(records(path).length).toBe(1);
-		expect(errors.map((e) => e.message)).toEqual(["audit log: record after close dropped"]);
+		expect(errors.map((e) => e.message)).toEqual(["audit log: record after close dropped", "audit log: record after close dropped"]);
 	});
 
 	test("a missing directory and invalid options fail at construction", () => {

@@ -59,7 +59,7 @@ export interface AuditRecord {
 }
 
 /** The `node:fs` surface the log uses; injectable so tests can simulate I/O failures without touching permissions. */
-export type AuditFs = Pick<typeof nodeFs, "openSync" | "closeSync" | "readSync" | "writeSync" | "fsyncSync" | "fchmodSync" | "renameSync" | "existsSync">;
+export type AuditFs = Pick<typeof nodeFs, "openSync" | "closeSync" | "readSync" | "writeSync" | "fsyncSync" | "fchmodSync" | "renameSync" | "existsSync" | "statSync" | "truncateSync">;
 
 export interface AuditLogOptions {
 	/** Path of the JSON Lines file. Its directory must already exist and be writable. */
@@ -67,8 +67,8 @@ export interface AuditLogOptions {
 	/** Clock in epoch milliseconds; defaults to `Date.now`. */
 	now?: () => number;
 	/**
-	 * Receives every failure the log swallows: a quarantined file on open, a dropped record on write failure. Each
-	 * distinct write-failure message is reported once until a later append succeeds. The callback must not throw;
+	 * Receives every failure the log swallows: a quarantined file on open or on a later change, a file adopted after an
+	 * outside change, and each dropped record. Every drop is reported; a caller that writes log lines deduplicates them. The callback must not throw;
 	 * if it does, the error is discarded.
 	 */
 	onError?: (error: Error) => void;
@@ -98,7 +98,7 @@ export interface AuditLog {
 	record(event: AuditEvent, fields?: Record<string, unknown>): void;
 	/** Full scan of the file on disk, constant memory per line. Reads with the log's `fs` hooks. */
 	verify(): AuditVerification;
-	/** Further `record()` calls are dropped (reported once through `onError`). Idempotent. */
+	/** Further `record()` calls are dropped, and each one is reported through `onError`. Idempotent. */
 	close(): void;
 }
 
@@ -284,6 +284,15 @@ function writeAll(fs: AuditFs, fd: number, data: Buffer): void {
 	}
 }
 
+/** Size of a file, or undefined when it does not exist. */
+function sizeOf(path: string, fs: AuditFs): number | undefined {
+	try {
+		return fs.statSync(path).size;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Opens (or creates, `0600`) the audit file and continues its chain. An existing file is verified first; a broken
  * one (truncated by a crash, edited, reordered) is moved to `${path}.corrupt-<now>` and reported through `onError`,
@@ -300,7 +309,6 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	const now = options.now ?? Date.now;
 	const fs = options.fs ?? nodeFs;
 	const onError = options.onError;
-	const reported = new Set<string>();
 	let closed = false;
 
 	const report = (error: Error): void => {
@@ -310,11 +318,6 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		} catch {
 			// The error sink is best effort.
 		}
-	};
-	const reportOnce = (error: Error): void => {
-		if (reported.has(error.message)) return;
-		reported.add(error.message);
-		report(error);
 	};
 
 	let seq = 0;
@@ -351,13 +354,55 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		fs.closeSync(probe);
 	}
 
+	// The size of the file as this log last left it. Undefined means the disk must be read before the next append.
+	let expectedSize: number | undefined = sizeOf(path, fs) ?? 0;
+
+	/**
+	 * Re-reads the chain from disk and adopts it, so an outside change (a rotated, removed or edited file) does not break
+	 * the chain. A file that no longer verifies is quarantined, as at startup. False when the record must be dropped.
+	 */
+	function adoptDisk(): boolean {
+		const check = scanChain(path, fs);
+		if (check.ok) {
+			if (check.records !== seq || check.lastHash !== prev) {
+				report(new Error(`audit log: ${path} changed outside the service; continuing from the file on disk`));
+			}
+			seq = check.records;
+			prev = check.lastHash;
+			expectedSize = sizeOf(path, fs) ?? 0;
+			return true;
+		}
+		if (check.brokenAt === 0) {
+			report(new Error(`audit log: cannot verify ${path}: ${check.reason}; record dropped`));
+			expectedSize = undefined;
+			return false;
+		}
+		const quarantine = `${path}.corrupt-${stamp(now).replace(/[:.]/g, "-")}`;
+		try {
+			fs.renameSync(path, quarantine);
+		} catch (error) {
+			report(new Error(`audit log: ${path} is broken at record ${check.brokenAt} and cannot be quarantined: ${errorOf(error).message}; record dropped`));
+			expectedSize = undefined;
+			return false;
+		}
+		report(new Error(`audit log: ${path} broken at record ${check.brokenAt} (${check.reason}); moved to ${quarantine}, starting a new chain`));
+		seq = 0;
+		prev = GENESIS_HASH;
+		expectedSize = 0;
+		return true;
+	}
+
 	return {
 		path,
 		record(event, fields) {
 			if (closed) {
-				reportOnce(new Error("audit log: record after close dropped"));
+				report(new Error("audit log: record after close dropped"));
 				return;
 			}
+			if (expectedSize === undefined || sizeOf(path, fs) !== expectedSize) {
+				if (!adoptDisk()) return;
+			}
+			const before = sizeOf(path, fs) ?? 0;
 			const nextSeq = seq + 1;
 			const ts = stamp(now);
 			const clean = sanitizeFields(fields);
@@ -371,7 +416,14 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 				writeAll(fs, fd, data);
 				fs.fsyncSync(fd);
 			} catch (error) {
-				reportOnce(new Error(`audit log: record dropped: ${errorOf(error).message}`));
+				report(new Error(`audit log: record dropped: ${errorOf(error).message}`));
+				// Roll back whatever part of the record reached the file, so the chain on disk still ends at the last acknowledged record.
+				try {
+					fs.truncateSync(path, before);
+					expectedSize = before;
+				} catch {
+					expectedSize = undefined;
+				}
 				return;
 			} finally {
 				if (fd !== undefined) {
@@ -384,7 +436,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			}
 			seq = nextSeq;
 			prev = hash;
-			reported.clear();
+			expectedSize = before + data.length;
 		},
 		verify() {
 			return scanChain(path, fs);

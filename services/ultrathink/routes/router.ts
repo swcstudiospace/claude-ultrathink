@@ -210,7 +210,7 @@ function matchPath(pathname: string): Target | null {
 	if (pathname === "/oauth/register") return { endpoint: "oauth_register" };
 	if (pathname === "/oauth/revoke") return { endpoint: "oauth_revoke" };
 	if (pathname === "/login") return { endpoint: "login" };
-	if (pathname === "/logout") return { endpoint: "logout" };
+	if (pathname === "/ultrathink/logout") return { endpoint: "logout" };
 	if (pathname === "/ultrathink") return { endpoint: "ultrathink" };
 	if (pathname === "/mcp") return { endpoint: "mcp" };
 	const match = RUN_PATH.exec(pathname);
@@ -293,6 +293,9 @@ export function createApp(deps: RouterDeps): App {
 	const { config, store, auth } = deps;
 	const logger = deps.logger ?? createLogger();
 	const metrics = deps.metrics ?? createMetrics();
+	// Every dropped record counts; the log line is written once per distinct message until an append succeeds.
+	let auditDrops = 0;
+	let auditLoggedMessage: string | undefined;
 	// Absent when config.auditLog is off, unless a test injects one.
 	const auditLog =
 		deps.audit ??
@@ -300,13 +303,19 @@ export function createApp(deps: RouterDeps): App {
 			? createAuditLog({
 					path: auditPath(config.stateDir),
 					onError: (error) => {
+						auditDrops += 1;
 						metrics.inc("ultrathink_audit_write_failures_total");
+						if (error.message === auditLoggedMessage) return;
+						auditLoggedMessage = error.message;
 						logger.error("audit_write_failed", { error: error.message });
 					},
 				})
 			: undefined);
 	function record(event: AuditEvent, fields: Record<string, string | number | boolean> = {}): void {
+		const dropsBefore = auditDrops;
 		auditLog?.record(event, fields);
+		// onError runs inside record(), so no new drop means this append landed.
+		if (auditDrops === dropsBefore) auditLoggedMessage = undefined;
 	}
 	const oauth = createOAuth({
 		origin: config.publicOrigin,
@@ -763,7 +772,7 @@ export function createApp(deps: RouterDeps): App {
 			endpoint: "not_found",
 			authKind: "none",
 		};
-		return runWithRequestContext({ reqId: ctx.reqId, traceId: server.traceId, spanId: server.spanId }, async () => {
+		return runWithRequestContext({ reqId: ctx.reqId, traceId: server.traceId, spanId: server.spanId, sampled: server.sampled }, async () => {
 			let response: Response;
 			let release: (() => void) | undefined;
 			try {
@@ -839,6 +848,7 @@ export function createApp(deps: RouterDeps): App {
 					for (const kind of ["jobs", "sessions", "journals"] as const) {
 						metrics.inc("ultrathink_retention_removed_total", { kind }, result.removed[kind]);
 					}
+					if (result.errors > 0) logger.warn("retention_errors", { errors: result.errors });
 					refreshIntegrity();
 				},
 				onError: (error) => logger.error("retention_failed", { error: error.message }),

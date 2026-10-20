@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/readyz` now checks the store, the state directory, OAuth, the planner, integrity (SQLite `quick_check`, cached at startup and at each sweep) and draining.
 - Retention: once an hour the state directory is swept with `ULTRATHINK_RETENTION_DAYS` (default 30, `0` disables); finished session records and job files older than that are removed, and journal directories older than that are removed unless in progress. Running jobs and symlinks are never removed, and `ultrathink_retention_removed_total{kind}` counts removals.
 - Tracing: a valid inbound `traceparent` is continued with a child span, otherwise a new trace starts; every response carries `traceparent`, access and error log lines carry `traceId` and `reqId`, and outbound OpenRouter requests carry the same trace.
-- `POST /logout` clears the session cookie and needs the exact public origin; a valid session presented there is recorded as `logout`.
+- `POST /ultrathink/logout` clears the session cookie and needs the exact public origin; a valid session presented there is recorded as `logout`.
 
 ### Changed
 

@@ -1149,15 +1149,17 @@ describe("OAuth audit trail and response headers", () => {
 		expect((await revokeCall(h, { token: next.access, client_id: clientId })).status).toBe(200);
 		expect(events.map((entry) => entry.event)).toEqual([
 			"client_registered",
+			"login_ok",
 			"consent_approved",
 			"code_exchanged",
 			"token_refreshed",
 			"refresh_reuse_detected",
+			"login_ok",
 			"consent_approved",
 			"code_exchanged",
 			"token_revoked",
 		]);
-		for (const entry of events) expect(entry.fields).toEqual({ clientId });
+		for (const entry of events) expect(entry.fields).toEqual(entry.event === "login_ok" ? { ip: expect.any(String) } : { clientId });
 		const serialised = JSON.stringify(events);
 		for (const secret of [code, verifier, firstAccess, firstRefresh, String(second.access_token), String(second.refresh_token), next.access, next.refresh]) {
 			expect(serialised).not.toContain(secret);
@@ -1202,6 +1204,42 @@ describe("OAuth audit trail and response headers", () => {
 		expect(policy).toContain("form-action 'self' https://claude.ai");
 		expect(policy).toContain("style-src 'unsafe-inline'");
 		expect(policy).not.toBe("default-src 'none'; frame-ancestors 'none'");
+	});
+
+	test("a wrong consent password records login_failed and a correct one records login_ok", async () => {
+		const events: { event: string; fields: Record<string, string | number | boolean> }[] = [];
+		const h = await makeHarness({ audit: (event, fields) => events.push({ event, fields }) });
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const html = await (await authorizeCall(h, clientId, challenge)).text();
+		const ip = "203.0.113.70";
+		const wrong = await approveWith(h, html, "not-the-password", ip);
+		expect(await wrong.text()).toContain("Incorrect password.");
+		const right = await approveWith(h, html, password, ip);
+		expect(new URL(right.headers.get("location") ?? "").searchParams.get("code")).not.toBeNull();
+		expect(events.map((entry) => entry.event)).toEqual(["client_registered", "login_failed", "login_ok", "consent_approved"]);
+		expect(events[1]?.fields).toEqual({ ip });
+		expect(events[2]?.fields).toEqual({ ip });
+		expect(JSON.stringify(events)).not.toContain(password);
+	});
+
+	test("exhausting the login window records rate_limited and no login_failed for the refused attempt", async () => {
+		const events: { event: string; fields: Record<string, string | number | boolean> }[] = [];
+		const h = await makeHarness({ audit: (event, fields) => events.push({ event, fields }) });
+		const clientId = await registered(h);
+		const { challenge } = pkcePair();
+		const html = await (await authorizeCall(h, clientId, challenge)).text();
+		const ip = "203.0.113.71";
+		// Each attempt waits out the one-minute approval window, so only the login window can refuse.
+		for (let i = 0; i < 5; i += 1) {
+			h.clock.now += 61_000;
+			expect(await (await approveWith(h, html, "not-the-password", ip)).text()).toContain("Incorrect password.");
+		}
+		h.clock.now += 61_000;
+		const refused = await approveWith(h, html, "not-the-password", ip);
+		expect(refused.status).toBe(429);
+		expect(events.map((entry) => entry.event)).toEqual(["client_registered", "login_failed", "login_failed", "login_failed", "login_failed", "login_failed", "rate_limited"]);
+		expect(events.at(-1)?.fields).toEqual({ scope: "login", ip });
 	});
 });
 

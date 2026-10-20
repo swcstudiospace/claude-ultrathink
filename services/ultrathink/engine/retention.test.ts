@@ -210,6 +210,15 @@ describe("sweepStateDir", () => {
 		expect(second.removed.sessions).toBe(3);
 	});
 
+	test("entries past one sweep's cap are reached by later sweeps, wrapping around the directory", () => {
+		const stateDir = tmp();
+		for (let i = 0; i < 7; i += 1) writeRecord(stateDir, randomUUID(), OLD);
+		let removed = 0;
+		for (let run = 0; run < 3; run += 1) removed += sweepStateDir({ stateDir, ...RETENTION, maxEntries: 3 }).removed.sessions;
+		expect(removed).toBe(7);
+		expect(names(join(stateDir, "sessions"))).toHaveLength(0);
+	});
+
 	test("uses Date.now when no clock is injected", () => {
 		const stateDir = tmp();
 		const stale = randomUUID();

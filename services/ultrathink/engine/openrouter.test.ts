@@ -824,4 +824,18 @@ describe("trace propagation", () => {
 		await complete("s", "u");
 		expect(Object.keys((calls[0] as Call).init.headers as Record<string, string>)).not.toContain("traceparent");
 	});
+
+	test("an unsampled inbound trace stays unsampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-00$/);
+	});
+
+	test("a sampled or undefined inbound trace is sent sampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok"), completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: true }, () => complete("s", "u"));
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(TRACEPARENT);
+		expect(traceparentOf(calls[1] as Call)).toMatch(TRACEPARENT);
+	});
 });

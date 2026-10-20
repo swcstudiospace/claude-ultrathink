@@ -92,7 +92,8 @@ describe("redactText: secrets", () => {
 		expect(redactText("X-Auth-Token: t0k3n")).toBe("X-Auth-Token: [redacted]");
 		expect(redactText("Proxy-Authorization: Basic dXNlcjpwYXNz")).toBe("Proxy-Authorization: [redacted]");
 		expect(redactText("Cookie: session=abcdef0123456789")).toBe("Cookie: [redacted]");
-		expect(redactText("Set-Cookie: auth=abcdef0123456789; Path=/; HttpOnly")).toBe("Set-Cookie: [redacted]; Path=/; HttpOnly");
+		expect(redactText("Set-Cookie: auth=abcdef0123456789; Path=/; HttpOnly")).toBe("Set-Cookie: [redacted]");
+		expect(redactText("Cookie: theme=dark; sid=abc123456789xyz")).toBe("Cookie: [redacted]");
 		expect(redactText('{"cookie": "session=abcdef0123456789"}')).toBe('{"cookie": "[redacted]"}');
 		for (const text of ["X-API-Key: sk_live_1234567890abcdef", "Cookie: session=abcdef0123456789"]) {
 			const once = redactText(text);
