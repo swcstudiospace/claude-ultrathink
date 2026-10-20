@@ -1540,3 +1540,61 @@ describe("durable state writes", () => {
 		expect(readdirSync(dir)).toEqual(["state.json"]);
 	});
 });
+
+describe("OAuth token rollback when the state save fails", () => {
+	// writeFileDurably opens `<state>.<pid>.tmp` before it writes anything. A directory at that path makes
+	// the open fail, so persist() throws and the store never reaches disk. Removing it restores normal saves.
+	function blockStateSave(h: Harness): string {
+		const blocker = `${h.statePath}.${process.pid}.tmp`;
+		nodeFs.mkdirSync(blocker);
+		return blocker;
+	}
+
+	test("exchangeCode save-failure rollback restores the unused code and issues no tokens", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		const { code, verifier, redirect } = await authorizedCode(h, clientId);
+		const fields = { grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirect, resource: RESOURCE };
+		const before = readFileSync(h.statePath, "utf8");
+		const blocker = blockStateSave(h);
+		try {
+			const failed = await tokenCall(h, fields);
+			expect(failed.status).toBe(500);
+			expect((await bodyOf(failed)).error).toBe("server_error");
+		} finally {
+			rmSync(blocker, { recursive: true, force: true });
+		}
+		expect(readFileSync(h.statePath, "utf8")).toBe(before);
+		expect(readdirSync(h.dir)).toEqual(["oauth.json"]);
+		// The code was rolled back to unused, so a retry still redeems it.
+		const retry = await tokenCall(h, fields);
+		expect(retry.status).toBe(200);
+		const tokens = await bodyOf(retry);
+		expect(typeof tokens.access_token).toBe("string");
+		expect(h.oauth.verifyAccessToken(tokens.access_token as string)).toBe(true);
+	});
+
+	test("refreshGrant save-failure rollback restores the refresh token and keeps the grant", async () => {
+		const h = await makeHarness();
+		const clientId = await registered(h);
+		const first = await grant(h, clientId);
+		const before = readFileSync(h.statePath, "utf8");
+		const fields = { grant_type: "refresh_token", refresh_token: first.refresh, client_id: clientId };
+		const blocker = blockStateSave(h);
+		try {
+			const failed = await tokenCall(h, fields);
+			expect(failed.status).toBe(500);
+			expect((await bodyOf(failed)).error).toBe("server_error");
+		} finally {
+			rmSync(blocker, { recursive: true, force: true });
+		}
+		expect(readFileSync(h.statePath, "utf8")).toBe(before);
+		expect(readdirSync(h.dir)).toEqual(["oauth.json"]);
+		// The refresh token was rolled back to unspent, so a retry rotates it instead of tripping reuse detection.
+		const retry = await tokenCall(h, fields);
+		expect(retry.status).toBe(200);
+		const rotated = await bodyOf(retry);
+		expect(typeof rotated.access_token).toBe("string");
+		expect(h.oauth.verifyAccessToken(rotated.access_token as string)).toBe(true);
+	});
+});
