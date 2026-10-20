@@ -25,6 +25,17 @@ import { type Metrics, createMetrics } from "../obs/metrics.ts";
 import { createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
+import {
+	ConsoleSecurityEventLogger,
+	ObjectValidator,
+	SecurityEventType,
+	type SecurityHeadersConfig,
+	StringValidator,
+	type Validator,
+	buildSecurityHeaders,
+	createSecurityEvent,
+	readBodyPrefix,
+} from "../security/index.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
 import { createWalCheckpointer } from "../store/checkpoint.ts";
 import { ROUTES, type Route, parseRouteFlag, sanitizeInput, selectRoute } from "./input.ts";
@@ -80,8 +91,6 @@ type Endpoint =
 
 type Target = { endpoint: Exclude<Endpoint, "run"> } | { endpoint: "run"; runId: string };
 
-type BodyRead = { ok: true; bytes: Uint8Array } | { ok: false; reason: "too_large" | "unreadable" };
-
 type JsonRead = { ok: true; value: unknown } | { ok: false; response: Response };
 
 type AuthKind = "connector-key" | "bearer" | "session" | "none";
@@ -135,15 +144,31 @@ const LOG_VALUE_MAX = 64;
 
 const OAUTH_STATE_FILE = "oauth.json";
 
-/** On every JSON, metrics and 202 response. OAuth HTML pages carry their own policy (oauth.ts). */
-const SECURITY_HEADERS: Record<string, string> = {
-	"Cache-Control": "no-store",
-	"X-Content-Type-Options": "nosniff",
-	"Referrer-Policy": "no-referrer",
-	"X-Frame-Options": "DENY",
-	"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-	"Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+// Any string reaches the authenticator, an empty one included, as before; the authenticator refuses it.
+const LOGIN_BODY: Record<string, Validator<unknown>> = { password: new StringValidator({ allowEmpty: true }) };
+
+/**
+ * The headers on every JSON, metrics and 202 response, built by the security module. OAuth HTML pages keep their own
+ * policy (oauth.ts). coop, corp and coep are off: the JSON API never sent them. nginx falls back to these same values
+ * only where a response carries none (deploy/nginx-ultrathink.swcstudio.space.conf).
+ */
+const API_HEADER_CONFIG: SecurityHeadersConfig = {
+	hsts: true,
+	hstsMaxAge: 31536000,
+	hstsIncludeSubdomains: true,
+	hstsPreload: false,
+	csp: "default-src 'none'; frame-ancestors 'none'",
+	cspReportOnly: false,
+	cspReportUri: "",
+	frameOptions: "DENY",
+	contentTypeOptions: true,
+	referrerPolicy: "no-referrer",
+	permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+	coop: "",
+	corp: "",
+	coep: "",
 };
+export const SECURITY_HEADERS: Record<string, string> = { "Cache-Control": "no-store", ...buildSecurityHeaders(API_HEADER_CONFIG) };
 
 const USAGE = {
 	usage:
@@ -227,50 +252,72 @@ function isJsonRequest(req: Request): boolean {
 	return contentType.split(";")[0]?.trim().toLowerCase() === "application/json";
 }
 
-async function readCapped(req: Request, maxBytes: number): Promise<BodyRead> {
-	const declared = req.headers.get("content-length");
-	if (declared !== null && Number(declared) > maxBytes) return { ok: false, reason: "too_large" };
-	if (req.body === null) return { ok: true, bytes: new Uint8Array(0) };
-
-	const reader = req.body.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	try {
-		for (;;) {
-			const result = await reader.read();
-			if (result.done) break;
-			total += result.value.byteLength;
-			if (total > maxBytes) {
-				await reader.cancel().catch(() => undefined);
-				return { ok: false, reason: "too_large" };
-			}
-			chunks.push(result.value);
-		}
-	} catch {
-		return { ok: false, reason: "unreadable" };
-	}
-
-	const bytes = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		bytes.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return { ok: true, bytes };
-}
-
+/**
+ * A JSON body, read through the security body reader: at most maxBytes, and the read stops when the request aborts.
+ * A declared length over the cap is refused before anything is read.
+ */
 async function readJson(req: Request, maxBytes: number): Promise<JsonRead> {
-	const read = await readCapped(req, maxBytes);
-	if (!read.ok) {
-		const response = read.reason === "too_large" ? fail(413, "body_too_large") : fail(400, "invalid_json");
-		return { ok: false, response };
-	}
+	const declared = req.headers.get("content-length");
+	if (declared !== null && Number(declared) > maxBytes) return { ok: false, response: fail(413, "body_too_large") };
+
+	const utf8 = utf8Checked(req.body);
+	let read: { text: string; complete: boolean };
 	try {
-		const text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
-		return { ok: true, value: JSON.parse(text) };
+		read = await readBodyPrefix(new Response(utf8.body), maxBytes, req.signal);
 	} catch {
 		return { ok: false, response: fail(400, "invalid_json") };
 	}
+	if (!read.complete) return { ok: false, response: fail(413, "body_too_large") };
+	if (!utf8.valid()) return { ok: false, response: fail(400, "invalid_json") };
+	try {
+		return { ok: true, value: JSON.parse(read.text) };
+	} catch {
+		return { ok: false, response: fail(400, "invalid_json") };
+	}
+}
+
+/**
+ * Passes a body through unchanged and records whether its bytes are valid UTF-8. The body reader decodes leniently;
+ * this keeps the strict decoding, so an invalid body is still refused with invalid_json.
+ */
+function utf8Checked(body: ReadableStream<Uint8Array> | null): { body: ReadableStream<Uint8Array> | null; valid: () => boolean } {
+	if (body === null) return { body, valid: () => true };
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	let valid = true;
+	const check = new TransformStream<Uint8Array, Uint8Array>({
+		transform(chunk, controller) {
+			if (valid) {
+				try {
+					decoder.decode(chunk, { stream: true });
+				} catch {
+					valid = false;
+				}
+			}
+			controller.enqueue(chunk);
+		},
+		flush() {
+			if (!valid) return;
+			try {
+				decoder.decode();
+			} catch {
+				valid = false;
+			}
+		},
+	});
+	return { body: body.pipeThrough(check), valid: () => valid };
+}
+
+/** The parsed body as an object whose schema fields pass; unknown fields are allowed. Null when the shape is wrong. */
+function validateBody(value: unknown, schema: Record<string, Validator<unknown>>): Record<string, unknown> | null {
+	const result = new ObjectValidator<Record<string, unknown>>(schema, { allowExtraKeys: true, strict: true }).validate(value);
+	return result.valid && result.value !== undefined ? result.value : null;
+}
+
+/** The OAuth error code of a refused response (invalid_grant and the like). Anything else is "unknown"; the body is never logged. */
+async function oauthErrorCode(response: Response): Promise<string> {
+	const body: unknown = await response.clone().json().catch(() => null);
+	const code = typeof body === "object" && body !== null && "error" in body ? body.error : undefined;
+	return typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "unknown";
 }
 
 /**
@@ -295,6 +342,7 @@ function lazyLedger(store: Store, config: UltrathinkConfig, now: (() => number) 
 export function createApp(deps: RouterDeps): App {
 	const { config, store, auth } = deps;
 	const logger = deps.logger ?? createLogger();
+	const securityEvents = new ConsoleSecurityEventLogger(logger);
 	const metrics = deps.metrics ?? createMetrics();
 	// Every dropped record counts; the log line is written once per distinct message until an append succeeds.
 	let auditDrops = 0;
@@ -396,6 +444,21 @@ export function createApp(deps: RouterDeps): App {
 		metrics.inc("ultrathink_auth_failures_total", { kind });
 	}
 
+	/** One line per refused credential: the endpoint, status and reason. Never the token, cookie or password. */
+	function tokenRejected(ctx: RequestCtx, kind: string, status: number, reason: string): void {
+		securityEvents.log(
+			createSecurityEvent(SecurityEventType.AUTH_FAILURE, {
+				name: "oauth.token_rejected",
+				source: "auth",
+				severity: "medium",
+				ip: ctx.ip,
+				resource: ctx.endpoint,
+				action: kind,
+				details: { reqId: ctx.reqId, status, reason },
+			}),
+		);
+	}
+
 	function publishBreakerState(state: BreakerState): void {
 		for (const name of BREAKER_STATES) metrics.gauge("ultrathink_upstream_breaker_state", name === state ? 1 : 0, { state: name });
 	}
@@ -413,7 +476,7 @@ export function createApp(deps: RouterDeps): App {
 		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
 		const parsed = await readJson(req, config.maxBodyBytes);
 		if (!parsed.ok) return parsed.response;
-		const password = (parsed.value as { password?: unknown } | null)?.password;
+		const password = validateBody(parsed.value, LOGIN_BODY)?.password;
 		if (typeof password !== "string") return fail(400, "invalid_input");
 
 		const result = await auth.login({ password, clientIp: ctx.ip });
@@ -425,6 +488,7 @@ export function createApp(deps: RouterDeps): App {
 		authFailed("login");
 		logger.warn("login_failed", { reqId: ctx.reqId, ip: ctx.ip });
 		record("login_failed", { ip: ctx.ip });
+		securityEvents.log(createSecurityEvent(SecurityEventType.AUTH_FAILURE, { name: "auth.login_failed", source: "auth", severity: "medium", ip: ctx.ip, resource: ctx.endpoint, details: { reqId: ctx.reqId } }));
 		return fail(401, "invalid_credentials");
 	}
 
@@ -465,10 +529,9 @@ export function createApp(deps: RouterDeps): App {
 
 		const parsed = await readJson(req, config.maxBodyBytes);
 		if (!parsed.ok) return parsed.response;
-		if (typeof parsed.value !== "object" || parsed.value === null || Array.isArray(parsed.value)) {
-			return fail(400, "invalid_input");
-		}
-		const body = parsed.value as { input?: unknown; flags?: unknown };
+		// Only the envelope is checked here; input and flags are checked below.
+		const body = validateBody(parsed.value, {});
+		if (body === null) return fail(400, "invalid_input");
 
 		const input = sanitizeInput(body.input, config.maxInputChars);
 		if (!input.ok) {
@@ -675,6 +738,8 @@ export function createApp(deps: RouterDeps): App {
 			principal = `bearer:${createHash("sha256").update(presented).digest("hex").slice(0, 16)}`;
 		} else {
 			authFailed(bearer === "invalid" ? "bearer" : presentedKey !== null ? "connector_key" : "missing");
+			if (bearer === "invalid") tokenRejected(ctx, "bearer", 401, "invalid_token");
+			else if (presentedKey !== null) tokenRejected(ctx, "connector_key", 401, "invalid_key");
 			const challenge = `Bearer resource_metadata="${oauth.resourceMetadataUrl}"${bearer === "invalid" ? ', error="invalid_token"' : ""}`;
 			return fail(401, "unauthenticated", { "WWW-Authenticate": challenge });
 		}
@@ -731,8 +796,11 @@ export function createApp(deps: RouterDeps): App {
 				return await oauth.register(req, ctx.ip);
 			case "oauth_authorize":
 				return await oauth.authorize(req, ctx.ip);
-			case "oauth_token":
-				return await oauth.token(req, ctx.ip);
+			case "oauth_token": {
+				const response = await oauth.token(req, ctx.ip);
+				if (response.status >= 400) tokenRejected(ctx, "oauth_token", response.status, await oauthErrorCode(response));
+				return response;
+			}
 			case "oauth_revoke":
 				return await oauth.revoke(req, ctx.ip);
 			case "healthz":

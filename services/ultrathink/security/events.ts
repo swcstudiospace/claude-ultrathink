@@ -5,6 +5,8 @@
  * Provides structured security event logging for SIEM integration
  */
 
+import { type Logger, createLogger } from "../obs/log.ts";
+
 export enum SecurityEventType {
 	AUTH_FAILURE = 'auth_failure',
 	AUTH_SUCCESS = 'auth_success',
@@ -20,6 +22,8 @@ export enum SecurityEventType {
 
 export interface SecurityEvent {
 	type: SecurityEventType;
+	/** Structured log event name, such as auth.login_failed. Without it, the log event is security.<type>. */
+	name?: string;
 	timestamp: number;
 	severity: 'low' | 'medium' | 'high' | 'critical';
 	source: string;
@@ -50,9 +54,17 @@ function getCurrentTimestamp(): number {
 	return Date.now();
 }
 
+const LOG_LEVEL = { low: "info", medium: "warn", high: "warn", critical: "error" } as const;
+
 export class ConsoleSecurityEventLogger implements SecurityEventLogger {
 	private severityOrder = { low: 0, medium: 1, high: 2, critical: 3 };
 	private minSeverity: 'low' | 'medium' | 'high' | 'critical' = 'low';
+	private readonly logger: Logger;
+
+	/** Writes through the app's structured logger, which stamps each line and drops secret-named fields. */
+	constructor(logger: Logger = createLogger()) {
+		this.logger = logger;
+	}
 
 	setMinSeverity(severity: 'low' | 'medium' | 'high' | 'critical'): void {
 		this.minSeverity = severity;
@@ -63,14 +75,14 @@ export class ConsoleSecurityEventLogger implements SecurityEventLogger {
 			return;
 		}
 
-		const logEntry = {
-			...event,
+		const { name, ...fields } = event;
+		const entry = {
+			...fields,
 			timestamp: event.timestamp || getCurrentTimestamp(),
 			correlationId: event.correlationId || generateCorrelationId(),
 		};
-
-		// In production, this would go to a SIEM, syslog, or log aggregation service
-		console.log(JSON.stringify(logEntry));
+		// The app's structured logger is the event feed: one JSON line per event, level taken from the severity.
+		this.logger[LOG_LEVEL[event.severity]](name ?? `security.${event.type}`, entry);
 	}
 
 	logAuthFailure(details: Partial<SecurityEvent>): void {
