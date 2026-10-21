@@ -929,7 +929,11 @@ describe("flight lifecycle (D-12)", () => {
 			});
 			const lookup = Promise.withResolvers<GroundOutcome>();
 			const empty: GroundOutcome = { status: "none", chunks: [], chars: 0, ms: 0, datasets: 0 };
-			const rec = recorder((call) => reply([{ type: "text", text: stageAnswer(userText(call)).text }]));
+			const firstCall = Promise.withResolvers<void>();
+			const rec = recorder((call) => {
+				firstCall.resolve();
+				return reply([{ type: "text", text: stageAnswer(userText(call)).text }]);
+			});
 			let tracks = 0;
 			const events: ProgressEvent[] = [];
 			const oldCompleted = Promise.withResolvers<PlanResponse>();
@@ -956,7 +960,8 @@ describe("flight lifecycle (D-12)", () => {
 				return response;
 			}, 10, { stateDir, config: () => config }, { cwd: root, model: live, ...runtime });
 			const oldPromise = h.run("add a widget");
-			for (let i = 0; i < 200 && rec.calls.length === 0; i++) await Promise.resolve();
+			// The planner reaches its first model call only after a real event-loop turn on Bun 1.2, so await that call itself.
+			await firstCall.promise;
 			expect(rec.calls).toHaveLength(1);
 			h.emit("turn_start");
 			const nextPromise = h.run("add a widget immediately");
