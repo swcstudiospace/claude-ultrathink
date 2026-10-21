@@ -150,7 +150,7 @@ export async function planPrompt(
 	try {
 		// `/ultrathink-<verb>` (and the older `/ultrathink:<verb>` / `/ultrathink <verb>`) is a control command, never a request to plan.
 		if (parseUltrathinkCommand(text)) return skip("ultrathink-command");
-		const target = planningTarget(text, { cwd });
+		const target = planningTarget(text, { cwd, host });
 		if ("skip" in target) return skip(target.skip);
 		text = target.text;
 		skill = target.skill;

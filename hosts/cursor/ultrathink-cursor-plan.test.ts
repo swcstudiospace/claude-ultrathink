@@ -235,3 +235,28 @@ printf '%s\\n' '{"context":"PLAN"}'
 		}
 	});
 });
+
+describe("Cursor swarm handoff", () => {
+	const repo = join(import.meta.dir, "..", "..");
+	const cursorSkill = readFileSync(join(repo, "skills", "ultrathink-cursor", "SKILL.md"), "utf8");
+	const kickoff = readFileSync(join(repo, "skills", "ultrathink-kickoff", "SKILL.md"), "utf8");
+
+	test("the hook's swarm note is the heading that kickoff keys on", () => {
+		expect(readFileSync(HOOK, "utf8")).toContain("## Cursor swarm");
+		expect(kickoff).toContain("the Cursor swarm note (`## Cursor swarm`)");
+	});
+
+	test("the Cursor skill finishes only kickoff's state steps before the handoff, never its final prompt or dispatch", () => {
+		expect(cursorSkill).not.toContain("finish `ultrathink-kickoff` first");
+		expect(cursorSkill).toContain("Stop before its final prompt and its \"Proceed as normal\" section");
+	});
+
+	test("kickoff does only steps 1 and 4 of section 5 on a Cursor handoff, and section 6 is skipped", () => {
+		const section5 = kickoff.slice(kickoff.indexOf("## 5. "), kickoff.indexOf("## 6. "));
+		expect(section5).toContain("When the plan carries the Cursor swarm note (`## Cursor swarm`), do steps 1 and 4 only, then stop.");
+		const section6 = kickoff.slice(kickoff.indexOf("## 6. "));
+		expect(section6.startsWith("## 6. Proceed as normal\n\nSkip this section when the plan carries the Cursor swarm note")).toBe(true);
+		// The dispatch sentence still exists for the non-Cursor hosts.
+		expect(section6).toContain("Dispatch the graph's WORKFLOW waves as parallel subagents");
+	});
+});

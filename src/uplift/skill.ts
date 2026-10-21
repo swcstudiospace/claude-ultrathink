@@ -3,6 +3,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { resolvePstack } from "../cursor/pstack.ts";
 import { isCommandPrompt, isTrivial } from "./detect.ts";
 
 export interface SkillInvocation {
@@ -21,6 +22,8 @@ export interface SkillLookup {
 	home?: string;
 	/** This plugin's checkout, whose commands/ and skills/ are ultrathink's own. Defaults to the running copy. */
 	pluginRoot?: string;
+	/** The host the prompt came from. `cursor` also searches Cursor's skill and command folders and its pstack plugin cache. */
+	host?: string;
 }
 
 /** Ultrathink's own skills; a user typing one of them must never re-plan (duplicate tracker rows). */
@@ -242,6 +245,23 @@ export function resolveSkillFile(name: string, lookup: SkillLookup): { path: str
 		join(lookup.cwd, ".prime", "agent", "skills", normalized, "SKILL.md"),
 		join(home, ".prime", "agent", "skills", normalized, "SKILL.md"),
 	];
+	if (lookup.host === "cursor") {
+		// Cursor's own project and personal skills and commands, then the newest pstack plugin's skills. Other hosts do not
+		// search these folders: a Cursor skill cannot run in Claude Code, so planning it there would plan a missing skill.
+		const cursorCandidates = [
+			join(lookup.cwd, ".cursor", "skills", normalized, "SKILL.md"),
+			join(lookup.cwd, ".cursor", "commands", `${normalized}.md`),
+			join(home, ".cursor", "skills", normalized, "SKILL.md"),
+			join(home, ".cursor", "commands", `${normalized}.md`),
+		];
+		for (const path of [...candidates, ...cursorCandidates]) {
+			const found = readSkill(path);
+			if (found) return found;
+		}
+		const pstack = resolvePstack(join(home, ".cursor"));
+		const pstackFound = "skillsDir" in pstack ? readSkill(join(pstack.skillsDir, normalized, "SKILL.md")) : undefined;
+		return pstackFound;
+	}
 	for (const path of candidates) {
 		const found = readSkill(path);
 		if (found) return found;

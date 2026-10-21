@@ -22,7 +22,7 @@ Do the work in this session in those cases. Do not run `scripts/swarm_run.py` or
 
 When the plan is new implementation work and `a01-orchestrator` is installed:
 
-1. If tracking is on, finish `ultrathink-kickoff` first. When an MCP server named `substrate` is connected, its `graph_register` call uses surface `cursor` (the session record's `host`). Skip that call when the server is not connected.
+1. If tracking is on, run `ultrathink-kickoff` as its own Cursor swarm note says: read the state, finish tracking, ask any HITL questions, set the Implementing status and mark the session kicked off. Stop before its final prompt and its "Proceed as normal" section, because `a01-orchestrator` owns the implementation and would otherwise start the same work twice. When an MCP server named `substrate` is connected, its `graph_register` call uses surface `cursor` (the session record's `host`). Skip that call when the server is not connected.
 2. Spawn the Task subagent `a01-orchestrator` once. Give it the Graph ID and the uplifted unit (the spec file, not a truncated copy). Tell it to pass that id to the planner:
 
    ```bash

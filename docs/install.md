@@ -322,6 +322,8 @@ The installer does not install the plugin's skills. Cursor loads `ultrathink-cur
 
 A prompt that is `/gsd-*` or `/skill:gsd-*` is planned even when no GSD skill file is installed. The planner uses the text after the command name. `/ultrathink-quick` and the other `/ultrathink-*` commands are still not planned, and neither is an unknown command such as `/model`. The pstack hook (`ultrathink-managed`) still adds its skill paths on a `/gsd-*` invocation when `pstack.enabled` is true. The two hooks use different markers and do not replace each other.
 
+On Cursor only, the planner also finds a skill or command you type from Cursor's own folders: `~/.cursor/skills/<name>/SKILL.md`, `~/.cursor/commands/<name>.md`, the same two under the workspace's `.cursor/`, and the skills of the newest completed pstack plugin under `~/.cursor/plugins/cache/cursor-public/pstack/`. Other hosts do not search those folders, so a Cursor-only skill still skips planning there. The pstack cache path matches `src/cursor/pstack.ts`. The personal and workspace folder names are not checked against Cursor's documentation or a live Cursor session.
+
 ### Connect
 
 1. Clone this repo, [agent-substrate](https://github.com/swcstudiospace/agent-substrate), and [agent-swarm](https://github.com/swcstudiospace/agent-swarm). Bun 1.2 or newer must be installed (`bin/run-bun` also looks in `~/.bun/bin/bun`).

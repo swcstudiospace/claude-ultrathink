@@ -329,3 +329,54 @@ describe("planningTarget", () => {
 		expect(planningTarget(quoted, { cwd, home })).toMatchObject({ text: quoted });
 	});
 });
+
+describe("Cursor skill and command folders and the pstack plugin cache", () => {
+	/** A completed pstack plugin in Cursor's plugin cache, the layout resolvePstack reads. */
+	function pstackPlugin(version: string, skill: string): void {
+		const plugin = join(home, ".cursor", "plugins", "cache", "cursor-public", "pstack", version);
+		put(join(plugin, ".cursor-plugin", "plugin.json"), JSON.stringify({ name: "pstack", version }));
+		put(join(plugin, ".cache-complete"), "");
+		put(join(plugin, "skills", skill, "SKILL.md"), `---\ndescription: ${skill} from pstack\n---\n`);
+	}
+
+	test("host cursor plans skills and commands in Cursor's project and personal folders", () => {
+		put(join(cwd, ".cursor", "skills", "projectskill", "SKILL.md"), "---\ndescription: project skill\n---\n");
+		put(join(home, ".cursor", "skills", "personalskill", "SKILL.md"), "---\ndescription: personal skill\n---\n");
+		put(join(home, ".cursor", "commands", "deploy.md"), "---\ndescription: deploy command\n---\n");
+		put(join(cwd, ".cursor", "commands", "review.md"), "---\ndescription: review command\n---\n");
+		expect(planningTarget("/projectskill do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "projectskill", source: "slash", summary: "project skill" },
+		});
+		expect(planningTarget("/personalskill do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "personalskill", summary: "personal skill" },
+		});
+		expect(planningTarget("/deploy do x", { cwd, home, host: "cursor" })).toMatchObject({ text: "do x", skill: { name: "deploy" } });
+		expect(planningTarget("/review do x", { cwd, home, host: "cursor" })).toMatchObject({ text: "do x", skill: { name: "review" } });
+	});
+
+	test("host cursor plans a skill that the pstack plugin provides in Cursor's plugin cache", () => {
+		pstackPlugin("1.0.0", "architect");
+		expect(planningTarget("/architect design the cache", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "design the cache",
+			skill: { name: "architect", summary: "architect from pstack" },
+		});
+	});
+
+	test("the other hosts do not search Cursor's folders or cache, so the same names still skip", () => {
+		put(join(home, ".cursor", "skills", "personalskill", "SKILL.md"), "---\ndescription: personal skill\n---\n");
+		pstackPlugin("1.0.0", "architect");
+		expect(planningTarget("/personalskill do x", { cwd, home, host: "claude-code" })).toEqual({ skip: "slash-command" });
+		expect(planningTarget("/architect design", { cwd, home })).toEqual({ skip: "slash-command" });
+		expect(planningTarget("/architect design", { cwd, home, host: "omp" })).toEqual({ skip: "slash-command" });
+	});
+
+	test("resolveSkillFile names the pstack skill file under the newest completed version", () => {
+		pstackPlugin("1.0.0", "architect");
+		expect(resolveSkillFile("architect", { cwd, home, host: "cursor" })?.path).toBe(
+			join(home, ".cursor", "plugins", "cache", "cursor-public", "pstack", "1.0.0", "skills", "architect", "SKILL.md"),
+		);
+		expect(resolveSkillFile("architect", { cwd, home })).toBeUndefined();
+	});
+});

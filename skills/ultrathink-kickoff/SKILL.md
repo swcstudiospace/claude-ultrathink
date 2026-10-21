@@ -104,6 +104,7 @@ Without a `plan`, read `record.clarifications` instead of `plan.hitl`: blocking 
 - Fold the answers (or stated assumptions) into the final prompt as a short "Clarifications" note.
 
 ## 5. Set Implementing and emit the final prompt
+When the plan carries the Cursor swarm note (`## Cursor swarm`), do steps 1 and 4 only, then stop. The Cursor session hands the unit to `a01-orchestrator`, so do not emit the final prompt in steps 2 and 3 here.
 
 1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent). If the Notion MCP tools are not available in this session, tell the user once to register them with `bun <repo>/scripts/mcp-register.ts` (or connect the official Notion MCP server), skip this update and continue — never block the work.
 2. The final prompt is the **full spec file** (`sessions/<id>.xml`, the spec path from the prompt context), which already carries the `<ISSUES>` block with identifiers and URLs. Do not use `plan.task.upliftedPrompt` — that copy is truncated to 1900 characters.
@@ -112,4 +113,4 @@ Without a `plan`, read `record.clarifications` instead of `plan.hitl`: blocking 
 
 ## 6. Proceed as normal
 
-Treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns (without a `plan` there are no URLs to pass). Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.
+Skip this section when the plan carries the Cursor swarm note (`## Cursor swarm`). The Cursor session hands the unit to `a01-orchestrator`, which dispatches the waves itself; dispatching them here would start the same work twice and let both sets of agents edit the same files. Otherwise, treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns (without a `plan` there are no URLs to pass). Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.
