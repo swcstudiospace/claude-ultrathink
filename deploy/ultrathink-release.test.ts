@@ -9,6 +9,7 @@ import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import tls from "node:tls";
 
 const SCRIPT = resolve(import.meta.dir, "ultrathink-release.sh");
 const OPS_URI = "spiffe://ultrathink.internal/ops/probe";
@@ -94,23 +95,66 @@ async function writeTls(dir: string, trustCa: string, appCa: string, opsCa: stri
 
 type Counter = { hits: number };
 
-// Serves /healthz and /readyz over TLS. The client must present a leaf signed by clientCaFile (requestCert plus
-// rejectUnauthorized), so a handshake that fails never reaches the handler and never increments the counter.
-function serveMtls(serverCert: string, serverKey: string, clientCaFile: string, readyz: number) {
+// Serves /healthz and /readyz over TLS from a node:tls listener. The handshake requires a client leaf that chains to
+// clientCaFile (requestCert plus rejectUnauthorized), and the socket must still report `authorized` before a request
+// is answered, so a refused client never reaches respond(). Bun.serve is not used here: on Bun 1.2.23 it admitted a
+// foreign-CA client leaf in some handshakes (3 of 20 runs), while tls.createServer refused every run measured (60).
+interface MtlsStub {
+	port: number;
+	hits: () => number;
+	stop: () => void;
+}
+
+async function serveMtls(serverCert: string, serverKey: string, clientCaFile: string, readyz: number): Promise<MtlsStub> {
 	const counter: Counter = { hits: 0 };
-	const server = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
-		tls: {
+	const sockets = new Set<tls.TLSSocket>();
+	const listener = tls.createServer(
+		{
 			cert: readFileSync(serverCert, "utf8"),
 			key: readFileSync(serverKey, "utf8"),
 			ca: readFileSync(clientCaFile, "utf8"),
 			requestCert: true,
 			rejectUnauthorized: true,
 		},
-		fetch: (req) => respond(req, readyz, counter),
+		(socket) => {
+			if (!socket.authorized) {
+				socket.destroy();
+				return;
+			}
+			sockets.add(socket);
+			socket.once("close", () => sockets.delete(socket));
+			let head = "";
+			let answered = false;
+			socket.on("data", (chunk: Buffer) => {
+				head += chunk.toString("latin1");
+				if (answered || !head.includes("\r\n\r\n")) return;
+				answered = true;
+				const target = head.split(" ")[1] ?? "/";
+				const response = respond(new Request(`https://127.0.0.1${target}`), readyz, counter);
+				void response.text().then((body) => {
+					socket.end(`HTTP/1.1 ${response.status} ${response.statusText}\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+				});
+			});
+		},
+	);
+	// A refused handshake is the expected outcome here; Bun 1.2.23 emits its error on the raw TCP socket, not the TLS one.
+	listener.on("connection", (raw) => raw.on("error", () => {}));
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	listener.once("error", reject);
+	listener.listen(0, "127.0.0.1", () => {
+		const address = listener.address();
+		if (address === null || typeof address === "string") reject(new Error("serveMtls did not bind a TCP address"));
+		else resolve(address.port);
 	});
-	return { port: server.port, hits: () => counter.hits, stop: () => server.stop(true) };
+	const port = await promise;
+	return {
+		port,
+		hits: () => counter.hits,
+		stop: () => {
+			listener.close();
+			for (const socket of sockets) socket.destroy();
+		},
+	};
 }
 
 // Plain HTTP, the TLS-less service the probe must refuse.
@@ -201,7 +245,7 @@ test("sourcing the release script defines functions without running a subcommand
 });
 
 test("probe accepts 200 on /healthz and /readyz from a server that verifies the ops identity", async () => {
-	const server = serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
+	const server = await serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
 	try {
 		expect(await probe(server.port, tlsReal)).toBe(0);
 		expect(server.hits()).toBe(2);
@@ -212,7 +256,7 @@ test("probe accepts 200 on /healthz and /readyz from a server that verifies the 
 }, PROBE_TIMEOUT_MS);
 
 test("probe fails when the ops leaf is from another CA, and the handler never runs", async () => {
-	const server = serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
+	const server = await serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
 	try {
 		expect(await probe(server.port, tlsForeignOps)).toBe(1);
 		expect(server.hits()).toBe(0);
@@ -226,7 +270,7 @@ test("probe sends no request when the ops identity is absent", async () => {
 	const noOps = join(work, "tls-no-ops");
 	cpSync(tlsReal, noOps, { recursive: true });
 	rmSync(join(noOps, "ops"), { recursive: true, force: true });
-	const server = serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
+	const server = await serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 200);
 	try {
 		expect(await probe(server.port, noOps)).toBe(1);
 		expect(server.hits()).toBe(0);
@@ -238,7 +282,7 @@ test("probe sends no request when the ops identity is absent", async () => {
 
 test("probe does not accept a server certificate the pinned CA did not sign", async () => {
 	// The server still verifies the ops leaf (signed by the real CA), so only the probe's server check can refuse it.
-	const server = serveMtls(join(foreignServer, "cert.pem"), join(foreignServer, "key.pem"), join(caReal, "ca.pem"), 200);
+	const server = await serveMtls(join(foreignServer, "cert.pem"), join(foreignServer, "key.pem"), join(caReal, "ca.pem"), 200);
 	try {
 		expect(await probe(server.port, tlsReal)).toBe(1);
 		expect(server.hits()).toBe(0);
@@ -259,7 +303,7 @@ test("probe fails a TLS-less service", async () => {
 }, PROBE_TIMEOUT_MS);
 
 test("probe requires /readyz to be 200 after /healthz passes", async () => {
-	const server = serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 503);
+	const server = await serveMtls(join(tlsReal, "app", "cert.pem"), join(tlsReal, "app", "key.pem"), join(caReal, "ca.pem"), 503);
 	try {
 		expect(await probe(server.port, tlsReal)).toBe(1);
 		// /healthz passed with no retry; the retry budget was spent on /readyz.
