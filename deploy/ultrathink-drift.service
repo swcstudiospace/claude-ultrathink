@@ -1,6 +1,6 @@
 # Installed as /etc/systemd/system/ultrathink-drift.service and started by ultrathink-drift.timer.
 # Daily and report only. It compares each installed ultrathink unit with deploy/ by sha256, then probes the live security
-# headers on the loopback listener. It writes /var/lib/ultrathink-policy/drift-report.json and changes nothing else.
+# headers on the loopback listener over TLS, with the probe identity. It writes /var/lib/ultrathink-policy/drift-report.json and changes nothing else.
 # Run by hand: systemctl start ultrathink-drift.service ; journalctl -u ultrathink-drift -n 50 --no-pager
 # Read the last report: cat /var/lib/ultrathink-policy/drift-report.json
 # Remediation is manual. Print the install commands for drifted units with:
@@ -25,8 +25,14 @@ WorkingDirectory=/opt/ultrathink/current
 Environment=HOME=/var/lib/ultrathink-policy
 # check.sh runs bun (/opt/ultrathink/bin/bun) to collect the policy input. OPA is the binary pinned in opa-pin.json.
 Environment=PATH=/opt/ultrathink/bin:/usr/local/bin:/usr/bin:/bin
+# The live probe is TLS only, and the listener accepts only the probe identity (the ops leaf, runbook section 17). systemd
+# reads those files as root and gives the unit copies under %d, so the unit user needs no access to /etc/ultrathink/tls
+# private keys.
+LoadCredential=ca.pem:/etc/ultrathink/tls/ca.pem
+LoadCredential=probe-cert.pem:/etc/ultrathink/tls/ops/cert.pem
+LoadCredential=probe-key.pem:/etc/ultrathink/tls/ops/key.pem
 ExecStart=-/usr/bin/bash /opt/ultrathink/current/deploy/drift-check.sh --unit-dir /opt/ultrathink/current/deploy --install-dir /etc/systemd/system --report /var/lib/ultrathink-policy/drift-report.json
-ExecStart=/usr/bin/bash /opt/ultrathink/current/policy/check.sh --live http://127.0.0.1:8795/
+ExecStart=/usr/bin/bash /opt/ultrathink/current/policy/check.sh --live https://127.0.0.1:8795/ --live-ca %d/ca.pem --live-cert %d/probe-cert.pem --live-key %d/probe-key.pem
 
 # State: /var/lib/ultrathink-policy holds the report and the HOME directory. Only this unit writes it.
 StateDirectory=ultrathink-policy

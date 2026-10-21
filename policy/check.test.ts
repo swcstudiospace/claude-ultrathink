@@ -211,6 +211,21 @@ test("an unknown --root writes nothing to stdout and exits non-zero", async () =
 	expect(result.stdout).toBe("");
 });
 
+test("an empty --live-ca, --live-cert or --live-key is refused with its flag named, before any download", async () => {
+	const refusals: Array<[string[], string]> = [
+		[["--live", "https://127.0.0.1:1/", "--live-ca", ""], "--live-ca needs a non-empty file"],
+		[["--live", "https://127.0.0.1:1/", "--live-cert", "", "--live-key", "key.pem"], "--live-cert needs a non-empty file"],
+		[["--live", "https://127.0.0.1:1/", "--live-cert", "cert.pem", "--live-key", ""], "--live-key needs a non-empty file"],
+	];
+	for (const [args, message] of refusals) {
+		const result = await runVerified(writeStubOpa(evalResult([])), args);
+
+		expect(result.exitCode).toBe(2);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toContain(message);
+	}
+});
+
 test("a non-empty violations set fails the run and names each violation", async () => {
 	const violation = {
 		rule: "W-R1",

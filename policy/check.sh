@@ -10,6 +10,9 @@
 #
 #   --root <dir>   tree to inspect; .github/workflows and deploy/ are read from here (default: this repository)
 #   --live <url>   also collect the live response headers from <url> (collect.ts --live)
+#   --live-ca <file>   CA that signed the https --live server (collect.ts --live-ca)
+#   --live-cert <file> client certificate for the https --live probe; needs --live-key
+#   --live-key <file>  its private key; needs --live-cert
 #
 # OPA binary: always the one named in policy/opa-pin.json. It is downloaded, its sha256 is checked, and it runs only on a
 # match. A mismatch aborts the run. No environment variable selects another binary or skips the check.
@@ -62,6 +65,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 ROOT="$REPO_DIR"
 LIVE=""
+LIVE_CA=""
+LIVE_CERT=""
+LIVE_KEY=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -75,11 +81,36 @@ while [ $# -gt 0 ]; do
 		LIVE="$2"
 		shift 2
 		;;
+	--live-ca)
+		[ $# -ge 2 ] || usage "--live-ca needs a file"
+		[ -n "$2" ] || usage "--live-ca needs a non-empty file: an empty value would fall back to the system trust store"
+		LIVE_CA="$2"
+		shift 2
+		;;
+	--live-cert)
+		[ $# -ge 2 ] || usage "--live-cert needs a file"
+		[ -n "$2" ] || usage "--live-cert needs a non-empty file: an empty value would drop the pinned certificate"
+		LIVE_CERT="$2"
+		shift 2
+		;;
+	--live-key)
+		[ $# -ge 2 ] || usage "--live-key needs a file"
+		[ -n "$2" ] || usage "--live-key needs a non-empty file: an empty value would drop the pinned key"
+		LIVE_KEY="$2"
+		shift 2
+		;;
 	*)
 		usage "unknown argument: $1"
 		;;
 	esac
 done
+
+if [ -z "$LIVE" ] && [ -n "$LIVE_CA$LIVE_CERT$LIVE_KEY" ]; then
+	usage "--live-ca, --live-cert and --live-key need --live"
+fi
+if [ -n "$LIVE_CERT$LIVE_KEY" ] && { [ -z "$LIVE_CERT" ] || [ -z "$LIVE_KEY" ]; }; then
+	usage "--live-cert and --live-key must be given together"
+fi
 
 [ -d "$ROOT" ] || usage "--root is not a directory: $ROOT"
 ROOT="$(cd -- "$ROOT" && pwd)"
@@ -130,6 +161,8 @@ say "collect $ROOT${LIVE:+ (live: $LIVE)}"
 COLLECT_ARGS=(--root "$ROOT")
 if [ -n "$LIVE" ]; then
 	COLLECT_ARGS+=(--live "$LIVE")
+	if [ -n "$LIVE_CA" ]; then COLLECT_ARGS+=(--live-ca "$LIVE_CA"); fi
+	if [ -n "$LIVE_CERT" ]; then COLLECT_ARGS+=(--live-cert "$LIVE_CERT" --live-key "$LIVE_KEY"); fi
 fi
 bun "$SCRIPT_DIR/collect.ts" "${COLLECT_ARGS[@]}" > "$WORK/input.json" || die "collect.ts failed"
 

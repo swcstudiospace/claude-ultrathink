@@ -14,7 +14,7 @@ import { SECURITY_HEADERS } from "../services/ultrathink/routes/router.ts";
 
 const LIVE_TIMEOUT_MS = 10_000;
 const DEFAULT_ROOT = resolve(import.meta.dir, "..");
-const USAGE = "usage: bun policy/collect.ts [--root <dir>] [--live <url>]";
+const USAGE = "usage: bun policy/collect.ts [--root <dir>] [--live <url> [--live-ca <file>] [--live-cert <file> --live-key <file>]]";
 
 /** `permissions` as written: the shorthand string, a scope map, or null when the key is absent. */
 export type Permissions = string | Record<string, string> | null;
@@ -54,6 +54,7 @@ export interface PolicyInput {
 export interface CollectOptions {
 	root?: string;
 	live?: string;
+	liveTls?: LiveTlsFiles;
 }
 
 type Obj = Record<string, unknown>;
@@ -177,8 +178,30 @@ function lowercaseKeys(source: Record<string, string>): Record<string, string> {
 	return out;
 }
 
-/** GET the URL and return its response headers, lowercased. Absent headers stay absent. */
-export async function fetchLiveHeaders(url: string): Promise<Record<string, string>> {
+/** PEM files for an https --live probe: the CA that signed the server, and the client certificate and key it presents. */
+export interface LiveTlsFiles {
+	ca?: string;
+	cert?: string;
+	key?: string;
+}
+
+function liveTlsOptions(files: LiveTlsFiles): { ca?: string; cert?: string; key?: string } {
+	if ((files.cert === undefined) !== (files.key === undefined)) {
+		throw new Error("--live-cert and --live-key must be given together");
+	}
+	return {
+		ca: files.ca === undefined ? undefined : readFileSync(files.ca, "utf8"),
+		cert: files.cert === undefined ? undefined : readFileSync(files.cert, "utf8"),
+		key: files.key === undefined ? undefined : readFileSync(files.key, "utf8"),
+	};
+}
+
+/**
+ * GET the URL and return its response headers, lowercased. Absent headers stay absent. An https URL is verified against
+ * `files.ca` and presents `files.cert` and `files.key`; without them, the system trust store applies. TLS files are
+ * refused for an http URL, where they would be silently ignored.
+ */
+export async function fetchLiveHeaders(url: string, files: LiveTlsFiles = {}): Promise<Record<string, string>> {
 	let parsed: URL;
 	try {
 		parsed = new URL(url);
@@ -188,7 +211,12 @@ export async function fetchLiveHeaders(url: string): Promise<Record<string, stri
 	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
 		throw new Error(`--live must be an http or https URL: ${url}`);
 	}
-	const response = await fetch(parsed, { method: "GET", signal: AbortSignal.timeout(LIVE_TIMEOUT_MS) });
+	const hasTlsFiles = files.ca !== undefined || files.cert !== undefined || files.key !== undefined;
+	if (parsed.protocol === "http:" && hasTlsFiles) {
+		throw new Error(`--live-ca, --live-cert and --live-key need an https --live URL: ${url}`);
+	}
+	const tls = parsed.protocol === "https:" ? liveTlsOptions(files) : undefined;
+	const response = await fetch(parsed, { method: "GET", signal: AbortSignal.timeout(LIVE_TIMEOUT_MS), tls });
 	await response.body?.cancel();
 	const headers: Record<string, string> = {};
 	response.headers.forEach((value, name) => {
@@ -204,7 +232,7 @@ export async function collect(options: CollectOptions = {}): Promise<PolicyInput
 	}
 
 	const workflowNames = readdirSync(join(root, ".github/workflows"))
-		.filter((name) => /\.yml$/.test(name))
+		.filter((name) => /\.ya?ml$/.test(name))
 		.sort();
 	const workflows = workflowNames.map((name) => {
 		const file = `.github/workflows/${name}`;
@@ -226,20 +254,30 @@ export async function collect(options: CollectOptions = {}): Promise<PolicyInput
 	return {
 		source: "live",
 		expected,
-		headers: await fetchLiveHeaders(options.live),
+		headers: await fetchLiveHeaders(options.live, options.liveTls),
 		workflows,
 		units,
 	};
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
-	let values: { root?: string; live?: string; help?: boolean };
+	let values: {
+		root?: string;
+		live?: string;
+		"live-ca"?: string;
+		"live-cert"?: string;
+		"live-key"?: string;
+		help?: boolean;
+	};
 	try {
 		({ values } = parseArgs({
 			args: [...argv],
 			options: {
 				root: { type: "string" },
 				live: { type: "string" },
+				"live-ca": { type: "string" },
+				"live-cert": { type: "string" },
+				"live-key": { type: "string" },
 				help: { type: "boolean", short: "h" },
 			},
 			strict: true,
@@ -254,7 +292,11 @@ export async function main(argv: readonly string[]): Promise<number> {
 		return 0;
 	}
 	try {
-		const input = await collect({ root: values.root, live: values.live });
+		const input = await collect({
+			root: values.root,
+			live: values.live,
+			liveTls: { ca: values["live-ca"], cert: values["live-cert"], key: values["live-key"] },
+		});
 		process.stdout.write(`${JSON.stringify(input, null, 2)}\n`);
 		return 0;
 	} catch (error) {

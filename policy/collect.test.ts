@@ -206,6 +206,18 @@ describe("static collection of a fixture repository", () => {
 		expect(input.units.map((unit) => unit.file)).toEqual(["deploy/ultrathink-x.service", "deploy/ultrathink-x.timer"]);
 	});
 
+	test("collects workflows ending in .yml and .yaml, and ignores other files there", async () => {
+		const root = tempRoot();
+		writeRepoFile(root, ".github/workflows/ci.yml", "on: push\njobs:\n  t:\n    steps:\n      - uses: actions/checkout@v4\n");
+		writeRepoFile(root, ".github/workflows/release.yaml", "on: push\njobs:\n  r:\n    steps:\n      - uses: actions/checkout@v4\n");
+		writeRepoFile(root, ".github/workflows/notes.txt", "not a workflow\n");
+		writeRepoFile(root, "deploy/ultrathink-x.service", "[Service]\nUser=ultrathink\n");
+
+		const input = await collect({ root });
+		expect(input.workflows.map((workflow) => workflow.file)).toEqual([".github/workflows/ci.yml", ".github/workflows/release.yaml"]);
+		expect(input.workflows[1]?.jobs.r?.uses).toEqual(["actions/checkout@v4"]);
+	});
+
 	test("a root without a workflows directory is an error, never an empty input", async () => {
 		const root = tempRoot();
 		writeRepoFile(root, "deploy/ultrathink-x.service", "[Service]\nUser=ultrathink\n");
@@ -330,6 +342,18 @@ describe("live mode against a server that omits HSTS", () => {
 
 	test("a live URL that is not http or https is rejected", async () => {
 		await expect(collect({ root: REPO_ROOT, live: "ftp://127.0.0.1/" })).rejects.toThrow("http or https");
+	});
+
+	test("TLS files are refused for an http live URL, where they would be ignored", async () => {
+		await expect(collect({ root: REPO_ROOT, live: "http://127.0.0.1:1/", liveTls: { ca: "/no/such/ca.pem" } })).rejects.toThrow(
+			"need an https",
+		);
+	});
+
+	test("a client certificate without its key is refused before any connection is made", async () => {
+		await expect(collect({ root: REPO_ROOT, live: "https://127.0.0.1:1/", liveTls: { cert: "/no/such/cert.pem" } })).rejects.toThrow(
+			"given together",
+		);
 	});
 });
 
