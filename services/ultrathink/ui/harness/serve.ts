@@ -8,14 +8,27 @@
  *   open http://127.0.0.1:4173/?fixture=diamond&theme=dark&width=360
  *
  * `/app.html` carries the CSP a conforming host applies to a View with no declared origins (spec 2026-01-26,
- * default policy) as a header; the document itself also embeds it as a meta tag, which is what applies when the host
- * page frames it via `srcdoc`. Either way any network or inline-handler use by the app fails visibly here.
+ * default policy), so any network or inline-handler use by the app fails visibly here.
  */
 import { FIXTURE_NAMES, FIXTURES } from "../fixtures.ts";
-import { APP_CSP, graphAppHtml } from "../graph-app.ts";
+import { graphAppHtml } from "../graph-app.ts";
 
 const DEFAULT_PORT = 4173;
 const HOST_PAGE = new URL("./host.html", import.meta.url);
+
+/** The default CSP of the MCP Apps spec, plus the directives its construction example adds. */
+export const APP_CSP = [
+	"default-src 'none'",
+	"script-src 'self' 'unsafe-inline'",
+	"style-src 'self' 'unsafe-inline'",
+	"img-src 'self' data:",
+	"media-src 'self' data:",
+	"connect-src 'none'",
+	"object-src 'none'",
+	"base-uri 'self'",
+	"frame-src 'none'",
+	"font-src 'self'",
+].join("; ");
 
 function respond(body: ConstructorParameters<typeof Response>[0], type: string, extra: Record<string, string> = {}): Response {
 	return new Response(body, { headers: { "content-type": type, "cache-control": "no-store", ...extra } });

@@ -6,7 +6,7 @@
  *
  * The plan never reads the operator's personal config or control state: the plugin config is built here and handed
  * over captured, the env is built from scratch, and tracking, substrate, Hindsight, RAGFlow, shipping, lessons and
- * (unless `serverDecisions`) Jev stay off. The only outbound traffic is the OpenRouter completer.
+ * Jev stay off. The only outbound traffic is the OpenRouter completer.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -170,7 +170,7 @@ const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
 };
 
 /** The plugin config a server plan runs with: planning on, everything that reaches outside the model off. */
-function pluginConfig(service: UltrathinkConfig): PluginConfig {
+function pluginConfig(): PluginConfig {
 	const config = defaultConfig();
 	config.uplift = { ...config.uplift, enabled: true, skipTrivial: false, echo: false };
 	config.claude = { ...config.claude, concurrency: 3, callTimeoutMs: 0, budgetMs: 0, echo: false };
@@ -181,7 +181,8 @@ function pluginConfig(service: UltrathinkConfig): PluginConfig {
 	config.hindsight = { ...config.hindsight, enabled: false, url: "" };
 	config.ragflow = { ...config.ragflow, enabled: false, ground: false, url: "" };
 	config.teach = { ...config.teach, enabled: false, recall: false };
-	config.decisions = { ...config.decisions, enabled: service.serverDecisions };
+	// Decision spend is not metered yet, so Jev stays off in every server plan.
+	config.decisions = { ...config.decisions, enabled: false };
 	config.substrate = { ...config.substrate, url: "" };
 	config.gateway = { ...config.gateway, url: "" };
 	config.notion = { dataSourceUrl: "" };
@@ -288,14 +289,10 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			ULTRATHINK_RAGFLOW: "0",
 			ULTRATHINK_TEACH: "0",
 			ULTRATHINK_GATEWAY: "0",
+			ULTRATHINK_DECISIONS: "0",
 			SUBSTRATE_DISABLED: "1",
 		});
-		if (config.serverDecisions) {
-			// Jev reads its key from the env; this is the one place the key is handed to the plugin.
-			if (config.openRouterApiKey !== undefined) env.OPENROUTER_API_KEY = config.openRouterApiKey;
-		} else {
-			env.ULTRATHINK_DECISIONS = "0";
-		}
+		// The OpenRouter key never reaches a plan: decision spend is not metered, so Jev stays off here.
 		// ULTRATHINK_CHILD and ULTRATHINK_UPLIFT are not on the allowlist, so they cannot reach the plan.
 		return env;
 	}
@@ -484,7 +481,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(), {
 				stateDir,
 				signal: job.controller.signal,
-				config: pluginConfig(config),
+				config: pluginConfig(),
 				control: { enabled: true },
 				createTracker: () => undefined,
 				selectEngine: async (): Promise<SelectedEngine> => ({

@@ -10,7 +10,16 @@ import { type Auth, createAuth } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { type Store, openStore } from "../store/store.ts";
 import { createLogger } from "../obs/log.ts";
-import { createHandler } from "./router.ts";
+import { SECURITY_HEADERS, createHandler } from "./router.ts";
+
+/** A header the security module sets, read from the exported constant. A missing one is a broken build, not a value to compare. */
+function requiredHeader(name: string): string {
+	const value = SECURITY_HEADERS[name];
+	if (value === undefined) throw new Error(`SECURITY_HEADERS has no ${name}`);
+	return value;
+}
+
+const PERMISSIONS_POLICY = requiredHeader("Permissions-Policy");
 
 const PUBLIC_ORIGIN = "https://ultrathink.test";
 const PEER_IP = "127.0.0.1";
@@ -75,7 +84,6 @@ beforeAll(async () => {
 		modelTimeoutMs: 120000,
 		planTimeoutMs: 600000,
 		modelMaxOutputTokens: 8000,
-		serverDecisions: false,
 		sessionSecretPrevious: [],
 		breakerFailures: 5,
 		breakerWindowMs: 60000,
@@ -349,7 +357,7 @@ describe("router", () => {
 		for (const res of responses) {
 			expect(res.headers.get("x-frame-options")).toBe("DENY");
 			expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
-			expect(res.headers.get("permissions-policy")).toBe("camera=(), microphone=(), geolocation=()");
+			expect(res.headers.get("permissions-policy")).toBe(PERMISSIONS_POLICY);
 			expect(res.headers.get("cache-control")).toBe("no-store");
 		}
 	});
@@ -453,7 +461,7 @@ describe("MCP endpoint", () => {
 		expect(response.status).toBe(202);
 		expect(response.headers.get("x-frame-options")).toBe("DENY");
 		expect(response.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
-		expect(response.headers.get("permissions-policy")).toBe("camera=(), microphone=(), geolocation=()");
+		expect(response.headers.get("permissions-policy")).toBe(PERMISSIONS_POLICY);
 		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 	});
 

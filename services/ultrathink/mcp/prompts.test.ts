@@ -154,13 +154,13 @@ describe("the new prompts", () => {
 		expect(onlyNode).not.toContain("sessionId set to");
 	});
 
-	test("ultrathink-last uses ultrathink_sessions, then ultrathink_graph and ultrathink_result, and shows the diagram first", () => {
+	test("ultrathink-last uses ultrathink_graph then ultrathink_result and shows the diagram first", () => {
 		const text = textOf(renderPrompt("ultrathink-last", {}));
-		expect(text).toContain("ultrathink_sessions");
 		expect(text).toContain("ultrathink_graph");
 		expect(text).toContain("ultrathink_result");
+		expect(text).not.toContain("ultrathink_sessions");
 		expect(text).toContain("mermaid");
-		expect(text.indexOf("ultrathink_sessions")).toBeLessThan(text.indexOf("ultrathink_graph"));
+		expect(text.indexOf("ultrathink_graph")).toBeLessThan(text.indexOf("ultrathink_result"));
 	});
 
 	test("ultrathink-status uses ultrathink_sessions only", () => {

@@ -81,7 +81,6 @@ function baseConfig(dir: string, overrides: Partial<UltrathinkConfig> = {}): Ult
 		modelTimeoutMs: 5000,
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
-		serverDecisions: false,
 		sessionSecretPrevious: [],
 		breakerFailures: 5,
 		breakerWindowMs: 60000,
@@ -1250,7 +1249,13 @@ describe("hardening wiring", () => {
 	});
 
 	test("past maxInflight a request is refused with 503 and Retry-After, while /healthz still answers", async () => {
-		const planner = stubPlanner(true, { result: () => new Promise<never>(() => undefined) });
+		const reached = Promise.withResolvers<void>();
+		const planner = stubPlanner(true, {
+			result: () => {
+				reached.resolve();
+				return new Promise<never>(() => undefined);
+			},
+		});
 		const h = harness({ config: { maxInflight: 1 }, deps: { planner } });
 		// Never settles, so it holds the only slot.
 		void rpc(h, {
@@ -1259,6 +1264,9 @@ describe("hardening wiring", () => {
 			method: "tools/call",
 			params: { name: "ultrathink_result", arguments: { sessionId: randomSessionId(), waitSeconds: 0, detail: "full" } },
 		});
+		// The held request reads its body under the slot, then reaches the planner. Wait for that, so the refusal below
+		// happens while the slot is still held.
+		await reached.promise;
 
 		const refused = await h.app.handle(mcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }), PEER);
 		expect(refused.status).toBe(503);

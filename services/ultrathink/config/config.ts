@@ -37,7 +37,6 @@ export interface UltrathinkConfig {
 	modelTimeoutMs: number;
 	planTimeoutMs: number;
 	modelMaxOutputTokens: number;
-	serverDecisions: boolean;
 	/** Absent means the `reasoning` request parameter is not sent. */
 	modelReasoningEffort?: ReasoningEffort;
 	/** Failures counted within `breakerWindowMs` that open the upstream breaker; 0 disables it. */
@@ -434,7 +433,6 @@ export function loadConfig(
 			256,
 			32000,
 		),
-		serverDecisions: readFlag(env, "ULTRATHINK_SERVER_DECISIONS") === true,
 		modelReasoningEffort: readReasoningEffort(env),
 		breakerFailures: readInteger(env, "ULTRATHINK_BREAKER_FAILURES", 5, 0, 100),
 		breakerWindowMs: readInteger(env, "ULTRATHINK_BREAKER_WINDOW_MS", 60000, 1000, 3600000),

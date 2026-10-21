@@ -763,8 +763,11 @@ export default function tokenOpt(pi: PiLike): void {
 				return;
 			}
 			if (event.toolName === "read" && typeof event.input?.path === "string") {
-				const skimmed = skimSource(joined, event.input.path);
+				let skimmed = skimSource(joined, event.input.path);
 				if (skimmed.length < joined.length) rememberSkim(event.input.path, joined);
+				if (budget) {
+					skimmed = shrinkToolText(skimmed, capFor(budget.handle.tier(), DEFAULT_CAP)).text;
+				}
 				const baseline = estimateTokens(joined);
 				const current = estimateTokens(skimmed);
 				if (baseline > current) {

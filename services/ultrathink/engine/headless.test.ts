@@ -171,7 +171,6 @@ function setup(overrides: Partial<UltrathinkConfig> = {}, options: Partial<Headl
 		modelTimeoutMs: 5000,
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
-		serverDecisions: false,
 		sessionSecretPrevious: [],
 		breakerFailures: 5,
 		breakerWindowMs: 60000,
@@ -723,7 +722,7 @@ describe("headless planner: upstream breaker", () => {
 		const sessionId = randomUUID();
 		const started = h.planner.start({ prompt: PROMPT, sessionId });
 		// The completer backs off (Retry-After: 1 s) through the planner's clock between the two 503s.
-		await flush();
+		for (let i = 0; i < 20 && !h.clock.has(1000); i++) await flush();
 		expect(h.clock.has(1000)).toBe(true);
 		h.clock.fire(1000);
 		expect(await started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "upstream_unavailable" } });
@@ -799,22 +798,28 @@ describe("headless planner: isolation", () => {
 		expect(options.config).toMatchObject({ track: { enabled: false }, ship: { enabled: false }, hindsight: { enabled: false }, ragflow: { enabled: false }, teach: { enabled: false }, decisions: { enabled: false }, hitl: { knowledgeBase: false } });
 	});
 
-	test("serverDecisions leaves Jev on and hands it the key; the kill switches for everything else stay", async () => {
+	test("ULTRATHINK_SERVER_DECISIONS in the environment never gives a server plan the OpenRouter key or Jev", async () => {
 		let env: Record<string, string | undefined> = {};
+		let decisions: boolean | undefined;
 		const h = setup(
-			{ serverDecisions: true },
+			{},
 			{
+				// The operator's environment asks for decisions and holds the key; neither reaches the plan.
+				env: { PATH: process.env.PATH, ULTRATHINK_SERVER_DECISIONS: "1", OPENROUTER_API_KEY: FAKE_KEY },
 				// Not the real planPrompt: a live Jev gate would call out.
-				plan: async (_request, given) => {
+				plan: async (_request, given, options) => {
+					if (!options?.config) throw new Error("planPrompt was called without a config");
 					env = given ?? {};
+					decisions = options.config.decisions.enabled;
 					return { context: "", skipped: "precheck-skip" };
 				},
 			},
 		);
 		await h.planner.start({ prompt: PROMPT });
-		expect("ULTRATHINK_DECISIONS" in env).toBe(false);
-		expect(env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
-		expect(env).toMatchObject({ ULTRATHINK_SHIP: "0", ULTRATHINK_HINDSIGHT: "0", ULTRATHINK_RAGFLOW: "0", SUBSTRATE_DISABLED: "1" });
+		expect(env.OPENROUTER_API_KEY).toBeUndefined();
+		expect(env.ULTRATHINK_SERVER_DECISIONS).toBeUndefined();
+		expect(env.ULTRATHINK_DECISIONS).toBe("0");
+		expect(decisions).toBe(false);
 	});
 
 	test("a hostile operator config changes nothing and nothing but OpenRouter is contacted", async () => {

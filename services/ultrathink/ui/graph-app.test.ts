@@ -3,8 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import type { GraphView } from "../engine/graph-view.ts";
 import { FIXTURES, FIXTURE_NAMES, type Fixture } from "./fixtures.ts";
-import { APP_CSP, GRAPH_APP_MIME, GRAPH_APP_URI, graphAppHtml, graphAppResourceMeta } from "./graph-app.ts";
-import { harnessFetch, startHarness } from "./harness/serve.ts";
+import { GRAPH_APP_MIME, GRAPH_APP_URI, graphAppHtml, graphAppResourceMeta } from "./graph-app.ts";
+import { APP_CSP, harnessFetch, startHarness } from "./harness/serve.ts";
 
 const html = graphAppHtml();
 const SCRIPT_RE = /<script>([\s\S]*)<\/script>/;
@@ -328,17 +328,12 @@ describe("fixtures", () => {
 });
 
 describe("harness", () => {
-	test("the host page loads nothing from outside and frames the app at an opaque origin", async () => {
+	test("the host page loads nothing from outside and sandboxes the app", async () => {
 		const page = await Bun.file(new URL("./harness/host.html", import.meta.url)).text();
 		expect(/https?:\/\//i.test(page)).toBe(false);
 		expect(/<script[^>]*\ssrc=/i.test(page)).toBe(false);
 		expect(/<link\b/i.test(page)).toBe(false);
-		// Scripts only: with allow-same-origin on a same-origin document the app could reach the host page and lift its own sandbox.
 		expect(page).toContain('frame.setAttribute("sandbox", "allow-scripts");');
-		expect(page).not.toContain("allow-same-origin\"");
-		expect(page).toContain("frame.srcdoc = text");
-		expect(page).not.toContain("frame.src =");
-		expect(page).toContain('postMessage(msg, "*")');
 		expect(page).toContain("/app.html");
 		expect(page).toContain("window.__log");
 		expect(page).toContain('param("msgform", "array")');

@@ -2,7 +2,7 @@
 
 This guide connects a chat client to the hosted ultrathink server, or to the same connector running on your machine over stdio, and shows how to run `/ultrathink <request>` and the other connector commands from it. The hosted server is at `https://ultrathink.swcstudio.space/mcp`. For the server's operation, see the [runbook](../ops/runbook-ultrathink.md). For Grok Bot, see [Connect Grok Bot to ultrathink](../ops/grok-bot-setup-ultrathink.md). For every command and what each client does with it, see [Commands: Connector](../commands.md#connector).
 
-**Status: Grok Chat connected live; no Claude connection seen.** Grok Chat connected to the hosted server on 2026-10-18 and 2026-10-19, listed its tools and called them, against the older 7-tool build. No connection from Claude chat, Claude Desktop or Claude Code appears in the retained server logs of 2026-10-11 to 2026-10-19 (no Claude user agent, no Anthropic address range, no claude.ai redirect URI), so none is known to have connected. What Claude does with this connector is taken from vendor documentation and public issue reports read on 2026-10-19, with the source named where it matters; anything no source settles is marked *not verified*. The list of what has and has not been run is under [What is not verified](#what-is-not-verified).
+**Status: not verified live.** This connector has never been connected to Claude chat, Claude Code or Grok Chat in a live session. What a client does with it is taken from vendor documentation and public issue reports read on 2026-10-19, with the source named where it matters; anything no source settles is marked *not verified*. The list of what has and has not been run is under [What is not verified](#what-is-not-verified).
 
 ## What /ultrathink does in a chat
 
@@ -15,7 +15,7 @@ This guide connects a chat client to the hosted ultrathink server, or to the sam
 
 The chat model then reads the plan, asks you the questions that matter (or states the defaults it assumes), and carries out the plan.
 
-This path has no Notion, no Linear, no tracking, no shipping, and no Hindsight or RAGFlow lookups. The Jev decision gate is off unless the operator sets `ULTRATHINK_SERVER_DECISIONS=1`. Nothing is written to your repository or to any tracker.
+This path has no Notion, no Linear, no tracking, no shipping, and no Hindsight or RAGFlow lookups. The Jev decision gate is off: server-side decisions stay disabled until their spend is metered. Nothing is written to your repository or to any tracker.
 
 ## Two modes
 
@@ -84,16 +84,12 @@ On Team and Enterprise plans an Owner may have to add the connector for the orga
 
 Use this when you do not want the plugin. You get the tools, and the model follows a typed `/ultrathink` only because their descriptions tell it to.
 
-Claude connects to a custom connector from Anthropic's cloud, not from your device, also in Claude Desktop (`https://claude.com/docs/connectors/custom/add-unlisted`). The server URL must therefore be public; `https://ultrathink.swcstudio.space/mcp` is. Servers listed in `claude_desktop_config.json` are a separate mechanism: see [Local stdio](#local-stdio).
-
-1. Open **Customize**, then **Connectors**.
+1. Open Settings, then Connectors.
 2. Choose **Add custom connector**.
-3. Enter a name (`ultrathink`) and the URL `https://ultrathink.swcstudio.space/mcp`, then click **Continue**.
-4. Review the settings Claude detected. Set **Authentication** to **Sign in now**. Set **OAuth client** to **Register automatically**. Anthropic describes it as Dynamic Client Registration, which works with most servers. Do not choose **Use Claude's published identity**: that option reads Claude's details from a Client ID Metadata Document, and this server supports Dynamic Client Registration only.
-5. Click **Add**, then **Connect**. The consent page opens. Enter the owner password and click **Approve**.
-6. In a new chat, open the **+** menu and switch the ultrathink connector on for that chat.
-
-Claude does not let you change authentication settings after a connector is added. To change them, remove the connector and add it again. Whether Claude's detection picks **Register automatically** by itself is *not verified*; choose it explicitly if the dialog offers the choice.
+3. Enter a name (`ultrathink`) and the URL `https://ultrathink.swcstudio.space/mcp`.
+4. Leave the advanced OAuth client ID and secret empty. If the dialog asks how Claude should register, choose automatic registration; the "published identity" option needs client ID metadata documents, which this server does not advertise.
+5. Choose **Connect**. The consent page opens. Enter the owner password and click **Approve**.
+6. In a new chat, open the connectors menu and switch the ultrathink connector on for that chat. The auth settings cannot be edited after the connector is added; to change them, remove the connector and add it again.
 
 Menu labels differ by app version and plan. Custom connectors may not be available on every plan. Claude shows an Allow once, Always allow or Blocked choice per tool; the read-only tools declare `readOnlyHint`, which Anthropic says lets them run without a per-call prompt.
 
@@ -120,9 +116,7 @@ The six prompts are `/mcp__ultrathink__ultrathink`, `/mcp__ultrathink__ultrathin
 3. Enter the URL `https://ultrathink.swcstudio.space/mcp`.
 4. Choose OAuth when Grok offers it. Grok opens the ultrathink consent page. If Grok shows a manual "OAuth Credentials Required" dialog, the server needs no client secret: it registers public clients (token auth method none, PKCE).
 5. Enter the owner password and click **Approve**.
-6. Check that the ultrathink tools are listed in the connector, including `ultrathink_uplift`, `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`. If a tool you expect is missing, the list is stale: re-authenticate or reconnect (see the next paragraph).
-
-Grok fetches the tool list once, when the connector is connected, and fetches it again only when the connector is re-authenticated (xAI plugin-marketplace issue 1402, `https://github.com/xai-org/plugin-marketplace/issues/1402`; the iOS app has no Reauthenticate button). After any release that changes tools, remove and re-add the connector or re-authenticate it. The Grok sessions of 2026-10-19 ran against the older 7-tool build, so a reconnect is needed before Grok shows the current 10-tool surface.
+6. Check that the ultrathink tools are listed in the connector, including `ultrathink_uplift`, `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`. If a tool you expect is missing, the list is stale: re-authenticate or reconnect (see above).
 
 Grok Chat gets the tools only. There is no plugin bundle for it, so a typed `/ultrathink` works through the tool descriptions and, if the model ignores them, the custom instructions below.
 
@@ -238,7 +232,7 @@ For Grok, paste this into Grok's custom instructions (Settings, Customize; the l
 
 ```text
 When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command, verbatim. Call ultrathink_uplift with it as prompt. If the status is running, call ultrathink_result with the sessionId, and call it again until the status is planned. Do not invent a sessionId or a status. When the plan is ready, show the user its wave tree first, unchanged, in a code block, ask the questions in the plan that matter, state the defaults you assume for the rest, and carry out the plan. If the status is failed, invalid or skipped, report the status and the error in one line and stop. If nothing follows /ultrathink, ask for a request and call no tool.
-A message that starts with /ultrathink- and a command name is another command, not a request to plan. /ultrathink-think [sessionId] [node] calls ultrathink_graph. /ultrathink-last calls ultrathink_sessions with limit 5, then ultrathink_graph and ultrathink_result with the sessionId of the newest session whose status is planned. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> calls ultrathink_command with command set to the name and args set to the rest, verbatim; relay its message and make the tool call it names in next.
+A message that starts with /ultrathink- and a command name is another command, not a request to plan. /ultrathink-think [sessionId] [node] calls ultrathink_graph. /ultrathink-last calls ultrathink_graph with no arguments (newest planned session), then ultrathink_result with that sessionId. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> calls ultrathink_command with command set to the name and args set to the rest, verbatim; relay its message and make the tool call it names in next.
 ```
 
 For Claude, paste the same text into the instructions of a Claude Project that has the ultrathink connector switched on. For Claude Code, add it to `CLAUDE.md`, or use the prompt route.
@@ -247,10 +241,9 @@ If server-side planning is off (no `ultrathink_uplift` in the tool list), the fi
 
 ### What is not verified
 
-- Claude chat, Claude Desktop and Claude Code live. No connection from any of them is known: no Claude user agent, no Anthropic address range (`160.79.104.0/21`) and no claude.ai redirect URI appear in the retained nginx logs of 2026-10-11 to 2026-10-19. No step above was seen working in Claude. Whether Claude's detection picks the OAuth client choice **Register automatically** by itself, and whether Claude's backend tolerates the `io.modelcontextprotocol/ui` entry under `capabilities.extensions` in the `initialize` result, are *not verified*. The same tolerance is *not verified* for Grok's connector gateway (`grok-connectors-manager`); the official TypeScript and Python SDKs accept it.
-- What Grok Chat did live. In the retained logs of 2026-10-18 and 2026-10-19 it registered, signed in through the consent page, sent `initialize`, `notifications/initialized` and one `tools/list`, then called `ultrathink_uplift` and `ultrathink_result` (long polls of 20, 40 and 45 seconds, all HTTP 200). Before every `tools/call` it sent `initialize` and `notifications/initialized` again, and it never sent a second `tools/list`. It sent no `prompts/list` and no `resources/*` request, and no HTTP 400 on `/mcp` from Grok is in the retained logs. This ran against the older 7-tool build; the current 10-tool, 6-prompt, 1-resource build has not been seen by Grok. Details are in [the evidence record](../ops/evidence-connector-commands.md#2026-10-19-live-observations-and-release).
+- Anything about a live connection. The connector has not been connected to Claude chat, Claude Code or Grok Chat, so no step above was seen working in those products.
 - Whether Claude's "/" menu lists the plugin's commands for this connector, whether `$ARGUMENTS` is filled in when chat loads a command as a skill, and whether the Connectors tab accepts the owner-password sign-in. These follow Anthropic's plugin documentation.
-- Whether Grok Chat or Claude hand the model `structuredContent`, `_meta`, or the server's instructions. Only Claude Code's behavior is documented. Grok's live calls did not show what the model received.
+- Whether Grok Chat or Claude hand the model `structuredContent`, `_meta`, or the server's instructions. Only Claude Code's behavior is documented.
 - Whether the MCP App card renders inside Claude or Grok. The card was run in a real headless Chrome through a host harness that implements the MCP Apps specification (handshake, themes, 360 to 1000 px widths, keyboard navigation, a content security policy with `connect-src 'none'`), not inside either product. Real hosts may differ.
 - Whether Claude chat or Grok Chat renders a fenced Mermaid block. The Mermaid source was parsed and rendered with Mermaid 11 in strict mode for twelve graphs, including hostile ones, but that says nothing about those two products.
 - Which protocol revision Claude chat and Grok Chat open with, and how they react to the 400 on a 2026-07-28 probe. The fallback was confirmed only for the official SDK clients.
@@ -280,11 +273,10 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_PUBLIC_ORIGIN` | none (required) | Public origin of the service, `https://ultrathink.swcstudio.space`. `http://` is allowed only for localhost and 127.0.0.1. |
 | `ULTRATHINK_OWNER_PASSWORD_HASH` | none (required) | Argon2id hash of the owner password. |
 | `ULTRATHINK_SESSION_SECRET` | none (required) | Secret for web login sessions, at least 32 characters. |
-| `ULTRATHINK_SESSION_SECRET_PREVIOUS` | unset | Earlier session secrets: a comma list of at most 4, each at least 32 characters. They verify existing sessions and pending consents during a rotation; remove them after 12 hours (sessions) and 10 minutes (pending consents) and restart. |
-| `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | Absolute path to the state directory: database, `oauth.json`, `audit.jsonl`, `journal/`, `sessions/`, `jobs/`. Trailing slashes are removed. |
+| `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | State directory: database, `oauth.json`, `journal/`, `sessions/`, `jobs/`. |
 | `ULTRATHINK_PORT` | `8795` | Listen port, 1024 to 65535. |
 | `ULTRATHINK_MAX_INPUT_CHARS` | `8000` | Longest request, 1 to 20000 characters. |
-| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 20000 characters. The request body cap is 64 KiB, so a larger value fails startup. |
+| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 20000 characters. |
 | `ULTRATHINK_RUN_TOKEN_CEILING` | `150000` | Token limit for one plan. A plan over it stops with `budget_exceeded`. |
 | `ULTRATHINK_DAILY_TOKEN_CEILING` | `1000000` | Token limit per UTC day across all plans. |
 | `ULTRATHINK_PLANNING_MODEL` | unset | OpenRouter model id for server-side planning, for example `x-ai/grok-4.7`. Server-side mode needs it. |
@@ -296,21 +288,12 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_PLAN_TIMEOUT_MS` | `600000` | Timeout for one whole plan, 30000 to 1800000. |
 | `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
 | `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. The pipeline already asks the model to write its reasoning steps, so hidden reasoning only adds minutes. |
-| `ULTRATHINK_SERVER_DECISIONS` | off | `1` turns on the Jev decision gate in server-side plans. |
+| Server-side Jev decisions | off | Off until their spend is metered. Server-side plans never receive the OpenRouter key. |
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
 | `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | none | Comma list of extra https origins allowed in client redirect URIs. |
-| `ULTRATHINK_BREAKER_FAILURES` | `5` | Upstream failures (errors, timeouts, rate limits) in one window before planning is refused as `upstream_unavailable`. `0` disables the upstream breaker. 0 to 100. |
-| `ULTRATHINK_BREAKER_WINDOW_MS` | `60000` | Length of the window in which upstream failures are counted, 1000 to 3600000 ms. |
-| `ULTRATHINK_BREAKER_OPEN_MS` | `30000` | How long planning stays refused before one probe is let through, 1000 to 600000 ms. |
-| `ULTRATHINK_MAX_INFLIGHT` | `256` | Requests in flight at once, 1 to 10000. Further requests, except `/healthz`, `/readyz` and `/metrics`, get 503 `overloaded`. |
-| `ULTRATHINK_DRAIN_MS` | `5000` | On SIGTERM or SIGINT, how long `/readyz` reports `draining` before the listener stops, 0 to 60000 ms. |
-| `ULTRATHINK_RETENTION_DAYS` | `30` | Age in days after which finished session records, job files and journal directories are removed by the hourly sweep. `0` disables it. 0 to 3650. |
-| `ULTRATHINK_AUDIT_LOG` | `1` | `1` writes the audit log `audit.jsonl` in the state directory; `0` turns it off. Only `0` and `1` are accepted. |
 
 Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 65,536 bytes and is not configurable. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
-
-Web login sessions use the cookie `__Host-ut_session` when the public origin is https and `ut_session` otherwise. Sessions issued before this release no longer validate, so every browser session ends at deploy (at most 12 hours). `POST /ultrathink/logout` clears the cookie and needs the exact public origin.
 
 ## Troubleshooting
 

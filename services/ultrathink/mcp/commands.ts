@@ -88,7 +88,7 @@ export const COMMAND_OVERLAY: Readonly<Record<string, OverlayEntry>> = {
 	"ultrathink-last": {
 		state: "native",
 		summary: "shows the newest planned session's plan with its diagram",
-		tools: ["ultrathink_sessions", "ultrathink_result", "ultrathink_graph"],
+		tools: ["ultrathink_graph", "ultrathink_result"],
 		arguments: [],
 		description: "Show the newest plan",
 	},

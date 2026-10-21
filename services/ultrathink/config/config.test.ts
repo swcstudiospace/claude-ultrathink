@@ -298,7 +298,6 @@ describe("server planning defaults", () => {
 		expect(config.modelTimeoutMs).toBe(240000);
 		expect(config.planTimeoutMs).toBe(600000);
 		expect(config.modelMaxOutputTokens).toBe(8000);
-		expect(config.serverDecisions).toBe(false);
 	});
 
 	test("maxBodyBytes defaults to 65536", () => {
@@ -311,13 +310,11 @@ describe("server planning defaults", () => {
 		env.ULTRATHINK_MODEL_TIMEOUT_MS = "30000";
 		env.ULTRATHINK_PLAN_TIMEOUT_MS = "90000";
 		env.ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS = "4096";
-		env.ULTRATHINK_SERVER_DECISIONS = "1";
 		const config = loadConfig(env);
 		expect(config.maxConcurrentPlans).toBe(4);
 		expect(config.modelTimeoutMs).toBe(30000);
 		expect(config.planTimeoutMs).toBe(90000);
 		expect(config.modelMaxOutputTokens).toBe(4096);
-		expect(config.serverDecisions).toBe(true);
 	});
 });
 
@@ -345,14 +342,6 @@ describe("server planning bounds", () => {
 			}
 		});
 	}
-
-	test("server decisions accepts only 0 or 1", () => {
-		const env = baseEnv();
-		env.ULTRATHINK_SERVER_DECISIONS = "0";
-		expect(loadConfig(env).serverDecisions).toBe(false);
-		env.ULTRATHINK_SERVER_DECISIONS = "yes";
-		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_SERVER_DECISIONS");
-	});
 });
 
 describe("openRouterApiKey", () => {
