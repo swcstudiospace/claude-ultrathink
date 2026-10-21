@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ULTRATHINK_VERBS } from "../../../src/uplift/commands.ts";
@@ -112,6 +112,26 @@ describe("the catalog over the real repository files", () => {
 		}
 	});
 
+	test("the catalog covers every discovered command, and the Cursor plugin skill is one unsupported entry", () => {
+		// Plugin skills, Grok Bot skills and plugin command files are all connector commands; each needs one catalog entry.
+		const discovered = new Set<string>([
+			...readdirSync(join(REPOSITORY_ROOT, "skills")),
+			...readdirSync(join(REPOSITORY_ROOT, "hosts/grok-bot/skills")),
+			...readdirSync(join(REPOSITORY_ROOT, "commands"))
+				.filter((file) => file.endsWith(".md"))
+				.map((file) => file.slice(0, -".md".length)),
+		]);
+		for (const name of discovered) expect(catalog.find(name), name).toBeDefined();
+		const cursor = catalog.find("ultrathink-cursor");
+		expect(cursor?.state).toBe("unsupported");
+		expect(cursor?.reason?.trim()).toBeTruthy();
+		expect(cursor?.instead?.trim()).toBeTruthy();
+		expect(cursor?.sources.map((source) => source.path).sort()).toEqual([
+			"hosts/grok-bot/skills/ultrathink-cursor/SKILL.md",
+			"skills/ultrathink-cursor/SKILL.md",
+		]);
+	});
+
 	test("the locked states of 65-CONTEXT hold", () => {
 		const state = (name: string) => catalog.find(name)?.state;
 		expect(state("ultrathink")).toBe("native");
@@ -138,6 +158,7 @@ describe("the catalog over the real repository files", () => {
 				"ultrathink-engine",
 				"ultrathink-protocol",
 				"ultrathink-hitl",
+				"ultrathink-cursor",
 			].sort(),
 		);
 	});

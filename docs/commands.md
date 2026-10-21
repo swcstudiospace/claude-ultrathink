@@ -155,8 +155,9 @@ States: **native** means the connector implements it; **alias** means the same a
 | `/ultrathink-engine` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
 | `/ultrathink-protocol` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
 | `/ultrathink-hitl` | unsupported | Clarifying questions are part of every plan result. | Read the plan's questions. |
+| `/ultrathink-cursor` | unsupported | It is a Cursor host command, and the connector has no Cursor session to run it in. | Run it in Cursor with the ultrathink plugin installed. |
 
-That is 22 commands: 4 native, 1 alias, 1 passthrough and 16 unsupported. The six supported ones are listed as MCP prompts, with the arguments above (`request` is required for `/ultrathink` and `/ultrathink-plan`, `message` for `/ultrathink-quick`, and `sessionId` and `node` are optional for `/ultrathink-think`). `ultrathink_command` also accepts a bare name (`ship`), a slash form, the `ultrathink:` plugin namespace and any case, and `help` lists every command with its state. A command argument is limited to 20,000 characters.
+That is 23 commands: 4 native, 1 alias, 1 passthrough and 17 unsupported. The six supported ones are listed as MCP prompts, with the arguments above (`request` is required for `/ultrathink` and `/ultrathink-plan`, `message` for `/ultrathink-quick`, and `sessionId` and `node` are optional for `/ultrathink-think`). `ultrathink_command` also accepts a bare name (`ship`), a slash form, the `ultrathink:` plugin namespace and any case, and `help` lists every command with its state. A command argument is limited to 20,000 characters.
 
 ### How each client reaches a command
 

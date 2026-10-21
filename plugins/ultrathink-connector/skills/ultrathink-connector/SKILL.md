@@ -49,6 +49,7 @@ When the user types one of these, relay the reason and the alternative in one or
 | `/ultrathink-teach`, `/ultrathink-teach-admin`, `/ultrathink-learn`, `/ultrathink-lessons` | Teachable Moments state lives on the host | use it in a plugin host |
 | `/ultrathink-decisions`, `/ultrathink-hindsight`, `/ultrathink-engine`, `/ultrathink-protocol` | it is an operator control for a plugin host's own planner | use it in a plugin host |
 | `/ultrathink-hitl` | clarifying questions are part of every plan result | read the plan's questions |
+| `/ultrathink-cursor` | it is a Cursor host command, and the connector has no Cursor session to run it in | run it in Cursor with the ultrathink plugin installed |
 
 ## What is not verified
 
