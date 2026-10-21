@@ -251,7 +251,7 @@ dr_rsync() {
 
 # Milliseconds since the epoch, or ULTRATHINK_DR_NOW_MS when set (a test seam: a fixed "now"). Returns 2 on a bad value.
 dr_now_ms() {
-	local fixed
+	local fixed ms
 	fixed="$(dr_setting ULTRATHINK_DR_NOW_MS '')"
 	if [ -n "$fixed" ]; then
 		case "$fixed" in
@@ -263,7 +263,14 @@ dr_now_ms() {
 		printf '%s\n' "$fixed"
 		return 0
 	fi
-	date +%s%3N
+	ms="$(date +%s%3N)"
+	case "$ms" in
+	'' | *[!0-9]*)
+		# BSD date (macOS) has no %N and prints a literal "3N": keep the value numeric there, to the second.
+		ms="$(date +%s)000"
+		;;
+	esac
+	printf '%s\n' "$ms"
 }
 
 # dr_timing STEP START_MS: prints "step STEP NNNms" for the time elapsed since START_MS.

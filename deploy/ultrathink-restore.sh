@@ -116,7 +116,7 @@ validate_iso() {
 # iso_to_ms ISO: prints the epoch milliseconds of a UTC time that validate_iso accepted. Shell arithmetic, not date -d:
 # BSD date (macOS) has neither -d nor %N, so the same --at must pick the same snapshot on both platforms.
 iso_to_ms() {
-	local s="$1" y m d H M S frac="" frac3 era yoe mp doy doe days secs
+	local s="$1" y m d H M S frac="" frac3 era yoe mp doy doe days secs leap dim
 	s="${s%Z}"
 	s="${s%+00:00}"
 	y="${s:0:4}"
@@ -129,6 +129,22 @@ iso_to_ms() {
 	frac3="${frac}000"
 	frac3="${frac3:0:3}"
 	y=$((10#$y)); m=$((10#$m)); d=$((10#$d))
+	H=$((10#$H)); M=$((10#$M)); S=$((10#$S))
+	# Out-of-range fields are refused, not normalised: 12:60 must not become 13:00, and a day past the end of its month
+	# (or a leap second) must not roll over. date -d refused these; the same --at must refuse them here.
+	if [ "$m" -lt 1 ] || [ "$m" -gt 12 ] || [ "$H" -gt 23 ] || [ "$M" -gt 59 ] || [ "$S" -gt 59 ]; then
+		return 1
+	fi
+	leap=0
+	if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }; then leap=1; fi
+	case "$m" in
+	4 | 6 | 9 | 11) dim=30 ;;
+	2) dim=$((28 + leap)) ;;
+	*) dim=31 ;;
+	esac
+	if [ "$d" -lt 1 ] || [ "$d" -gt "$dim" ]; then
+		return 1
+	fi
 	if [ "$m" -le 2 ]; then y=$((y - 1)); fi
 	if [ "$y" -ge 0 ]; then era=$((y / 400)); else era=$(((y - 399) / 400)); fi
 	yoe=$((y - era * 400))
@@ -273,7 +289,7 @@ select_source() {
 select_archive() {
 	local base tarball extract="$SCRATCH/archive"
 	[ -f "$ARCHIVE" ] || die "archive not found: $ARCHIVE"
-	base="$(basename -- "$ARCHIVE")"
+	base="${ARCHIVE##*/}"
 	case "$base" in
 	ultrathink-*.tar.gz)
 		tarball="$ARCHIVE"
@@ -288,7 +304,7 @@ select_archive() {
 	esac
 	mkdir -m 0700 "$extract"
 	tar -xzf "$tarball" -C "$extract" --no-same-owner || die "cannot extract $base"
-	SRC_TOP="$(find "$extract" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+	SRC_TOP="$(find "$extract" -mindepth 1 -maxdepth 1 -type d | sed -n 1p)"
 	[ -n "$SRC_TOP" ] || die "archive has no top-level directory: $base"
 	SRC_LABEL="$base"
 	SRC_DB="$SRC_TOP/ultrathink.sqlite"
@@ -303,17 +319,38 @@ select_archive() {
 	printf 'source %s\n' "$SRC_LABEL"
 }
 
+# verify_sums DIR: checks DIR/SHA256SUMS. macOS has no sha256sum; shasum -a 256 gives the same digests for the same
+# SHA256SUMS file, so it is used when sha256sum is absent.
+verify_sums() {
+	local dir="$1"
+	if command -v sha256sum >/dev/null 2>&1; then
+		(cd "$dir" && sha256sum --check --quiet SHA256SUMS)
+	else
+		(cd "$dir" && shasum -a 256 -c SHA256SUMS >/dev/null)
+	fi
+}
+
 verify_source() {
+	local name
 	if [ -n "$SRC_TOP" ]; then
-		(cd "$SRC_TOP" && sha256sum --check --quiet SHA256SUMS) || die "checksum mismatch in $SRC_LABEL"
+		verify_sums "$SRC_TOP" || die "checksum mismatch in $SRC_LABEL"
 	fi
 	dr_bun quick "$SRC_DB" || die "database failed quick_check: $SRC_LABEL"
 	if [ -n "$SRC_FILES" ]; then
 		if [ -f "$SRC_FILES/oauth.json" ]; then
 			dr_bun json "$SRC_FILES/oauth.json" || die "oauth.json is not valid JSON: $SRC_LABEL"
 		fi
+		# Sealed segments are part of the audit chain. Every file the archive declares must be present, and segments
+		# without audit.jsonl are refused. audit.jsonl is verified with the segments beside it (verifyAuditFile reads them).
+		if [ -n "$SRC_TOP" ]; then
+			for name in $(sed -n 's/^files=//p' "$SRC_TOP/BACKUP_INFO" 2>/dev/null || true); do
+				[ -f "$SRC_FILES/$name" ] || die "archive is missing $name: $SRC_LABEL"
+			done
+		fi
 		if [ -f "$SRC_FILES/audit.jsonl" ]; then
 			audit_verify "$SRC_FILES/audit.jsonl"
+		elif [ -n "$(sealed_names "$SRC_FILES")" ]; then
+			die "sealed audit segments without audit.jsonl: $SRC_LABEL"
 		fi
 	fi
 }
@@ -355,7 +392,7 @@ guard_and_stop_units() {
 		fi
 	done
 	RESUME_TIMERS=1
-	for unit in "${ACTIVE_TIMERS[@]}" "${ACTIVE_SERVICES[@]}"; do
+	for unit in "${ACTIVE_TIMERS[@]+"${ACTIVE_TIMERS[@]}"}" "${ACTIVE_SERVICES[@]+"${ACTIVE_SERVICES[@]}"}"; do
 		"$SYSTEMCTL" stop "$unit" || die "cannot stop $unit; restore aborted"
 	done
 }
@@ -363,10 +400,23 @@ guard_and_stop_units() {
 resume_units() {
 	local unit
 	# Restarts only what guard_and_stop_units recorded as active. Nothing is enabled.
-	for unit in "${ACTIVE_TIMERS[@]}" "${ACTIVE_SERVICES[@]}"; do
+	for unit in "${ACTIVE_TIMERS[@]+"${ACTIVE_TIMERS[@]}"}" "${ACTIVE_SERVICES[@]+"${ACTIVE_SERVICES[@]}"}"; do
 		"$SYSTEMCTL" start "$unit" || warn "cannot start $unit"
 	done
 	RESUME_TIMERS=0
+}
+
+# sealed_names DIR: bare names of the sealed audit segments (audit-<first>-<last>.jsonl) in DIR, the pattern the backup
+# and snapshot scripts use. Regular files only.
+sealed_names() {
+	local dir="$1" path name
+	for path in "$dir"/audit-*.jsonl; do
+		[ -f "$path" ] || continue
+		name="${path##*/}"
+		if [[ "$name" =~ ^audit-[1-9][0-9]*-[1-9][0-9]*\.jsonl$ ]]; then
+			printf '%s\n' "$name"
+		fi
+	done
 }
 
 # state_entries: names in the state directory that a restore replaces. The database family always; the rest only for
@@ -375,7 +425,7 @@ state_entries() {
 	local entry name
 	for entry in "$STATE_DIR"/ultrathink.sqlite*; do
 		if [ -e "$entry" ] || [ -L "$entry" ]; then
-			basename -- "$entry"
+			printf '%s\n' "${entry##*/}"
 		fi
 	done
 	if [ "$DB_ONLY" -eq 0 ]; then
@@ -384,6 +434,8 @@ state_entries() {
 				printf '%s\n' "$name"
 			fi
 		done
+		# Sealed segments are part of the audit chain: they move aside with audit.jsonl, so none is left beside the new one.
+		sealed_names "$STATE_DIR"
 	fi
 }
 
@@ -403,6 +455,10 @@ place_files() {
 				cp -- "$SRC_FILES/$name" "$STATE_DIR/$name" || return 1
 			fi
 		done
+		while IFS= read -r name; do
+			PLACED+=("$name")
+			cp -- "$SRC_FILES/$name" "$STATE_DIR/$name" || return 1
+		done < <(sealed_names "$SRC_FILES")
 		for name in jobs sessions journal; do
 			if [ -d "$SRC_FILES/$name" ]; then
 				PLACED+=("$name")
@@ -426,10 +482,10 @@ place_files() {
 
 rollback_placement() {
 	local name
-	for name in "${PLACED[@]}"; do
+	for name in "${PLACED[@]+"${PLACED[@]}"}"; do
 		rm -rf -- "${STATE_DIR:?}/$name"
 	done
-	for name in "${MOVED_OUT[@]}"; do
+	for name in "${MOVED_OUT[@]+"${MOVED_OUT[@]}"}"; do
 		mv -- "$PRE_DIR/$name" "$STATE_DIR/$name" || warn "cannot move $name back from $PRE_DIR"
 	done
 }
@@ -469,7 +525,7 @@ probe_web() {
 		tls_args=(--cacert "$TLS_DIR/ca.pem" --cert "$TLS_DIR/ops/cert.pem" --key "$TLS_DIR/ops/key.pem")
 	fi
 	for ((i = 1; i <= 30; i++)); do
-		if curl -fs --max-time 2 "${tls_args[@]}" -o /dev/null "$PROBE_URL"; then
+		if curl -fs --max-time 2 "${tls_args[@]+"${tls_args[@]}"}" -o /dev/null "$PROBE_URL"; then
 			return 0
 		fi
 		if [ "$i" -lt 30 ]; then
@@ -515,7 +571,7 @@ run_promote() {
 		warn "promote refuses without --origin-fenced: the operator must attest that the origin is stopped"
 		exit 2
 	fi
-	parse_restore_args "${rest[@]}"
+	parse_restore_args "${rest[@]+"${rest[@]}"}"
 	if [ "$NO_START" -eq 1 ] || [ "$SCRATCH_MODE" -eq 1 ]; then
 		usage
 	fi
@@ -545,15 +601,15 @@ offhost_leg() {
 		warn "no off-host copy in $BACKUP_DIR or $SNAPSHOT_DIR/.offhost"
 		return 1
 	fi
-	say "off-host copy $(basename -- "$newest")"
+	say "off-host copy ${newest##*/}"
 	case "$newest" in
 	*.tar.gz.age)
 		dr_age decrypt "$newest" "$work/archive.tar.gz" || return 1
 		mkdir -m 0700 "$work/archive" || return 1
 		tar -xzf "$work/archive.tar.gz" -C "$work/archive" --no-same-owner || return 1
-		top="$(find "$work/archive" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+		top="$(find "$work/archive" -mindepth 1 -maxdepth 1 -type d | sed -n 1p)"
 		[ -n "$top" ] || return 1
-		(cd "$top" && sha256sum --check --quiet SHA256SUMS) || return 1
+		verify_sums "$top" || return 1
 		db="$top/ultrathink.sqlite"
 		;;
 	*.sqlite.age)

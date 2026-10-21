@@ -24,6 +24,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { hasTool, makeStateDir, runDr, type StateDirSpec, type SystemctlStub } from "./dr-fixtures.ts";
+import { createAuditLog, verifyAuditFile } from "./obs/audit.ts";
 import { formatStamp } from "./store/snapshots.ts";
 import { openStore } from "./store/store.ts";
 
@@ -218,6 +219,25 @@ function preRestoreDir(s: Scenario): string {
 	return join(s.state, dirs[0]!);
 }
 
+/** Sealed audit segment names, as the release writes them: audit-<first>-<last>.jsonl. */
+const SEALED_RE = /^audit-[1-9]\d*-[1-9]\d*\.jsonl$/;
+
+/**
+ * Writes a real audit chain into `dir`, replacing audit.jsonl, with at least one sealed segment. Strings are capped at
+ * 256 characters, so a record is about 500 bytes; 2500 records pass the 1 MiB segment minimum once.
+ */
+function sealedAuditChain(dir: string): void {
+	rmSync(join(dir, "audit.jsonl"), { force: true });
+	const log = createAuditLog({ path: join(dir, "audit.jsonl"), segmentBytes: 1_048_576 });
+	try {
+		const pad = "x".repeat(250);
+		for (let i = 0; i < 2500; i++) log.record("login_ok", { fixture: i, pad });
+	} finally {
+		log.close();
+	}
+	if (!readdirSync(dir).some((name) => SEALED_RE.test(name))) throw new Error("no sealed segment was written");
+}
+
 /** Writes an archive in the layout W1-B produces under s.backup and returns its path. */
 function archive(s: Scenario, ms: number, opts: { tamperAudit?: boolean } = {}): string {
 	const stamp = formatStamp(ms);
@@ -226,7 +246,8 @@ function archive(s: Scenario, ms: number, opts: { tamperAudit?: boolean } = {}):
 	const stage = join(stageRoot, name);
 	mkdirSync(stage);
 	vacuumInto(join(s.state, "ultrathink.sqlite"), join(stage, "ultrathink.sqlite"));
-	for (const file of ["oauth.json", "audit.jsonl"]) {
+	const sealed = readdirSync(s.state).filter((name) => SEALED_RE.test(name));
+	for (const file of ["oauth.json", "audit.jsonl", ...sealed]) {
 		if (existsSync(join(s.state, file))) cpSync(join(s.state, file), join(stage, file));
 	}
 	const dirs = ["jobs", "sessions", "journal"].filter((dir) => existsSync(join(s.state, dir)));
@@ -241,7 +262,7 @@ function archive(s: Scenario, ms: number, opts: { tamperAudit?: boolean } = {}):
 	}
 	writeFileSync(
 		join(stage, "BACKUP_INFO"),
-		`created_utc=${stamp}\nstate_dir=${s.state}\ndirs=${dirs.join(" ")}\nfiles=${existsSync(join(stage, "audit.jsonl")) ? "audit.jsonl" : ""}\nrevision=unknown\n`,
+		`created_utc=${stamp}\nstate_dir=${s.state}\ndirs=${dirs.join(" ")}\nfiles=${["audit.jsonl", ...sealed].filter((file) => existsSync(join(stage, file))).join(" ")}\nrevision=unknown\n`,
 	);
 	const sums = Object.entries(fileSums(stage))
 		.map(([rel, hash]) => `${hash}  ./${rel}`)
@@ -332,6 +353,47 @@ describe("restore", () => {
 			expect(r.code).toBe(1);
 			expect(r.stderr).toContain("no snapshot at or before");
 			expect(fileSums(s.state)).toEqual(before);
+		},
+		SLOW,
+	);
+
+	test(
+		"--at with an out-of-range time (12:60) is refused: exit 1, nothing changed",
+		() => {
+			const s = scenario({ runs: 2 });
+			snapshot(s, T1);
+			const before = fileSums(s.state);
+
+			const r = restore(s, ["--at", "2026-10-20T12:60:00Z", "--db-only", "--no-start"]);
+
+			expect(r.code).toBe(1);
+			expect(r.stderr).toContain("cannot read --at");
+			expect(fileSums(s.state)).toEqual(before);
+		},
+		SLOW,
+	);
+
+	test(
+		"an archive with audit.jsonl and sealed segments restores all of them, and stale host segments are moved aside",
+		() => {
+			const s = scenario({ runs: 2 });
+			sealedAuditChain(s.state);
+			const chain = readdirSync(s.state).filter((name) => name === "audit.jsonl" || SEALED_RE.test(name));
+			expect(chain.some((name) => SEALED_RE.test(name))).toBe(true);
+			const expected = chain.map((name) => ({ name, text: readFileSync(join(s.state, name), "utf8") }));
+			const arch = archive(s, T1);
+			// A stale host segment the archive does not hold: restore moves it aside with the rest of the chain.
+			writeFileSync(join(s.state, "audit-1-2.jsonl"), "stale host segment");
+
+			const r = restore(s, ["--archive", arch, "--no-start"]);
+
+			expect(r.code).toBe(0);
+			for (const { name, text } of expected) {
+				expect(readFileSync(join(s.state, name), "utf8")).toBe(text);
+			}
+			expect(existsSync(join(s.state, "audit-1-2.jsonl"))).toBe(false);
+			expect(readFileSync(join(preRestoreDir(s), "audit-1-2.jsonl"), "utf8")).toBe("stale host segment");
+			expect(verifyAuditFile(join(s.state, "audit.jsonl")).ok).toBe(true);
 		},
 		SLOW,
 	);
