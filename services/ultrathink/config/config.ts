@@ -19,6 +19,13 @@ export interface AuditSyslogTarget {
 	readonly port: number;
 }
 
+/** Absolute paths of the mTLS listener files: server certificate, its key, and the CA that signs client certificates. */
+export interface TlsFiles {
+	readonly certFile: string;
+	readonly keyFile: string;
+	readonly clientCaFile: string;
+}
+
 export interface UltrathinkConfig {
 	publicOrigin: string;
 	ownerPasswordHash: string;
@@ -98,6 +105,12 @@ export interface UltrathinkConfig {
 	auditKafkaTopic?: string;
 	/** OTLP/JSON trace collector base URL: https, or http to 127.0.0.1, localhost or [::1]. Absent disables span export. */
 	otlpEndpoint?: string;
+	/** mTLS listener files: absolute paths, all three or none. Absent only with the plaintext loopback opt-in. */
+	tls: TlsFiles | undefined;
+	/** SPIFFE trust domain that peer certificate identities must belong to. */
+	spiffeTrustDomain: string;
+	/** Set when the service may run without TLS: dev and local smoke only. */
+	plaintextLoopback: boolean;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -139,6 +152,9 @@ const DEFAULT_AUDIT_RETENTION_DAYS = 365;
 const DEFAULT_AUDIT_WATCH_MS = 1000;
 const DEFAULT_AUDIT_SINK_QUEUE = 10000;
 const MIN_AUDIT_HTTP_TOKEN_LENGTH = 16;
+const DEFAULT_SPIFFE_TRUST_DOMAIN = "ultrathink.internal";
+const TRUST_DOMAIN_PATTERN = /^[a-z0-9._-]{1,255}$/;
+const TLS_VARIABLES = ["ULTRATHINK_TLS_CERT", "ULTRATHINK_TLS_KEY", "ULTRATHINK_TLS_CLIENT_CA"] as const;
 
 function readOptional(
 	env: Record<string, string | undefined>,
@@ -543,12 +559,58 @@ function readPenaltyBlocks(env: Record<string, string | undefined>): {
 	return { penaltyBaseSec, penaltyMaxSec };
 }
 
+/** Absolute path from a variable that must be set; errors name the variable, never the path. */
+function readAbsoluteFile(env: Record<string, string | undefined>, name: string): string {
+	const path = readRequired(env, name);
+	if (!isAbsolute(path)) {
+		throw new ConfigError(`${name} must be an absolute path`);
+	}
+	return path;
+}
+
+/**
+ * The three mTLS files are one set. Unset is allowed only with the plaintext loopback opt-in, the single way to run
+ * without TLS; a partial set is refused even with it.
+ */
+function readTlsFiles(
+	env: Record<string, string | undefined>,
+	plaintextLoopback: boolean,
+): TlsFiles | undefined {
+	const present = TLS_VARIABLES.filter((name) => readOptional(env, name) !== undefined);
+	if (present.length === 0) {
+		if (plaintextLoopback) {
+			return undefined;
+		}
+		throw new ConfigError(
+			`${TLS_VARIABLES.join(", ")} must be set to absolute paths; ULTRATHINK_PLAINTEXT_LOOPBACK=1 allows plaintext for dev and local smoke only`,
+		);
+	}
+	const missing = TLS_VARIABLES.filter((name) => !present.includes(name));
+	if (missing.length > 0) {
+		throw new ConfigError(`${TLS_VARIABLES.join(", ")} must be set together; missing ${missing.join(", ")}`);
+	}
+	return {
+		certFile: readAbsoluteFile(env, "ULTRATHINK_TLS_CERT"),
+		keyFile: readAbsoluteFile(env, "ULTRATHINK_TLS_KEY"),
+		clientCaFile: readAbsoluteFile(env, "ULTRATHINK_TLS_CLIENT_CA"),
+	};
+}
+
+function readSpiffeTrustDomain(env: Record<string, string | undefined>): string {
+	const domain = readOptional(env, "ULTRATHINK_SPIFFE_TRUST_DOMAIN") ?? DEFAULT_SPIFFE_TRUST_DOMAIN;
+	if (!TRUST_DOMAIN_PATTERN.test(domain)) {
+		throw new ConfigError("ULTRATHINK_SPIFFE_TRUST_DOMAIN must be 1-255 characters from a-z, 0-9, '.', '_' and '-'");
+	}
+	return domain;
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
 	const stateDir = readStateDir(env);
 	const planningModel = readPlanningModel(env);
 	const openRouterApiKey = readOpenRouterApiKey(env);
+	const plaintextLoopback = readFlag(env, "ULTRATHINK_PLAINTEXT_LOOPBACK") === true;
 	return {
 		publicOrigin: readPublicOrigin(env),
 		ownerPasswordHash: readOwnerPasswordHash(env),
@@ -651,6 +713,9 @@ export function loadConfig(
 		auditHttpToken: readAuditHttpToken(env),
 		auditSyslog: readAuditSyslog(env),
 		otlpEndpoint: readOtlpEndpoint(env),
+		tls: readTlsFiles(env, plaintextLoopback),
+		spiffeTrustDomain: readSpiffeTrustDomain(env),
+		plaintextLoopback,
 		...readKafkaSink(env),
 	};
 }

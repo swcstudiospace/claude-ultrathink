@@ -16,7 +16,7 @@
 #
 # Environment overrides: ULTRATHINK_REPO (git checkout to archive from, default: the checkout holding this script),
 # ULTRATHINK_ROOT, ULTRATHINK_ENV_FILE, ULTRATHINK_UNIT, ULTRATHINK_SERVICE_USER, ULTRATHINK_SMOKE_PORT,
-# ULTRATHINK_KEEP_RELEASES.
+# ULTRATHINK_KEEP_RELEASES, ULTRATHINK_TLS_DIR (CA bundle and app/ops leaves, default /etc/ultrathink/tls).
 set -euo pipefail
 
 ROOT="${ULTRATHINK_ROOT:-/opt/ultrathink}"
@@ -25,6 +25,7 @@ UNIT="${ULTRATHINK_UNIT:-ultrathink-web}"
 SERVICE_USER="${ULTRATHINK_SERVICE_USER:-ultrathink}"
 SMOKE_PORT="${ULTRATHINK_SMOKE_PORT:-8796}"
 KEEP="${ULTRATHINK_KEEP_RELEASES:-5}"
+TLS_DIR="${ULTRATHINK_TLS_DIR:-/etc/ultrathink/tls}"
 BUN="$ROOT/bin/bun"
 RELEASES="$ROOT/releases"
 CURRENT="$ROOT/current"
@@ -139,21 +140,41 @@ env_value() {
 	printf '%s' "$default"
 }
 
+probe_status() {
+	# probe_status <port> <path>: prints the HTTP status, or 000 when the handshake or the request fails.
+	curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+		--cacert "$TLS_DIR/ca.pem" --cert "$TLS_DIR/ops/cert.pem" --key "$TLS_DIR/ops/key.pem" \
+		"https://127.0.0.1:$1$2" || true
+}
+
 probe() {
-	# probe <port> <label>: /healthz and /readyz must both answer 200 within about 30 s.
+	# probe <port> <label>: /healthz and /readyz must both answer 200 within about 30 s over mTLS as the ops identity.
+	# The app CA is pinned with --cacert and -k is never passed, so a server that cannot prove its chain or refuses the
+	# ops leaf fails here, and no probe request goes out unauthenticated.
 	local port="$1" label="$2" path attempt
 	for path in /healthz /readyz; do
 		attempt=0
-		until [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port$path" || true)" = "200" ]; do
+		until [ "$(probe_status "$port" "$path")" = "200" ]; do
 			attempt=$((attempt + 1))
 			if [ "$attempt" -ge 30 ]; then
-				warn "$label: $path did not return 200 on port $port"
+				warn "$label: $path did not return 200 on port $port over mTLS"
 				return 1
 			fi
 			sleep 1
 		done
 		say "$label: $path is 200"
 	done
+}
+
+# The app key is 0440 root:ultrathink, so the service user must be able to read it. Runs before any release file is
+# written: a missing file or an unreadable key stops the release before the symlink switch.
+check_tls_material() {
+	local path
+	for path in "$TLS_DIR/ca.pem" "$TLS_DIR/app/cert.pem" "$TLS_DIR/app/key.pem" "$TLS_DIR/ops/cert.pem" "$TLS_DIR/ops/key.pem"; do
+		[ -f "$path" ] || die "TLS file missing: $path"
+	done
+	setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- test -r "$TLS_DIR/app/key.pem" ||
+		die "service user $SERVICE_USER cannot read $TLS_DIR/app/key.pem"
 }
 
 current_target() {
@@ -241,6 +262,7 @@ smoke_test() {
 	: >"$SMOKE_LOG"
 	chown "$SERVICE_USER": "$SMOKE_LOG"
 	say "smoke start on port $SMOKE_PORT with a throwaway state directory"
+	# ENV_ARGS carries ULTRATHINK_TLS_*, so the smoke process serves the leaf production serves, and probe checks it over mTLS.
 	(
 		cd "$release"
 		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
@@ -266,6 +288,7 @@ do_release() {
 	take_lock
 	REPO="${ULTRATHINK_REPO:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}" || die "cannot locate the git checkout; set ULTRATHINK_REPO"
 	load_env_file
+	check_tls_material
 	port="$(env_value ULTRATHINK_PORT 8795)"
 
 	sha="$(git -C "$REPO" rev-parse --verify "$ref^{commit}")" || die "cannot resolve git ref: $ref"
@@ -359,9 +382,12 @@ do_status() {
 	fi
 }
 
-case "${1:-}" in
-release) do_release "${2:-}" ;;
-rollback) do_rollback ;;
-status) do_status ;;
-*) usage ;;
-esac
+# Sourcing the file defines its functions without running a subcommand; the release test sources it that way.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	case "${1:-}" in
+	release) do_release "${2:-}" ;;
+	rollback) do_rollback ;;
+	status) do_status ;;
+	*) usage ;;
+	esac
+fi

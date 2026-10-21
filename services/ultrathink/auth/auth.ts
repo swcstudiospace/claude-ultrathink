@@ -428,8 +428,12 @@ function limiterKey(address: string): string {
 		.join(":")}::/64`;
 }
 
-export function clientIpFrom(req: Request, peerIp: string): string {
-	if (LOOPBACK_PEERS[peerIp] !== true) return limiterKey(peerIp);
+/**
+ * Address the limiters and logs use. X-Real-IP is read only when `trustForwarded` is true. The default is the
+ * plaintext-mode rule (a loopback peer); with mTLS the router passes true only for the verified edge identity.
+ */
+export function clientIpFrom(req: Request, peerIp: string, trustForwarded = LOOPBACK_PEERS[peerIp] === true): string {
+	if (!trustForwarded) return limiterKey(peerIp);
 	const forwarded = req.headers.get("x-real-ip")?.trim();
 	if (forwarded && FORWARDED_IP.test(forwarded) && isIP(forwarded) !== 0) return limiterKey(forwarded);
 	return limiterKey(peerIp);

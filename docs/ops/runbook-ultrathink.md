@@ -6,14 +6,14 @@ Operations guide for the ultrathink MCP service on the VPS. Commands run as root
 
 1. Clients (Grok Chat, claude.ai, Claude Desktop, Claude Code, Grok Bot) call `https://ultrathink.swcstudio.space/mcp`.
 2. Cloudflare terminates the public TLS connection (SSL mode Full strict) and forwards to the VPS origin `187.77.130.10:443`.
-3. nginx (`deploy/nginx-ultrathink.swcstudio.space.conf`) accepts only Cloudflare peers, takes the real client address from `CF-Connecting-IP`, rate-limits per client, and proxies the allowed routes to `127.0.0.1:8795`.
-4. The Bun service `ultrathink-web` (`services/ultrathink/server.ts`) serves `/mcp`, the OAuth endpoints, `/login`, `/ultrathink`, `/healthz`, `/readyz` and `/metrics` (loopback only).
+3. nginx (`deploy/nginx-ultrathink.swcstudio.space.conf`) accepts only Cloudflare peers, takes the real client address from `CF-Connecting-IP`, rate-limits per client, and proxies the allowed routes over mTLS to `127.0.0.1:8795` (section 17).
+4. The Bun service `ultrathink-web` (`services/ultrathink/server.ts`) serves `/mcp`, the OAuth endpoints, `/login`, `/ultrathink`, `/healthz`, `/readyz` and `/metrics` on a TLS-only loopback listener. Which client certificate may reach which route is in section 17.
 5. It runs as the unprivileged user `ultrathink` from `/opt/ultrathink/current`, a symlink into `/opt/ultrathink/releases/<sha>-<utc>`, under a systemd sandbox (`deploy/ultrathink-web.service`).
 6. Server-side planning calls OpenRouter (`OPENROUTER_API_KEY`, model `ULTRATHINK_PLANNING_MODEL`); the client-driven loop (Grok Bot) makes no model call.
 7. State lives in `/var/lib/ultrathink` (mode 0700): `ultrathink.sqlite` (runs, token ledger), `oauth.json` (OAuth clients and tokens), `journal/`, `sessions/`, `jobs/`.
 8. Configuration and secrets live in `/etc/ultrathink/ultrathink.env` (mode 0600, root), read by systemd.
 9. `deploy/ultrathink-release.sh` builds, tests, smoke-tests and switches releases; `deploy/ultrathink-maintenance.timer` runs the daily backup and retention job.
-10. Logs go to journald as JSON lines; Prometheus-format metrics are on `127.0.0.1:8795/metrics`.
+10. Logs go to journald as JSON lines; Prometheus-format metrics are on `https://127.0.0.1:8795/metrics`, which accepts the probe identity only (section 17).
 
 ## 2. First install
 
@@ -58,6 +58,8 @@ Prerequisites: a git checkout of this repository on the VPS (any path; the relea
    nginx -t && systemctl reload nginx
    ```
 
+   The vhost needs the TLS files of section 17 first: `nginx -t` fails while `proxy_ssl_trusted_certificate` or the edge leaf is missing.
+
 6. Build and start the first release with the release script (section 3), then enable everything. When the host still runs the old root-owned service, do not use the script for the first release: follow "First cutover from the old root service" below instead.
 
    ```bash
@@ -97,8 +99,8 @@ The release script's probes need `/readyz`, which the old code lacks, and its re
        -e '/^EnvironmentFile=/a EnvironmentFile=/etc/ultrathink/canary.env' \
        deploy/ultrathink-web.service >/etc/systemd/system/ultrathink-canary.service
    systemctl daemon-reload && systemctl start ultrathink-canary
-   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8796/healthz
-   curl -s -w '\n%{http_code}\n' http://127.0.0.1:8796/readyz
+   curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8796/healthz
+   curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -w '\n%{http_code}\n' https://127.0.0.1:8796/readyz
    journalctl -u ultrathink-canary -n 30 --no-pager
    ```
 
@@ -118,11 +120,11 @@ The release script's probes need `/readyz`, which the old code lacks, and its re
    ln -sfn "$rel" /opt/ultrathink/current
    install -m 0644 deploy/ultrathink-web.service deploy/ultrathink-maintenance.service deploy/ultrathink-maintenance.timer /etc/systemd/system/
    systemctl daemon-reload && systemctl start ultrathink-web
-   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8795/healthz
-   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8795/readyz
+   curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8795/healthz
+   curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8795/readyz
    ```
 
-   Then install the nginx conf (step 5), verify from outside (step 7), `systemctl enable ultrathink-web`, and `systemctl enable --now ultrathink-maintenance.timer` (install the tmpfiles entry first, as in step 6). Later deploys use the release script, which treats this release as `current`.
+   Then install the nginx conf (step 5) in the same window, after the app restart above. Section 17 gives the order: the public site answers 503 until both are live. Then verify from outside (step 7), `systemctl enable ultrathink-web`, and `systemctl enable --now ultrathink-maintenance.timer` (install the tmpfiles entry first, as in step 6). Later deploys use the release script, which treats this release as `current`.
 
 4. Rollback of the cutover: `systemctl stop ultrathink-web`, restore the old unit with `cp -a "$bak"/ultrathink-web.service /etc/systemd/system/`, `systemctl daemon-reload`, `systemctl start ultrathink-web`. The old unit still points at the working tree under `/root`, which the cutover did not modify, and root can read the service-owned state. If the new code changed state the old code cannot read, also restore it: `rm -rf /var/lib/ultrathink && cp -a "$bak"/state /var/lib/ultrathink`. Restore the nginx conf from `$bak` if it was already replaced, then `nginx -t && systemctl reload nginx`.
 
@@ -135,9 +137,9 @@ cd /path/to/claude-ultrathink
 deploy/ultrathink-release.sh release <git-ref>      # for example: main, a tag, or a sha
 ```
 
-The script, in order: archives the commit into `/opt/ultrathink/releases/<sha>-<utc>`, runs `bun test services/ultrathink` there, starts the new release on port 8796 with the production environment but a throwaway state directory and probes `/healthz` and `/readyz`, switches `current` atomically (the old release becomes `previous`), restarts `ultrathink-web`, probes both endpoints on the production port, and rolls back by itself when any production probe fails. It keeps the 5 newest releases (never deleting `current` or `previous`). It refuses to run unless root.
+The script, in order: checks the TLS files of section 17 and refuses before it creates a release when one is missing, archives the commit into `/opt/ultrathink/releases/<sha>-<utc>`, runs `bun test services/ultrathink` there, starts the new release on port 8796 with the production environment but a throwaway state directory and probes `/healthz` and `/readyz` over mTLS, switches `current` atomically (the old release becomes `previous`), restarts `ultrathink-web`, probes both endpoints on the production port over mTLS, and rolls back by itself when any production probe fails. It keeps the 5 newest releases (never deleting `current` or `previous`). It refuses to run unless root.
 
-After a deploy that changed units or nginx, install the new copies (section 2, step 5) and reload. Unit changes need `systemctl daemon-reload` and a restart.
+After a deploy that changed units or nginx, install the new copies (section 2, step 5) and reload. Unit changes need `systemctl daemon-reload` and a restart. The renewal units are installed the same way; section 17 gives their order.
 
 ## 4. Rollback
 
@@ -181,7 +183,7 @@ Restore drill (do it after the first install and then quarterly):
    # Start with the production env file and the scratch state on port 8797; see the env parsing in deploy/ultrathink-release.sh.
    ```
 
-   Probe `http://127.0.0.1:8797/readyz` and stop the instance.
+   Probe `https://127.0.0.1:8797/readyz` with the ops identity (`--cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem`) and stop the instance.
 3. Real restore: `systemctl stop ultrathink-web`; move the damaged `ultrathink.sqlite*` aside; copy `ultrathink.sqlite`, `oauth.json` and the `jobs/`, `sessions/` and `journal/` directories from the extracted archive into `/var/lib/ultrathink` with `cp -a` (the saved plans and client-driven sessions live in `sessions/` and `journal/`; `jobs/` alone restores status only; `BACKUP_INFO` in the archive lists which directories it holds); `chown -R ultrathink:ultrathink /var/lib/ultrathink`; `find /var/lib/ultrathink -type f -exec chmod 0600 {} +`; `systemctl start ultrathink-web`; probe `/readyz`. Removing stale `ultrathink.sqlite-wal` and `-shm` files before the copy is required.
 4. Record the date, archive name and outcome of the drill in your change log.
 
@@ -216,9 +218,9 @@ First look:
 systemctl status ultrathink-web --no-pager
 journalctl -u ultrathink-web -n 100 --no-pager
 journalctl -u ultrathink-web --since "15 min ago" -o cat | grep '"level":"error"'
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8795/healthz
-curl -s http://127.0.0.1:8795/readyz
-curl -s http://127.0.0.1:8795/metrics | head -50
+curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8795/healthz
+curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz
+curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/metrics | head -50
 ```
 
 `/healthz` is liveness only (the process answers and the database responds). `/readyz` reports whether the service can do work (database ping, state directory writable, OAuth state readable). Through the edge, a 503 whose body is exactly `{"error":"unavailable"}` with `Retry-After: 60` is nginx saying the upstream is down or timed out (it turns an upstream 502 or 504 into that 503). Any other 503 body comes from the app and is passed through unchanged (`persistence_unavailable` with a `correlationId`, `/readyz` `not_ready`, OAuth `temporarily_unavailable`).
@@ -242,10 +244,13 @@ Common symptoms:
 | `ultrathink-maintenance.service` fails with `status=226/NAMESPACE` ("Failed to set up mount namespacing: /var/backups/ultrathink: No such file or directory") | The backup directory does not exist. systemd builds the `ReadWritePaths=` mount namespace before any `ExecStartPre=` runs, so the unit cannot create it itself. | `install -m 0644 deploy/ultrathink-tmpfiles.conf /etc/tmpfiles.d/ultrathink.conf && systemd-tmpfiles --create /etc/tmpfiles.d/ultrathink.conf`, then start the unit again. |
 | Service flapping | Bad env file, port in use, failed sandbox call. | `systemctl status` shows the start limit (5 starts in 60 seconds). A `SIGSYS` kill means the syscall filter blocked a call: `journalctl -k \| grep -i seccomp`. Roll back the release (section 4). |
 | A client connects, then lists no tools or never calls any | The probe was refused and the client did not fall back, the tool list is stale (Grok caches it), or the rate limit fired. | Read the first connection in the request log (section 13). Grok only refreshes its tool list on re-authentication. |
+| curl exit 35 or 56 on `https://127.0.0.1:8795` with no HTTP status | The TLS handshake was refused: no client certificate, a leaf that does not chain to `ca.pem`, or an expired leaf. | `openssl x509 -in /etc/ultrathink/tls/ops/cert.pem -noout -enddate` must show a future date, and `openssl verify -CAfile /etc/ultrathink/tls/ca.pem /etc/ultrathink/tls/ops/cert.pem` must pass. Renewal is in section 17. |
+| `deploy/ultrathink-release.sh` stops with `TLS file missing` or `cannot read ... app/key.pem` | The release checks the TLS files before it creates a release, so nothing was switched. | Install the files (section 17, cutover step 2), then run the release again. |
+| The app stops at start with a `ConfigError` that names `ULTRATHINK_TLS_*` or `ULTRATHINK_PLAINTEXT_LOOPBACK` | TLS settings are missing, partial or not absolute paths. Plaintext starts only with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`. | Fix `/etc/ultrathink/ultrathink.env` (section 17, environment table). Do not set the plaintext opt-in in production. |
 
 ## 8. Suggested alerts
 
-Scrape `127.0.0.1:8795/metrics` (loopback only; nginx does not proxy it). List the series and label values with `curl -s 127.0.0.1:8795/metrics`. Series:
+Scrape `https://127.0.0.1:8795/metrics` with the probe identity (loopback only; nginx does not proxy it; section 17). List the series and label values with `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/metrics`. Series:
 
 | Series | Labels | Meaning |
 |---|---|---|
@@ -321,7 +326,8 @@ Known gaps that are accepted for now. Each has an owner decision pending.
 - **Client ID Metadata Documents are not implemented.** Clients that identify themselves by a metadata URL instead of dynamic registration cannot connect. Dynamic client registration (RFC 7591) is the supported path.
 - **`POST /ultrathink` run API has no worker.** The web run API queues runs but nothing executes them (there is no worker entrypoint and no worker unit is shipped). Server-side planning for chat clients runs inside `ultrathink-web` instead; do not tell users the run API works.
 - **Abandoned ledger reservations count until pruned.** A run that never finished keeps its reserved tokens against the per-run and daily ceilings of its own day; the daily job removes the rows after the retention window.
-- **Smoke tests run unsandboxed.** The release script's smoke start uses the production secrets as the service user without the systemd sandbox, on loopback port 8796 for a few seconds.
+- **Smoke tests run unsandboxed.** The release script's smoke start uses the production secrets as the service user without the systemd sandbox, on loopback port 8796 for a few seconds, over TLS with the production leaves.
+- **Internal CA key on the host (phase 69).** The intermediate key that issues the 24 hour internal leaves stays on the VPS, so the renewal timer needs no person. A host compromise can mint leaves for the internal trust domain. Section 17 gives the scope and the recovery limits.
 
 ## 12. Planner latency and model choice
 
@@ -356,9 +362,9 @@ Chat clients wait through long polling (`ultrathink_result` waits up to 40 s per
 Switching models safely:
 
 1. Edit `/etc/ultrathink/ultrathink.env` with `sudoedit` (mode stays 0600): change `ULTRATHINK_PLANNING_MODEL` and, if needed, `ULTRATHINK_MODEL_REASONING_EFFORT`. Keep the old line as a comment until the check passes.
-2. `systemctl restart ultrathink-web`, then confirm `curl -s http://127.0.0.1:8795/readyz` is 200 and `ultrathink_planner_enabled` is 1.
+2. `systemctl restart ultrathink-web`, then confirm `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz` is 200 and `ultrathink_planner_enabled` is 1.
 3. Run one plan from a chat client with a short prompt.
-4. Check the cost and size of that plan: `curl -s http://127.0.0.1:8795/metrics | grep ultrathink_plan_` (`ultrathink_plan_cost_usd_total`, `ultrathink_plan_tokens_total`; the counters start from zero at the restart, so the values are that plan), and inspect the job file under `/var/lib/ultrathink/jobs/` (as root; it holds the request and the plan) for the status, usage and any error.
+4. Check the cost and size of that plan: `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/metrics | grep ultrathink_plan_` (`ultrathink_plan_cost_usd_total`, `ultrathink_plan_tokens_total`; the counters start from zero at the restart, so the values are that plan), and inspect the job file under `/var/lib/ultrathink/jobs/` (as root; it holds the request and the plan) for the status, usage and any error.
 5. If the plan failed, was slow, or cost more than expected, restore the old line and restart again. If it passed, delete the commented old line.
 
 ## 13. Connector surface and diagnostics
@@ -404,10 +410,10 @@ A 5xx on the probe would be worse than a 400: official SDK clients treat a 5xx o
 
 ### Smoke checklist with curl
 
-Run it on the VPS against `http://127.0.0.1:8795` (or against the public URL). The key goes into a variable and is never printed:
+Run it on the VPS against the public URL. The `/mcp` route admits only the edge identity (section 17), and a loopback request carrying the probe identity is refused there, so this check does not use the loopback listener. The key goes into a variable and is never printed:
 
 ```bash
-BASE=http://127.0.0.1:8795
+BASE=https://ultrathink.swcstudio.space
 UT_KEY=$(grep -m1 '^ULTRATHINK_CONNECTOR_KEY=' /etc/ultrathink/ultrathink.env | cut -d= -f2-)
 rpc() { curl -s "$BASE/mcp" -H "x-connector-key: $UT_KEY" -H 'content-type: application/json' "$@"; }
 rpc -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
@@ -546,7 +552,7 @@ These cannot be finished from the repo. Each names what must exist first. Until 
 - **B1, SIEM endpoint (AUDIT-02).** Prerequisite: an ingest URL and token from the operator's SIEM tenant (for example Splunk HEC, Elastic or Sentinel).
   1. Confirm the endpoint accepts NDJSON POSTs. The HTTP sink sends `Authorization: Bearer <token>`. If the SIEM expects another scheme, put a receiver-side adapter in front of it; the repo has none, and changing the transport is a code change.
   2. `sudoedit /etc/ultrathink/ultrathink.env` (mode 0600): set `ULTRATHINK_AUDIT_HTTP_URL` and `ULTRATHINK_AUDIT_HTTP_TOKEN`. Never put the token on a command line.
-  3. `systemctl restart ultrathink-web`, then `curl -s 127.0.0.1:8795/readyz`.
+  3. `systemctl restart ultrathink-web`, then `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz`.
   4. Wait for one record to appear in the SIEM, and check that `ultrathink_audit_sink_events_total` with `outcome="sent"` rises.
 - **B2, Kafka via REST Proxy (AUDIT-02).** Prerequisite: a running Kafka cluster behind Confluent REST Proxy v2, reachable over https, and the topic created on it. The native broker protocol is not implemented, and no client dependency is approved. The router sends no bearer token to the Kafka transport, so the REST Proxy must be reachable without one (a private network or an allowlist); adding auth needs a code change.
   1. Create the topic. Confirm `POST <url>/topics/<topic>` with `Content-Type: application/vnd.kafka.json.v2+json` is accepted from the VPS.
@@ -635,7 +641,7 @@ A failed credential (a 401 on `/mcp`, or a failed session on `POST /ultrathink`)
 - The ladder tracks 10000 IPs. A new IP that finds the table full is not tracked, so no penalty applies to it (`ultrathink_abuse_untracked_total`). The rate windows still refuse new keys when full, so a key-churn flood can refuse new clients for up to one window.
 - `ultrathink_abuse_penalty_total` counts each new block. The audit log records `abuse_penalty` with `ip`, `level` and `blockedSec`.
 
-Check the series with `curl -s 127.0.0.1:8795/metrics | grep -E 'ultrathink_(adaptive_quota|load_forecast|recommended_replicas|fair_share|abuse_|rate_limited)'`.
+Check the series with `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/metrics | grep -E 'ultrathink_(adaptive_quota|load_forecast|recommended_replicas|fair_share|abuse_|rate_limited)'`.
 
 ### Blocked items
 
@@ -648,7 +654,7 @@ Each item below is not built. Its prerequisite is named; until that exists, only
 
 ## 16. Observability
 
-This section covers the phase 71 signals. Metrics live in memory and reset on restart. Scrape them on loopback with `curl -s 127.0.0.1:8795/metrics`. Every family named here is in the closed list in `services/ultrathink/obs/metric-families.ts`, and the deploy files may use only those names.
+This section covers the phase 71 signals. Metrics live in memory and reset on restart. Scrape them on loopback over TLS with the probe identity (section 17, loopback checks). Every family named here is in the closed list in `services/ultrathink/obs/metric-families.ts`, and the deploy files may use only those names.
 
 ### Traces
 
@@ -695,7 +701,7 @@ State is in memory, so after a restart a signal needs about 150 s of warm-up bef
 ### Deploy files
 
 - `deploy/observability/rules.yml`: group `ultrathink-alerts` encodes the metric rows of section 8, plus breaker open (page, 5 m) and anomaly active (ticket, 10 m). Group `ultrathink-slo` holds the 30-day recording rule and the burn-rate alerts. Ratios and increases use `or vector(0)`. Check with `promtool check rules deploy/observability/rules.yml`. Not encoded: restart count, external probes, planner saturation, the USD budget threshold, backups, disk and certificates.
-- `deploy/observability/prometheus.yml`: scrapes `127.0.0.1:8795/metrics` every 30 s and loads `rules.yml`. It has no `alerting:` block. Prometheus must run on the same host, because `/metrics` answers only on loopback. Check with `promtool check config deploy/observability/prometheus.yml`.
+- `deploy/observability/prometheus.yml`: scrapes `127.0.0.1:8795/metrics` every 30 s over plain HTTP and loads `rules.yml`. It has no `alerting:` block. Prometheus must run on the same host, because `/metrics` answers only on loopback. The TLS-only listener refuses that plain-HTTP scrape; section 17 lists the change. Check with `promtool check config deploy/observability/prometheus.yml`.
 - `deploy/observability/dashboards/ultrathink.json`: one Grafana dashboard with a `DS_PROMETHEUS` input and three rows: Service health, Business flows, and SLO and anomaly.
 - `services/ultrathink/obs/observability-contract.test.ts` fails when a deploy file names a family outside `METRIC_FAMILIES`, so a rename cannot silently blank a rule or panel.
 
@@ -711,3 +717,138 @@ Each item is open and names its prerequisite. Until the prerequisite exists, the
 - **Log shipping.** Prerequisite: a log backend such as journald forwarded to an aggregator. The service writes to stdout only.
 - **Grafana and staging.** Prerequisite: a Grafana instance with a Prometheus datasource to render the dashboard, and a staging host to run the scrape and rules before production.
 - **ML anomaly models.** Prerequisite: persisted time-series history and an approved ML dependency. The detector is an in-process EWMA, and the repo has no runtime dependencies (D1).
+
+## 17. Internal TLS and identity
+
+Phase 69 puts the one internal hop, nginx to the app, and every loopback probe under mutual TLS. The app listens on `127.0.0.1:8795` with TLS only. A client reaches it only with a leaf certificate that chains to the internal CA, and the SPIFFE ID in that certificate selects what it may reach. Headers never set an identity.
+
+**Status.** The code, the nginx vhost, the systemd units and the release script carry this change. The issuing script `deploy/ultrathink-pki.sh` is not in the repository, so the certificate files cannot be created from it yet (see 17.8). Until the files exist, the TLS-only service refuses to start, and the release script stops before it switches `current`. Do not work around that with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`.
+
+### 17.1 Identities and route policy
+
+The trust domain is `ultrathink.internal` (`ULTRATHINK_SPIFFE_TRUST_DOMAIN`).
+
+| SPIFFE ID | Certificate | Routes it may reach |
+|---|---|---|
+| `spiffe://ultrathink.internal/edge/nginx` | `edge/` leaf, presented by nginx | `proxied` and `health`: every route except `/metrics` |
+| `spiffe://ultrathink.internal/ops/probe` | `ops/` leaf, used by root for probes, scrapes and operator curl | `health` (`/healthz`, `/readyz`) and `metrics` (`/metrics`) only |
+
+- No certificate, a certificate that does not chain to `ca.pem`, or an expired one: the handshake fails and the request never reaches the app.
+- A valid certificate whose SPIFFE ID is not in the table, or whose trust domain is not the configured one: the router answers 403 `forbidden_identity` on every route.
+- `X-Real-IP` is honoured only from the edge identity. Any other peer's address is the one used for limits and logs.
+- `/metrics` stays refused to any non-loopback peer, as before.
+
+### 17.2 Files
+
+| Path | Who reads it | Mode and notes |
+|---|---|---|
+| `/etc/ultrathink/tls/ca.pem` | app, nginx, probes | Trust bundle: root and intermediate |
+| `/etc/ultrathink/tls/intermediate/intermediate.key` | root only | `0400`. Issuing key of the intermediate CA; never leaves the host |
+| `/etc/ultrathink/tls/app/cert.pem`, `key.pem` | app (group `ultrathink`) | Server leaf for `127.0.0.1` (SAN IP). Key `0440 root:ultrathink` |
+| `/etc/ultrathink/tls/edge/cert.pem`, `key.pem` | nginx (root) | Client leaf, SAN `spiffe://ultrathink.internal/edge/nginx`. Key `0400` |
+| `/etc/ultrathink/tls/ops/cert.pem`, `key.pem` | root | Client leaf, SAN `spiffe://ultrathink.internal/ops/probe`. Key `0400` |
+
+Directories come from `deploy/ultrathink-tmpfiles.conf`: `tls` `0750 root:ultrathink`; `intermediate`, `edge` and `ops` `0700 root:root`; `app` `0750 root:ultrathink`. The root CA key is not on the host.
+
+Check a leaf's identity and expiry without printing key material: `openssl x509 -in /etc/ultrathink/tls/app/cert.pem -noout -ext subjectAltName -enddate`.
+
+### 17.3 Chain, lifetimes and renewal
+
+- **Root**: ECDSA P-256, 10 years, `pathlen:1`. Created offline and never copied to the VPS.
+- **Intermediate**: `pathlen:0`, one year, signed by the offline root. Its key is created on the host.
+- **Leaves**: 24 hours, usable for server and client authentication. Issued from the intermediate.
+- **Renewal**: `ultrathink-cert-renew.timer` runs `ultrathink-cert-renew.service` hourly (up to 5 minutes random delay, `Persistent=true`). It renews each leaf with less than 12 hours left, then reloads only what changed:
+  - app leaf renewed: `systemctl restart ultrathink-web`;
+  - edge leaf renewed: `nginx -t && systemctl reload nginx`;
+  - ops leaf renewed: nothing is reloaded.
+- A failed renewal keeps the old files and fails the unit. The journal names the leaf: `journalctl -u ultrathink-cert-renew -n 50 --no-pager`.
+- Old and new leaves of the same CA are both accepted during rotation, because the CA is the trust anchor.
+
+Consequences:
+
+- Each leaf is renewed about every 12 hours, so **the app restarts about twice a day.** The app reads its leaf only at start. A plan running at that moment ends `interrupted` (section 7).
+- The intermediate is the one file the timer cannot renew. It expires a year after it was signed, and re-signing needs the offline root. Nothing in the repository alerts before it expires.
+
+### 17.4 Accepted risk: the intermediate key on the host
+
+Phase 69 keeps the intermediate key on the VPS so that the hourly timer can issue leaves without a person. This is accepted and recorded here.
+
+- A compromise of the host with root reads the intermediate key and can mint leaves for any `spiffe://ultrathink.internal/...` identity, including `edge/nginx` and `ops/probe`.
+- The exposure is this trust domain only. Public TLS does not trust this CA, and the root stays offline, so the attacker cannot sign a new intermediate.
+- There is no revocation. Nothing checks a CRL or OCSP, and the app trusts every unexpired leaf that chains to `ca.pem`. Replacing the intermediate does not revoke a stolen one, because the root still signs it until it expires. Full recovery means a new root, a new `ca.pem` everywhere, and reissued leaves. The repository has no procedure for that.
+
+### 17.5 Listener configuration
+
+From `services/ultrathink/config/config.ts`:
+
+| Variable | Default | Allowed |
+|---|---|---|
+| `ULTRATHINK_TLS_CERT` | unset | Absolute path. Production: `/etc/ultrathink/tls/app/cert.pem` |
+| `ULTRATHINK_TLS_KEY` | unset | Absolute path. Production: `/etc/ultrathink/tls/app/key.pem` |
+| `ULTRATHINK_TLS_CLIENT_CA` | unset | Absolute path. Production: `/etc/ultrathink/tls/ca.pem` |
+| `ULTRATHINK_SPIFFE_TRUST_DOMAIN` | `ultrathink.internal` | 1 to 255 characters from `a-z`, `0-9`, `.`, `_` and `-` |
+| `ULTRATHINK_PLAINTEXT_LOOPBACK` | unset (off) | `0` or `1`. `1` allows a start with no TLS settings; dev and local smoke only |
+
+- The three TLS variables are one set. Set all three or none; a partial set stops startup even with the opt-in.
+- With none set and no opt-in, startup stops with a `ConfigError` that names the variables.
+- The listener binds `127.0.0.1` only.
+
+Production env file lines:
+
+```bash
+ULTRATHINK_TLS_CERT=/etc/ultrathink/tls/app/cert.pem
+ULTRATHINK_TLS_KEY=/etc/ultrathink/tls/app/key.pem
+ULTRATHINK_TLS_CLIENT_CA=/etc/ultrathink/tls/ca.pem
+```
+
+Never set `ULTRATHINK_PLAINTEXT_LOOPBACK=1` on the VPS.
+
+### 17.6 Cutover order
+
+Do these steps in one window. Between the app restart (step 5) and the nginx reload (step 6), the public site answers 503 `{"error":"unavailable"}` (section 7), so keep the gap short.
+
+1. Create the directories: `install -m 0644 deploy/ultrathink-tmpfiles.conf /etc/tmpfiles.d/ultrathink.conf && systemd-tmpfiles --create /etc/tmpfiles.d/ultrathink.conf`.
+2. Create the CA bundle and the three leaves at the paths in 17.2, with the issuing script that 17.8 lists as blocked. Then check that each leaf chains to the bundle: `openssl verify -CAfile /etc/ultrathink/tls/ca.pem /etc/ultrathink/tls/app/cert.pem /etc/ultrathink/tls/edge/cert.pem /etc/ultrathink/tls/ops/cert.pem`. Each must print `OK`.
+3. Add the three `ULTRATHINK_TLS_*` lines (17.5) to `/etc/ultrathink/ultrathink.env` with `sudoedit`.
+4. Install the renewal units and reload systemd: `install -m 0644 deploy/ultrathink-cert-renew.service deploy/ultrathink-cert-renew.timer /etc/systemd/system/ && systemctl daemon-reload`. Do not enable the timer yet (step 8).
+5. Release the app: `deploy/ultrathink-release.sh release <ref>`, or the first-cutover path in section 2. The release checks the TLS files before it creates a release, and it probes the new listener over mTLS before it keeps the switch.
+6. In the same window: `install -m 0644 deploy/nginx-ultrathink.swcstudio.space.conf /etc/nginx/sites-available/ultrathink.swcstudio.space && nginx -t && systemctl reload nginx`. The vhost sends traffic to `https://ultrathink_app`, and `nginx -t` fails while the CA or edge files are missing.
+7. Run the loopback checks in 17.7, and the public `/healthz` check from section 2, step 7.
+8. Enable the timer, only once the issuing script exists: `systemctl enable --now ultrathink-cert-renew.timer`. Until then every hourly run fails with `PKI script not found`.
+
+Rollback: put back the previous release and the previous vhost in the same window (section 2, first cutover, step 4). The previous code and vhost both speak plain HTTP. Rolling back one side alone gives the 503 described above.
+
+### 17.7 Loopback checks
+
+Probe identity, expect `200` on health and metrics:
+
+```bash
+curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8795/healthz
+```
+
+No client certificate, expect no HTTP status and curl exit 35 or 56:
+
+```bash
+curl -sS --cacert /etc/ultrathink/tls/ca.pem -o /dev/null https://127.0.0.1:8795/healthz; echo "exit $?"
+```
+
+The edge leaf is refused on `/metrics` (expect 403). Testing it needs the edge key, which only root can read, and it presents nginx's identity, so run it only as a deliberate check.
+
+### 17.8 Blocked items
+
+Each item is not built. Its prerequisite is named. Until the prerequisite exists, the matching part of this section is unverified.
+
+- **Issuing script and its test: `deploy/ultrathink-pki.sh` and `deploy/ultrathink-pki.test.ts`.** The write to `deploy/` was refused by a protected-path guard, so neither file is in the repository, and nothing in this runbook assumes that either exists. Prerequisite: the operator supplies an executable script with the subcommands the phase plan specifies (`init-root`, `init-intermediate`, `sign-intermediate`, `issue`, `renew-if-due`) and its test. Until then no leaf can be issued, `ultrathink-cert-renew.sh` exits 1 with `PKI script not found`, the release script stops before its switch, and the TLS-only service cannot start.
+- **Checks that need the VPS.** `nginx -t` with the files present, `systemd-analyze verify` on the renewal units, `systemd-analyze security ultrathink-web`, and `openssl verify` on the installed leaves. Prerequisite: root on the VPS and the files from the item above.
+- **Real SPIFFE identities (ZT-04 real SVIDs, ZT-06 SPIRE part).** Prerequisite: a SPIRE server and agent on the host, and a decision on who owns the `ultrathink.internal` trust domain. The local CA covers the authorization layer only.
+- **Service mesh and mesh-wide mTLS (ZT-02, and ZT-01 beyond the one hop).** Prerequisite: a Kubernetes cluster, a chosen mesh control plane (Istio or Linkerd), and more than one service to protect. The repository has one internal hop.
+- **Network policy at L3/L4 (ZT-05).** Prerequisite: root on `187.77.130.10` for `nft -c` and a rollback window that keeps SSH reachable, or a cluster with a NetworkPolicy-capable CNI. No ruleset is in the repository.
+- **ZT-03.** The roadmap has no criterion 3 text. Prerequisite: the orchestrator confirms the intended requirement.
+
+### 17.9 Open items
+
+These need no outside resource, but they are not done.
+
+- **Prometheus scrape.** `deploy/observability/prometheus.yml` still scrapes `http://127.0.0.1:8795/metrics`, and no phase 69 unit changes it. The change is `scheme: https` with `tls_config` naming the CA and the ops leaf and key, and its owner has to make it. Any scraper that reads the ops leaf once needs a reload after that leaf renews every 12 hours; nothing in this repository reloads it.
+- **Alerts on leaf and intermediate expiry.** Section 8 has none. Prerequisite: the alert routing that section 16 already lists as open.
+- **Plans interrupted at renewal.** Each app-leaf renewal restarts `ultrathink-web` (17.3). There is no in-place reload, so a plan running at that moment is interrupted. Prerequisite: a design decision on zero-downtime rotation.

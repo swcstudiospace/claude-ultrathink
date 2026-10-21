@@ -40,6 +40,7 @@ import type { SinkTransport } from "../obs/sinks/types.ts";
 import { createSloTracker } from "../obs/slo.ts";
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
+import { type RouteGroup, authorize, isEdgeIdentity } from "../security/identity.ts";
 import {
 	ObjectValidator,
 	SecurityEventType,
@@ -85,7 +86,8 @@ export interface RouterDeps {
 }
 
 export interface App {
-	handle(req: Request, peerIp: string): Promise<Response>;
+	/** `peer` carries the verified mTLS identity; it is absent in plaintext mode, where the identity gate is off. */
+	handle(req: Request, peerIp: string, peer?: { spiffeId: string | null }): Promise<Response>;
 	/** Starts the runtime probe and, when retention is on, the sweep; reads store integrity. Idempotent. */
 	start(): void;
 	/** Fails /readyz so the load balancer stops routing here; /healthz keeps answering. Idempotent. */
@@ -295,6 +297,20 @@ function matchPath(pathname: string): Target | null {
 	const match = RUN_PATH.exec(pathname);
 	if (match?.[1]) return { endpoint: "run", runId: match[1] };
 	return null;
+}
+
+/** Policy group a request is judged by: probes are health or metrics; every other path, known or not, is proxied. */
+function routeGroupOf(target: Target | null): RouteGroup {
+	if (target === null) return "proxied";
+	switch (target.endpoint) {
+		case "healthz":
+		case "readyz":
+			return "health";
+		case "metrics":
+			return "metrics";
+		default:
+			return "proxied";
+	}
 }
 
 function isJsonRequest(req: Request): boolean {
@@ -1108,15 +1124,18 @@ export function createApp(deps: RouterDeps): App {
 		}
 	}
 
-	async function handle(req: Request, peerIp: string): Promise<Response> {
+	async function handle(req: Request, peerIp: string, peer?: { spiffeId: string | null }): Promise<Response> {
 		const started = performance.now();
 		const startedWall = Date.now();
+		// Only the edge identity may vouch for X-Real-IP. Without TLS there is no identity, so undefined keeps the loopback rule.
+		const spiffeId = peer?.spiffeId ?? null;
+		const trustForwarded = config.tls === undefined ? undefined : isEdgeIdentity(spiffeId, config.spiffeTrustDomain);
 		// A valid inbound traceparent is continued under a new span; anything else starts a fresh trace.
 		const inbound = traceContextFor(req.headers.get("traceparent"));
 		const server = inbound.inherited ? childSpan(inbound.ctx) : inbound.ctx;
 		const ctx: RequestCtx = {
 			reqId: sanitizeRequestId(req.headers.get("x-request-id")) ?? newRequestId(),
-			ip: clientIpFrom(req, peerIp),
+			ip: clientIpFrom(req, peerIp, trustForwarded),
 			peerIp,
 			endpoint: "not_found",
 			authKind: "none",
@@ -1129,7 +1148,11 @@ export function createApp(deps: RouterDeps): App {
 				if (target) ctx.endpoint = target.endpoint;
 				const ungated = target !== null && UNGATED[target.endpoint] === true;
 				const blockedSec = ungated ? 0 : penalty.blockedSec(ctx.ip);
-				if (blockedSec > 0) {
+				const group = routeGroupOf(target);
+				if (config.tls !== undefined && !authorize(spiffeId, group, config.spiffeTrustDomain)) {
+					logger.warn("identity_denied", { reqId: ctx.reqId, group, reason: spiffeId === null ? "absent" : "not_authorized" });
+					response = fail(403, "forbidden_identity");
+				} else if (blockedSec > 0) {
 					metrics.inc("ultrathink_rate_limited_total", { scope: "penalty" });
 					response = fail(429, "rate_limited", { "Retry-After": String(blockedSec) });
 				} else {

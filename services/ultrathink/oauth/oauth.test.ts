@@ -197,6 +197,9 @@ beforeAll(async () => {
 		abuseFailuresPerMinute: 20,
 		penaltyBaseSec: 60,
 		penaltyMaxSec: 3600,
+		tls: undefined,
+		spiffeTrustDomain: "ultrathink.internal",
+		plaintextLoopback: true,
 	};
 	const auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);

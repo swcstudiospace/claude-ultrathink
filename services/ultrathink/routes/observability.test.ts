@@ -94,6 +94,9 @@ function harness(configOverrides: Partial<UltrathinkConfig> = {}, deps: Partial<
 		abuseFailuresPerMinute: 20,
 		penaltyBaseSec: 60,
 		penaltyMaxSec: 3600,
+		tls: undefined,
+		spiffeTrustDomain: "ultrathink.internal",
+		plaintextLoopback: true,
 		...configOverrides,
 	};
 	const store = openStore(config.dbPath);

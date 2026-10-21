@@ -610,4 +610,13 @@ describe("clientIpFrom", () => {
 	test("keys an IPv4-mapped IPv6 address as the IPv4 address", () => {
 		expect(clientIpFrom(requestWithRealIp("::ffff:198.51.100.9"), "127.0.0.1")).toBe("198.51.100.9");
 	});
+
+	test("does not read X-Real-IP when trustForwarded is false, even from loopback", () => {
+		expect(clientIpFrom(requestWithRealIp("198.51.100.9"), "127.0.0.1", false)).toBe("127.0.0.1");
+	});
+
+	test("reads X-Real-IP from loopback when trustForwarded is true or left to the default", () => {
+		expect(clientIpFrom(requestWithRealIp("198.51.100.9"), "127.0.0.1", true)).toBe("198.51.100.9");
+		expect(clientIpFrom(requestWithRealIp("198.51.100.9"), "127.0.0.1", undefined)).toBe("198.51.100.9");
+	});
 });

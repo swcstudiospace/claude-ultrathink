@@ -21,6 +21,7 @@ function baseEnv(): Record<string, string | undefined> {
 		ULTRATHINK_PUBLIC_ORIGIN: "https://ultrathink.swcstudio.space",
 		ULTRATHINK_OWNER_PASSWORD_HASH: randomHash(),
 		ULTRATHINK_SESSION_SECRET: randomSecret(),
+		ULTRATHINK_PLAINTEXT_LOOPBACK: "1",
 	};
 }
 
@@ -925,5 +926,109 @@ describe("ULTRATHINK_OTLP_ENDPOINT", () => {
 			expect(message).not.toContain("secret");
 			expect(message).not.toContain("key=1");
 		}
+	});
+});
+
+const TLS_PATHS = {
+	ULTRATHINK_TLS_CERT: "/etc/ultrathink/tls/app/cert.pem",
+	ULTRATHINK_TLS_KEY: "/etc/ultrathink/tls/app/key.pem",
+	ULTRATHINK_TLS_CLIENT_CA: "/etc/ultrathink/tls/ca.pem",
+};
+
+function tlsEnv(): Record<string, string | undefined> {
+	const env = baseEnv();
+	delete env.ULTRATHINK_PLAINTEXT_LOOPBACK;
+	return { ...env, ...TLS_PATHS };
+}
+
+describe("mTLS and plaintext opt-in", () => {
+	test("no TLS and no opt-in throws, naming the three TLS variables and the opt-in", () => {
+		const env = baseEnv();
+		delete env.ULTRATHINK_PLAINTEXT_LOOPBACK;
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("ULTRATHINK_TLS_CERT");
+		expect(message).toContain("ULTRATHINK_TLS_KEY");
+		expect(message).toContain("ULTRATHINK_TLS_CLIENT_CA");
+		expect(message).toContain("ULTRATHINK_PLAINTEXT_LOOPBACK");
+	});
+
+	test("ULTRATHINK_PLAINTEXT_LOOPBACK=0 is not an opt-in", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PLAINTEXT_LOOPBACK = "0";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_TLS_CERT");
+	});
+
+	test("a partial TLS set throws naming only the missing variables, even with the opt-in", () => {
+		const env = {
+			...baseEnv(),
+			ULTRATHINK_TLS_CERT: TLS_PATHS.ULTRATHINK_TLS_CERT,
+			ULTRATHINK_TLS_KEY: TLS_PATHS.ULTRATHINK_TLS_KEY,
+		};
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("missing ULTRATHINK_TLS_CLIENT_CA");
+		expect(message).not.toContain("missing ULTRATHINK_TLS_CERT");
+		expect(message).not.toContain("missing ULTRATHINK_TLS_KEY");
+	});
+
+	test("a single TLS variable names both of the others as missing", () => {
+		const env = { ...tlsEnv(), ULTRATHINK_TLS_CERT: undefined, ULTRATHINK_TLS_KEY: undefined };
+		expect(messageOf(() => loadConfig(env))).toContain("missing ULTRATHINK_TLS_CERT, ULTRATHINK_TLS_KEY");
+	});
+
+	test("full TLS with absolute paths loads with tls set and the default trust domain", () => {
+		const config = loadConfig(tlsEnv());
+		expect(config.tls).toEqual({
+			certFile: TLS_PATHS.ULTRATHINK_TLS_CERT,
+			keyFile: TLS_PATHS.ULTRATHINK_TLS_KEY,
+			clientCaFile: TLS_PATHS.ULTRATHINK_TLS_CLIENT_CA,
+		});
+		expect(config.spiffeTrustDomain).toBe("ultrathink.internal");
+		expect(config.plaintextLoopback).toBe(false);
+	});
+
+	test("TLS set together with the opt-in keeps tls set", () => {
+		const config = loadConfig({ ...baseEnv(), ...TLS_PATHS });
+		expect(config.tls?.certFile).toBe(TLS_PATHS.ULTRATHINK_TLS_CERT);
+		expect(config.plaintextLoopback).toBe(true);
+	});
+
+	test("ULTRATHINK_PLAINTEXT_LOOPBACK=1 with no TLS loads with tls undefined", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PLAINTEXT_LOOPBACK = "1";
+		const config = loadConfig(env);
+		expect(config.tls).toBeUndefined();
+		expect(config.plaintextLoopback).toBe(true);
+	});
+
+	test("ULTRATHINK_PLAINTEXT_LOOPBACK must be 0 or 1", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PLAINTEXT_LOOPBACK = "yes";
+		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_PLAINTEXT_LOOPBACK must be 0 or 1");
+	});
+
+	test("a relative TLS path throws naming the variable and not the path", () => {
+		const env = { ...tlsEnv(), ULTRATHINK_TLS_KEY: "tls/app/key.pem" };
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("ULTRATHINK_TLS_KEY must be an absolute path");
+		expect(message).not.toContain("tls/app/key.pem");
+	});
+
+	test("a lowercase trust domain with dots, dashes and underscores is accepted", () => {
+		const config = loadConfig({ ...tlsEnv(), ULTRATHINK_SPIFFE_TRUST_DOMAIN: "spiffe.example-1_x" });
+		expect(config.spiffeTrustDomain).toBe("spiffe.example-1_x");
+	});
+
+	test("an uppercase trust domain throws naming the variable and not the value", () => {
+		const env = { ...tlsEnv(), ULTRATHINK_SPIFFE_TRUST_DOMAIN: "Ultrathink.Internal" };
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("ULTRATHINK_SPIFFE_TRUST_DOMAIN");
+		expect(message).not.toContain("Ultrathink.Internal");
+	});
+
+	test("a trust domain is limited to 255 characters", () => {
+		expect(loadConfig({ ...tlsEnv(), ULTRATHINK_SPIFFE_TRUST_DOMAIN: "a".repeat(255) }).spiffeTrustDomain).toBe(
+			"a".repeat(255),
+		);
+		expect(() => loadConfig({ ...tlsEnv(), ULTRATHINK_SPIFFE_TRUST_DOMAIN: "a".repeat(256) })).toThrow(ConfigError);
 	});
 });
