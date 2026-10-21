@@ -283,6 +283,7 @@ describe("prune", () => {
 		expect(verifyAuditFile(path).ok).toBe(true);
 	});
 
+	// Two 200-record logs with anchors, each append fsynced: 5.7 s under load, past the 5 s default. Allow 30 s.
 	test("the next anchor after a prune has the root a never-pruned log gives for the same records", () => {
 		const dirA = tempDir();
 		const dirB = tempDir();
@@ -308,7 +309,7 @@ describe("prune", () => {
 		const pathC = auditPath(dirC);
 		rewrite(pathC, [...wholeChain, ...prunedChain.filter((r) => r.seq > total)].map((r) => JSON.stringify(r)));
 		expect(verifyAuditFile(pathC).ok).toBe(true);
-	});
+	}, 30_000);
 
 	test("a pruned directory verifies, and a reopened log continues its chain and its anchors", () => {
 		const dir = tempDir();
