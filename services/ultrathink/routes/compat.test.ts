@@ -87,6 +87,13 @@ function harness(overrides: Partial<UltrathinkConfig> = {}): Harness {
 		auditRetentionDays: 365,
 		auditWatchMs: 1000,
 		auditSinkQueue: 10000,
+		priorityReservePct: 25,
+		adaptiveQuotaMinPct: 50,
+		lagTargetMs: 100,
+		replicaCapacityRps: 20,
+		abuseFailuresPerMinute: 20,
+		penaltyBaseSec: 60,
+		penaltyMaxSec: 3600,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);

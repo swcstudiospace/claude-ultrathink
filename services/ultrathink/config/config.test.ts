@@ -796,3 +796,101 @@ describe("audit sink configuration", () => {
 		expect(message).toContain("ULTRATHINK_AUDIT_KAFKA_REST_URL");
 	});
 });
+
+describe("rate limiting settings", () => {
+	test("apply the phase 70 defaults with an empty env", () => {
+		const config = loadConfig(baseEnv());
+		expect(config.priorityReservePct).toBe(25);
+		expect(config.adaptiveQuotaMinPct).toBe(50);
+		expect(config.lagTargetMs).toBe(100);
+		expect(config.replicaCapacityRps).toBe(20);
+		expect(config.abuseFailuresPerMinute).toBe(20);
+		expect(config.penaltyBaseSec).toBe(60);
+		expect(config.penaltyMaxSec).toBe(3600);
+	});
+
+	test("each variable overrides its default", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PRIORITY_RESERVE_PCT = "40";
+		env.ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT = "30";
+		env.ULTRATHINK_LAG_TARGET_MS = "250";
+		env.ULTRATHINK_REPLICA_CAPACITY_RPS = "75";
+		env.ULTRATHINK_ABUSE_FAILURES_PER_MINUTE = "5";
+		env.ULTRATHINK_PENALTY_BASE_SEC = "120";
+		env.ULTRATHINK_PENALTY_MAX_SEC = "1800";
+		const config = loadConfig(env);
+		expect(config.priorityReservePct).toBe(40);
+		expect(config.adaptiveQuotaMinPct).toBe(30);
+		expect(config.lagTargetMs).toBe(250);
+		expect(config.replicaCapacityRps).toBe(75);
+		expect(config.abuseFailuresPerMinute).toBe(5);
+		expect(config.penaltyBaseSec).toBe(120);
+		expect(config.penaltyMaxSec).toBe(1800);
+	});
+
+	const ranges = [
+		{ name: "ULTRATHINK_PRIORITY_RESERVE_PCT", field: "priorityReservePct", min: "0", max: "90" },
+		{ name: "ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT", field: "adaptiveQuotaMinPct", min: "10", max: "100" },
+		{ name: "ULTRATHINK_LAG_TARGET_MS", field: "lagTargetMs", min: "10", max: "5000" },
+		{ name: "ULTRATHINK_REPLICA_CAPACITY_RPS", field: "replicaCapacityRps", min: "1", max: "100000" },
+		{ name: "ULTRATHINK_ABUSE_FAILURES_PER_MINUTE", field: "abuseFailuresPerMinute", min: "1", max: "10000" },
+	] as const;
+
+	for (const range of ranges) {
+		test(`${range.name} accepts its bounds`, () => {
+			for (const value of [range.min, range.max]) {
+				const env = baseEnv();
+				env[range.name] = value;
+				expect(loadConfig(env)[range.field]).toBe(Number(value));
+			}
+		});
+
+		test(`${range.name} rejects values outside its bounds, naming the variable`, () => {
+			for (const value of [String(Number(range.max) + 1), "-1", "1.5"]) {
+				const env = baseEnv();
+				env[range.name] = value;
+				const message = messageOf(() => loadConfig(env));
+				expect(message).toContain(range.name);
+				expect(message).not.toContain(value);
+			}
+		});
+	}
+
+	test("penalty base accepts 1 and 86400 when the cap allows it", () => {
+		const low = baseEnv();
+		low.ULTRATHINK_PENALTY_BASE_SEC = "1";
+		expect(loadConfig(low).penaltyBaseSec).toBe(1);
+		const high = baseEnv();
+		high.ULTRATHINK_PENALTY_BASE_SEC = "86400";
+		high.ULTRATHINK_PENALTY_MAX_SEC = "86400";
+		expect(loadConfig(high).penaltyBaseSec).toBe(86400);
+	});
+
+	test("penalty base and max reject values outside 1..86400, naming the variable", () => {
+		for (const name of ["ULTRATHINK_PENALTY_BASE_SEC", "ULTRATHINK_PENALTY_MAX_SEC"]) {
+			for (const value of ["0", "86401", "-1", "1.5"]) {
+				const env = baseEnv();
+				env[name] = value;
+				expect(messageOf(() => loadConfig(env))).toContain(name);
+			}
+		}
+	});
+
+	test("a penalty max below the penalty base throws a ConfigError naming both variables", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PENALTY_BASE_SEC = "600";
+		env.ULTRATHINK_PENALTY_MAX_SEC = "300";
+		const message = messageOf(() => loadConfig(env));
+		expect(message).toContain("ULTRATHINK_PENALTY_MAX_SEC");
+		expect(message).toContain("ULTRATHINK_PENALTY_BASE_SEC");
+	});
+
+	test("a penalty max equal to the penalty base is accepted", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_PENALTY_BASE_SEC = "300";
+		env.ULTRATHINK_PENALTY_MAX_SEC = "300";
+		const config = loadConfig(env);
+		expect(config.penaltyBaseSec).toBe(300);
+		expect(config.penaltyMaxSec).toBe(300);
+	});
+});

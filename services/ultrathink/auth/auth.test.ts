@@ -393,6 +393,117 @@ describe("allowRequest", () => {
 		expect(denied.scope).toBe("principal");
 		expect(auth.allowRequest({ clientIp: "10.2.1.1", ownerId: "owner-z", principal: `${long}y` })).toEqual({ ok: true });
 	});
+
+	test("scale 0.5 halves the owner window: 30 admitted, the 31st denied as owner with a 60-second retry-after", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 30; i++) {
+			expect(auth.allowRequest({ clientIp: `10.3.0.${i}`, ownerId: "owner", scale: 0.5 })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.3.1.1", ownerId: "owner", scale: 0.5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+		expect(denied.retryAfterSec).toBe(60);
+	});
+
+	test("scale 0.5 halves the IP window: 60 admitted, the 61st denied as ip", () => {
+		const auth = makeAuth(makeClock());
+		const ip = "203.0.113.20";
+		for (let i = 0; i < 60; i++) {
+			expect(auth.allowRequest({ clientIp: ip, ownerId: `owner-${i}`, scale: 0.5 })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: ip, ownerId: "owner-x", scale: 0.5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("ip");
+	});
+
+	test("scale 0.5 halves the principal window: 30 admitted, the 31st denied as principal", () => {
+		const auth = makeAuth(makeClock());
+		const principal = "bearer:cccc";
+		for (let i = 0; i < 30; i++) {
+			expect(auth.allowRequest({ clientIp: `10.4.0.${i}`, ownerId: `owner-${i}`, principal, scale: 0.5 })).toEqual({
+				ok: true,
+			});
+		}
+		const denied = auth.allowRequest({ clientIp: "10.4.1.1", ownerId: "owner-x", principal, scale: 0.5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("principal");
+	});
+
+	test("the ownerLimit override is scaled too: 240 at scale 0.5 admits 120", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 120; i++) {
+			expect(
+				auth.allowRequest({ clientIp: `10.7.0.${i}`, ownerId: "connector", ownerLimit: 240, scale: 0.5 }),
+			).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.7.1.1", ownerId: "connector", ownerLimit: 240, scale: 0.5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+	});
+
+	test("scale 0.001 clamps to 0.1: six owner requests admitted, the seventh denied", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 6; i++) {
+			expect(auth.allowRequest({ clientIp: `10.8.0.${i}`, ownerId: "owner", scale: 0.001 })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.8.1.1", ownerId: "owner", scale: 0.001 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+	});
+
+	test("NaN, Infinity and non-number scales fail closed to 0.1", () => {
+		const invalid: unknown[] = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, "half"];
+		for (const scale of invalid) {
+			const auth = makeAuth(makeClock());
+			for (let i = 0; i < 6; i++) {
+				expect(auth.allowRequest({ clientIp: `10.9.0.${i}`, ownerId: "owner", scale: scale as number })).toEqual({
+					ok: true,
+				});
+			}
+			const denied = auth.allowRequest({ clientIp: "10.9.1.1", ownerId: "owner", scale: scale as number });
+			expect(denied.ok).toBe(false);
+			if (denied.ok) return;
+			expect(denied.scope).toBe("owner");
+		}
+	});
+
+	test("a scale above 1 clamps to 1: 60 owner requests admitted", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 60; i++) {
+			expect(auth.allowRequest({ clientIp: `10.10.0.${i}`, ownerId: "owner", scale: 5 })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.10.1.1", ownerId: "owner", scale: 5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+	});
+
+	test("an explicit scale of 1 keeps the default owner window of 60", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 60; i++) {
+			expect(auth.allowRequest({ clientIp: `10.11.0.${i}`, ownerId: "owner", scale: 1 })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.11.1.1", ownerId: "owner", scale: 1 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+	});
+
+	test("the scale applies to each call against counts already recorded", () => {
+		const auth = makeAuth(makeClock());
+		for (let i = 0; i < 40; i++) {
+			expect(auth.allowRequest({ clientIp: `10.12.0.${i}`, ownerId: "owner" })).toEqual({ ok: true });
+		}
+		const denied = auth.allowRequest({ clientIp: "10.12.1.1", ownerId: "owner", scale: 0.5 });
+		expect(denied.ok).toBe(false);
+		if (denied.ok) return;
+		expect(denied.scope).toBe("owner");
+	});
 });
 
 describe("approval proofs", () => {

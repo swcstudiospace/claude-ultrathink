@@ -76,12 +76,14 @@ export interface Auth {
 	 * windows, in that order, and reports the first one that is exhausted.
 	 * `principal` is an opaque id of at most 128 characters; longer ids are
 	 * hashed. `ownerLimit` overrides the 60-per-minute owner window.
+	 * `scale` (optional, default 1) multiplies the IP, principal and owner limits. Finite values are clamped to [0.1, 1]; NaN, Infinity or a non-number fails closed to 0.1. Each scaled limit is at least one request.
 	 */
 	allowRequest(input: {
 		clientIp: string;
 		ownerId: string;
 		principal?: string;
 		ownerLimit?: number;
+		scale?: number;
 	}): { ok: true } | { ok: false; retryAfterSec: number; scope: RequestLimitScope };
 	newApprovalNonce(): string;
 	/** Returns `<kid>.<mac>`, signed with the current secret. */
@@ -218,6 +220,24 @@ function retryAfterOf(hit: Hit | null, windowMs: number): number {
 	return hit ? hit.retryAfterSec : Math.ceil(windowMs / 1000);
 }
 
+/** Lowest effective per-call scale; smaller finite values clamp up to it. */
+const MIN_REQUEST_SCALE = 0.1;
+
+/**
+ * Effective per-call scale. Omitted means 1. A finite value is clamped to
+ * [0.1, 1]. Anything else (NaN, Infinity, a non-number) fails closed to 0.1.
+ */
+function effectiveScale(scale: number | undefined): number {
+	if (scale === undefined) return 1;
+	if (typeof scale !== "number" || !Number.isFinite(scale)) return MIN_REQUEST_SCALE;
+	return Math.min(1, Math.max(MIN_REQUEST_SCALE, scale));
+}
+
+/** A request window limit multiplied by the scale factor, never below one request. */
+function scaledLimit(base: number, factor: number): number {
+	return Math.max(1, Math.floor(base * factor));
+}
+
 export function createAuth(options: AuthOptions): Auth {
 	const { ownerPasswordHash, sessionSecret, cookieSecure } = options;
 	const now = options.now ?? (() => Date.now());
@@ -332,9 +352,10 @@ export function createAuth(options: AuthOptions): Auth {
 			return cookieHeader("", 0);
 		},
 
-		allowRequest({ clientIp, ownerId, principal, ownerLimit }) {
+		allowRequest({ clientIp, ownerId, principal, ownerLimit, scale }) {
+			const factor = effectiveScale(scale);
 			const ip = requests.hit(`ip:${clientIp}`, REQUEST_WINDOW_MS);
-			if (!ip || ip.count > IP_REQUESTS_PER_WINDOW) {
+			if (!ip || ip.count > scaledLimit(IP_REQUESTS_PER_WINDOW, factor)) {
 				return { ok: false, retryAfterSec: retryAfterOf(ip, REQUEST_WINDOW_MS), scope: "ip" };
 			}
 			if (principal !== undefined) {
@@ -342,12 +363,12 @@ export function createAuth(options: AuthOptions): Auth {
 					? principal
 					: `sha256:${createHash("sha256").update(principal).digest("hex")}`;
 				const hit = requests.hit(`principal:${key}`, REQUEST_WINDOW_MS);
-				if (!hit || hit.count > PRINCIPAL_REQUESTS_PER_WINDOW) {
+				if (!hit || hit.count > scaledLimit(PRINCIPAL_REQUESTS_PER_WINDOW, factor)) {
 					return { ok: false, retryAfterSec: retryAfterOf(hit, REQUEST_WINDOW_MS), scope: "principal" };
 				}
 			}
 			const owner = requests.hit(`owner:${ownerId}`, REQUEST_WINDOW_MS);
-			if (!owner || owner.count > (ownerLimit ?? OWNER_REQUESTS_PER_WINDOW)) {
+			if (!owner || owner.count > scaledLimit(ownerLimit ?? OWNER_REQUESTS_PER_WINDOW, factor)) {
 				return { ok: false, retryAfterSec: retryAfterOf(owner, REQUEST_WINDOW_MS), scope: "owner" };
 			}
 			return { ok: true };

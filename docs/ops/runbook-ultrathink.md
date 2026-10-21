@@ -558,3 +558,88 @@ These cannot be finished from the repo. Each names what must exist first. Until 
 - **B5, off-host anchors (AUDIT-01).** Prerequisite: B1 or B2, or another store the VPS cannot rewrite. B4 protects the files on the host; B5 protects the `(seq, hash)` pairs. Without an off-host store, a whole-file rewrite that recomputes anchors and head, made while the service is stopped, is not detected. `chattr` on the VPS does not help, because root can undo it.
   1. Each day, read the head with `tail -n 1 /var/lib/ultrathink/audit.jsonl` and copy its `seq` and `hash` to the off-host store.
   2. Each day, run verify with the stored pairs: `bun services/ultrathink/obs/audit-cli.ts verify /var/lib/ultrathink/audit.jsonl --expect <seq>:<hash>`. Exit 1 means a stored record is missing or changed. Treat it as an incident: copy the file before any repair.
+
+## 15. Rate limits, load shedding and abuse penalties
+
+Phase 70 makes the request limits follow process load, shares the HTTP pool and the plan slots across priority classes, and blocks an IP that keeps failing. Every counter lives in process memory, so with more than one replica each process counts alone (see the blocked items).
+
+### Priority classes
+
+A request that reaches the HTTP pool has one of three classes: `owner` (a signed-in session), `connector` (a connector key) or `bearer` (an OAuth token). Anonymous requests never reach the pool. `/healthz`, `/readyz` and `/metrics` are never shed. On `/mcp`, discovery and `initialize` are not gated by the pool; `tools/call` and batches are.
+
+- `owner` may take any free slot.
+- `connector` and `bearer` may not take the last `reserve` slots, and no one non-owner principal may hold more than `ceil(capacity / 2)` slots.
+
+The HTTP pool has `capacity` = `ULTRATHINK_MAX_INFLIGHT` (default 256) and `reserve` = `floor(ULTRATHINK_MAX_INFLIGHT * ULTRATHINK_PRIORITY_RESERVE_PCT / 100)`. The plan slots have `capacity` = `ULTRATHINK_MAX_CONCURRENT_PLANS`, a reserve of 1 when that value is 2 or more (fixed in code, not an env key), and a per-principal cap of `ceil(max / 2)`.
+
+### Environment
+
+| Variable | Default | Allowed | Effect |
+|---|---|---|---|
+| `ULTRATHINK_PRIORITY_RESERVE_PCT` | 25 | integer 0 to 90 | Share of the HTTP pool that non-owner classes may not take. 0 removes the reserve. |
+| `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT` | 50 | integer 10 to 100 | Lowest factor, in percent, applied to the IP, principal and owner windows. 100 keeps the windows at full size. |
+| `ULTRATHINK_LAG_TARGET_MS` | 100 | integer 10 to 5000 | Event-loop lag above which a probe sample counts as pressure. |
+| `ULTRATHINK_REPLICA_CAPACITY_RPS` | 20 | integer 1 to 100000 | Requests per second one replica serves. The replica recommendation divides by it. The default is an uncalibrated placeholder. |
+| `ULTRATHINK_ABUSE_FAILURES_PER_MINUTE` | 20 | integer 1 to 10000 | Failures from one IP in one minute that trigger a block. |
+| `ULTRATHINK_PENALTY_BASE_SEC` | 60 | integer 1 to 86400 | Length of the first block. |
+| `ULTRATHINK_PENALTY_MAX_SEC` | 3600 | integer 1 to 86400, not less than the base | Cap on any one block. |
+
+An out-of-range value stops startup with a `ConfigError` that names the variable. A max below the base fails with a message that names both.
+
+### Responses that refuse a request
+
+Every 429 has the body `{"error":"rate_limited"}` and a `Retry-After` header in seconds. The body does not say which limit fired.
+
+| Cause | Response | Counter |
+|---|---|---|
+| Login window | 429 | `ultrathink_rate_limited_total{scope="login"}` |
+| `POST /ultrathink`: IP, principal or owner window | 429 | `ultrathink_rate_limited_total{scope="run"}` |
+| `/mcp`: IP, principal or owner window | 429 | `ultrathink_rate_limited_total{scope="mcp"}` |
+| IP blocked by a penalty (every route except probes) | 429, `Retry-After` = seconds left in the block | `ultrathink_rate_limited_total{scope="penalty"}` |
+| Pool refusal by class (`/mcp`, `POST /ultrathink`) | 429, `Retry-After: 1` | `ultrathink_fair_share_refused_total{class,reason}` |
+| Global in-flight cap full | 503, body `{"error":"overloaded"}`, `Retry-After: 1` | `ultrathink_overload_total` |
+
+The window names `ip`, `principal` and `owner` are the scopes that `allowRequest` reports. They are not metric labels; on `/mcp` they appear as the `window` field of the `rate_limit_window` log line. The global cap is checked first, so a full process answers 503 to everyone, and a class refusal happens only while the process still has room. `reason` is `capacity`, `reserved` or `principal`; `class` is `owner`, `connector` or `bearer`.
+
+### Busy
+
+Plan start returns `busy` when `ULTRATHINK_MAX_CONCURRENT_PLANS` plans are running, and also when the plan-slot policy refuses the caller: capacity, the reserved slot, or the per-principal cap. Every case returns the same `busy` code, so the response does not give the reason. Section 7 lists the 503 that carries it.
+
+### Forecast gauges and replica recommendation
+
+The runtime probe samples every 5 s, and each sample updates these gauges.
+
+| Gauge | Value |
+|---|---|
+| `ultrathink_adaptive_quota_factor` | The current factor, from `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT / 100` up to 1, starting at 1. A sample with lag above `ULTRATHINK_LAG_TARGET_MS`, or in-flight utilisation of 0.8 or more, halves it. A calm sample adds 0.05 back. |
+| `ultrathink_load_forecast_rps` | Forecast peak admitted rate over the next 15 minutes, in requests per second. Holt linear trend over per-minute counts, with the same 15 minutes one day earlier as a floor. With fewer than 5 observed minutes it reports the current minute's rate; with no history, 0. |
+| `ultrathink_recommended_replicas` | `max(1, ceil(load_forecast_rps / ULTRATHINK_REPLICA_CAPACITY_RPS))`. |
+
+> **Do not act on `ultrathink_recommended_replicas` until `ULTRATHINK_REPLICA_CAPACITY_RPS` is calibrated.** The default of 20 is a placeholder. Run a load test on the VPS with the production build, find the sustained requests per second one replica serves at the latency you accept, set that value in `/etc/ultrathink/ultrathink.env`, and restart. A wrong value gives a wrong replica count at every traffic level.
+
+The factor scales the IP, principal and owner windows only. The login and approval windows keep their own limits. Setting `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT` to 100 makes the factor always 1.
+
+### Load history
+
+Per-minute admitted-request counts are kept for one day (1440 minutes). They are written to `/var/lib/ultrathink/load-history.json` every 5 minutes and at shutdown, through a temporary file in the same directory that is renamed into place, mode 0600. At start, a missing file means an empty history. An unreadable or malformed file also means an empty history, with one warning in the log, and the service still starts. A failed save logs a warning and does not stop the service. Retention does not sweep this file.
+
+### Abuse penalties
+
+A failed credential (a 401 on `/mcp`, or a failed session on `POST /ultrathink`) and every 429 from the rate windows count against the client IP. When one IP has more than `ULTRATHINK_ABUSE_FAILURES_PER_MINUTE` failures in one fixed minute, it is blocked for `base * 2^(level - 1)` seconds, capped at `ULTRATHINK_PENALTY_MAX_SEC`.
+
+- While blocked, every request from that IP except the probes returns 429 `rate_limited` before authentication, including valid ones. Users behind one NAT share the block.
+- A block that starts within 15 minutes after the previous block ended doubles the level. After 15 quiet minutes the level resets to 1.
+- Failures during an active block change nothing.
+- The ladder tracks 10000 IPs. A new IP that finds the table full is not tracked, so no penalty applies to it (`ultrathink_abuse_untracked_total`). The rate windows still refuse new keys when full, so a key-churn flood can refuse new clients for up to one window.
+- `ultrathink_abuse_penalty_total` counts each new block. The audit log records `abuse_penalty` with `ip`, `level` and `blockedSec`.
+
+Check the series with `curl -s 127.0.0.1:8795/metrics | grep -E 'ultrathink_(adaptive_quota|load_forecast|recommended_replicas|fair_share|abuse_|rate_limited)'`.
+
+### Blocked items
+
+Each item below is not built. Its prerequisite is named; until that exists, only the behaviour above applies.
+
+- **Automatic scale-out.** Prerequisite: an orchestrator (an autoscaler or HPA) and state that replicas can share. State is one SQLite file under `/var/lib/ultrathink`, so a second replica today would split every counter. Nothing here acts on the recommendation; an orchestrator would have to read it.
+- **Shared rate-limit state (RATE-04, Redis Cluster).** Prerequisite: a reachable Redis Cluster endpoint, approval of a Redis client dependency (`package.json` has none), and a multi-replica deployment to test against. Until then the limits in this section apply per process.
+- **SIEM delivery of abuse events.** Prerequisite: the Phase 68 SIEM sink and its collector. Until both exist, `abuse_penalty` stays in the local audit log and in any sink from section 14, and no collector alerts on it.
+- **Calibration of `ULTRATHINK_REPLICA_CAPACITY_RPS`.** Prerequisite: a load test on the VPS with the production build. See the warning above.

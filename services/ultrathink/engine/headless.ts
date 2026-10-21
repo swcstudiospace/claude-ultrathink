@@ -19,6 +19,8 @@ import { GROKBOT_ENGINE_HOST, checkRecord, journalDir, readMeta } from "../../..
 import { type PlanResponse, planPrompt } from "../../../src/host/plan.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { CeilingError, type Ledger } from "../cost/ledger.ts";
+import { currentRequestContext } from "../obs/context.ts";
+import { createFairShare } from "../obs/fair-share.ts";
 import type { Logger } from "../obs/log.ts";
 import type { Store } from "../store/store.ts";
 import type { BreakerState, CircuitBreaker } from "./breaker.ts";
@@ -128,6 +130,8 @@ interface Job extends JobFile {
 	settled: boolean;
 	done: Promise<void>;
 	finish: () => void;
+	/** Releases the plan slot taken from the fair-share pool; absent for starts without an admission. */
+	slotRelease?: () => void;
 }
 
 interface Outcome {
@@ -218,6 +222,12 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 	const jobsDir = join(stateDir, "jobs");
 	const cwd = join(stateDir, "cwd");
 	const jobs = new Map<string, Job>();
+	/** Plan slots for admitted starts. The running count below still caps every start, admitted or not. */
+	const slots = createFairShare({
+		capacity: config.maxConcurrentPlans,
+		reserve: config.maxConcurrentPlans >= 2 ? 1 : 0,
+		perPrincipalMax: Math.ceil(config.maxConcurrentPlans / 2),
+	});
 	/** Session ids of settled jobs kept only in memory, oldest first. */
 	const unpersisted: string[] = [];
 	const enabled = config.serverPlanning;
@@ -445,6 +455,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 	function finalize(job: Job, outcome: Outcome): void {
 		if (job.settled) return;
 		job.settled = true;
+		job.slotRelease?.();
 		job.status = outcome.status;
 		if (outcome.error === undefined) delete job.error;
 		else job.error = outcome.error;
@@ -548,6 +559,13 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			let running = 0;
 			for (const job of jobs.values()) if (!job.settled) running += 1;
 			if (running >= config.maxConcurrentPlans) return fail("busy");
+			const admission = currentRequestContext()?.admission;
+			let slotRelease: (() => void) | undefined;
+			if (admission !== undefined) {
+				const slot = slots.acquire(admission);
+				if (!slot.ok) return fail("busy");
+				slotRelease = slot.release;
+			}
 
 			let job: Job;
 			try {
@@ -575,9 +593,11 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 					settled: false,
 					done: promise,
 					finish: resolve,
+					slotRelease,
 				};
 				persist(job);
 			} catch {
+				slotRelease?.();
 				return fail("engine_error");
 			}
 			jobs.set(sessionId, job);

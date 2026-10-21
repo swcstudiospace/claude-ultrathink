@@ -44,6 +44,7 @@ export type AuditEvent =
 	| "refresh_reuse_detected"
 	| "token_revoked"
 	| "rate_limited"
+	| "abuse_penalty"
 	| "audit_anchor"
 	| "anomaly_detected"
 	| "audit_tamper_detected"
@@ -61,6 +62,7 @@ export const AUDIT_EVENTS: readonly AuditEvent[] = [
 	"refresh_reuse_detected",
 	"token_revoked",
 	"rate_limited",
+	"abuse_penalty",
 	"audit_anchor",
 	"anomaly_detected",
 	"audit_tamper_detected",

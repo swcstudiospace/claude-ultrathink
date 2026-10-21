@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { Admission } from "./fair-share.ts";
 
 /**
  * Request-scoped identifiers for log enrichment and outbound trace propagation. The router enters it once per
@@ -13,6 +14,8 @@ export interface RequestContext {
 	traceId: string;
 	spanId: string;
 	sampled?: boolean;
+	/** Priority class and principal set by the router after authentication; absent outside authenticated routes. */
+	admission?: Admission;
 }
 
 const storage = new AsyncLocalStorage<RequestContext>();

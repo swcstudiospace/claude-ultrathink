@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Auth, createAuth } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
+import type { HeadlessPlanner } from "../engine/headless.ts";
 import { type Store, openStore } from "../store/store.ts";
 import { createLogger } from "../obs/log.ts";
-import { SECURITY_HEADERS, createHandler } from "./router.ts";
+import { createMetrics, type Metrics } from "../obs/metrics.ts";
+import type { RuntimeSample } from "../obs/runtime.ts";
+import { type App, SECURITY_HEADERS, createApp, createHandler } from "./router.ts";
 
 /** A header the security module sets, read from the exported constant. A missing one is a broken build, not a value to compare. */
 function requiredHeader(name: string): string {
@@ -97,6 +100,13 @@ beforeAll(async () => {
 		auditRetentionDays: 365,
 		auditWatchMs: 1000,
 		auditSinkQueue: 10000,
+		priorityReservePct: 25,
+		adaptiveQuotaMinPct: 50,
+		lagTargetMs: 100,
+		replicaCapacityRps: 20,
+		abuseFailuresPerMinute: 20,
+		penaltyBaseSec: 60,
+		penaltyMaxSec: 3600,
 	};
 	auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);
@@ -541,5 +551,236 @@ describe("MCP endpoint", () => {
 		const result = await callTool("ultrathink_plan", { prompt: "x".repeat(MAX_INPUT_CHARS + 1) });
 		expect(result.isError).toBe(true);
 		expect(result.structuredContent.error).toBe("invalid_input");
+	});
+});
+
+/** A runtime sample with only the event-loop lag set; the router reads nothing else from it. */
+function sample(eventLoopLagMs: number): RuntimeSample {
+	return { eventLoopLagMs, rssBytes: 0, heapUsedBytes: 0, uptimeSec: 0 };
+}
+
+/** The value of one unlabelled gauge as the metrics render it. */
+function gaugeValue(metrics: Metrics, name: string): number {
+	const line = metrics.render().split("\n").find((text) => text.startsWith(`${name} `));
+	if (line === undefined) throw new Error(`${name} is not rendered`);
+	return Number(line.slice(name.length + 1));
+}
+
+describe("penalties, pool shares, pressure scaling and load history", () => {
+	const ATTACKER = "203.0.113.10";
+	const OTHER_CLIENT = "203.0.113.11";
+	const OWNER_IP = "198.51.100.5";
+	const CONNECTOR_KEY = randomBytes(24).toString("hex");
+	/** A minute boundary, so every fixed window and minute bucket here starts whole. */
+	const START_MS = 100_000 * 60_000;
+	let root: string;
+	let clock: { ms: number };
+	let logLines: string[];
+
+	beforeAll(() => {
+		root = mkdtempSync(join(tmpdir(), "ultrathink-limits-"));
+	});
+
+	afterAll(() => {
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	beforeEach(() => {
+		clock = { ms: START_MS };
+		logLines = [];
+	});
+
+	/** A fresh app over its own state directory: its own penalty table, pools, load history and auth windows. */
+	function build(overrides: Partial<UltrathinkConfig> = {}, extras: { stateDir?: string; planner?: HeadlessPlanner } = {}): { app: App; metrics: Metrics } {
+		const metrics = createMetrics();
+		const auth = createAuth({ ownerPasswordHash: config.ownerPasswordHash, sessionSecret: config.sessionSecret, cookieSecure: true });
+		const app = createApp({
+			config: { ...config, stateDir: extras.stateDir ?? mkdtempSync(join(root, "app-")), ...overrides },
+			store,
+			auth,
+			logger: createLogger({ write: (line) => logLines.push(line) }),
+			metrics,
+			now: () => clock.ms,
+			...(extras.planner === undefined ? {} : { planner: extras.planner }),
+		});
+		return { app, metrics };
+	}
+
+	/** A bearer token the router refuses: a 401 that counts against the caller's IP. */
+	function badBearer(): Request {
+		return new Request(`${PUBLIC_ORIGIN}/mcp`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer not-a-real-token" },
+			body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+		});
+	}
+
+	async function failCredentials(app: App, ip: string, times: number): Promise<void> {
+		for (let i = 0; i < times; i++) expect((await app.handle(badBearer(), ip)).status).toBe(401);
+	}
+
+	async function ownerCookie(app: App): Promise<string> {
+		const login = await app.handle(
+			new Request(`${PUBLIC_ORIGIN}/login`, { method: "POST", headers: jsonHeaders(), body: JSON.stringify({ password }) }),
+			OWNER_IP,
+		);
+		expect(login.status).toBe(200);
+		return (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+	}
+
+	function ownerRun(app: App, cookie: string, origin: string = PUBLIC_ORIGIN): Promise<Response> {
+		return app.handle(
+			new Request(`${PUBLIC_ORIGIN}/ultrathink`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Origin: origin, Cookie: cookie },
+				body: JSON.stringify({ input: "plan the rollout" }),
+			}),
+			OWNER_IP,
+		);
+	}
+
+	/** A connector `tools/call` that the stub planner holds open until it is released. */
+	function connectorUplift(id: number): Request {
+		return new Request(`${PUBLIC_ORIGIN}/mcp`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "x-connector-key": CONNECTOR_KEY },
+			body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "ultrathink_uplift", arguments: { prompt: "plan it" } } }),
+		});
+	}
+
+	test("20 failed credentials pass, the 21st escalates, the 22nd is blocked; health stays up; the block ends", async () => {
+		const { app, metrics } = build();
+		await failCredentials(app, ATTACKER, 20);
+		expect((await app.handle(badBearer(), ATTACKER)).status).toBe(401);
+		expect(metrics.render()).toContain("ultrathink_abuse_penalty_total 1");
+
+		const blocked = await app.handle(badBearer(), ATTACKER);
+		expect(blocked.status).toBe(429);
+		expect(blocked.headers.get("retry-after")).toBe("60");
+		expect(await blocked.json()).toEqual({ error: "rate_limited" });
+		expect(metrics.render()).toContain('ultrathink_rate_limited_total{scope="penalty"} 1');
+		expect((await app.handle(new Request(`${PUBLIC_ORIGIN}/healthz`), ATTACKER)).status).toBe(200);
+
+		clock.ms += 60_000;
+		expect((await app.handle(badBearer(), ATTACKER)).status).toBe(401);
+	});
+
+	test("a repeat offence inside the decay period doubles the block, and never exceeds penaltyMaxSec", async () => {
+		const { app } = build();
+		await failCredentials(app, ATTACKER, 21);
+		clock.ms += 60_000;
+		await failCredentials(app, ATTACKER, 21);
+		const second = await app.handle(badBearer(), ATTACKER);
+		expect(second.status).toBe(429);
+		expect(second.headers.get("retry-after")).toBe("120");
+
+		const capped = build({ penaltyMaxSec: 90 }).app;
+		await failCredentials(capped, OTHER_CLIENT, 21);
+		clock.ms += 60_000;
+		await failCredentials(capped, OTHER_CLIENT, 21);
+		expect((await capped.handle(badBearer(), OTHER_CLIENT)).headers.get("retry-after")).toBe("90");
+	});
+
+	test("a blocked IP does not affect another IP", async () => {
+		const { app } = build();
+		await failCredentials(app, ATTACKER, 21);
+		expect((await app.handle(badBearer(), ATTACKER)).status).toBe(429);
+		expect((await app.handle(badBearer(), OTHER_CLIENT)).status).toBe(401);
+	});
+
+	test("under pressure the owner window is halved: 30 requests pass the window, the 31st is rate limited", async () => {
+		const pressured = build().app;
+		const cookie = await ownerCookie(pressured);
+		// One lag sample above the 100 ms target steps the factor to its 0.5 floor.
+		pressured.observeRuntime(sample(1000));
+		for (let i = 0; i < 30; i++) expect((await ownerRun(pressured, cookie, "https://evil.test")).status).toBe(403);
+		const limited = await ownerRun(pressured, cookie, "https://evil.test");
+		expect(limited.status).toBe(429);
+		expect(await limited.json()).toEqual({ error: "rate_limited" });
+
+		const calm = build().app;
+		const calmCookie = await ownerCookie(calm);
+		for (let i = 0; i < 60; i++) expect((await ownerRun(calm, calmCookie, "https://evil.test")).status).toBe(403);
+		expect((await ownerRun(calm, calmCookie, "https://evil.test")).status).toBe(429);
+	});
+
+	test("a connector holds at most capacity minus reserve; the owner is still admitted into the reserve", async () => {
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		let entered = 0;
+		const planner: HeadlessPlanner = {
+			enabled: true,
+			async start(input) {
+				entered += 1;
+				if (entered === 2) reached.resolve();
+				await gate.promise;
+				return { ok: true, data: { sessionId: String(input.sessionId ?? "held"), status: "running", pollAfterSec: 5 } };
+			},
+			async result() {
+				throw new Error("the stub planner is not asked for results in this test");
+			},
+			status: () => null,
+			async shutdown() {},
+			upstream: () => undefined,
+		};
+		// maxInflight 4 with a 50 % reserve: the reserve is 2, so non-owner classes may hold 2 slots.
+		const { app, metrics } = build({ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50 }, { planner });
+		const cookie = await ownerCookie(app);
+
+		const holdA = app.handle(connectorUplift(1), "198.51.100.1");
+		const holdB = app.handle(connectorUplift(2), "198.51.100.2");
+		await reached.promise;
+
+		const refused = await app.handle(connectorUplift(3), "198.51.100.3");
+		expect(refused.status).toBe(429);
+		expect(refused.headers.get("retry-after")).toBe("1");
+		expect(await refused.json()).toEqual({ error: "rate_limited" });
+		expect(metrics.render()).toContain('ultrathink_fair_share_refused_total{class="connector",reason="reserved"} 1');
+
+		expect((await ownerRun(app, cookie)).status).toBe(202);
+
+		gate.resolve();
+		expect((await holdA).status).toBe(200);
+		expect((await holdB).status).toBe(200);
+		// Both holds have released their slots, so a connector is admitted again.
+		expect((await app.handle(connectorUplift(4), "198.51.100.3")).status).toBe(200);
+	});
+
+	test("a corrupt load-history.json starts the app empty and is logged; readiness and metrics still answer", async () => {
+		const stateDir = mkdtempSync(join(root, "corrupt-"));
+		writeFileSync(join(stateDir, "load-history.json"), "not json");
+		const { app, metrics } = build({}, { stateDir });
+		app.start();
+		try {
+			expect(logLines.some((line) => line.includes("load_history_malformed"))).toBe(true);
+			expect((await app.handle(new Request(`${PUBLIC_ORIGIN}/readyz`), "127.0.0.1")).status).toBe(200);
+			expect((await app.handle(new Request(`${PUBLIC_ORIGIN}/metrics`), "127.0.0.1")).status).toBe(200);
+			app.observeRuntime(sample(0));
+			expect(gaugeValue(metrics, "ultrathink_load_forecast_rps")).toBe(0);
+		} finally {
+			await app.shutdown();
+		}
+	});
+
+	test("the load history survives a restart: the forecast of a new app equals the one before shutdown", async () => {
+		const stateDir = mkdtempSync(join(root, "history-"));
+		const first = build({}, { stateDir });
+		first.app.start();
+		for (let i = 0; i < 30; i++) {
+			expect((await first.app.handle(new Request(`${PUBLIC_ORIGIN}/.well-known/oauth-protected-resource`), "127.0.0.1")).status).toBe(200);
+		}
+		first.app.observeRuntime(sample(0));
+		// Thirty requests in the current minute, fewer than five minutes recorded: the cold forecast is 30 / 60.
+		const before = gaugeValue(first.metrics, "ultrathink_load_forecast_rps");
+		expect(before).toBe(0.5);
+		await first.app.shutdown();
+		expect(statSync(join(stateDir, "load-history.json")).mode & 0o777).toBe(0o600);
+
+		logLines = [];
+		const second = build({}, { stateDir });
+		second.app.observeRuntime(sample(0));
+		expect(gaugeValue(second.metrics, "ultrathink_load_forecast_rps")).toBe(before);
+		expect(logLines.some((line) => line.includes("load_history"))).toBe(false);
+		await second.app.shutdown();
 	});
 });

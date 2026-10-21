@@ -2,11 +2,12 @@
 // Copyright (C) 2026 SWC Studio
 
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import pkg from "../../../package.json";
 import { type Auth, clientIpFrom } from "../auth/auth.ts";
+import { createPenaltyLadder } from "../auth/penalty.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { type Ledger, createLedger } from "../cost/ledger.ts";
 import { type BreakerState, createCircuitBreaker } from "../engine/breaker.ts";
@@ -22,10 +23,13 @@ import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "
 import { type AnomalyAlert, DEFAULT_ANOMALY_RULES, createAnomalyDetector } from "../obs/anomaly.ts";
 import { type Fingerprint, createAuditWatch } from "../obs/audit-watch.ts";
 import { type AuditEvent, type AuditLog, auditPath, createAuditLog } from "../obs/audit.ts";
-import { runWithRequestContext } from "../obs/context.ts";
+import { currentRequestContext, runWithRequestContext } from "../obs/context.ts";
+import { type Admission, createFairShare } from "../obs/fair-share.ts";
+import { type LoadHistory, createLoadHistory, loadLoadHistory, recommendedReplicas } from "../obs/forecast.ts";
 import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../obs/log.ts";
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
-import { createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
+import { createAdaptiveQuota } from "../obs/quota.ts";
+import { type RuntimeSample, createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
 import { createAuditStreams } from "../obs/sinks/fanout.ts";
 import { createHttpTransport, createKafkaRestTransport } from "../obs/sinks/http.ts";
 import type { SinkEvent } from "../obs/sinks/queue.ts";
@@ -83,6 +87,8 @@ export interface App {
 	beginDrain(): void;
 	/** Stops the probe and sweep, closes the audit log, then stops accepting planner work and ends running jobs. The caller closes the store. */
 	shutdown(): Promise<void>;
+	/** Feeds one runtime sample to the adaptive quota and refreshes the load gauges. The runtime probe calls it on every sample. */
+	observeRuntime(sample: RuntimeSample): void;
 	planner: HeadlessPlanner;
 	metrics: Metrics;
 	logger: Logger;
@@ -155,12 +161,19 @@ const WAL_CHECKPOINT_MS = 10 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** How long shutdown lets queued audit and security envelopes reach their sinks. */
 const AUDIT_FLUSH_MS = 2000;
+/** Penalty window, decay period and key cap; fixed in code (Phase 70, CONTEXT decision 7). */
+const PENALTY_WINDOW_MS = 60 * 1000;
+const PENALTY_DECAY_MS = 15 * 60 * 1000;
+const PENALTY_KEYS = 10_000;
+/** The load history is saved this often, and once more on shutdown. */
+const HISTORY_SAVE_MS = 5 * 60 * 1000;
 
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 
 const LOG_VALUE_MAX = 64;
 
 const OAUTH_STATE_FILE = "oauth.json";
+const LOAD_HISTORY_FILE = "load-history.json";
 
 // Any string reaches the authenticator, an empty one included, as before; the authenticator refuses it.
 const LOGIN_BODY: Record<string, Validator<unknown>> = { password: new StringValidator({ allowEmpty: true }) };
@@ -382,6 +395,40 @@ function diskFingerprint(path: string): Fingerprint | undefined {
 	}
 }
 
+/**
+ * The saved load history. A missing file is a fresh start. A file that cannot be read starts empty and is logged.
+ * A file this service wrote always round-trips through toJSON exactly; any other text is logged as malformed.
+ */
+function restoreHistory(path: string, logger: Logger): LoadHistory {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return createLoadHistory();
+		logger.warn("load_history_unreadable", { error: error instanceof Error ? error.name : "UnknownError" });
+		return createLoadHistory();
+	}
+	const restored = loadLoadHistory(text);
+	if (restored.toJSON() !== text) logger.warn("load_history_malformed", {});
+	return restored;
+}
+
+/** Saves through a temporary file beside the target, then renames it into place. Never throws; a failed save is logged. */
+function saveHistory(history: LoadHistory, path: string, logger: Logger): void {
+	const temp = `${path}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temp, history.toJSON(), { mode: 0o600 });
+		renameSync(temp, path);
+	} catch (error) {
+		logger.warn("load_history_save_failed", { error: error instanceof Error ? error.name : "UnknownError" });
+		try {
+			rmSync(temp, { force: true });
+		} catch {
+			// The temporary file stays; the next save writes under a new name.
+		}
+	}
+}
+
 export function createApp(deps: RouterDeps): App {
 	const { config, store, auth } = deps;
 	const logger = deps.logger ?? createLogger();
@@ -514,6 +561,25 @@ export function createApp(deps: RouterDeps): App {
 				})
 			: undefined;
 	const inflight = createInflight(config.maxInflight);
+	// The HTTP pool refuses at once and keeps owner work ahead of connector and bearer work (CONTEXT decision 5).
+	const httpShare = createFairShare({
+		capacity: config.maxInflight,
+		reserve: Math.floor((config.maxInflight * config.priorityReservePct) / 100),
+		perPrincipalMax: Math.ceil(config.maxInflight / 2),
+	});
+	const quota = createAdaptiveQuota({ minFactor: config.adaptiveQuotaMinPct / 100, lagTargetMs: config.lagTargetMs });
+	const clock = deps.now ?? Date.now;
+	const penalty = createPenaltyLadder({
+		windowMs: PENALTY_WINDOW_MS,
+		failuresPerWindow: config.abuseFailuresPerMinute,
+		baseSec: config.penaltyBaseSec,
+		maxSec: config.penaltyMaxSec,
+		decayMs: PENALTY_DECAY_MS,
+		maxKeys: PENALTY_KEYS,
+		now: clock,
+	});
+	const historyPath = join(config.stateDir, LOAD_HISTORY_FILE);
+	const history = restoreHistory(historyPath, logger);
 	const drain = createDrainState(deps.now);
 	// Refreshed by start() and after each retention sweep; openStore already ran quick_check at startup.
 	let integrityOk = true;
@@ -558,7 +624,42 @@ export function createApp(deps: RouterDeps): App {
 		metrics.inc("ultrathink_rate_limited_total", { scope });
 		logger.warn("rate_limited", { reqId: ctx.reqId, ip: ctx.ip, scope });
 		record("rate_limited", { scope, ip: ctx.ip });
+		countAbuse(ctx);
 		return fail(429, "rate_limited", { "Retry-After": String(retryAfterSec) });
+	}
+
+	/**
+	 * Counts one failed credential or refused rate limit against the caller's IP. An escalation is audited and counted;
+	 * a key the table could not track is counted apart, so the gap shows.
+	 */
+	function countAbuse(ctx: RequestCtx): void {
+		const outcome = penalty.fail(ctx.ip);
+		if (outcome.escalated) {
+			record("abuse_penalty", { ip: ctx.ip, level: outcome.level, blockedSec: outcome.blockedSec });
+			metrics.inc("ultrathink_abuse_penalty_total");
+		}
+		if (!outcome.tracked) metrics.inc("ultrathink_abuse_untracked_total");
+	}
+
+	/**
+	 * Runs `work` while holding one HTTP pool slot for `admission`. A refused slot answers 429 with a one-second retry
+	 * and runs nothing. While `work` runs, the admission sits on the request context, so planner work it starts takes a
+	 * plan slot under the same class and principal.
+	 */
+	async function admitted(admission: Admission, work: () => Promise<Response>): Promise<Response> {
+		const slot = httpShare.acquire(admission);
+		if (!slot.ok) {
+			metrics.inc("ultrathink_fair_share_refused_total", { class: admission.class, reason: slot.reason });
+			return fail(429, "rate_limited", { "Retry-After": "1" });
+		}
+		const context = currentRequestContext();
+		if (context) context.admission = admission;
+		try {
+			return await work();
+		} finally {
+			if (context) context.admission = undefined;
+			slot.release();
+		}
 	}
 
 	function authFailed(kind: string): void {
@@ -630,6 +731,7 @@ export function createApp(deps: RouterDeps): App {
 			return session;
 		}
 		authFailed("session");
+		countAbuse(ctx);
 		return null;
 	}
 
@@ -642,9 +744,14 @@ export function createApp(deps: RouterDeps): App {
 		const session = sessionFor(req, ctx);
 		if (!session) return fail(401, "unauthenticated");
 
-		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: session.ownerId });
+		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: session.ownerId, scale: quota.factor() });
 		if (!limit.ok) return rateLimited(ctx, "run", limit.retryAfterSec);
 
+		return await admitted({ principal: "owner", class: "owner" }, () => startRun(req, ctx, session));
+	}
+
+	/** Origin, envelope, input and flags, then the run is queued. Runs only while the owner holds a pool slot. */
+	async function startRun(req: Request, ctx: RequestCtx, session: { ownerId: "owner" }): Promise<Response> {
 		if (req.headers.get("origin") !== config.publicOrigin) return fail(403, "forbidden");
 		if (!isJsonRequest(req)) return fail(415, "unsupported_media_type");
 
@@ -862,10 +969,11 @@ export function createApp(deps: RouterDeps): App {
 			if (bearer === "invalid") tokenRejected(ctx, "bearer", 401, "invalid_token");
 			else if (presentedKey !== null) tokenRejected(ctx, "connector_key", 401, "invalid_key");
 			const challenge = `Bearer resource_metadata="${oauth.resourceMetadataUrl}"${bearer === "invalid" ? ', error="invalid_token"' : ""}`;
+			countAbuse(ctx);
 			return fail(401, "unauthenticated", { "WWW-Authenticate": challenge });
 		}
 
-		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: CONNECTOR_RATE_OWNER, principal, ownerLimit: CONNECTOR_OWNER_LIMIT });
+		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: CONNECTOR_RATE_OWNER, principal, ownerLimit: CONNECTOR_OWNER_LIMIT, scale: quota.factor() });
 		if (!limit.ok) {
 			logger.warn("rate_limit_window", { reqId: ctx.reqId, window: limit.scope });
 			return rateLimited(ctx, "mcp", limit.retryAfterSec);
@@ -886,9 +994,14 @@ export function createApp(deps: RouterDeps): App {
 		if (!parsed.ok) return respond(400, rpcError(-32700, "parse error"));
 		describeRpc(parsed.value, ctx);
 
-		const reply = await handleMcpPayload(mcpHost, parsed.value, { protocolVersion: version.version });
-		if (reply === null) return new Response(null, { status: 202, headers: SECURITY_HEADERS });
-		return respond(reply.status ?? 200, reply.body);
+		const answer = async (): Promise<Response> => {
+			const reply = await handleMcpPayload(mcpHost, parsed.value, { protocolVersion: version.version });
+			if (reply === null) return new Response(null, { status: 202, headers: SECURITY_HEADERS });
+			return respond(reply.status ?? 200, reply.body);
+		};
+		// Discovery and initialize are not pooled; a tool call or a batch holds one slot while it runs.
+		if (ctx.rpcMethod !== "tools/call" && ctx.rpcMethod !== "batch") return await answer();
+		return await admitted({ principal, class: ctx.authKind === "connector-key" ? "connector" : "bearer" }, answer);
 	}
 
 	async function dispatch(req: Request, ctx: RequestCtx, target: Target | null): Promise<Response> {
@@ -972,14 +1085,21 @@ export function createApp(deps: RouterDeps): App {
 				const target = matchPath(new URL(req.url).pathname);
 				if (target) ctx.endpoint = target.endpoint;
 				const ungated = target !== null && UNGATED[target.endpoint] === true;
-				const slot = ungated ? undefined : inflight.enter();
-				if (slot === null) {
-					metrics.inc("ultrathink_overload_total");
-					response = fail(503, "overloaded", { "Retry-After": "1" });
+				const blockedSec = ungated ? 0 : penalty.blockedSec(ctx.ip);
+				if (blockedSec > 0) {
+					metrics.inc("ultrathink_rate_limited_total", { scope: "penalty" });
+					response = fail(429, "rate_limited", { "Retry-After": String(blockedSec) });
 				} else {
-					release = slot;
-					metrics.gauge("ultrathink_http_inflight", inflight.count);
-					response = await dispatch(req, ctx, target);
+					const slot = ungated ? undefined : inflight.enter();
+					if (slot === null) {
+						metrics.inc("ultrathink_overload_total");
+						response = fail(503, "overloaded", { "Retry-After": "1" });
+					} else {
+						release = slot;
+						if (!ungated) history.record(clock());
+						metrics.gauge("ultrathink_http_inflight", inflight.count);
+						response = await dispatch(req, ctx, target);
+					}
 				}
 			} catch (error) {
 				const correlationId = randomUUID();
@@ -1014,11 +1134,24 @@ export function createApp(deps: RouterDeps): App {
 		});
 	}
 
+	/**
+	 * One runtime sample: one AIMD step on the adaptive quota, then the factor, the forecast and the replica
+	 * recommendation as gauges. The probe calls it on every sample; tests call it directly.
+	 */
+	function observeRuntime(sample: RuntimeSample): void {
+		quota.observe({ lagMs: sample.eventLoopLagMs, utilisation: inflight.count / inflight.max });
+		const { rps } = history.forecast(clock());
+		metrics.gauge("ultrathink_adaptive_quota_factor", quota.factor());
+		metrics.gauge("ultrathink_load_forecast_rps", rps);
+		metrics.gauge("ultrathink_recommended_replicas", recommendedReplicas(rps, config.replicaCapacityRps));
+	}
+
 	let stopProbe: (() => void) | undefined;
 	let stopSweeper: (() => void) | undefined;
 	let stopCheckpoint: (() => void) | undefined;
 	let stopWatch: (() => void) | undefined;
 	let stopPrune: (() => void) | undefined;
+	let stopHistorySave: (() => void) | undefined;
 	let lifecycleStarted = false;
 
 	/** Starts the runtime probe and, when retention is enabled, the sweeper. Runs once; later calls change nothing. */
@@ -1034,6 +1167,7 @@ export function createApp(deps: RouterDeps): App {
 				metrics.gauge("ultrathink_uptime_seconds", sample.uptimeSec);
 				metrics.gauge("ultrathink_http_inflight", inflight.count);
 				if (breaker) publishBreakerState(breaker.state());
+				observeRuntime(sample);
 			},
 		}).start();
 		if (config.retentionDays > 0) {
@@ -1054,6 +1188,11 @@ export function createApp(deps: RouterDeps): App {
 			checkpoint: () => store.checkpoint(),
 			intervalMs: WAL_CHECKPOINT_MS,
 			onBlocked: () => logger.warn("wal_checkpoint_blocked", {}),
+		}).start();
+		stopHistorySave = createSweeper({
+			sweep: () => saveHistory(history, historyPath, logger),
+			intervalMs: HISTORY_SAVE_MS,
+			...timerSeams,
 		}).start();
 		const log = auditLog;
 		if (log !== undefined) {
@@ -1088,6 +1227,7 @@ export function createApp(deps: RouterDeps): App {
 	return {
 		handle,
 		start,
+		observeRuntime,
 		beginDrain() {
 			drain.begin();
 		},
@@ -1097,6 +1237,8 @@ export function createApp(deps: RouterDeps): App {
 			stopCheckpoint?.();
 			stopWatch?.();
 			stopPrune?.();
+			stopHistorySave?.();
+			saveHistory(history, historyPath, logger);
 			auditLog?.close();
 			// Queued envelopes get a bounded chance to reach the sinks; anything still queued after that is dropped.
 			if (!(await streams.flush(AUDIT_FLUSH_MS))) logger.warn("audit_sink_flush_incomplete", {});

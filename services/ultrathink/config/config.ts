@@ -54,6 +54,20 @@ export interface UltrathinkConfig {
 	breakerOpenMs: number;
 	/** Upper bound on concurrent HTTP requests the router admits. */
 	maxInflight: number;
+	/** Share of `maxInflight` (percent, 0..90) that non-owner classes may not take, so owners always have headroom. */
+	priorityReservePct: number;
+	/** Lowest percentage the adaptive quota may shrink the request windows to. */
+	adaptiveQuotaMinPct: number;
+	/** Event-loop lag above which the process counts as under pressure and the adaptive quota shrinks. */
+	lagTargetMs: number;
+	/** Requests per second one replica is assumed to serve; uncalibrated until a load test sets it. */
+	replicaCapacityRps: number;
+	/** Failed credentials and rate-limit refusals per minute from one IP that start an abuse penalty. */
+	abuseFailuresPerMinute: number;
+	/** Length of an IP's first abuse penalty block. */
+	penaltyBaseSec: number;
+	/** Longest abuse penalty block; never below `penaltyBaseSec`. */
+	penaltyMaxSec: number;
 	/** Wait after shutdown begins, before the server stops, so in-flight work can finish. */
 	drainMs: number;
 	/** Days of finished jobs, sessions and journals to keep; 0 disables the sweep. */
@@ -486,6 +500,21 @@ function readKafkaSink(env: Record<string, string | undefined>): {
 	return { auditKafkaRestUrl, auditKafkaTopic };
 }
 
+/** Penalty blocks: the cap may not sit below the first block, or every escalation would be capped from the start. */
+function readPenaltyBlocks(env: Record<string, string | undefined>): {
+	penaltyBaseSec: number;
+	penaltyMaxSec: number;
+} {
+	const penaltyBaseSec = readInteger(env, "ULTRATHINK_PENALTY_BASE_SEC", 60, 1, 86400);
+	const penaltyMaxSec = readInteger(env, "ULTRATHINK_PENALTY_MAX_SEC", 3600, 1, 86400);
+	if (penaltyMaxSec < penaltyBaseSec) {
+		throw new ConfigError(
+			"ULTRATHINK_PENALTY_MAX_SEC must be greater than or equal to ULTRATHINK_PENALTY_BASE_SEC",
+		);
+	}
+	return { penaltyBaseSec, penaltyMaxSec };
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
@@ -569,6 +598,12 @@ export function loadConfig(
 		breakerWindowMs: readInteger(env, "ULTRATHINK_BREAKER_WINDOW_MS", 60000, 1000, 3600000),
 		breakerOpenMs: readInteger(env, "ULTRATHINK_BREAKER_OPEN_MS", 30000, 1000, 600000),
 		maxInflight: readInteger(env, "ULTRATHINK_MAX_INFLIGHT", 256, 1, 10000),
+		priorityReservePct: readInteger(env, "ULTRATHINK_PRIORITY_RESERVE_PCT", 25, 0, 90),
+		adaptiveQuotaMinPct: readInteger(env, "ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT", 50, 10, 100),
+		lagTargetMs: readInteger(env, "ULTRATHINK_LAG_TARGET_MS", 100, 10, 5000),
+		replicaCapacityRps: readInteger(env, "ULTRATHINK_REPLICA_CAPACITY_RPS", 20, 1, 100000),
+		abuseFailuresPerMinute: readInteger(env, "ULTRATHINK_ABUSE_FAILURES_PER_MINUTE", 20, 1, 10000),
+		...readPenaltyBlocks(env),
 		drainMs: readInteger(env, "ULTRATHINK_DRAIN_MS", 5000, 0, 60000),
 		retentionDays: readInteger(env, "ULTRATHINK_RETENTION_DAYS", 30, 0, 3650),
 		auditLog: readFlag(env, "ULTRATHINK_AUDIT_LOG") ?? true,
