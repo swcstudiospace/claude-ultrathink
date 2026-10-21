@@ -9,7 +9,8 @@
 # Reload rules:
 #   app renewed   -> systemctl restart ultrathink-web   (the app reads its leaf only at start)
 #   edge renewed  -> nginx -t && systemctl reload nginx (nginx loads proxy_ssl_certificate at config time)
-#   nothing renewed -> nothing restarted or reloaded
+#   nothing renewed and no reload pending -> nothing restarted or reloaded
+#   a failed reload -> its marker stays in the TLS directory, and the next run retries it
 #
 # The PKI script is called once per leaf, not once for all three. It stops at its first failing name, so a combined
 # call would leave the names after a failing one unchecked, and a leaf could expire without anyone retrying it. Each
@@ -56,20 +57,50 @@ if (( ${#renewed[@]} == 0 && ${#failed[@]} == 0 )); then
 	say "no TLS leaf due for renewal"
 fi
 
+# A reload stays pending until it succeeds. Its marker sits in the TLS directory, so a failed reload is retried by the next
+# hourly run, even though the leaf is no longer due for renewal.
+pending_marker() {
+	printf '%s/.reload-pending-%s\n' "$TLS_DIR" "$1"
+}
+
+was_renewed() {
+	local leaf
+	# ${renewed[@]+...} expands to nothing when the array is empty; a bare "${renewed[@]}" fails under set -u on bash 3.2.
+	for leaf in ${renewed[@]+"${renewed[@]}"}; do
+		if [[ "$leaf" == "$1" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 reload_failed=0
-for name in "${renewed[@]}"; do
+for name in app edge; do
+	marker="$(pending_marker "$name")"
+	if [[ ! -e "$marker" ]] && ! was_renewed "$name"; then
+		continue
+	fi
+	# The marker is written before the reload and removed only after the reload succeeds.
+	if ! : >"$marker"; then
+		warn "cannot write the reload marker $marker; a failed reload of $name will not be retried"
+		reload_failed=1
+	fi
 	case "$name" in
 	app)
-		say "restarting ultrathink-web (app leaf renewed)"
-		if ! systemctl restart ultrathink-web; then
-			warn "restart of ultrathink-web failed after app leaf renewal"
+		say "restarting ultrathink-web (app leaf renewed or reload pending)"
+		if systemctl restart ultrathink-web; then
+			rm -f -- "$marker"
+		else
+			warn "restart of ultrathink-web failed; the next run retries it"
 			reload_failed=1
 		fi
 		;;
 	edge)
-		say "reloading nginx (edge leaf renewed)"
-		if ! { nginx -t && systemctl reload nginx; }; then
-			warn "nginx reload failed after edge leaf renewal"
+		say "reloading nginx (edge leaf renewed or reload pending)"
+		if nginx -t && systemctl reload nginx; then
+			rm -f -- "$marker"
+		else
+			warn "nginx reload failed; the next run retries it"
 			reload_failed=1
 		fi
 		;;
