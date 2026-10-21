@@ -16,6 +16,10 @@
  * - Body cap: a 413 is returned for an over-cap Content-Length and for an over-cap chunked body.
  * - Idle timeout: http.Server.setTimeout does not close manually-emitted sockets; a per-socket
  *   setTimeout with a "timeout" handler that destroys the socket does, and the client sees close.
+ * - Runtime floor: Bun 1.4.0, enforced by assertMtlsRuntime, which startMtlsServer calls first. On Bun 1.2.23,
+ *   node:http does not read requests from a socket passed to emit("connection") (a bare http.Server on a plain
+ *   TCP socket fails the same way), so requests through the adapter hang. The TLS verification itself holds on
+ *   1.2.23: a foreign-CA leaf is refused and the edge leaf is authorized.
  *
  * Timeouts: `idleTimeoutSec` is used three ways. It bounds idle gaps on a socket, it bounds the TLS
  * handshake, and it is the absolute per-request deadline, armed at the first byte of a request and
@@ -217,12 +221,36 @@ async function serveRequest(
 	await writeResponse(res, response);
 }
 
+/** Oldest Bun that serves requests through this adapter. Older runtimes hang on them (see the runtime floor note). */
+export const MTLS_MIN_BUN: readonly [number, number, number] = [1, 4, 0];
+const MTLS_RUNTIME_MESSAGE = "mTLS requires Bun 1.4.0 or newer; on older runtimes requests through the adapter hang.";
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
+
+/**
+ * True when `version` is a semantic version x.y.z at or above `floor`. A pre-release or build suffix is ignored.
+ * A string that is not a version is not at or above any floor, so an unknown runtime fails closed.
+ */
+export function bunAtLeast(version: string, floor: readonly [number, number, number]): boolean {
+	const match = SEMVER.exec(version);
+	if (match === null) return false;
+	const [major, minor, patch] = [Number(match[1]), Number(match[2]), Number(match[3])];
+	if (major !== floor[0]) return major > floor[0];
+	if (minor !== floor[1]) return minor > floor[1];
+	return patch >= floor[2];
+}
+
+/** Throws when the running Bun is below MTLS_MIN_BUN. Runs before any socket or server is created. */
+export function assertMtlsRuntime(): void {
+	if (!bunAtLeast(Bun.version, MTLS_MIN_BUN)) throw new Error(MTLS_RUNTIME_MESSAGE);
+}
+
 /**
  * Starts the mTLS listener on 127.0.0.1. The TLS layer refuses clients without a certificate from
  * `clientCaFile`, so `handle` runs only for verified peers. `port: 0` binds an ephemeral port.
  * Resolves once the listener is bound; a bind failure rejects with the listener's error.
  */
 export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHandler): Promise<MtlsServer> {
+	assertMtlsRuntime();
 	const hostname = options.hostname ?? LOOPBACK;
 	if (hostname !== LOOPBACK) throw new RangeError("mTLS listener binds 127.0.0.1 only");
 	if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
@@ -285,6 +313,9 @@ export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHa
 	// bounded here. The inactivity timer stays on the raw socket, which also carries the TLS bytes afterwards.
 	tlsServer.on("connection", (raw) => {
 		raw.setTimeout(idleMs, () => raw.destroy());
+		// A refused handshake emits its error on this raw socket. Bun 1.2.23 does not route it to tlsClientError, so
+		// without a listener it escalates as an unhandled error. The failed handshake already closes the socket.
+		raw.on("error", () => {});
 	});
 
 	const { promise, resolve, reject } = Promise.withResolvers<MtlsServer>();

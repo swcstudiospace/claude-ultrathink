@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
 import { identityFromUriSans, type IdentityResult } from "./identity.ts";
-import { MAX_CONNECTIONS, type MtlsPeer, type MtlsServer, peerIdentity, startMtlsServer } from "./mtls.ts";
+import { bunAtLeast, MAX_CONNECTIONS, MTLS_MIN_BUN, type MtlsPeer, type MtlsServer, peerIdentity, startMtlsServer } from "./mtls.ts";
 
 const TRUST_DOMAIN = "ultrathink.test";
 const EDGE_URI = "spiffe://ultrathink.test/edge/nginx";
@@ -113,31 +113,43 @@ function edgeClient(port: number): tls.TLSSocket {
 	return client;
 }
 
-beforeAll(async () => {
-	dir = mkdtempSync(join(tmpdir(), "mtls-test-"));
-	openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=ultrathink-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
-	openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca2.key", "-out", "ca2.pem", "-days", "2", "-subj", "/CN=other-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
-	ca = readFileSync(join(dir, "ca.pem"), "utf8");
-	serverCreds = issueLeaf("srv", "IP:127.0.0.1", join(dir, "ca.pem"), join(dir, "ca.key"));
-	writeFileSync(join(dir, "srv.key"), serverCreds.key);
-	writeFileSync(join(dir, "srv.pem"), serverCreds.cert);
-	edgeCreds = issueLeaf("edge", `URI:${EDGE_URI},DNS:edge.test`, join(dir, "ca.pem"), join(dir, "ca.key"));
-	edgeNewCreds = issueLeaf("edge-new", `URI:${EDGE_URI}`, join(dir, "ca.pem"), join(dir, "ca.key"));
-	foreignCreds = issueLeaf("foreign", `URI:${EDGE_URI}`, join(dir, "ca2.pem"), join(dir, "ca2.key"));
-	expiredCreds = issueExpiredLeaf("expired", `URI:${EDGE_URI}`);
-	server = await startMtlsServer(serverOptions(30), async (req, peer) => {
-		calls++;
-		lastPeer = peer;
-		return new Response(await req.text());
+const ADAPTER_SKIP_REASON = "Bun below 1.4.0: requests through the adapter hang";
+const ADAPTER_SUPPORTED = bunAtLeast(Bun.version, MTLS_MIN_BUN);
+const ADAPTER_TITLE = ADAPTER_SUPPORTED ? "mTLS server adapter" : `mTLS server adapter (skipped: ${ADAPTER_SKIP_REASON})`;
+
+test("bunAtLeast compares semantic versions and fails closed on malformed input", () => {
+	expect(bunAtLeast("1.2.23", MTLS_MIN_BUN)).toBe(false);
+	expect(bunAtLeast("1.4.0", MTLS_MIN_BUN)).toBe(true);
+	expect(bunAtLeast("1.4.7", MTLS_MIN_BUN)).toBe(true);
+	expect(bunAtLeast("2.0.0", MTLS_MIN_BUN)).toBe(true);
+	expect(bunAtLeast("not-a-version", MTLS_MIN_BUN)).toBe(false);
+});
+
+describe.skipIf(!ADAPTER_SUPPORTED)(ADAPTER_TITLE, () => {
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), "mtls-test-"));
+		openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=ultrathink-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
+		openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca2.key", "-out", "ca2.pem", "-days", "2", "-subj", "/CN=other-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
+		ca = readFileSync(join(dir, "ca.pem"), "utf8");
+		serverCreds = issueLeaf("srv", "IP:127.0.0.1", join(dir, "ca.pem"), join(dir, "ca.key"));
+		writeFileSync(join(dir, "srv.key"), serverCreds.key);
+		writeFileSync(join(dir, "srv.pem"), serverCreds.cert);
+		edgeCreds = issueLeaf("edge", `URI:${EDGE_URI},DNS:edge.test`, join(dir, "ca.pem"), join(dir, "ca.key"));
+		edgeNewCreds = issueLeaf("edge-new", `URI:${EDGE_URI}`, join(dir, "ca.pem"), join(dir, "ca.key"));
+		foreignCreds = issueLeaf("foreign", `URI:${EDGE_URI}`, join(dir, "ca2.pem"), join(dir, "ca2.key"));
+		expiredCreds = issueExpiredLeaf("expired", `URI:${EDGE_URI}`);
+		server = await startMtlsServer(serverOptions(30), async (req, peer) => {
+			calls++;
+			lastPeer = peer;
+			return new Response(await req.text());
+		});
 	});
-});
 
-afterAll(async () => {
-	await server.stop();
-	rmSync(dir, { recursive: true, force: true });
-});
+	afterAll(async () => {
+		await server.stop();
+		rmSync(dir, { recursive: true, force: true });
+	});
 
-describe("mTLS server adapter", () => {
 	test("admits a verified edge client and reports its SPIFFE identity", async () => {
 		calls = 0;
 		const response = await fetchWith(server.port, { body: "hi", tls: { ca, cert: edgeCreds.cert, key: edgeCreds.key } });

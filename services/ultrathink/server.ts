@@ -12,7 +12,7 @@ import { TOOL_DEFINITIONS } from "./mcp/mcp.ts";
 import { createLogger } from "./obs/log.ts";
 import { type App, createApp } from "./routes/router.ts";
 import { identityFromUriSans } from "./security/identity.ts";
-import { startMtlsServer } from "./security/mtls.ts";
+import { assertMtlsRuntime, startMtlsServer } from "./security/mtls.ts";
 import { openStore } from "./store/store.ts";
 
 // Running plans are aborted and marked interrupted within 5 s of the signal; the rest is draining connections.
@@ -68,6 +68,7 @@ interface Listener {
 // With TLS configured the listener is mTLS only: the handshake refuses any client that does not chain to the CA, and
 // the verified SPIFFE identity (never a header) is the only identity the router sees.
 async function startTlsListener(tls: TlsFiles, config: UltrathinkConfig, app: App): Promise<Listener> {
+	assertMtlsRuntime();
 	requireReadableOrExit("ULTRATHINK_TLS_CERT", tls.certFile);
 	requireReadableOrExit("ULTRATHINK_TLS_KEY", tls.keyFile);
 	requireReadableOrExit("ULTRATHINK_TLS_CLIENT_CA", tls.clientCaFile);
