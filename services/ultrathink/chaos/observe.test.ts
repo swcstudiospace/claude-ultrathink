@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import tls, { type TLSSocket } from "node:tls";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import { type HttpFetch, type HttpRequestInit, httpTarget, parsePrometheusValue } from "./observe.ts";
@@ -139,24 +140,53 @@ describe("httpTarget", () => {
 		let server = { cert: "", key: "" };
 		let probe = { cert: "", key: "" };
 		let intruder = { cert: "", key: "" };
-		let listener: Server<undefined> | undefined;
+		let listener: { port: number; stop: () => void } | undefined;
+		// Tracks accepted sockets so stop() can destroy any still open.
+		const sockets = new Set<TLSSocket>();
 
-		beforeAll(() => {
+		beforeAll(async () => {
 			dir = mkdtempSync(join(tmpdir(), "chaos-observe-"));
 			ca = makeCa(dir, "ca");
 			makeCa(dir, "foreign-ca");
 			server = issueLeaf(dir, "server", "ca", SERVER_EXT);
 			probe = issueLeaf(dir, "probe", "ca", CLIENT_EXT);
 			intruder = issueLeaf(dir, "intruder", "foreign-ca", CLIENT_EXT);
-			listener = Bun.serve({
-				port: 0,
-				hostname: "127.0.0.1",
-				tls: { cert: server.cert, key: server.key, ca, requestCert: true, rejectUnauthorized: true },
-				fetch: () => new Response("ready"),
+			// node:tls, as deploy/ultrathink-release.test.ts does. Bun.serve on Bun 1.2.23 admitted a foreign-CA leaf in some
+			// handshakes; tls.createServer refused every one measured. The handler answers only an authorized socket.
+			const endpoint = tls.createServer({ cert: server.cert, key: server.key, ca, requestCert: true, rejectUnauthorized: true }, (socket) => {
+				if (!socket.authorized) {
+					socket.destroy();
+					return;
+				}
+				sockets.add(socket);
+				socket.once("close", () => sockets.delete(socket));
+				let head = "";
+				socket.on("data", (chunk: Buffer) => {
+					head += chunk.toString("latin1");
+					if (!head.includes("\r\n\r\n")) return;
+					socket.end("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready");
+				});
 			});
+			// A refused handshake is expected here; its error arrives on the raw socket, so it is swallowed.
+			endpoint.on("connection", (raw) => raw.on("error", () => {}));
+			const { promise, resolve, reject } = Promise.withResolvers<number>();
+			endpoint.once("error", reject);
+			endpoint.listen(0, "127.0.0.1", () => {
+				const address = endpoint.address();
+				if (address === null || typeof address === "string") reject(new Error("no TCP address for the mTLS listener"));
+				else resolve(address.port);
+			});
+			const port = await promise;
+			listener = {
+				port,
+				stop: () => {
+					endpoint.close();
+					for (const socket of sockets) socket.destroy();
+				},
+			};
 		});
 		afterAll(() => {
-			listener?.stop(true);
+			listener?.stop();
 			rmSync(dir, { recursive: true, force: true });
 		});
 
