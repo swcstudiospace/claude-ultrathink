@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CLARIFY_SYSTEM_PROMPT } from "../hitl/prompts.ts";
 import { normalizeClarifications } from "../hitl/pipeline.ts";
-import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionRecordPath, type SessionRecord } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { extractJsonObject, isFallbackGraph, normalizeGraph, parseNodeFill } from "../think/graph.ts";
@@ -500,7 +500,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 	const dir = journalDir(stateDir, input.sessionId);
 	const meta = readMeta(dir);
 	if (meta?.original !== undefined && meta.original !== input.prompt) throw new Error("session already holds a different original prompt; use a new session id");
-	const existing = sessionPath(stateDir, input.sessionId);
+	const existing = sessionRecordPath(stateDir, input.sessionId);
 	if (meta?.status === "planned" && !input.replan && existsSync(existing)) {
 		const record = JSON.parse(readFileSync(existing, "utf8")) as SessionRecord;
 		return { status: "planned", sessionId: input.sessionId, journal: dir, pending: [], replayed: 0, check: checkRecord(record, { thinkOff: thinkingOff(stateDir, input.cwd, env) }), response: { statePath: existing, specPath: existing.replace(/\.json$/, ".xml") } as PlanResponse };

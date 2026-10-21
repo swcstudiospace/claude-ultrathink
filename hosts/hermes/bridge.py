@@ -32,6 +32,7 @@ unless `teach status` reports enabled, and every failure here is swallowed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -445,10 +446,38 @@ def state_dir(env: dict[str, str] | None = None) -> Path:
 	return REPO_ROOT / directory
 
 
+# Mirrors src/claude/state.ts: a plain session id names its file as it is; any other id gets a lowercase slug and a hash.
+PLAIN_SESSION_ID = re.compile(r"[a-z0-9_.-]{1,120}")
+
+
+def safe_session_id(session_id: str) -> str:
+	"""The file-name stem of a session id, as src/claude/state.ts gives it, so Hermes reads the record the engine wrote."""
+	if PLAIN_SESSION_ID.fullmatch(session_id):
+		return session_id
+	slug = "".join(char.lower() if char.isascii() and (char.isalnum() or char in "_.-") else "_" for char in session_id)[:80]
+	return f"{slug}~{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:16]}"
+
+
 def state_path(session_id: str, env: dict[str, str] | None = None) -> Path:
 	"""The session record hooks/engine.ts writes for Hermes (src/claude/state.ts sessionPath)."""
-	safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120] or "unknown"
-	return state_dir(env) / "sessions" / f"{safe_id}.json"
+	return state_dir(env) / "sessions" / f"{safe_session_id(session_id)}.json"
+
+
+def legacy_state_path(session_id: str, env: dict[str, str] | None = None) -> Path:
+	"""Where earlier builds wrote a session's record: its id with characters a file name cannot hold replaced by `_`, case kept."""
+	legacy = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120] or "unknown"
+	return state_dir(env) / "sessions" / f"{legacy}.json"
+
+
+def session_record_path(session_id: str, env: dict[str, str] | None = None) -> Path:
+	"""The file holding this session's record, as src/claude/state.ts sessionRecordPath picks it: the current name, or the
+	earlier name when only that file exists and its stored sessionId is this id."""
+	current = state_path(session_id, env)
+	legacy = legacy_state_path(session_id, env)
+	if current.exists() or legacy == current or not legacy.exists():
+		return current
+	record = _read_record(legacy)
+	return legacy if record is not None and record.get("sessionId") == session_id else current
 
 
 def _is_planning_path(path: str) -> bool:
@@ -518,8 +547,10 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	if opened is None:
 		return None
 	session_id, url, by_child = opened
-	path = state_path(session_id, env)
+	path = session_record_path(session_id, env)
 	record = _read_record(path)
+	if record is not None and record.get("sessionId") != session_id:
+		record = None
 	if record is None or not isinstance(record.get("plan"), dict):
 		return None
 	graph_id = str(record["plan"].get("graphId") or "")
@@ -616,8 +647,10 @@ def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> di
 	session_id = str(payload.get("session_id") or "").strip()
 	if not session_id or payload.get("attempt"):
 		return None
-	path = state_path(session_id, env)
+	path = session_record_path(session_id, env)
 	record = _read_record(path)
+	if record is not None and record.get("sessionId") != session_id:
+		record = None
 	if record is None or record.get("synced") is True:
 		return None
 	plan_record = record.get("plan")
@@ -642,14 +675,28 @@ def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> di
 	return {"action": "continue", "message": message}
 
 
-def control(args: list[str], env: dict[str, str] | None = None) -> tuple[bool, str]:
-	"""Run `bin/ultrathink <args>` as Hermes against the engine's state directory:
+# The control verbs whose answer belongs to one session: `skip` arms this session's next message, `status` shows whether it is armed.
+SESSION_CONTROL_VERBS = ("skip", "status")
+
+
+def control_args(args: list[str], session_id: str | None) -> list[str]:
+	"""The bin/ultrathink argv for a control. A session-scoped verb gets ``--session <id>``; a blank id gets none, so the
+	CLI refuses ``skip`` rather than arming it for every session."""
+	argv = list(args)
+	sid = (session_id or "").strip()
+	if sid and argv and argv[0] in SESSION_CONTROL_VERBS:
+		argv += ["--session", sid]
+	return argv
+
+
+def control(args: list[str], env: dict[str, str] | None = None, session_id: str | None = None) -> tuple[bool, str]:
+	"""Run `bin/ultrathink <args>` as Hermes against the engine's state directory, for the session ``session_id`` names:
 	(True, its text), or (False, one line saying what failed). Never raises."""
 	label = " ".join(["Ultrathink", *args[:1]])
 	try:
 		child_env = _child_env(env)
 		completed = subprocess.run(
-			[str(CLI), *args],
+			[str(CLI), *control_args(args, session_id)],
 			encoding="utf-8",
 			errors="replace",
 			capture_output=True,

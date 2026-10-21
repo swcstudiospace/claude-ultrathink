@@ -87,6 +87,24 @@ class Bridge(unittest.TestCase):
 		self.assertEqual(bridge.session_id({**self.env, "ULTRATHINK_SESSION_ID": "explicit"}), "explicit")
 		self.assertEqual(bridge.session_id({"RLM_SESSION_DIR": ""}), "unknown")
 
+	def test_control_forwards_the_kernel_session_to_skip_and_status_only(self) -> None:
+		self.assertEqual(bridge.control_args(("skip",), "sess-123"), ["skip", "--session", "sess-123"])
+		self.assertEqual(bridge.control_args(("status",), " Sess-123 "), ["status", "--session", "Sess-123"])
+		self.assertEqual(bridge.control_args(("skip",), None), ["skip"])
+		self.assertEqual(bridge.control_args(("track", "off"), "sess-123"), ["track", "off"])
+		self.assertEqual(bridge._kernel_session(self.env), "sess-123")
+		self.assertIsNone(bridge._kernel_session({"RLM_SESSION_DIR": ""}))
+		# The CLI the kernel runs gets the session; a kernel with none sends a bare skip, which the CLI refuses.
+		root = Path(self.tmp.name) / "clone"
+		(root / "bin").mkdir(parents=True, exist_ok=True)
+		cli = root / "bin" / "ultrathink"
+		cli.write_text('#!/bin/sh\necho "$@"\n', encoding="utf-8")
+		cli.chmod(cli.stat().st_mode | stat.S_IEXEC)
+		env = {**self.env, "ULTRATHINK_PLUGIN_ROOT": str(root)}
+		self.assertEqual(bridge.ctl("skip", env=env), "skip --session sess-123")
+		self.assertEqual(bridge.ctl("status", env=env), "status --session sess-123")
+		self.assertEqual(bridge.ctl("skip", env={k: v for k, v in env.items() if k != "RLM_SESSION_DIR"}), "skip")
+
 	def test_state_dir_follows_prime_agent_home_and_refuses_planning_trees(self) -> None:
 		self.assertEqual(bridge.state_dir(self.env), Path(self.tmp.name) / "agent" / "ultrathink")
 		self.assertEqual(bridge.state_dir({**self.env, "ULTRATHINK_STATE_DIR": "/x/.planning/state"}), Path(self.tmp.name) / "agent" / "ultrathink")

@@ -11,9 +11,9 @@
 import { claudeConfigPaths, loadConfig } from "../src/config.ts";
 import { isChildInvocation } from "../src/claude/complete.ts";
 import { runPromptSubmit, type PromptSubmitInput } from "../src/claude/hook.ts";
-import { defaultStateDir, readControl, sessionPath } from "../src/claude/state.ts";
+import { defaultStateDir, hostSessionId, readControl, readSkipOnce, sessionPath } from "../src/claude/state.ts";
 import { recentConversationFromTranscript } from "../src/claude/transcript.ts";
-import { parseUltrathinkCommand, runControl, trackingEnabled, trackingOff } from "../src/uplift/commands.ts";
+import { parseUltrathinkCommand, runControl, takeSessionFlag, trackingEnabled, trackingOff } from "../src/uplift/commands.ts";
 import { planningTarget } from "../src/uplift/skill.ts";
 import { clearPlanCarrier, writePlanCarrier } from "../src/host/carrier.ts";
 import { claimTurn } from "../src/host/claim.ts";
@@ -37,7 +37,8 @@ async function readStdin(): Promise<string> {
 async function main(): Promise<void> {
 	const argv = process.argv.slice(2);
 	if (argv[0] === "--ctl") {
-		process.stdout.write(`${await runControl(argv.slice(1), { stateDir: defaultStateDir(), cwd: process.cwd() })}\n`);
+		const { sessionId, args } = takeSessionFlag(argv.slice(1));
+		process.stdout.write(`${await runControl(args, { stateDir: defaultStateDir(), cwd: process.cwd(), sessionId })}\n`);
 		return;
 	}
 	if (isChildInvocation()) return;
@@ -71,7 +72,12 @@ async function main(): Promise<void> {
 	}
 	if (command) {
 		if (grok) clearPlanCarrier(stateDir);
-		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], { stateDir, cwd, host });
+		const reason = await runControl([command.verb, ...command.args.split(/\s+/).filter(Boolean)], {
+			stateDir,
+			cwd,
+			host,
+			sessionId: hostSessionId(raw.session_id),
+		});
 		process.stdout.write(JSON.stringify({ decision: "block", reason }));
 		return;
 	}
@@ -103,6 +109,9 @@ async function main(): Promise<void> {
 	}
 	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);
+	// Read before the engine wait: a /ultrathink-skip typed while the engine is selected is for this session's next prompt.
+	const hookSession = hostSessionId(raw.session_id);
+	const armedSkip = hookSession !== undefined && readSkipOnce(stateDir, hookSession);
 	// Legacy route evidence only when the host's own envelope carries it (blank means unknown); nothing is read from a
 	// transcript (AD-4). selectEngine reads a session model for Hermes `auto` routing only, so other routes are unchanged.
 	const sessionModel = typeof envelope.model === "string" && envelope.model.trim() ? envelope.model.trim() : undefined;
@@ -128,6 +137,7 @@ async function main(): Promise<void> {
 		engineError: engine.error,
 		modelResolution: engine.resolution,
 		stateDir,
+		armedSkip,
 		surface: host,
 		conversation: recentConversationFromTranscript,
 		log,
@@ -143,7 +153,7 @@ async function main(): Promise<void> {
 		// Claude reads stdout first, so a carrier failure can never cost it the plan.
 		// Grok discards stdout; last-plan.json is the carrier there.
 		process.stdout.write(JSON.stringify(result.output));
-		const sessionId = input.session_id?.trim() || "";
+		const sessionId = hostSessionId(input.session_id) ?? "";
 		try {
 			writePlanCarrier({
 				host,

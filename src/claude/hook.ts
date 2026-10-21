@@ -44,7 +44,7 @@ import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
 import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
-import { type ControlState, readSession, type SessionRecord, sessionPath, writeControl, writeSession } from "./state.ts";
+import { clearSkipOnce, type ControlState, hostSessionId, isTurnSessionId, newTurnSessionId, readSession, readSkipOnce, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 
 export interface PromptSubmitInput {
 	session_id?: string;
@@ -73,6 +73,11 @@ export interface HookDeps {
 	 */
 	modelResolution?: ModelResolution;
 	stateDir: string;
+	/**
+	 * The session's armed /ultrathink-skip as the caller read it, before any engine wait (the Claude/Grok/Muse hook and
+	 * planPrompt both do). Absent, the hook reads it at its own start. Either way, a prompt skipped by it clears the flag.
+	 */
+	armedSkip?: boolean;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
 	/** First error the completer threw (already redacted), surfaced in the summary. */
 	engineError?: () => string | undefined;
@@ -139,6 +144,19 @@ function specFile(stateDir: string, sessionId: string): string {
 }
 
 /**
+ * A replan keeps the session's edited repos and recalculates its mismatch against the new plan's label, so a session that
+ * already edited another repo neither forgets it nor repeats its warning (see recordEditAttribution in host/omp.ts).
+ */
+function carryRepoAttribution(prior: SessionRecord | undefined, record: SessionRecord): SessionRecord {
+	const workRepos = prior?.workRepos;
+	if (workRepos === undefined) return record;
+	if (!record.plan) return { ...record, workRepos };
+	const labelled = record.plan.task.repo ?? null;
+	if (workRepos.every((repo) => repo === labelled)) return { ...record, workRepos };
+	return { ...record, workRepos, repoMismatch: { labelled, edited: workRepos } };
+}
+
+/**
  * Saves a fresh plan record and its spec XML under the session's file lock, the
  * same lock `updateSession` (the answers/ship/mark updates) holds, so a locked
  * update can neither be overwritten by nor overwrite this save with stale
@@ -162,10 +180,11 @@ export function savePlanRecord(
 		statePath,
 		() => {
 			const base = record.clarifications ?? [];
-			const late = (readSession(stateDir, sessionId)?.clarifications ?? []).filter(
+			const prior = readSession(stateDir, sessionId);
+			const late = (prior?.clarifications ?? []).filter(
 				(c) => c.answer && c.source !== "knowledge",
 			);
-			let merged = record;
+			let merged = carryRepoAttribution(prior, record);
 			if (late.length > 0) {
 				const byQuestion = new Map<string, Clarification>(late.map((c) => [normalizeQuestion(c.question), c]));
 				const seen = new Set(base.map((c) => normalizeQuestion(c.question)));
@@ -175,7 +194,7 @@ export function savePlanRecord(
 				}
 				if (clarifications.some((c, index) => c !== base[index])) {
 					merged = {
-						...record,
+						...merged,
 						clarifications,
 						result: { ...record.result, xml: injectClarificationsXml(record.result.xml, clarifications) },
 					};
@@ -439,17 +458,21 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	const started = now();
 	const log = deps.log ?? (() => {});
 	const cwd = input.cwd?.trim() || process.cwd();
-	const sessionId = input.session_id?.trim() || "unknown";
+	const sessionId = hostSessionId(input.session_id) ?? newTurnSessionId();
 
+	// The armed skip belongs to this session alone; the global control file never carries one. A caller that read it before
+	// an engine wait passes that value, so a skip armed during the wait waits for this session's next prompt. The prompt
+	// that consumes the flag clears it here.
+	const skipArmed = deps.armedSkip ?? readSkipOnce(deps.stateDir, sessionId);
 	const state: UpliftState = {
 		enabled: deps.control.enabled ?? deps.config.uplift.enabled,
-		skipOnce: deps.control.skipOnce === true,
+		skipOnce: skipArmed,
 		skipTrivial: deps.config.uplift.skipTrivial,
 	};
 	const decision = decideUplift({ text: input.prompt ?? "", source: "user", idle: true }, state);
-	if (deps.control.skipOnce && !state.skipOnce) {
+	if (skipArmed && !state.skipOnce) {
 		try {
-			writeControl(deps.stateDir, { skipOnce: false });
+			clearSkipOnce(deps.stateDir, sessionId);
 		} catch {
 			// fail-open
 		}
@@ -464,7 +487,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	// looks exactly like a deterministic one: no event, engine, brief, knowledge or tracker call, and no state write.
 	const decisions = createDecisions({
 		config: deps.config.decisions,
-		...(sessionId === "unknown" ? {} : { sessionId }),
+		...(isTurnSessionId(sessionId) ? {} : { sessionId }),
 		...deps.decisionsDeps,
 	});
 	// Keep cancellation separate from the hook's partial-result budget, whose timer starts after the gate as before.
@@ -939,9 +962,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			},
 		};
 		// One event, after every fallible step, for a plan that exists and whose record is on disk, in a session the
-		// substrate can chain on: a skip, a fallback spec, a failed state write or an unknown session leaves nothing behind.
+		// substrate can chain on: a skip, a fallback spec, a failed state write or a turn with no session id leaves nothing behind.
 		// Bounded by the planning budget, and ahead of the summary so the elapsed time it shows includes the attempt.
-		if (plan?.graphId && statePath && sessionId !== "unknown") {
+		if (plan?.graphId && statePath && !isTurnSessionId(sessionId)) {
 			await announcePlan(deps, {
 				plan,
 				sessionId,
