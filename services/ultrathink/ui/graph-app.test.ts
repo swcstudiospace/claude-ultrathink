@@ -64,7 +64,7 @@ function runIngest(state: Partial<IngestState>, result: unknown): { S: IngestSta
 	expect(delaySource).not.toBe("");
 	const S: IngestState = { status: "idle", sessionId: "", pollAfter: 0, canTools: true, gaveUp: false, startedAt: 0, note: "", ...state };
 	const calls: IngestCalls = { ensure: [], gaveUp: [] };
-	// nosemgrep: no-dynamic-code -- test-only: runs the app's own static ingest script extracted from the served HTML; no external input.
+	// nosemgrep: no-dynamic-code, semgrep.rules.no-dynamic-code -- test-only: runs the app's own static ingest script extracted from the served HTML; no external input.
 	new Function(
 		"S",
 		"calls",
@@ -138,7 +138,7 @@ describe("graph app document", () => {
 		const lineSource = /function oneLine\(s, max\) \{[\s\S]*?\n\s*\}/.exec(script)?.[0];
 		expect(cutSource).toBeDefined();
 		expect(lineSource).toBeDefined();
-		// nosemgrep: no-dynamic-code -- test-only: runs the app's own static cut/oneLine helpers extracted from the served HTML; no external input.
+		// nosemgrep: no-dynamic-code, semgrep.rules.no-dynamic-code -- test-only: runs the app's own static cut/oneLine helpers extracted from the served HTML; no external input.
 		const oneLine = new Function(`${cutSource}\n${lineSource}\nreturn oneLine;`)() as (s: string, max: number) => string;
 		// Max 120 with the ellipsis: the emoji occupies units 118 and 119 and must go whole.
 		expect(oneLine(`${"a".repeat(118)}😀tail`, 120)).toBe(`${"a".repeat(118)}…`);
@@ -222,7 +222,7 @@ describe("graph app document", () => {
 		const source = /function defaultsText\(\) \{[\s\S]*?\n\t\}/.exec(script)?.[0] ?? "";
 		expect(source).not.toBe("");
 		const defaultsText = (sessionId: string): string =>
-			// nosemgrep: no-dynamic-code -- test-only: runs the app's own static defaultsText helper extracted from the served HTML; no external input.
+			// nosemgrep: no-dynamic-code, semgrep.rules.no-dynamic-code -- test-only: runs the app's own static defaultsText helper extracted from the served HTML; no external input.
 			new Function("S", "DEFAULTS_TEXT", `${source}\nreturn defaultsText();`)({ sessionId }, "Use the defaults for all clarifying questions and go ahead.") as string;
 		expect(defaultsText("0b9d1c7e-5a2f-4c1d-8e3a-6f7a9b0c1d2e")).toBe(
 			"Use the defaults for all clarifying questions of plan 0b9d1c7e-5a2f-4c1d-8e3a-6f7a9b0c1d2e and go ahead.",
