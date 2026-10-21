@@ -4,7 +4,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
 import { METRIC_FAMILIES } from "./metric-families.ts";
 import { createAnomalyDetector } from "./signal-anomaly.ts";
 
@@ -80,11 +79,8 @@ describe("observability deploy contract", () => {
 	test("a sustained runtime jump stays active long enough for UltrathinkAnomalyActive to fire", () => {
 		// The runtime sampler feeds each detector every 5 s (RUNTIME_SAMPLE_MS in routes/router.ts).
 		const SAMPLE_SECONDS = 5;
-		const rules = parseYaml(readFileSync(fileURLToPath(new URL("deploy/observability/rules.yml", REPO_ROOT)), "utf8")) as {
-			groups: Array<{ rules: Array<{ alert?: string; for?: string }> }>;
-		};
-		const alert = rules.groups.flatMap((group) => group.rules).find((rule) => rule.alert === "UltrathinkAnomalyActive");
-		const waitSeconds = durationSeconds(alert?.for);
+		const rulesText = readFileSync(fileURLToPath(new URL("deploy/observability/rules.yml", REPO_ROOT)), "utf8");
+		const waitSeconds = durationSeconds(alertFor(rulesText, "UltrathinkAnomalyActive"));
 
 		const detector = createAnomalyDetector();
 		for (let sample = 0; sample < 40; sample += 1) detector.observe(1);
@@ -108,4 +104,20 @@ function durationSeconds(duration: string | undefined): number {
 	if (match === null) throw new Error(`unsupported duration ${duration ?? "(absent)"}`);
 	const unit = { s: 1, m: 60, h: 3600 }[match[2] as "s" | "m" | "h"];
 	return Number(match[1]) * unit;
+}
+
+// The alert's for value, read from the rules text without a YAML package: the VPS release tree installs none.
+function alertFor(text: string, name: string): string | undefined {
+	const lines = text.split("\n");
+	const start = lines.findIndex((line) => line.trim() === `- alert: ${name}`);
+	if (start < 0) return undefined;
+	const indent = lines[start]?.search(/\S/) ?? 0;
+	for (const line of lines.slice(start + 1)) {
+		if (line.trim() === "") continue;
+		const lead = line.search(/\S/);
+		if (lead <= indent) break;
+		const match = /^for:\s*(\S+)\s*$/.exec(line.trim());
+		if (match !== null && lead === indent + 2) return match[1];
+	}
+	return undefined;
 }
