@@ -22,6 +22,7 @@ import type { PlanningInfo } from "../mcp/tools-connector.ts";
 import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "../mcp/transport.ts";
 import { type AnomalyAlert, DEFAULT_ANOMALY_RULES, createAnomalyDetector } from "../obs/anomaly.ts";
 import { type Fingerprint, createAuditWatch } from "../obs/audit-watch.ts";
+import { createAuditVerifier } from "../obs/audit-verify.ts";
 import { type AuditEvent, type AuditLog, auditPath, createAuditLog } from "../obs/audit.ts";
 import { currentRequestContext, runWithRequestContext } from "../obs/context.ts";
 import { type Admission, createFairShare } from "../obs/fair-share.ts";
@@ -419,6 +420,28 @@ function transportsFromConfig(config: UltrathinkConfig): SinkTransport[] {
 		transports.push(createSyslogTransport({ host: config.auditSyslog.host, port: config.auditSyslog.port, hostname: hostname(), appName: "ultrathink" }));
 	}
 	return transports;
+}
+
+/** Resolves when `wait` settles or after `ms`, whichever is first; never rejects, and `onFailure` sees a rejection. */
+function waitUpTo(wait: Promise<void>, ms: number, onFailure: (error: unknown) => void): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		wait.then(
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			(error: unknown) => {
+				clearTimeout(timer);
+				onFailure(error);
+				resolve();
+			},
+		);
+	});
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /** The audit file's identity on disk, read the way the log reads it, so the watch sees a change made outside the service. */
@@ -1308,6 +1331,8 @@ export function createApp(deps: RouterDeps): App {
 	let stopSweeper: (() => void) | undefined;
 	let stopCheckpoint: (() => void) | undefined;
 	let stopWatch: (() => void) | undefined;
+	let watchIdle: (() => Promise<void>) | undefined;
+	let closeVerifier: (() => void) | undefined;
 	let stopPrune: (() => void) | undefined;
 	let stopHistorySave: (() => void) | undefined;
 	let lifecycleStarted = false;
@@ -1348,18 +1373,24 @@ export function createApp(deps: RouterDeps): App {
 		}).start();
 		const log = auditLog;
 		if (log !== undefined) {
-			stopWatch = createAuditWatch({
+			// The full chain scan runs in a worker thread, so retained history never holds the request path.
+			const verifier = createAuditVerifier();
+			const watch = createAuditWatch({
 				intervalMs: config.auditWatchMs,
 				stat: () => diskFingerprint(log.path),
 				acknowledged: () => {
 					const head = log.head();
 					return { fingerprint: log.fingerprint(), seq: head.seq, hash: head.hash };
 				},
-				scan: () => log.verify(),
+				scan: (observed) => verifier.verify({ path: log.path, activeBytes: observed.size, activeIno: observed.ino }),
 				onAlert: (alert) => raiseTamper(alert.reason),
 				onRecover: () => logger.info("audit_tamper_cleared", {}),
+				onError: (error) => logger.error("audit_watch_failed", { error: errorMessage(error) }),
 				...timerSeams,
-			}).start();
+			});
+			stopWatch = watch.start();
+			watchIdle = () => watch.idle();
+			closeVerifier = () => verifier.close();
 			if (config.auditRetentionDays > 0) {
 				const now = deps.now ?? Date.now;
 				stopPrune = createSweeper({
@@ -1389,6 +1420,11 @@ export function createApp(deps: RouterDeps): App {
 			stopSweeper?.();
 			stopCheckpoint?.();
 			stopWatch?.();
+			// Waits at most the flush window for a scan in flight. A verdict that lands in that window is judged and its alert is
+			// queued before the sinks flush. A scan still running after it is abandoned unjudged; the next start checks the chain
+			// again and reports a broken file through a moved_to notice.
+			await waitUpTo(watchIdle?.() ?? Promise.resolve(), AUDIT_FLUSH_MS, (error) => logger.error("audit_watch_wait_failed", { error: errorMessage(error) }));
+			closeVerifier?.();
 			stopPrune?.();
 			stopHistorySave?.();
 			saveHistory(history, historyPath, logger);

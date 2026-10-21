@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { describe, expect, test } from "bun:test";
-import { type Acknowledged, type AuditWatch, createAuditWatch, type Fingerprint, type ScanOutcome, type WatchAlert } from "./audit-watch.ts";
+import { type Acknowledged, type AuditWatch, createAuditWatch, type Fingerprint, type ScanReply, type WatchAlert } from "./audit-watch.ts";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +24,7 @@ function harness(options: { intervalMs?: number; fullScanEveryTicks?: number } =
 	const world: {
 		disk: Fingerprint | undefined;
 		ack: Acknowledged;
-		outcome: ScanOutcome;
+		outcome: ScanReply;
 		scans: number;
 	} = {
 		disk: fp(100, 1_000),
@@ -41,7 +41,7 @@ function harness(options: { intervalMs?: number; fullScanEveryTicks?: number } =
 		fullScanEveryTicks: options.fullScanEveryTicks,
 		stat: () => world.disk,
 		acknowledged: () => world.ack,
-		scan: () => {
+		scan: async () => {
 			world.scans += 1;
 			return world.outcome;
 		},
@@ -64,30 +64,30 @@ function harness(options: { intervalMs?: number; fullScanEveryTicks?: number } =
 		alerts,
 		timers,
 		recovers: () => recovers,
-		tickMany: (count: number) => {
-			for (let i = 0; i < count; i += 1) watch.tick();
+		tickMany: async (count: number) => {
+			for (let i = 0; i < count; i += 1) await watch.tick();
 		},
 	};
 }
 
 describe("own writes", () => {
-	test("after a stat match with the acknowledged fingerprint, ten ticks do no scan and no alert", () => {
+	test("after a stat match with the acknowledged fingerprint, ten ticks do no scan and no alert", async () => {
 		const h = harness();
-		h.tickMany(10);
+		await h.tickMany(10);
 		expect(h.world.scans).toBe(0);
 		expect(h.alerts).toEqual([]);
 	});
 });
 
 describe("external edits", () => {
-	test("a changed file whose chain is broken alerts chain_broken on the first tick after the change", () => {
+	test("a changed file whose chain is broken alerts chain_broken on the first tick after the change", async () => {
 		const h = harness();
-		h.tickMany(3);
+		await h.tickMany(3);
 		expect(h.alerts).toEqual([]);
 
 		h.world.disk = fp(120, 2_000);
 		h.world.outcome = { ok: false, records: 3, brokenAt: 4, reason: "hash mismatch" };
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.world.scans).toBe(1);
 		expect(h.alerts).toHaveLength(1);
@@ -95,77 +95,77 @@ describe("external edits", () => {
 		expect(h.alerts[0]?.reason).toContain("record 4");
 	});
 
-	test("tail truncation with an intact prefix alerts head_mismatch", () => {
+	test("tail truncation with an intact prefix alerts head_mismatch", async () => {
 		const h = harness();
 		h.world.disk = fp(60, 2_000);
 		h.world.outcome = { ok: true, records: 3, lastHash: OTHER_HASH };
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.alerts).toHaveLength(1);
 		expect(h.alerts[0]?.kind).toBe("head_mismatch");
 		expect(h.alerts[0]?.reason).toContain("record 5");
 	});
 
-	test("a clean chain whose last hash differs from the acknowledged hash alerts head_mismatch", () => {
+	test("a clean chain whose last hash differs from the acknowledged hash alerts head_mismatch", async () => {
 		const h = harness();
 		h.world.disk = fp(100, 2_000);
 		h.world.outcome = { ok: true, records: 5, lastHash: OTHER_HASH };
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.alerts.map((alert) => alert.kind)).toEqual(["head_mismatch"]);
 	});
 
-	test("a removed file while the acknowledged seq is above zero alerts head_mismatch", () => {
+	test("a removed file while the acknowledged seq is above zero alerts head_mismatch", async () => {
 		const h = harness();
 		h.world.disk = undefined;
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.alerts).toHaveLength(1);
 		expect(h.alerts[0]?.kind).toBe("head_mismatch");
 	});
 
-	test("a missing file with an empty acknowledged head is not an alert", () => {
+	test("a missing file with an empty acknowledged head is not an alert", async () => {
 		const h = harness();
 		h.world.disk = undefined;
 		h.world.ack = { fingerprint: undefined, seq: 0, hash: GENESIS };
 		h.world.outcome = { ok: true, records: 0, lastHash: GENESIS };
-		h.tickMany(3);
+		await h.tickMany(3);
 
 		expect(h.alerts).toEqual([]);
 		expect(h.recovers()).toBe(0);
 	});
 
-	test("a touched file whose chain and head still match gives no alert", () => {
+	test("a touched file whose chain and head still match gives no alert", async () => {
 		const h = harness();
 		h.world.disk = fp(100, 9_999);
 		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.world.scans).toBe(1);
 		expect(h.alerts).toEqual([]);
 	});
 
-	test("an in-place edit that keeps size and mtime is not caught on ticks 1 to 59 and is caught on tick 60", () => {
+	test("an in-place edit that keeps size and mtime is not caught on ticks 1 to 59 and is caught on tick 60", async () => {
 		const h = harness();
 		// The file was edited in place: its stat still equals the acknowledged fingerprint.
 		h.world.outcome = { ok: false, records: 2, brokenAt: 3, reason: "hash mismatch" };
 
-		h.tickMany(59);
+		await h.tickMany(59);
 		expect(h.world.scans).toBe(0);
 		expect(h.alerts).toEqual([]);
 
-		h.watch.tick();
+		await h.watch.tick();
 		expect(h.world.scans).toBe(1);
 		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
 	});
 });
 
 describe("alert lifecycle", () => {
-	test("a persisting condition alerts once, and onRecover fires after it clears", () => {
+	test("a persisting condition alerts once, and onRecover fires after it clears", async () => {
 		const h = harness();
 		h.world.disk = fp(120, 2_000);
 		h.world.outcome = { ok: false, records: 3, brokenAt: 4, reason: "hash mismatch" };
-		h.tickMany(5);
+		await h.tickMany(5);
 
 		expect(h.alerts).toHaveLength(1);
 		expect(h.world.scans).toBe(1);
@@ -174,62 +174,234 @@ describe("alert lifecycle", () => {
 		// The file is restored to the log's own fingerprint and head. Ticks that are not full scans do not clear the alert.
 		h.world.disk = fp(100, 1_000);
 		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
-		h.tickMany(54);
+		await h.tickMany(54);
 		expect(h.recovers()).toBe(0);
 		expect(h.alerts).toHaveLength(1);
 
 		// The next full scan (tick 60) finds the chain healthy and clears the alert.
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.recovers()).toBe(1);
 		expect(h.alerts).toHaveLength(1);
 	});
 
-	test("a condition that changes again while still broken re-scans without a second alert for the same reason", () => {
+	test("a condition that changes again while still broken re-scans without a second alert for the same reason", async () => {
 		const h = harness();
 		h.world.disk = fp(120, 2_000);
 		h.world.outcome = { ok: false, records: 3, brokenAt: 4, reason: "hash mismatch" };
-		h.watch.tick();
+		await h.watch.tick();
 
 		h.world.disk = fp(121, 3_000);
-		h.watch.tick();
+		await h.watch.tick();
 
 		expect(h.world.scans).toBe(2);
 		expect(h.alerts).toHaveLength(1);
 	});
 
-	test("onRecover does not fire when nothing was alerting", () => {
+	test("onRecover does not fire when nothing was alerting", async () => {
 		const h = harness();
 		h.world.disk = fp(120, 2_000);
 		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
-		h.tickMany(3);
+		await h.tickMany(3);
 
 		expect(h.alerts).toEqual([]);
 		expect(h.recovers()).toBe(0);
 	});
 
-	test("a broken scan under an unchanged fingerprint keeps the alert across non-full ticks", () => {
+	test("a broken scan under an unchanged fingerprint keeps the alert across non-full ticks", async () => {
 		const h = harness();
 		h.world.outcome = { ok: false, records: 2, brokenAt: 3, reason: "hash mismatch" };
-		h.tickMany(60);
+		await h.tickMany(60);
 		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
 
 		// The file still matches the acknowledged fingerprint. Ticks that are not full scans must not retract the alert.
-		h.tickMany(59);
+		await h.tickMany(59);
 		expect(h.world.scans).toBe(1);
 		expect(h.recovers()).toBe(0);
 		expect(h.alerts).toHaveLength(1);
 
 		// Only a full scan that comes back healthy clears it.
 		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
-		h.tickMany(60);
+		await h.tickMany(60);
 		expect(h.recovers()).toBe(1);
+	});
+});
+
+describe("off the request path", () => {
+	/** A watch whose scan waits for the test to release it, so the scan is visibly in flight. */
+	function deferredWatch(alerts: WatchAlert[]) {
+		let scans = 0;
+		let release: ((reply: ScanReply) => void) | undefined;
+		const watch = createAuditWatch({
+			intervalMs: 1000,
+			stat: () => fp(120, 2_000),
+			acknowledged: () => ({ fingerprint: fp(100, 1_000), seq: 5, hash: HEAD_HASH }),
+			scan: () => {
+				scans += 1;
+				return new Promise<ScanReply>((resolve) => {
+					release = resolve;
+				});
+			},
+			onAlert: (alert) => alerts.push(alert),
+		});
+		return { watch, scans: () => scans, release: (reply: ScanReply) => release?.(reply) };
+	}
+
+	test("a tick returns before its scan settles, and raises nothing until the verdict lands", async () => {
+		const alerts: WatchAlert[] = [];
+		const d = deferredWatch(alerts);
+		const pending = d.watch.tick();
+		expect(d.scans()).toBe(1);
+		expect(alerts).toEqual([]);
+
+		d.release({ ok: false, records: 2, brokenAt: 3, reason: "hash mismatch" });
+		await pending;
+		expect(alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
+	});
+
+	test("while a scan is in flight, further ticks start no second scan", async () => {
+		const alerts: WatchAlert[] = [];
+		const d = deferredWatch(alerts);
+		const first = d.watch.tick();
+		const second = d.watch.tick();
+		const third = d.watch.tick();
+		expect(d.scans()).toBe(1);
+
+		d.release({ ok: true, records: 5, lastHash: HEAD_HASH });
+		await Promise.all([first, second, third]);
+		expect(alerts).toEqual([]);
+	});
+
+	test("a raced verdict decides nothing, and the next tick scans again", async () => {
+		const h = harness();
+		h.world.disk = fp(120, 2_000);
+		h.world.outcome = "raced";
+		await h.watch.tick();
+		expect(h.world.scans).toBe(1);
+		expect(h.alerts).toEqual([]);
+
+		h.world.outcome = { ok: false, records: 3, brokenAt: 4, reason: "hash mismatch" };
+		await h.watch.tick();
+		expect(h.world.scans).toBe(2);
+		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
+	});
+
+	test("a verdict from a scan that began before the file went missing does not clear the newer alert", async () => {
+		const alerts: WatchAlert[] = [];
+		let disk: Fingerprint | undefined = fp(120, 2_000);
+		const slot: { release?: (reply: ScanReply) => void } = {};
+		const watch = createAuditWatch({
+			intervalMs: 1000,
+			stat: () => disk,
+			acknowledged: () => ({ fingerprint: fp(100, 1_000), seq: 5, hash: HEAD_HASH }),
+			scan: () =>
+				new Promise<ScanReply>((resolve) => {
+					slot.release = resolve;
+				}),
+			onAlert: (alert) => alerts.push(alert),
+			onRecover: () => alerts.push({ kind: "head_mismatch", reason: "recovered" }),
+		});
+
+		const pending = watch.tick();
+		disk = undefined;
+		void watch.tick();
+		expect(alerts.map((alert) => alert.kind)).toEqual(["head_mismatch"]);
+
+		// The scan that started before the removal reports a healthy chain; it must not clear the missing-file alert.
+		slot.release?.({ ok: true, records: 5, lastHash: HEAD_HASH });
+		await pending;
+		expect(alerts.map((alert) => alert.kind)).toEqual(["head_mismatch"]);
+	});
+
+	test("a scan that rejects alerts once with the failure, and the next tick scans again", async () => {
+		const alerts: WatchAlert[] = [];
+		let scans = 0;
+		const watch = createAuditWatch({
+			intervalMs: 1000,
+			stat: () => fp(120, 2_000),
+			acknowledged: () => ({ fingerprint: fp(100, 1_000), seq: 5, hash: HEAD_HASH }),
+			scan: async () => {
+				scans += 1;
+				throw new Error("worker crashed");
+			},
+			onAlert: (alert) => alerts.push(alert),
+		});
+		await watch.tick();
+		await watch.tick();
+
+		expect(scans).toBe(2);
+		expect(alerts).toEqual([{ kind: "chain_broken", reason: "verifier failed: worker crashed" }]);
+	});
+
+	test("idle resolves once no scan is in flight", async () => {
+		const alerts: WatchAlert[] = [];
+		const d = deferredWatch(alerts);
+		void d.watch.tick();
+		let settled = false;
+		const waiting = d.watch.idle().then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		d.release({ ok: true, records: 5, lastHash: HEAD_HASH });
+		await waiting;
+		expect(settled).toBe(true);
+	});
+
+	test("an onAlert that throws is reported through onError, and idle still resolves", async () => {
+		const errors: unknown[] = [];
+		const watch = createAuditWatch({
+			intervalMs: 1000,
+			stat: () => fp(120, 2_000),
+			acknowledged: () => ({ fingerprint: fp(100, 1_000), seq: 5, hash: HEAD_HASH }),
+			scan: async () => ({ ok: false, records: 2, brokenAt: 3, reason: "hash mismatch" }),
+			onAlert: () => {
+				throw new Error("sink down");
+			},
+			onError: (error) => errors.push(error),
+		});
+		await watch.tick();
+		await watch.idle();
+
+		expect(errors).toEqual([expect.objectContaining({ message: "sink down" })]);
+	});
+
+	test("a full scan due while another runs is owed to the next tick, which runs it though the fingerprint matches", async () => {
+		const alerts: WatchAlert[] = [];
+		const resolvers: Array<(reply: ScanReply) => void> = [];
+		let scans = 0;
+		let disk = fp(120, 2_000);
+		const watch = createAuditWatch({
+			intervalMs: 1000,
+			fullScanEveryTicks: 2,
+			stat: () => disk,
+			acknowledged: () => ({ fingerprint: fp(100, 1_000), seq: 5, hash: HEAD_HASH }),
+			scan: () => {
+				scans += 1;
+				return new Promise<ScanReply>((resolve) => resolvers.push(resolve));
+			},
+			onAlert: (alert) => alerts.push(alert),
+		});
+		// Tick 1 starts a scan of the changed file and leaves it in flight. Tick 2 is a full-scan tick that falls due meanwhile.
+		const first = watch.tick();
+		const second = watch.tick();
+		expect(scans).toBe(1);
+		// The file is back to the log's own identity, so only the owed full scan can scan it on tick 3.
+		disk = fp(100, 1_000);
+		resolvers.shift()?.({ ok: true, records: 5, lastHash: HEAD_HASH });
+		await Promise.all([first, second]);
+		const third = watch.tick();
+		expect(scans).toBe(2);
+		resolvers.shift()?.({ ok: true, records: 5, lastHash: HEAD_HASH });
+		await third;
+		expect(alerts).toEqual([]);
 	});
 });
 
 describe("timer and interval", () => {
 	test("intervalMs 99 and 1001 throw RangeError; the 100 and 1000 bounds are accepted", () => {
-		const base = { stat: () => undefined, acknowledged: () => ({ fingerprint: undefined, seq: 0, hash: GENESIS }), scan: () => ({ ok: true as const, records: 0, lastHash: GENESIS }), onAlert: () => {} };
+		const base = { stat: () => undefined, acknowledged: () => ({ fingerprint: undefined, seq: 0, hash: GENESIS }), scan: async () => ({ ok: true as const, records: 0, lastHash: GENESIS }), onAlert: () => {} };
 		expect(() => createAuditWatch({ ...base, intervalMs: 99 })).toThrow(RangeError);
 		expect(() => createAuditWatch({ ...base, intervalMs: 1001 })).toThrow(RangeError);
 		expect(() => createAuditWatch({ ...base, intervalMs: 100 })).not.toThrow();
@@ -252,7 +424,7 @@ describe("timer and interval", () => {
 			intervalMs: 500,
 			stat: () => undefined,
 			acknowledged: () => ({ fingerprint: undefined, seq: 0, hash: GENESIS }),
-			scan: () => ({ ok: true, records: 0, lastHash: GENESIS }),
+			scan: async () => ({ ok: true, records: 0, lastHash: GENESIS }),
 			onAlert: () => {},
 			setTimer: () => {
 				scheduled += 1;
@@ -266,12 +438,13 @@ describe("timer and interval", () => {
 		expect(scheduled).toBe(1);
 	});
 
-	test("the scheduled callback runs the same tick as a manual call", () => {
+	test("the scheduled callback runs the same tick as a manual call", async () => {
 		const h = harness();
 		h.watch.start();
 		h.world.disk = fp(120, 2_000);
 		h.world.outcome = { ok: false, records: 3, brokenAt: 4, reason: "hash mismatch" };
 		h.timers.scheduled?.();
+		await h.watch.idle();
 
 		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
 	});
@@ -299,7 +472,7 @@ describe("pruned chain", () => {
 		}
 	}
 
-	test("a full scan of a pruned chain raises no tamper alert, and dropping its boundary record alerts", () => {
+	test("a full scan of a pruned chain raises no tamper alert, and dropping its boundary record alerts", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ultrathink-watch-"));
 		try {
 			const path = auditPath(dir);
@@ -317,16 +490,16 @@ describe("pruned chain", () => {
 					const head = log.head();
 					return { fingerprint: log.fingerprint(), seq: head.seq, hash: head.hash };
 				},
-				scan: () => log.verify(),
+				scan: async () => log.verify(),
 				onAlert: (alert) => alerts.push(alert),
 			});
-			watch.tick();
+			await watch.tick();
 			expect(alerts).toEqual([]);
 
 			// Drop the boundary record at the end of the file: the pruned chain no longer verifies, so the full scan alerts.
 			const kept = readFileSync(path, "utf8").split("\n").filter((l) => l.length > 0).slice(0, -1);
 			writeFileSync(path, kept.map((l) => `${l}\n`).join(""));
-			watch.tick();
+			await watch.tick();
 			expect(alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
 			log.close();
 		} finally {
