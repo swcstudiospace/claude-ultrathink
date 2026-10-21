@@ -251,6 +251,20 @@ describe("Cursor swarm handoff", () => {
 		expect(cursorSkill).toContain("Stop before its final prompt and its \"Proceed as normal\" section");
 	});
 
+	test("the Cursor handoff persists the user's answers into the spec before spawning a01", () => {
+		const handoff = cursorSkill.slice(cursorSkill.indexOf("## Hand the unit to the orchestrator"));
+		const persist = handoff.indexOf("2. Persist the answers before spawning.");
+		expect(persist).toBeGreaterThan(-1);
+		expect(persist).toBeLessThan(handoff.indexOf("3. Spawn the Task subagent `a01-orchestrator` once."));
+		expect(handoff).toContain('<ANSWER source="user">');
+	});
+
+	test("kickoff writes the user's answers into the spec's CLARIFICATION entries, not only the final prompt", () => {
+		const section4 = kickoff.slice(kickoff.indexOf("## 4. "), kickoff.indexOf("## 5. "));
+		expect(section4).toContain('<ANSWER source="user">');
+		expect(section4).not.toContain("into the final prompt as a short");
+	});
+
 	test("kickoff does only steps 1 and 4 of section 5 on a Cursor handoff, and section 6 is skipped", () => {
 		const section5 = kickoff.slice(kickoff.indexOf("## 5. "), kickoff.indexOf("## 6. "));
 		expect(section5).toContain("When the plan carries the Cursor swarm note (`## Cursor swarm`), do steps 1 and 4 only, then stop.");
