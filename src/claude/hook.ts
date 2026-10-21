@@ -24,6 +24,7 @@ import type { Tracker } from "../track/gateway.ts";
 import { injectTrackingXml } from "../track/render.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
+import { type ActivityNotice, toActivityNotice } from "../host/activity-notice.ts";
 import type { ProgressEvent, ProgressSink, StageName } from "../host/progress.ts";
 import type { UpliftResult, UpliftState } from "../types.ts";
 import { docsLookup, formatDocsSection, groundDocs } from "../ragflow/ground.ts";
@@ -423,6 +424,16 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			// fail-open: progress is display only
 		}
 	};
+	const emitActivity = (notice: ActivityNotice): void => {
+		if (!deps.progress) return;
+		try {
+			const clean = toActivityNotice(notice);
+			if (!clean) return;
+			deps.progress({ type: "activity", at: now(), notice: clean });
+		} catch {
+			// fail-open: a card never blocks planning
+		}
+	};
 	const stage = (name: StageName, phase: "start" | "end", ok?: boolean, detail?: string): void =>
 		emit({ type: "stage", at: now(), stage: name, phase, ...(ok === undefined ? {} : { ok }), ...(detail ? { detail } : {}) });
 	const started = now();
@@ -597,6 +608,22 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		throwIfCancelled(cancellation);
 		if (brief) log(`substrate brief: ${brief.split("\n").length} lines`);
 		stage("brief", "end", true, brief ? `${brief.split("\n").length} lines` : "none");
+		try {
+			if (brief) {
+				const lines = brief.split("\n").length;
+				emitActivity({
+					v: 1,
+					kind: "resource",
+					title: "Substrate brief",
+					source: "substrate",
+					outcome: "used",
+					count: lines,
+					detail: `${lines} lines`,
+				});
+			}
+		} catch {
+			// fail-open
+		}
 
 		// Settled before anything is formatted so the record says what happened; all are bounded and never reject.
 		const [recalled, grounded, skilled] = await Promise.all([recallPromise, groundPromise, skillsPromise]);
@@ -612,6 +639,22 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				lessons = { outcome: "error", count: 0, ids: [], chars: 0, ms: recalled.ms, source: "none", reason: "format" };
 			}
 			log(`lessons: ${lessons.outcome} · ${lessons.count} · ${lessons.source} · ${lessons.ms}ms${lessons.reason ? ` · ${lessons.reason}` : ""}`);
+			if (lessons.outcome !== "off") {
+				try {
+					const source = lessons.source === "hindsight" || lessons.source === "local" ? lessons.source : undefined;
+					emitActivity({
+						v: 1,
+						kind: "teachable-recalled",
+						title: "Lesson recalled",
+						...(source ? { source } : {}),
+						outcome: lessons.outcome,
+						count: lessons.count,
+						names: recalled.lessons.map((lesson) => lesson.name),
+					});
+				} catch {
+					// fail-open
+				}
+			}
 		}
 		let docs: DocsLookup | undefined;
 		let docsText = "";
@@ -624,6 +667,21 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				docs = { status: "error", count: 0, chars: 0, ms: grounded.ms, datasets: grounded.datasets, reason: "format" };
 			}
 			log(`docs (RAGFlow): ${docs.status} · ${docs.count} excerpts · ${docs.datasets} datasets · ${docs.ms}ms${docs.reason ? ` · ${docs.reason}` : ""}`);
+			if (docs.status !== "off") {
+				try {
+					emitActivity({
+						v: 1,
+						kind: "resource",
+						title: "RAGFlow",
+						source: "ragflow",
+						outcome: docs.status,
+						count: docs.count,
+						detail: docs.status === "error" ? (docs.reason ?? "error") : `${docs.count} excerpts`,
+					});
+				} catch {
+					// fail-open
+				}
+			}
 		}
 		let skills: SkillsLookup | undefined;
 		let skillsText = "";
@@ -636,6 +694,20 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				skills = { outcome: "error", count: 0, names: [], chars: 0, ms: skilled.ms, reason: "format" };
 			}
 			log(`skills: ${skills.outcome} · ${skills.count} · ${skills.ms}ms${skills.reason ? ` · ${skills.reason}` : ""}`);
+			if (skills.outcome !== "off") {
+				try {
+					emitActivity({
+						v: 1,
+						kind: "skill-recalled",
+						title: "Skill recalled",
+						outcome: skills.outcome,
+						count: skills.count,
+						names: skilled.skills.map((skill) => skill.name),
+					});
+				} catch {
+					// fail-open
+				}
+			}
 		}
 
 		let graph: ThoughtGraph | undefined;
@@ -687,6 +759,20 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 			stage("knowledge", "end", lookup.outcome !== "error", lookup.outcome === "used" ? `${lookup.docs.length} docs` : lookup.outcome);
 			knowledge = { ...lookup, settled: 0 };
 			if (lookup.outcome === "used") knowledgeInput = { digest: read.digest, docs: lookup.docs };
+			if (lookup.outcome !== "off") {
+				try {
+					emitActivity({
+						v: 1,
+						kind: "resource",
+						title: "Knowledge",
+						source: "greptile",
+						outcome: lookup.outcome,
+						count: lookup.docs.length,
+					});
+				} catch {
+					// fail-open
+				}
+			}
 		}
 		if (hitlOn && !lifetime.aborted) {
 			stage("clarify", "start");

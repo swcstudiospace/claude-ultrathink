@@ -244,8 +244,10 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 				for (const content of saved) expect(content).not.toContain("SHUNT_VALID_SPEC_1");
 				current.delivery.resolve();
 				await flush();
-				expect(fixture.sent).toHaveLength(1);
-				expect(fixture.sent).toMatchObject([{ message: { customType: "ultrathink-plan", content: response.context }, options: { deliverAs: "aside" } }]);
+				// The valid run's RAGFlow activity card precedes its plan; any stale UI would add a third message.
+				expect(fixture.sent).toHaveLength(2);
+				expect(fixture.sent[0]).toMatchObject({ message: { customType: "ultrathink-activity" } });
+				expect(fixture.sent[1]).toMatchObject({ message: { customType: "ultrathink-plan", content: response.context }, options: { deliverAs: "aside" } });
 				const line = fixture.line();
 				expect(line).toContain("BUILD_PROMPT");
 				old.evidence.resolve(EMPTY);
@@ -255,7 +257,7 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 				expect(fixture.paths.map((path) => readFileSync(path, "utf8"))).toEqual(saved);
 				expect(old.tracked).toEqual([]);
 				expect(current.tracked).toHaveLength(1);
-				expect(fixture.sent).toHaveLength(1);
+				expect(fixture.sent).toHaveLength(2);
 				expect(await fixture.run()).toBeUndefined();
 				expect(fixture.runs).toHaveLength(3);
 				expect(fixture.calls).toHaveLength(2);
@@ -276,7 +278,7 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 				const saved = expectSaved(fixture, valid, response, "SHUNT_VALID_SPEC_1");
 				valid.delivery.resolve();
 				await flush();
-				expect(fixture.sent).toHaveLength(1);
+				expect(fixture.sent).toHaveLength(2);
 				expect(await fixture.run()).toBeUndefined();
 				expect(fixture.runs).toHaveLength(1);
 				fixture.setAlias(alias);
@@ -287,7 +289,7 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 				expect(fixture.line()).toContain("selector-invalid");
 				expect(fixture.paths.map((path) => readFileSync(path, "utf8"))).toEqual(saved);
 				expect(fixture.calls.map((call) => call.model)).toEqual(["SHUNT_A"]);
-				expect(fixture.sent).toHaveLength(1);
+				expect(fixture.sent).toHaveLength(2);
 				expect(await fixture.run()).toBeUndefined();
 				expect(fixture.runs).toHaveLength(2);
 				fixture.expectNoAuth();
@@ -322,8 +324,8 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 				expect(response.modelResolution).toMatchObject({ state: "override", source: "shunt-model", modelId: "SHUNT_A", reason: "explicit-model" });
 				current.delivery.resolve();
 				await flush();
-				expect(fixture.sent).toHaveLength(1);
-				expect(fixture.sent).toMatchObject([{ message: { content: response.context }, options: { deliverAs: "aside" } }]);
+				expect(fixture.sent).toHaveLength(2);
+				expect(fixture.sent[1]).toMatchObject({ message: { content: response.context }, options: { deliverAs: "aside" } });
 				expect(fixture.line()).toContain("BUILD_PROMPT");
 				expect(fixture.line()).not.toContain("selector-invalid");
 				expect(await fixture.run()).toBeUndefined();
@@ -363,7 +365,7 @@ describe("control-aware shunt flight identity (SEC15-DELTA-SHUNT-INTENT-CONTROLS
 					}
 					expect(fixture.runs).toHaveLength(1);
 					expect(fixture.calls).toHaveLength(1);
-					expect(fixture.sent).toHaveLength(1);
+					expect(fixture.sent).toHaveLength(2);
 					fixture.expectNoAuth();
 				} finally {
 					await fixture.close();
