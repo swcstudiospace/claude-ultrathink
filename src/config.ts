@@ -210,7 +210,7 @@ export function defaultConfig(): UltrathinkConfig {
 		uplift: {
 			enabled: true,
 			skipTrivial: true,
-			maxChars: 20000,
+			maxChars: 0,
 			echo: true,
 		},
 		think: {

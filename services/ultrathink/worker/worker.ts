@@ -14,7 +14,6 @@ export interface PlanningModel {
 	complete(input: {
 		system: string;
 		prompt: string;
-		maxOutputTokens: number;
 	}): Promise<{ text: string; tokensUsed: number }>;
 }
 
@@ -52,7 +51,11 @@ export type AnswerResult =
 	| { ok: true }
 	| { ok: false; code: "not_found" | "not_waiting" | "invalid_answer" };
 
-const MAX_OUTPUT_TOKENS = 2000;
+/**
+ * Accounting allowance added to each reservation for the reply. It is an estimate, not an output cap:
+ * the completion call sends no max_tokens.
+ */
+const RESERVATION_ALLOWANCE_TOKENS = 16000;
 const CHARS_PER_TOKEN = 3;
 const MIN_DECISION_OPTIONS = 2;
 const MAX_DECISION_OPTIONS = 5;
@@ -115,13 +118,15 @@ interface OwnerAnswer {
 interface ModelInput {
 	system: string;
 	prompt: string;
-	maxOutputTokens: number;
 }
 
 interface ModelReply {
 	text: string;
 	tokensUsed: number;
 }
+
+/** Outcome of one model call after retries. A truncated reply is a definitive failure, not retried. */
+type ModelOutcome = { kind: "reply"; reply: ModelReply } | { kind: "truncated" } | { kind: "unavailable" };
 
 interface DecisionOption {
 	label: string;
@@ -323,9 +328,10 @@ export function createWorker(options: WorkerOptions): Worker {
 
 	/**
 	 * Calls the model with retries and exponential backoff. The lease is renewed on a
-	 * heartbeat for the whole call. Returns null when every attempt fails.
+	 * heartbeat for the whole call. A truncated reply is not retried: the same request
+	 * would be cut the same way. Returns "unavailable" when every attempt fails.
 	 */
-	async function callModel(runId: string, input: ModelInput): Promise<ModelReply | null> {
+	async function callModel(runId: string, input: ModelInput): Promise<ModelOutcome> {
 		const heartbeat = { error: null as unknown };
 		const { promise: lease, reject: rejectLease } = Promise.withResolvers<never>();
 		lease.catch(() => {});
@@ -343,10 +349,14 @@ export function createWorker(options: WorkerOptions): Worker {
 		try {
 			for (let attempt = 1; ; attempt++) {
 				try {
-					return await Promise.race([model.complete(input), lease]);
+					return { kind: "reply", reply: await Promise.race([model.complete(input), lease]) };
 				} catch (error) {
 					if (heartbeat.error !== null) throw heartbeat.error;
-					if (attempt >= maxModelAttempts) return null;
+					// The adapter reports a reply cut at its own output limit with error code `truncated`.
+					const truncated =
+						typeof error === "object" && error !== null && "code" in error && error.code === "truncated";
+					if (truncated) return { kind: "truncated" };
+					if (attempt >= maxModelAttempts) return { kind: "unavailable" };
 					await sleep(backoffMs * 2 ** (attempt - 1));
 				}
 			}
@@ -374,7 +384,8 @@ export function createWorker(options: WorkerOptions): Worker {
 		const attempt = nextAttempt(run.id, phase);
 		const system = SYSTEM_PROMPTS[phase];
 		const prompt = buildPrompt(run.request, phase, outputs, latestAnswer(run.id, phase));
-		const estimatedTokens = Math.ceil((system.length + prompt.length) / CHARS_PER_TOKEN) + MAX_OUTPUT_TOKENS;
+		const estimatedTokens =
+			Math.ceil((system.length + prompt.length) / CHARS_PER_TOKEN) + RESERVATION_ALLOWANCE_TOKENS;
 
 		let reservationId: number;
 		try {
@@ -397,13 +408,15 @@ export function createWorker(options: WorkerOptions): Worker {
 		state.reservationId = reservationId;
 		store.updateRun(run.id, { status: PHASE_STATUS[phase], currentPhase: phase });
 
-		const reply = await callModel(run.id, { system, prompt, maxOutputTokens: MAX_OUTPUT_TOKENS });
-		if (reply === null) {
+		const outcome = await callModel(run.id, { system, prompt });
+		if (outcome.kind !== "reply") {
 			ledger.abandon(reservationId);
 			state.reservationId = null;
-			store.updateRun(run.id, { status: "paused-for-blocker", reason: "model_unavailable" });
+			const reason = outcome.kind === "truncated" ? "output_truncated" : "model_unavailable";
+			store.updateRun(run.id, { status: "paused-for-blocker", reason });
 			return { done: false, result: "paused" };
 		}
+		const reply = outcome.reply;
 
 		// Each commit is fenced by a lease renewal, so a worker that lost its lease mid-call cannot record.
 		const decision = parseDecision(reply.text);

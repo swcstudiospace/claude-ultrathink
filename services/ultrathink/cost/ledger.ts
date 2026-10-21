@@ -15,6 +15,7 @@ export class CeilingError extends Error {
 
 export class LedgerWriteError extends Error {}
 
+/** A ceiling of 0 means unlimited; a positive ceiling refuses any reservation that would exceed it. */
 export interface LedgerLimits {
 	runTokenCeiling: number;
 	dailyTokenCeiling: number;
@@ -116,12 +117,12 @@ export function createLedger(
 						const day = new Date(at).toISOString().slice(0, 10);
 
 						const runSpent = sumSpent(db, SPENT_FOR_RUN, input.runId);
-						if (runSpent + estimate > limits.runTokenCeiling) {
+						if (limits.runTokenCeiling > 0 && runSpent + estimate > limits.runTokenCeiling) {
 							throw new CeilingError(CEILING_RUN);
 						}
 
 						const daySpent = sumSpent(db, SPENT_FOR_DAY, day);
-						if (daySpent + estimate > limits.dailyTokenCeiling) {
+						if (limits.dailyTokenCeiling > 0 && daySpent + estimate > limits.dailyTokenCeiling) {
 							throw new CeilingError(CEILING_DAY);
 						}
 

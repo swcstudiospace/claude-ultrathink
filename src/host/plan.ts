@@ -215,6 +215,7 @@ export async function planPrompt(
 				complete: engine.complete,
 				engine: engine.label,
 				engineError: engine.error,
+				engineReport: engine.report,
 				modelResolution: resolution,
 				stateDir,
 				surface: host,

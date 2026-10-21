@@ -366,6 +366,27 @@ describe("headless planner: limits and lifecycle", () => {
 		expect(result).toMatchObject({ ok: true, data: { status: "failed", error: "timeout" } });
 	});
 
+	test("a plan timeout of 0 starts no timer, so a zero-length wait never aborts the plan", async () => {
+		const gate = Promise.withResolvers<void>();
+		const model = fakeModel(gate.promise);
+		const h = setup({ planTimeoutMs: 0 }, { completer: model.complete });
+		const sessionId = randomUUID();
+		await startRunning(h, sessionId);
+		h.clock.fire(0);
+		gate.resolve();
+		const result = await h.planner.result({ sessionId, waitSeconds: 30 });
+		expect(result).toMatchObject({ ok: true, data: { status: "planned" } });
+	});
+
+	test("a reply cut at the output limit ends the job as failed with truncated", async () => {
+		const cut: OpenRouterFetch = async () =>
+			new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: { content: "1. Partial step" } }] }), { status: 200 });
+		const h = setup({}, { completer: undefined, fetch: cut });
+		const sessionId = randomUUID();
+		const started = await h.planner.start({ prompt: PROMPT, sessionId });
+		expect(started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "truncated" } });
+	});
+
 	test("an engine failure ends the job as failed with the code, never the response body", async () => {
 		const failing: OpenRouterFetch = async () => new Response("secret upstream body", { status: 401 });
 		const h = setup({}, { completer: undefined, fetch: failing });
@@ -613,6 +634,12 @@ describe("headless planner: reasoning effort", () => {
 		const unset = await bodiesFor({});
 		expect(unset.length).toBeGreaterThanOrEqual(8);
 		for (const body of unset) expect("reasoning" in body).toBe(false);
+	});
+
+	test("sends no max_tokens key when the output cap is 0", async () => {
+		const bodies = await bodiesFor({ modelMaxOutputTokens: 0 });
+		expect(bodies.length).toBeGreaterThanOrEqual(8);
+		for (const body of bodies) expect("max_tokens" in body).toBe(false);
 	});
 });
 

@@ -59,7 +59,7 @@ Types: "integer" means a whole JSON number; "number" allows fractions. Ranges ar
 |---|---|---|---|
 | `enabled` | boolean | `true` | Plan prompts. When `false`, only prompts that start with `uplift:` are planned. `/ultrathink-off` and `/ultrathink-on` override this per host. |
 | `skipTrivial` | boolean | `true` | Skip trivial acknowledgements such as `ok` or `lgtm`. |
-| `maxChars` | number, >= 0 | `20000` | Prompts longer than this are not sent to the engine; they get the conservative fallback spec, and no rows are created. |
+| `maxChars` | number, >= 0 | `0` | `0` means no limit: every prompt is sent to the engine. A positive value caps the uplift call: a longer prompt is not sent, gets the conservative fallback spec, and creates no rows. |
 | `echo` | boolean | `true` | Accepted but not read. The one-line summary after each plan is controlled by `claude.echo`. |
 
 ### `think`: Graph of Thought
@@ -459,7 +459,7 @@ All keys are optional; write only the ones you change. This file shows every key
 
 ```json
 {
-  "uplift": { "enabled": true, "skipTrivial": true, "maxChars": 20000, "echo": true },
+  "uplift": { "enabled": true, "skipTrivial": true, "maxChars": 0, "echo": true },
   "think": { "enabled": true, "minNodes": 5, "maxNodes": 8, "engine": "auto" },
   "hitl": { "enabled": true, "maxQuestions": 4, "knowledgeBase": false },
   "claude": {

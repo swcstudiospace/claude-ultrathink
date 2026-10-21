@@ -27,7 +27,7 @@ import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { extractJsonObject, isFallbackGraph, normalizeGraph, parseNodeFill } from "../think/graph.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
-import { MAX_NODES, MAX_RATIONALE_CHARS, MAX_STEPS, MIN_NODES, MIN_STEPS, type ThoughtNode } from "../think/types.ts";
+import { MAX_NODES, MAX_STEPS, MIN_NODES, MIN_STEPS, type ThoughtNode } from "../think/types.ts";
 import { nodeStepTitles, splitRationaleSteps } from "../track/plan.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../uplift/prompt.ts";
 import { escapeXml, sanitizeUpliftXml } from "../uplift/xml.ts";
@@ -299,9 +299,6 @@ export function validateNodeFill(raw: string, kind: string | undefined): Validat
 	if (!/<rationale>/i.test(raw) || !/<conclusion>/i.test(raw)) errors.push("answer must be <node><rationale>…</rationale><conclusion>…</conclusion></node>");
 	if (/&(?:lt|gt|amp|quot|apos);/.test(raw)) errors.push("do not XML-escape node text: parseNodeFill reads it raw, so entities would reach Linear and Notion verbatim");
 	if (steps.length < MIN_STEPS || steps.length > MAX_STEPS) errors.push(`rationale must have ${MIN_STEPS}-${MAX_STEPS} numbered steps (got ${steps.length})`);
-	if (fill.thinking.length > MAX_RATIONALE_CHARS) errors.push(`rationale exceeds ${MAX_RATIONALE_CHARS} chars (${fill.thinking.length})`);
-	const limit = kind === "synthesize" ? 3000 : 1200;
-	if (fill.conclusion.length > limit) errors.push(`conclusion exceeds ${limit} chars (${fill.conclusion.length})`);
 	if (kind === "synthesize") {
 		if (!/^\s*WORKFLOW\s*$/m.test(fill.conclusion)) errors.push("synthesize conclusion needs a WORKFLOW section");
 		if (!/^\s*Wave \d+/m.test(fill.conclusion)) errors.push("synthesize WORKFLOW needs Wave lines");

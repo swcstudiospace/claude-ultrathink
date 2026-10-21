@@ -19,6 +19,7 @@ import type { ClaudeCompleter } from "../claude/complete.ts";
 import { type ControlState, readControl, readSession, type SessionRecord, sessionPath } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
 import type { LegacyModelProvenance, UltrathinkConfig } from "../config.ts";
+import type { CompletionReport } from "../types.ts";
 import { DEFAULT_GROK_CONFIG } from "../grok/types.ts";
 import { shipNudge } from "../ship/nudge.ts";
 import { shipApplies } from "../ship/policy.ts";
@@ -232,6 +233,8 @@ export interface OmpPlanRequest {
 	stateDir?: string;
 	/** Flight validity, checked before and after every native call; false cancels the call. Never a model chooser. */
 	isCurrent?: () => boolean;
+	/** Absolute flight limit (ms since the epoch); a transient retry never waits past it. */
+	deadline?: number;
 }
 
 export interface OmpPlan {
@@ -260,6 +263,8 @@ export interface NativeEngineDeps {
 	providerDefaults?: Readonly<Record<string, string>>;
 	/** Flight validity, not a model chooser: false before or after a native call cancels it. */
 	isCurrent?: () => boolean;
+	/** Backoff wait between transient retries: resolves after `ms`, or ends at once when the signal aborts. Tests inject an instant one. */
+	sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 type McpState = NonNullable<BarState["mcp"]>;
@@ -385,9 +390,57 @@ function textOf(result: AssistantMessage): string {
 	return content.map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : "")).join("");
 }
 
+/** A usable HTTP status (100-599) or nothing: only a real status names a retryable or permanent provider failure. */
+function httpStatusCode(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599 ? value : undefined;
+}
+
 function httpStatus(result: AssistantMessage): string {
-	const status = result?.errorStatus;
-	return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? `, HTTP ${status}` : "";
+	const status = httpStatusCode(result?.errorStatus);
+	return status === undefined ? "" : `, HTTP ${status}`;
+}
+
+/** A thrown provider error's HTTP status (`status`, or `statusCode`), when it carries one. */
+function thrownStatus(error: unknown): number | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const { status, statusCode } = error as { status?: unknown; statusCode?: unknown };
+	return httpStatusCode(status) ?? httpStatusCode(statusCode);
+}
+
+/** Backoff before the second and third attempt; each wait gains up to `RETRY_JITTER` of itself. Three attempts in all. */
+const RETRY_BACKOFF_MS = [2000, 6000] as const;
+const RETRY_JITTER = 0.25;
+/** Refusals no retry can fix (subscription, permission, entitlement), whatever the status says. */
+const PERMANENT_FAILURE = /subscription|permission|not entitled|forbidden|unauthori[sz]ed|insufficient[ _]quota|access denied/i;
+/** Network and timeout failures that carry no HTTP status. */
+const NETWORK_FAILURE =
+	/\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ETIMEDOUT|ESOCKETTIMEDOUT|EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH)\b|socket hang up|fetch failed|network error|connection (?:error|reset|closed)|Connection(?:Timeout)?Error|timed? ?out/i;
+
+/** Retry only what a later attempt can fix: 408, 429 and 5xx, or a network or timeout failure with no status. 401, 403 and 404 never retry. */
+function transientFailure(status: number | undefined, text: string): boolean {
+	if (status === 401 || status === 403 || status === 404) return false;
+	if (PERMANENT_FAILURE.test(text)) return false;
+	if (status !== undefined) return status === 408 || status === 429 || (status >= 500 && status <= 599);
+	return NETWORK_FAILURE.test(text);
+}
+
+/** A real wait that ends at once when the signal aborts, so cancellation never sits out a backoff. */
+function sleepOrAbort(ms: number, signal: AbortSignal): Promise<void> {
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	if (signal.aborted) {
+		reject(cancelled());
+		return promise;
+	}
+	const onAbort = (): void => {
+		clearTimeout(timer);
+		reject(cancelled());
+	};
+	const timer = setTimeout(() => {
+		signal.removeEventListener("abort", onAbort);
+		resolve();
+	}, ms);
+	signal.addEventListener("abort", onAbort, { once: true });
+	return promise;
 }
 
 /**
@@ -403,6 +456,20 @@ export function createNativeEngineSelector(request: OmpPlanRequest, flightSignal
 	const level = request.thinkingLevel;
 	const thinking: Pick<SimpleStreamOptions, "reasoning" | "disableReasoning"> =
 		level === "off" ? { disableReasoning: true } : level === undefined || level === "inherit" ? {} : { reasoning: level };
+	// Backoff waits go through the injected seam, or a real wait that ends at once on abort.
+	const sleep = deps.sleep ?? sleepOrAbort;
+	// The last settled call's report, read by the uplift stage right after its own call; a flight's stages run in turn.
+	let lastReport: CompletionReport | undefined;
+	/** Waits before a retry. False when the failure is final, the schedule is spent, or the wait would cross the flight deadline. */
+	const retryAfter = async (attempt: number, transient: boolean, lifetime: AbortSignal): Promise<boolean> => {
+		const base = RETRY_BACKOFF_MS[attempt - 1];
+		if (!transient || base === undefined) return false;
+		const wait = Math.round(base * (1 + Math.random() * RETRY_JITTER));
+		if (request.deadline !== undefined && Date.now() + wait > request.deadline) return false;
+		await sleep(wait, lifetime);
+		if (lifetime.aborted || deps.isCurrent?.() === false) throw cancelled();
+		return true;
+	};
 	return async (intent, signal) => {
 		const runtime = request.native;
 		if (!runtime) throw nativeFailure("omp-native runtime unavailable");
@@ -435,21 +502,34 @@ export function createNativeEngineSelector(request: OmpPlanRequest, flightSignal
 				const lifetime = stageSignal && stageSignal !== flightSignal ? AbortSignal.any([flightSignal, stageSignal]) : flightSignal;
 				if (lifetime.aborted || deps.isCurrent?.() === false) throw cancelled();
 				const context: Context = { systemPrompt: [system], messages: [{ role: "user", content: user, timestamp: Date.now() }] };
-				let result: AssistantMessage;
-				try {
-					result = await complete(snapshot, context, { apiKey, signal: lifetime, ...thinking, ...(sessionId ? { sessionId } : {}) });
-				} catch (error) {
-					// AbortSignal.timeout's TimeoutError is cancellation too; any other rejection stays a rejection with a safe message.
-					if (lifetime.aborted || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))) throw cancelled();
-					throw nativeFailure("omp-native completion failed", error);
+				for (let attempts = 1; ; attempts++) {
+					let result: AssistantMessage;
+					try {
+						result = await complete(snapshot, context, { apiKey, signal: lifetime, ...thinking, ...(sessionId ? { sessionId } : {}) });
+					} catch (error) {
+						// AbortSignal.timeout's TimeoutError is cancellation too; any other rejection stays a rejection with a safe message.
+						if (lifetime.aborted || (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))) throw cancelled();
+						const status = thrownStatus(error);
+						const text = error instanceof Error ? `${error.name} ${error.message}` : "";
+						if (await retryAfter(attempts, transientFailure(status, text), lifetime)) continue;
+						lastReport = { attempts, ...(status === undefined ? {} : { httpStatus: status }) };
+						throw nativeFailure("omp-native completion failed", error);
+					}
+					// A provider that ignores the signal and still answers never turns a cancelled flight into a plan.
+					if (lifetime.aborted || deps.isCurrent?.() === false || result?.stopReason === "aborted") throw cancelled();
+					if (result?.stopReason === "error") {
+						const status = httpStatusCode(result.errorStatus);
+						if (await retryAfter(attempts, transientFailure(status, result.errorMessage ?? ""), lifetime)) continue;
+						lastReport = { attempts, ...(status === undefined ? {} : { httpStatus: status }) };
+						throw nativeFailure(`omp-native completion failed (provider error${httpStatus(result)})`);
+					}
+					lastReport = { attempts };
+					return textOf(result);
 				}
-				// A provider that ignores the signal and still answers never turns a cancelled flight into a plan.
-				if (lifetime.aborted || deps.isCurrent?.() === false || result?.stopReason === "aborted") throw cancelled();
-				if (result?.stopReason === "error") throw nativeFailure(`omp-native completion failed (provider error${httpStatus(result)})`);
-				return textOf(result);
 			};
 		};
-		return selectNativeEngine(intent, query, bind);
+		const selection = await selectNativeEngine(intent, query, bind);
+		return "skipped" in selection ? selection : { ...selection, report: () => lastReport };
 	};
 }
 
@@ -739,7 +819,8 @@ export function createOmpExtension(
 ): (pi: ExtensionAPI) => void {
 	const plan = options.plan ?? nativeEnginePlanner;
 	const raceMs = options.raceMs ?? 25_000;
-	const maxRunMs = options.maxRunMs ?? 600_000;
+	// 0 (the default) means no outer limit: no flight timer and no retry deadline.
+	const maxRunMs = options.maxRunMs ?? 0;
 	const now = options.now ?? Date.now;
 	const uiEnabled = options.ui ?? true;
 	const readMcp = options.mcp ?? readMcpState;
@@ -1518,20 +1599,24 @@ export function createOmpExtension(
 					if (event.type === "end" && event.detail) flight.endDetail = event.detail;
 				});
 			// The deadline settles independently of provider cooperation; only the inline race keeps the flight running.
-			const timer = setTimeout(() => {
-				flight.timedOut = true;
-				finish({ context: "" });
-				guard(() => flight.controller.abort());
-			}, maxRunMs);
+			// maxRunMs 0 means no outer limit: no timer, so only the plan, cancellation or supersession ends the flight.
+			const timer =
+				maxRunMs > 0
+					? setTimeout(() => {
+							flight.timedOut = true;
+							finish({ context: "" });
+							guard(() => flight.controller.abort());
+						}, maxRunMs)
+					: undefined;
 			// Like the AbortSignal.timeout it replaces, the limit alone never keeps a process alive.
-			timer.unref?.();
+			timer?.unref?.();
 			const finish = (result: OmpPlan): void => {
 				clearTimeout(timer);
 				outcome.resolve(result);
 			};
 			void flight.result.then((result) => settle(flight, result));
 			try {
-				plan({ ...request, isCurrent: () => !flight.timedOut && !flight.settled && current(flight) }, flight.controller.signal, onEvent).then(finish, () => finish({ context: "" }));
+				plan({ ...request, deadline: maxRunMs > 0 ? Date.now() + maxRunMs : undefined, isCurrent: () => !flight.timedOut && !flight.settled && current(flight) }, flight.controller.signal, onEvent).then(finish, () => finish({ context: "" }));
 			} catch {
 				finish({ context: "" });
 			}

@@ -88,7 +88,7 @@ What happens next:
 
 If the request is empty (`/ultrathink` alone), the model should ask for a request and call no tool.
 
-The request is limited by `ULTRATHINK_MAX_INPUT_CHARS` (default 8000 characters).
+The request is limited by the 1 MB request body, which applies first over HTTP, and by `ULTRATHINK_MAX_INPUT_CHARS` (default 4,000,000 characters).
 
 ### Brief and full
 
@@ -113,18 +113,18 @@ Measured on 2026-10-18 on this VPS with the real planner. Prompt: "Compare three
 | `anthropic/claude-haiku-4.5` | 111 s | 10 | 39.3k / 10.0k | 0.089 USD | 23.9k chars | 7 / 56 |
 | `x-ai/grok-4.7` | 138 s | 10 | 50.9k / 11.7k | 0.153 USD | 23.9k chars | 7 / 56 |
 
-A plan makes 9 to 11 model calls: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1. `x-ai/grok-4.7` at the provider's default reasoning did not finish in 6 minutes: one call passed the per-call timeout (120 s at the time of the test; the default is now 240 s), and the 9 calls it made cost 0.167 USD. That is why the default effort is `low`. `x-ai/grok-4.7` writes about 45 tokens per second, so its single large specification call takes 110 to 120 s even at `low`.
+A plan makes 9 to 11 model calls: uplift 1, graph 1, Chain of Thought one per node (5 to 8), clarify 1. `x-ai/grok-4.7` at the provider's default reasoning did not finish in 6 minutes: one call passed the per-call timeout (120 s at the time of the test), and the 9 calls it made cost 0.167 USD. That is why the effort used to default to `low`. It now defaults to `high` with no timeout, so such a plan runs until it completes and can cost more. `x-ai/grok-4.7` writes about 45 tokens per second, so its single large specification call takes 110 to 120 s even at `low`.
 
 The shipped example model stays `x-ai/grok-4.7`, which is the operator's choice. A faster or cheaper model is one `ULTRATHINK_PLANNING_MODEL` change: `google/gemini-3.6-flash` for speed, `openai/gpt-5.6-luna` for price. Model ids are OpenRouter ids. The result's `usage` field reports the real calls, tokens and, when OpenRouter returns it, the cost of each plan. The server logs every model call (`planner_call`) and exposes `ultrathink_planner_calls_total` and `ultrathink_planner_call_duration_seconds`, which show which calls are slow.
 
-Two ceilings bound the spend, both counted in tokens by a ledger in the server's database:
+Two optional ceilings bound the spend, both counted in tokens by a ledger in the server's database. Both are off (0) by default:
 
-- `ULTRATHINK_RUN_TOKEN_CEILING` (default 150,000 tokens) for one plan.
-- `ULTRATHINK_DAILY_TOKEN_CEILING` (default 1,000,000 tokens) for one UTC day, across all plans.
+- `ULTRATHINK_RUN_TOKEN_CEILING` (default 0, no limit) for one plan.
+- `ULTRATHINK_DAILY_TOKEN_CEILING` (default 0, no limit) for one UTC day, across all plans.
 
 A plan that would pass a ceiling stops with `budget_exceeded`. Abandoned reservations keep counting, so the ledger errs toward stopping early.
 
-The server runs at most `ULTRATHINK_MAX_CONCURRENT_PLANS` plans at once (default 2). It cancels a model call after `ULTRATHINK_MODEL_TIMEOUT_MS` (default 240000) and a whole plan after `ULTRATHINK_PLAN_TIMEOUT_MS` (default 600000).
+The server runs at most `ULTRATHINK_MAX_CONCURRENT_PLANS` plans at once (default 2). It cancels a model call after `ULTRATHINK_MODEL_TIMEOUT_MS` and a whole plan after `ULTRATHINK_PLAN_TIMEOUT_MS` when those are set above 0; both are off by default.
 
 ## Make it reliable
 
@@ -174,25 +174,25 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_SESSION_SECRET` | none (required) | Secret for web login sessions, at least 32 characters. |
 | `ULTRATHINK_STATE_DIR` | `/var/lib/ultrathink` | State directory: database, `oauth.json`, `journal/`, `sessions/`, `jobs/`. |
 | `ULTRATHINK_PORT` | `8795` | Listen port, 1024 to 65535. |
-| `ULTRATHINK_MAX_INPUT_CHARS` | `8000` | Longest request, 1 to 20000 characters. |
+| `ULTRATHINK_MAX_INPUT_CHARS` | `4000000` | Longest request in characters. The 1 MB request body limit applies first over HTTP. |
 | `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 200000 characters. |
-| `ULTRATHINK_RUN_TOKEN_CEILING` | `150000` | Token limit for one plan. A plan over it stops with `budget_exceeded`. |
-| `ULTRATHINK_DAILY_TOKEN_CEILING` | `1000000` | Token limit per UTC day across all plans. |
+| `ULTRATHINK_RUN_TOKEN_CEILING` | `0` | Token limit for one plan; `0` means no limit. A plan over a positive limit stops with `budget_exceeded`. |
+| `ULTRATHINK_DAILY_TOKEN_CEILING` | `0` | Token limit per UTC day across all plans; `0` means no limit. |
 | `ULTRATHINK_PLANNING_MODEL` | unset | OpenRouter model id for server-side planning, for example `x-ai/grok-4.7`. Server-side mode needs it. |
 | `OPENROUTER_API_KEY` | unset | OpenRouter key, at least 20 characters. Server-side mode needs it. |
 | `ULTRATHINK_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base. https only, no credentials, query or fragment. |
 | `ULTRATHINK_SERVER_PLANNING` | unset | `0` turns server-side mode off. `1` requires the key and the model, otherwise the server refuses to start. Unset means on when both are set. |
 | `ULTRATHINK_MAX_CONCURRENT_PLANS` | `2` | Plans that run at once, 1 to 8. More starts return `busy`. |
-| `ULTRATHINK_MODEL_TIMEOUT_MS` | `240000` | Timeout for one model call, 5000 to 600000. A call that times out is not retried. |
-| `ULTRATHINK_PLAN_TIMEOUT_MS` | `600000` | Timeout for one whole plan, 30000 to 1800000. |
-| `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
-| `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. The pipeline already asks the model to write its reasoning steps, so hidden reasoning only adds minutes. |
+| `ULTRATHINK_MODEL_TIMEOUT_MS` | `0` | Timeout for one model call; `0` means no timeout. A positive value must be 5000 to 600000. A call that times out is not retried. |
+| `ULTRATHINK_PLAN_TIMEOUT_MS` | `0` | Timeout for one whole plan; `0` means no timeout. A positive value must be 30000 to 1800000. |
+| `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `0` | Output token limit for one model call; `0` sends no limit, so the provider's own maximum applies. A positive value must be 256 to 32000. |
+| `ULTRATHINK_MODEL_REASONING_EFFORT` | `high` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. |
 | `ULTRATHINK_SERVER_DECISIONS` | off | `1` turns on the Jev decision gate in server-side plans. |
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
 | `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | none | Comma list of extra https origins allowed in client redirect URIs. |
 
-Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 65,536 bytes and is not configurable. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
+Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 1 MB (1,048,576 bytes) and is not configurable; a reverse proxy in front must allow the same size on `/mcp`. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
 
 ## Troubleshooting
 
@@ -209,8 +209,9 @@ Origin lists take bare origins only (`https://host[:port]`, no path, query or fr
 | Status `skipped` | The pipeline declined the request, for example one that starts with a slash command or a `raw:` prefix. | State the request as a plain description of the task and call `ultrathink_uplift` again with a new `sessionId`. |
 | Status `failed`, error `auth` | OpenRouter refused the API key (HTTP 401 or 403). | The operator replaces `OPENROUTER_API_KEY` and restarts. |
 | Status `failed`, error `rate_limited`, `upstream`, `empty` or `bad_response` | The model provider limited, failed or returned nothing usable, after retries. | Try again with a new `sessionId`. The operator checks the model id, credit and timeouts. |
-| Status `failed`, error `timeout` | One model call took longer than `ULTRATHINK_MODEL_TIMEOUT_MS`, or the whole plan took longer than `ULTRATHINK_PLAN_TIMEOUT_MS`. A timeout is not retried: the plan fails with `timeout`. | Try a faster model (see the table above) or a lower `ULTRATHINK_MODEL_REASONING_EFFORT`. The cost of the partial run still counts against the ceilings. |
+| Status `failed`, error `timeout` | One model call took longer than `ULTRATHINK_MODEL_TIMEOUT_MS`, or the whole plan took longer than `ULTRATHINK_PLAN_TIMEOUT_MS`. Both are off by default, so this needs a limit you set. A timeout is not retried: the plan fails with `timeout`. | Raise the limit, try a faster model (see the table above), or a lower `ULTRATHINK_MODEL_REASONING_EFFORT`. The cost of the partial run still counts against the ceilings. |
 | Status `failed`, error `interrupted` | The service restarted while the plan ran. | Run it again with a new `sessionId`. |
+| Status `failed`, error `truncated` | The model stopped at its own output limit, so the plan was cut and not stored. | Try again with a new `sessionId`, or use a model with a larger output limit. |
 | Status `invalid` | The model produced an incomplete plan. | Run it again, or rephrase the request. |
 | Result says `truncated` | The plan was larger than the size limit, so later Graph of Thought sections were left out. | Ask the user for what is missing, or split the request into smaller ones. |
 | The model does not call any tool | The client did not act on the typed `/ultrathink`. | Use the MCP prompt, add the custom instructions above, or say "use the ultrathink connector". |

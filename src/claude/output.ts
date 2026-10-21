@@ -30,8 +30,8 @@ import type { UpliftResult } from "../types.ts";
 import type { DocsLookup } from "../ragflow/types.ts";
 import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
-/** Generous ceiling; the spec is normally far smaller. Over budget, RATIONALE bodies go first, then the tail. */
-export const DEFAULT_CONTEXT_CHARS = 90_000;
+/** Ceiling for the injected specification; 0 means no truncation. A positive value is an explicit cap: RATIONALE bodies go first, then the tail. */
+export const DEFAULT_CONTEXT_CHARS = 0;
 /**
  * Ceiling for a handoff. Hermes spills a hook context piece over 10,000 characters to a file and keeps only its first
  * and last 500, which could hide the kickoff instruction in the middle.
@@ -373,10 +373,17 @@ function degradationNotice(
 				`The ${engine} planning call failed${failure}. The specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Fix the engine (out-of-credits or login — see "Every plan shows fallback" in docs/troubleshooting.md) and resend the prompt to get a real plan.`,
 			].join("\n");
 		}
+		if (input.result.fallbackReason === "input_over_limit") {
+			return [
+				"## Planning degraded",
+				"",
+				`Planning was skipped because the prompt is over the planner's input limit, so the specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Shorten the prompt or raise uplift.maxChars, then resend to get a real plan.`,
+			].join("\n");
+		}
 		return [
 			"## Planning degraded",
 			"",
-			`Planning produced no usable model output (an empty or invalid completion, or a prompt over the uplift size limit), so the specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Shorten the prompt or fix the engine and resend to get a real plan.`,
+			`Planning produced no usable model output (an empty or invalid completion), so the specification below is generic fallback text, not a real plan; treat the attached graph as unverified. No tracker rows were created for it. Shorten the prompt or fix the engine and resend to get a real plan.`,
 		].join("\n");
 	}
 	const degraded = input.degraded ?? [];
@@ -488,8 +495,7 @@ export function formatPromptContext(input: PromptContextInput): string {
 
 	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, skills, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
-	const budget = Math.max(2_000, maxChars - fixed);
-	parts.push(truncateXml(input.result.xml, budget, input.specPath));
+	parts.push(maxChars > 0 ? truncateXml(input.result.xml, Math.max(2_000, maxChars - fixed), input.specPath) : input.result.xml);
 	return [...parts, ...tail].join("\n\n");
 }
 

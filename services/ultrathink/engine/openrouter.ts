@@ -18,7 +18,8 @@ export type OpenRouterErrorCode =
 	| "timeout"
 	| "aborted"
 	| "bad_response"
-	| "empty";
+	| "empty"
+	| "truncated";
 
 export class OpenRouterError extends Error {
 	readonly code: OpenRouterErrorCode;
@@ -49,10 +50,11 @@ export interface OpenRouterCompleterOptions {
 	/** Without a trailing slash, for example https://openrouter.ai/api/v1. */
 	baseUrl: string;
 	model: string;
-	maxOutputTokens: number;
+	/** Sent as `max_tokens`; unset or 0 omits the key. */
+	maxOutputTokens?: number;
 	/** Sent as `reasoning: { effort }`; unset omits the parameter. */
 	reasoningEffort?: ReasoningEffort;
-	/** Applies to each HTTP attempt, not to the whole call including retries. */
+	/** Applies to each HTTP attempt, not to the whole call including retries; 0 means no timer. */
 	timeoutMs: number;
 	/** Sent as HTTP-Referer; pass the service origin. */
 	referer?: string;
@@ -84,7 +86,7 @@ const MAX_RETRY_AFTER_MS = 20000;
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
-	if (signal?.aborted === true) {
+	if (signal?.aborted === true || ms <= 0) {
 		resolve();
 		return promise;
 	}
@@ -127,7 +129,7 @@ function count(value: unknown): number {
 
 /** Upstream JSON; every field is checked where it is used. Optional chaining is safe on any JSON value. */
 interface CompletionReply {
-	choices?: Array<{ message?: { content?: unknown } | null } | null> | null;
+	choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } | null } | null> | null;
 	usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; cost?: unknown } | null;
 }
 
@@ -147,7 +149,7 @@ type Attempt =
 	| { ok: true; text: string; usage: OpenRouterUsage }
 	| { ok: false; error: OpenRouterError; retry: boolean; retryAfterMs?: number };
 
-/** Validates a 200 body; `null` content (tool call, refusal) counts as empty, a missing message or content as malformed. */
+/** Validates a 200 body; a reply cut at the output limit (`finish_reason` length) is truncated, `null` content (tool call, refusal) counts as empty, a missing message or content as malformed. */
 function parseCompletion(raw: string): Attempt {
 	let reply: CompletionReply | null;
 	try {
@@ -155,7 +157,11 @@ function parseCompletion(raw: string): Attempt {
 	} catch {
 		return { ok: false, error: new OpenRouterError("bad_response"), retry: false };
 	}
-	const content = reply?.choices?.[0]?.message?.content;
+	const choice = reply?.choices?.[0];
+	if (choice?.finish_reason === "length") {
+		return { ok: false, error: new OpenRouterError("truncated"), retry: false };
+	}
+	const content = choice?.message?.content;
 	const text = content === null ? "" : contentText(content);
 	if (text === undefined) {
 		return { ok: false, error: new OpenRouterError("bad_response"), retry: false };
@@ -193,10 +199,13 @@ export function createOpenRouterCompleter(
 		let timedOut = false;
 		const onCallerAbort = (): void => controller.abort();
 		caller?.addEventListener("abort", onCallerAbort, { once: true });
-		const timer = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-		}, opts.timeoutMs);
+		const timer =
+			opts.timeoutMs > 0
+				? setTimeout(() => {
+						timedOut = true;
+						controller.abort();
+					}, opts.timeoutMs)
+				: undefined;
 		try {
 			let response: Response;
 			let raw: string | undefined;
@@ -257,7 +266,7 @@ export function createOpenRouterCompleter(
 				{ role: "system", content: system },
 				{ role: "user", content: user },
 			],
-			max_tokens: opts.maxOutputTokens,
+			...((opts.maxOutputTokens ?? 0) > 0 ? { max_tokens: opts.maxOutputTokens } : {}),
 			usage: { include: true },
 			...(opts.reasoningEffort === undefined ? {} : { reasoning: { effort: opts.reasoningEffort } }),
 		});

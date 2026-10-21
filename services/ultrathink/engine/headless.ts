@@ -126,6 +126,11 @@ const SHUTDOWN_WAIT_MS = 5_000;
 const DEFAULT_WAIT_SECONDS = 40;
 const MAX_WAIT_SECONDS = 45;
 const POLL_AFTER_SEC = 5;
+/**
+ * Accounting allowance added to each reservation for the reply. It is an estimate, not an output cap:
+ * the completion call sends no max_tokens.
+ */
+const RESERVATION_ALLOWANCE_TOKENS = 16000;
 const CHARS_PER_TOKEN = 3;
 const MAX_ERROR_CHARS = 300;
 const PLANNER_OWNER = "ultrathink-server-planner";
@@ -140,7 +145,7 @@ const fail = (code: JournalErrorCode, errors?: string[]): JournalResult<never> =
 
 const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
 	const { promise, resolve } = Promise.withResolvers<void>();
-	if (signal?.aborted) return Promise.resolve();
+	if (signal?.aborted || ms <= 0) return Promise.resolve();
 	const timer = setTimeout(resolve, ms);
 	signal?.addEventListener(
 		"abort",
@@ -314,7 +319,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 	function meteredCompleter(job: Job, model: string): ClaudeCompleter {
 		return async (system, user, signal) => {
 			if (signal?.aborted || job.controller.signal.aborted) throw new DOMException("plan aborted", "AbortError");
-			const estimated = Math.ceil((system.length + user.length) / CHARS_PER_TOKEN) + config.modelMaxOutputTokens;
+			const estimated = Math.ceil((system.length + user.length) / CHARS_PER_TOKEN) + RESERVATION_ALLOWANCE_TOKENS;
 			let reservationId: number;
 			try {
 				reservationId = ledger.reserve({ runId: job.runId, phase: `model-${++job.seq}`, attempt: 1, estimatedTokens: estimated }).reservationId;
@@ -350,7 +355,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 						apiKey: config.openRouterApiKey ?? "",
 						baseUrl: config.openRouterBaseUrl,
 						model,
-						maxOutputTokens: config.modelMaxOutputTokens,
+						maxOutputTokens: config.modelMaxOutputTokens === 0 ? undefined : config.modelMaxOutputTokens,
 						timeoutMs: config.modelTimeoutMs,
 						referer: config.publicOrigin,
 						...(config.modelReasoningEffort === undefined ? {} : { reasoningEffort: config.modelReasoningEffort }),
@@ -447,13 +452,15 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 
 	async function execute(job: Job, prompt: string, model: string): Promise<void> {
 		const timer = new AbortController();
-		sleep(config.planTimeoutMs, timer.signal)
-			.then(() => {
-				if (timer.signal.aborted || job.settled) return;
-				job.reason ??= "timeout";
-				job.controller.abort();
-			})
-			.catch(() => {});
+		if (config.planTimeoutMs > 0) {
+			sleep(config.planTimeoutMs, timer.signal)
+				.then(() => {
+					if (timer.signal.aborted || job.settled) return;
+					job.reason ??= "timeout";
+					job.controller.abort();
+				})
+				.catch(() => {});
+		}
 		let outcome: Outcome;
 		try {
 			const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(), {

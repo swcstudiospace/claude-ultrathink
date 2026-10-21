@@ -26,6 +26,7 @@ import { redactLine } from "../teach/redact.ts";
 import { detectHost } from "./detect.ts";
 import type { HostId } from "./types.ts";
 import { MAX_ENGINE_ERROR_CHARS } from "./display-limits.ts";
+import type { CompletionReport } from "../types.ts";
 
 export type ModelResolutionState = "override" | "detected" | "default" | "unresolved";
 export type PlanningTransport = "omp-native" | "claude-cli" | "muse-cli" | "grok-http" | "grok-cli" | "grok-shunt";
@@ -101,6 +102,8 @@ export interface SelectedEngine {
 	label: string;
 	complete: ClaudeCompleter;
 	error: () => string | undefined;
+	/** The completer's report for its most recent call (attempts, HTTP status); absent when the route reports nothing. */
+	report?: () => CompletionReport | undefined;
 	resolution: ModelResolution;
 }
 

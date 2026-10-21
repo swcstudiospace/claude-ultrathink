@@ -170,6 +170,16 @@ describe("formatPromptContext", () => {
 		expect(truncateXml("short", 100)).toBe("short");
 	});
 
+	test("a specification over 90,000 characters is not truncated when the limit is 0", () => {
+		const long = { ...result, xml: Array.from({ length: 1_000 }, (_, i) => `<L${i}>${"y".repeat(100)}</L${i}>`).join("\n") };
+		expect(long.xml.length).toBeGreaterThan(90_000);
+		for (const limit of [undefined, 0]) {
+			const out = formatPromptContext({ result: long, specPath: "/s/long.xml", maxChars: limit });
+			expect(out).toContain(long.xml);
+			expect(out).not.toContain("truncated by Prompt Uplift");
+		}
+	});
+
 	test("lists workflow waves, marking parallel waves, and keeps them past truncation", () => {
 		const node = (id: string, dependsOn: string[]) => ({ id, title: id, kind: "understand" as const, question: "?", dependsOn });
 		const diamond = { goal: "g", nodes: [node("n1", []), node("n2", ["n1"]), node("n3", ["n1"]), node("n4", ["n2", "n3"])] };

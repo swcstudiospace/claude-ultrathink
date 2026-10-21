@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Ledger, type LedgerLimits, LedgerWriteError, createLedger } from "../cost/ledger.ts";
+import { OpenRouterError } from "../engine/openrouter.ts";
 import { type Run, type Store, openStore } from "../store/store.ts";
 import {
 	PHASES,
@@ -43,7 +44,6 @@ function makeEnv(limits: LedgerLimits = { runTokenCeiling: 1_000_000, dailyToken
 interface ModelCall {
 	system: string;
 	prompt: string;
-	maxOutputTokens: number;
 }
 
 interface Reply {
@@ -391,6 +391,45 @@ describe("worker", () => {
 			[1, "abandoned"],
 			[2, "settled"],
 		]);
+	});
+
+	test("a truncated completion pauses with output_truncated, is never recorded as complete, and is not retried", async () => {
+		const env = makeEnv();
+		const run = newRun(env);
+		const model = fakeModel(() => {
+			throw new OpenRouterError("truncated");
+		});
+		const { worker, sleeps } = makeWorker(env, model, { maxModelAttempts: 3, backoffMs: 1000 });
+
+		expect(await worker.tickOnce()).toBe("paused");
+		const paused = reload(env, run);
+		expect(paused.status).toBe("paused-for-blocker");
+		expect(paused.reason).toBe("output_truncated");
+		expect(model.calls.length).toBe(1);
+		expect(sleeps).toEqual([]);
+		expect(env.store.listPhases(run.id).length).toBe(0);
+		expect(ledgerRows(env, run.id).map((row) => [row.phase, row.state])).toEqual([["discover", "abandoned"]]);
+	});
+
+	test("completion calls send no output cap", async () => {
+		const env = makeEnv();
+		newRun(env);
+		const model = fakeModel((_call, index) => ({ text: `output ${index + 1}`, tokensUsed: 10 }));
+		const { worker } = makeWorker(env, model);
+
+		expect(await worker.tickOnce()).toBe("complete");
+		expect(model.calls.length).toBe(4);
+		expect(model.calls.every((call) => !("maxOutputTokens" in call))).toBe(true);
+	});
+
+	test("zero ceilings are unlimited: the run completes", async () => {
+		const env = makeEnv({ runTokenCeiling: 0, dailyTokenCeiling: 0 });
+		const run = newRun(env);
+		const model = fakeModel((_call, index) => ({ text: `output ${index + 1}`, tokensUsed: 10 }));
+		const { worker } = makeWorker(env, model);
+
+		expect(await worker.tickOnce()).toBe("complete");
+		expect(reload(env, run).status).toBe("complete");
 	});
 
 	test("answerDecision rejects foreign owners, non-waiting runs, and invalid answers", async () => {

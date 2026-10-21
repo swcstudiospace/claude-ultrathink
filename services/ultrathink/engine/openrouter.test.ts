@@ -555,3 +555,41 @@ describe("onCall", () => {
 		expectNoLeak(error);
 	});
 });
+
+describe("unlimited limits and truncation", () => {
+	test("timeoutMs 0 sets no timer, so a response that arrives after 50 ms still succeeds", async () => {
+		// A real 50 ms wait on purpose: the claim is that no platform timer cuts a slow response short.
+		const slow: Step = async (init) => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 50);
+			await promise;
+			return completion("late")(init);
+		};
+		const { complete, calls } = setup([slow], { timeoutMs: 0 });
+		expect(await complete("s", "u")).toBe("late");
+		expect(calls).toHaveLength(1);
+		expect((calls[0] as Call).init.signal?.aborted).toBe(false);
+	});
+
+	test("without maxOutputTokens (undefined or 0) the body has no max_tokens key", async () => {
+		for (const maxOutputTokens of [undefined, 0]) {
+			const { complete, calls } = setup([completion("ok")], { maxOutputTokens });
+			await complete("s", "u");
+			expect("max_tokens" in JSON.parse((calls[0] as Call).init.body as string)).toBe(false);
+		}
+	});
+
+	test("finish_reason length throws truncated, never returns the partial text, and is not retried", async () => {
+		const cut: Step = () =>
+			new Response(
+				JSON.stringify({ choices: [{ finish_reason: "length", message: { role: "assistant", content: "PARTIAL-TEXT" } }] }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		const { complete, calls } = setup([cut, completion("never")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("truncated");
+		expect(error.message).not.toContain("PARTIAL-TEXT");
+		expect(calls).toHaveLength(1);
+		expectNoLeak(error);
+	});
+});

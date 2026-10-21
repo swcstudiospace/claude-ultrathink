@@ -40,11 +40,13 @@ export interface UltrathinkConfig {
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
 const DEFAULT_PORT = 8795;
-const DEFAULT_MAX_INPUT_CHARS = 8000;
+// Far above any model context. 0 means no limit; MAX_BODY_BYTES still bounds a request.
+const DEFAULT_MAX_INPUT_CHARS = 4000000;
 const DEFAULT_MAX_ANSWER_CHARS = 20000;
-const MAX_BODY_BYTES = 65536;
-const DEFAULT_RUN_TOKEN_CEILING = 150000;
-const DEFAULT_DAILY_TOKEN_CEILING = 1000000;
+const MAX_BODY_BYTES = 1048576;
+// 0 means unlimited for both token ceilings.
+const DEFAULT_RUN_TOKEN_CEILING = 0;
+const DEFAULT_DAILY_TOKEN_CEILING = 0;
 const MIN_SESSION_SECRET_LENGTH = 32;
 const MIN_CONNECTOR_KEY_LENGTH = 32;
 const INTEGER_PATTERN = /^[0-9]+$/;
@@ -52,11 +54,12 @@ const PLANNING_MODEL_PATTERN = /^[A-Za-z0-9._:\/-]{1,80}$/;
 const MIN_OPENROUTER_KEY_LENGTH = 20;
 const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_MAX_CONCURRENT_PLANS = 2;
-const DEFAULT_MODEL_TIMEOUT_MS = 240000;
-const DEFAULT_PLAN_TIMEOUT_MS = 600000;
-const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 8000;
+// 0 means unlimited; a positive value is an explicit cap.
+const DEFAULT_MODEL_TIMEOUT_MS = 0;
+const DEFAULT_PLAN_TIMEOUT_MS = 0;
+const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 0;
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high"];
-const DEFAULT_REASONING_EFFORT: ReasoningEffort = "low";
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = "high";
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
 
 function readOptional(
@@ -98,6 +101,21 @@ function readInteger(
 		throw new ConfigError(message);
 	}
 	return value;
+}
+
+/** Like readInteger, but `0` is accepted and means unlimited; any other value must lie in min..max. */
+function readLimit(
+	env: Record<string, string | undefined>,
+	name: string,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	const raw = readOptional(env, name);
+	if (raw !== undefined && INTEGER_PATTERN.test(raw) && Number(raw) === 0) {
+		return 0;
+	}
+	return readInteger(env, name, fallback, min, max);
 }
 
 function readPublicOrigin(env: Record<string, string | undefined>): string {
@@ -151,7 +169,7 @@ function readConnectorKey(env: Record<string, string | undefined>): string | und
 	return key;
 }
 
-/** Unset means `low`: the pipeline already writes its reasoning out, so hidden reasoning only adds latency. `default` omits the parameter. */
+/** Unset means `high`, the strongest value this setting accepts; `default` omits the parameter. */
 function readReasoningEffort(env: Record<string, string | undefined>): ReasoningEffort | undefined {
 	const name = "ULTRATHINK_MODEL_REASONING_EFFORT";
 	const raw = readOptional(env, name);
@@ -288,12 +306,12 @@ export function loadConfig(
 		stateDir,
 		dbPath: `${stateDir}/ultrathink.sqlite`,
 		port: readInteger(env, "ULTRATHINK_PORT", DEFAULT_PORT, 1024, 65535),
-		maxInputChars: readInteger(
+		maxInputChars: readLimit(
 			env,
 			"ULTRATHINK_MAX_INPUT_CHARS",
 			DEFAULT_MAX_INPUT_CHARS,
 			1,
-			20000,
+			Number.MAX_SAFE_INTEGER,
 		),
 		maxAnswerChars: readInteger(
 			env,
@@ -303,14 +321,14 @@ export function loadConfig(
 			200000,
 		),
 		maxBodyBytes: MAX_BODY_BYTES,
-		runTokenCeiling: readInteger(
+		runTokenCeiling: readLimit(
 			env,
 			"ULTRATHINK_RUN_TOKEN_CEILING",
 			DEFAULT_RUN_TOKEN_CEILING,
 			1,
 			Number.MAX_SAFE_INTEGER,
 		),
-		dailyTokenCeiling: readInteger(
+		dailyTokenCeiling: readLimit(
 			env,
 			"ULTRATHINK_DAILY_TOKEN_CEILING",
 			DEFAULT_DAILY_TOKEN_CEILING,
@@ -331,21 +349,21 @@ export function loadConfig(
 			1,
 			8,
 		),
-		modelTimeoutMs: readInteger(
+		modelTimeoutMs: readLimit(
 			env,
 			"ULTRATHINK_MODEL_TIMEOUT_MS",
 			DEFAULT_MODEL_TIMEOUT_MS,
 			5000,
 			600000,
 		),
-		planTimeoutMs: readInteger(
+		planTimeoutMs: readLimit(
 			env,
 			"ULTRATHINK_PLAN_TIMEOUT_MS",
 			DEFAULT_PLAN_TIMEOUT_MS,
 			30000,
 			1800000,
 		),
-		modelMaxOutputTokens: readInteger(
+		modelMaxOutputTokens: readLimit(
 			env,
 			"ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS",
 			DEFAULT_MODEL_MAX_OUTPUT_TOKENS,

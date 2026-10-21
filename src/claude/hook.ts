@@ -25,7 +25,7 @@ import { injectTrackingXml } from "../track/render.ts";
 import type { TrackingRefs, TrackPlan } from "../track/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
 import type { ProgressEvent, ProgressSink, StageName } from "../host/progress.ts";
-import type { UpliftResult, UpliftState } from "../types.ts";
+import type { CompletionReport, UpliftResult, UpliftState } from "../types.ts";
 import { docsLookup, formatDocsSection, groundDocs } from "../ragflow/ground.ts";
 import { teachContext, teachEnabled } from "../teach/context.ts";
 import { formatLessonsSection, lessonsLookup, recallLessons } from "../teach/recall.ts";
@@ -75,6 +75,8 @@ export interface HookDeps {
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
 	/** First error the completer threw (already redacted), surfaced in the summary. */
 	engineError?: () => string | undefined;
+	/** The completer's report for its most recent call (attempts, HTTP status), read when the uplift falls back. */
+	engineReport?: () => CompletionReport | undefined;
 	/** Test seam for git remote/branch resolution; default reads the real repo at cwd. */
 	git?: (cwd: string) => { repo?: string; branch?: string };
 	conversation?: (transcriptPath?: string) => string;
@@ -580,6 +582,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 				complete,
 				signal: lifetime,
 				maxChars: deps.config.uplift.maxChars,
+				report: deps.engineReport,
 			});
 		} catch (error) {
 			rethrowCancellation(error);

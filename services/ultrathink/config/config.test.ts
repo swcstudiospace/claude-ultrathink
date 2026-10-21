@@ -57,11 +57,11 @@ describe("loadConfig defaults", () => {
 		expect(config.stateDir).toBe("/var/lib/ultrathink");
 		expect(config.dbPath).toBe("/var/lib/ultrathink/ultrathink.sqlite");
 		expect(config.port).toBe(8795);
-		expect(config.maxInputChars).toBe(8000);
+		expect(config.maxInputChars).toBe(4000000);
 		expect(config.maxAnswerChars).toBe(20000);
-		expect(config.maxBodyBytes).toBe(65536);
-		expect(config.runTokenCeiling).toBe(150000);
-		expect(config.dailyTokenCeiling).toBe(1000000);
+		expect(config.maxBodyBytes).toBe(1048576);
+		expect(config.runTokenCeiling).toBe(0);
+		expect(config.dailyTokenCeiling).toBe(0);
 		expect(config.planningModel).toBeUndefined();
 	});
 
@@ -124,20 +124,25 @@ describe("strict integers", () => {
 		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_PORT");
 	});
 
-	test("rejects maxInputChars above 20000", () => {
+	test("maxInputChars accepts 0, meaning no input gate", () => {
 		const env = baseEnv();
-		env.ULTRATHINK_MAX_INPUT_CHARS = "20001";
-		expect(messageOf(() => loadConfig(env))).toContain(
-			"ULTRATHINK_MAX_INPUT_CHARS",
-		);
+		env.ULTRATHINK_MAX_INPUT_CHARS = "0";
+		expect(loadConfig(env).maxInputChars).toBe(0);
 	});
 
-	test("rejects a zero token ceiling", () => {
+	test("a zero token ceiling is unlimited", () => {
 		const env = baseEnv();
 		env.ULTRATHINK_RUN_TOKEN_CEILING = "0";
-		expect(messageOf(() => loadConfig(env))).toContain(
-			"ULTRATHINK_RUN_TOKEN_CEILING",
-		);
+		expect(loadConfig(env).runTokenCeiling).toBe(0);
+	});
+
+	test("0 is accepted as unlimited for the model and plan timeouts and the output cap", () => {
+		const env = baseEnv();
+		env.ULTRATHINK_MODEL_TIMEOUT_MS = "0";
+		env.ULTRATHINK_PLAN_TIMEOUT_MS = "0";
+		env.ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS = "0";
+		const config = loadConfig(env);
+		expect([config.modelTimeoutMs, config.planTimeoutMs, config.modelMaxOutputTokens]).toEqual([0, 0, 0]);
 	});
 
 	test("rejects a malformed daily token ceiling", () => {
@@ -203,14 +208,14 @@ describe("server planning defaults", () => {
 		expect(config.openRouterBaseUrl).toBe("https://openrouter.ai/api/v1");
 		expect(config.serverPlanning).toBe(false);
 		expect(config.maxConcurrentPlans).toBe(2);
-		expect(config.modelTimeoutMs).toBe(240000);
-		expect(config.planTimeoutMs).toBe(600000);
-		expect(config.modelMaxOutputTokens).toBe(8000);
+		expect(config.modelTimeoutMs).toBe(0);
+		expect(config.planTimeoutMs).toBe(0);
+		expect(config.modelMaxOutputTokens).toBe(0);
 		expect(config.serverDecisions).toBe(false);
 	});
 
-	test("maxBodyBytes defaults to 65536", () => {
-		expect(loadConfig(baseEnv()).maxBodyBytes).toBe(65536);
+	test("maxBodyBytes defaults to 1 MB", () => {
+		expect(loadConfig(baseEnv()).maxBodyBytes).toBe(1048576);
 	});
 
 	test("explicit values are read", () => {
@@ -445,8 +450,8 @@ describe("origin lists", () => {
 });
 
 describe("modelReasoningEffort", () => {
-	test("unset defaults to low", () => {
-		expect(loadConfig(baseEnv()).modelReasoningEffort).toBe("low");
+	test("unset defaults to high", () => {
+		expect(loadConfig(baseEnv()).modelReasoningEffort).toBe("high");
 	});
 
 	for (const value of ["minimal", "low", "medium", "high"]) {
@@ -466,7 +471,7 @@ describe("modelReasoningEffort", () => {
 	test("a blank value counts as unset", () => {
 		const env = baseEnv();
 		env.ULTRATHINK_MODEL_REASONING_EFFORT = "  ";
-		expect(loadConfig(env).modelReasoningEffort).toBe("low");
+		expect(loadConfig(env).modelReasoningEffort).toBe("high");
 	});
 
 	for (const value of ["extreme", "LOW", "none", "1"]) {

@@ -117,4 +117,67 @@ describe("runUplift", () => {
 		expect(result.source).toBe("llm");
 		expect(result.root).toBe("RESEARCH_PROMPT");
 	});
+
+	test("plans a prompt of 60,001 characters with the default config", async () => {
+		let called = 0;
+		const original = "x".repeat(60_001);
+		const result = await runUplift({
+			original,
+			complete: async () => {
+				called += 1;
+				return "<RESEARCH_PROMPT><Q>x</Q></RESEARCH_PROMPT>";
+			},
+		});
+		expect(called).toBe(1);
+		expect(result.source).toBe("llm");
+		expect(result.fallbackReason).toBeUndefined();
+		expect(result.root).toBe("RESEARCH_PROMPT");
+	});
+
+	test("an explicit positive maxChars cap skips a longer prompt with input_over_limit", async () => {
+		let called = 0;
+		const original = "x".repeat(101);
+		const result = await runUplift({
+			original,
+			maxChars: 100,
+			complete: async () => {
+				called += 1;
+				return "<RESEARCH_PROMPT><Q>x</Q></RESEARCH_PROMPT>";
+			},
+		});
+		expect(called).toBe(0);
+		expect(result.source).toBe("fallback");
+		expect(result.fallbackReason).toBe("input_over_limit");
+		expect(result.xml).toBe(fallbackUplift(original));
+	});
+
+	test("records provider_error:429 when the completer throws an HTTP 429", async () => {
+		let called = 0;
+		const original = "add a clients list page";
+		const result = await runUplift({
+			original,
+			complete: async () => {
+				called += 1;
+				throw Object.assign(new Error("rate limited"), { status: 429 });
+			},
+			report: () => ({ attempts: 1, httpStatus: 429 }),
+		});
+		expect(called).toBe(1);
+		expect(result.source).toBe("fallback");
+		expect(result.fallbackReason).toBe("provider_error:429");
+		expect(result.xml).toBe(fallbackUplift(original));
+	});
+
+	test("records unparseable_reply when the completion has no root element", async () => {
+		const original = "add a clients list page";
+		const reply = "Sorry, I cannot turn that into a prompt.";
+		const result = await runUplift({
+			original,
+			complete: async () => reply,
+		});
+		expect(result.source).toBe("fallback");
+		expect(result.fallbackReason).toBe("unparseable_reply");
+		expect(result.rawReplyChars).toBe(reply.length);
+		expect(result.xml).toBe(fallbackUplift(original));
+	});
 });

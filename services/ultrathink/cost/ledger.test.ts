@@ -102,6 +102,47 @@ describe("token ledger", () => {
 		expect((error as CeilingError).reason).toBe(CEILING_DAY);
 	});
 
+	test("a zero ceiling is unlimited and never raises CeilingError", () => {
+		const { ledger, runId } = setup({
+			runTokenCeiling: 0,
+			dailyTokenCeiling: 0,
+		});
+		expect(() => ledger.reserve({ runId, phase: "a", attempt: 1, estimatedTokens: 10_000_000 })).not.toThrow();
+		expect(() => ledger.reserve({ runId, phase: "b", attempt: 1, estimatedTokens: 10_000_000 })).not.toThrow();
+		expect(ledger.spentForRun(runId)).toBe(20_000_000);
+	});
+
+	test("a zero run ceiling leaves the daily ceiling enforced", () => {
+		const { store, ledger, runId } = setup({
+			runTokenCeiling: 0,
+			dailyTokenCeiling: 100,
+		});
+		ledger.reserve({ runId, phase: "a", attempt: 1, estimatedTokens: 60 });
+
+		const otherRun = store.createRun({
+			ownerId: "owner-a",
+			request: "second run",
+			route: "research",
+		});
+		const error = captureError(() =>
+			ledger.reserve({ runId: otherRun.id, phase: "a", attempt: 1, estimatedTokens: 50 }),
+		);
+		expect(error).toBeInstanceOf(CeilingError);
+		expect((error as CeilingError).reason).toBe(CEILING_DAY);
+	});
+
+	test("a zero daily ceiling leaves the run ceiling enforced", () => {
+		const { ledger, runId } = setup({
+			runTokenCeiling: 100,
+			dailyTokenCeiling: 0,
+		});
+		ledger.reserve({ runId, phase: "a", attempt: 1, estimatedTokens: 60 });
+
+		const error = captureError(() => ledger.reserve({ runId, phase: "b", attempt: 1, estimatedTokens: 50 }));
+		expect(error).toBeInstanceOf(CeilingError);
+		expect((error as CeilingError).reason).toBe(CEILING_RUN);
+	});
+
 	test("the daily total resets on the next UTC day", () => {
 		const { store, ledger, runId, clock } = setup({
 			runTokenCeiling: 10_000,

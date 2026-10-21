@@ -330,21 +330,21 @@ Measured on this VPS on 2026-10-18, one prompt, reasoning effort low:
 | claude-haiku-4.5 | 111 s | 0.089 USD |
 | grok-4.7 | 138 s | 0.153 USD |
 
-At the provider's default reasoning effort, grok-4.7 did not finish in 6 minutes. One prompt on one day is an indication, not a benchmark: re-measure after a model or prompt change. Keep the effort low unless plan quality demands more and the timeouts below are raised with it.
+At the provider's default reasoning effort, grok-4.7 did not finish in 6 minutes. One prompt on one day is an indication, not a benchmark: re-measure after a model or prompt change. The effort now defaults to `high`, with no timeout and no token ceiling, so a plan runs until it completes; set `ULTRATHINK_MODEL_REASONING_EFFORT` lower, or a positive timeout or ceiling, only when you want a limit.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `ULTRATHINK_PLANNING_MODEL` | none (planning off without it) | OpenRouter model id used for every stage |
-| `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | Reasoning effort sent with each call; the main lever on latency and cost |
-| `ULTRATHINK_MODEL_TIMEOUT_MS` | 240000 | Per model call. A call that exceeds it is not retried: it fails with `timeout` and the whole plan ends as `failed`. Only 429, 5xx and network errors are retried (up to 2 times) |
-| `ULTRATHINK_PLAN_TIMEOUT_MS` | 600000 | Whole plan; a plan over this ends as `failed` |
+| `ULTRATHINK_MODEL_REASONING_EFFORT` | `high` | Reasoning effort sent with each call; the main lever on latency and cost |
+| `ULTRATHINK_MODEL_TIMEOUT_MS` | 0 (no timeout) | Per model call, when set above 0. A call that exceeds it is not retried: it fails with `timeout` and the whole plan ends as `failed`. Only 429, 5xx and network errors are retried (up to 2 times) |
+| `ULTRATHINK_PLAN_TIMEOUT_MS` | 0 (no timeout) | Whole plan, when set above 0; a plan over this ends as `failed` |
 | `ULTRATHINK_MAX_CONCURRENT_PLANS` | 2 | Plans running at once; further starts are refused as busy |
-| `ULTRATHINK_RUN_TOKEN_CEILING` | see `config.ts` | Token ceiling for one run |
-| `ULTRATHINK_DAILY_TOKEN_CEILING` | see `config.ts` | Token ceiling per UTC day |
+| `ULTRATHINK_RUN_TOKEN_CEILING` | 0 (no ceiling) | Token ceiling for one run, when set above 0 |
+| `ULTRATHINK_DAILY_TOKEN_CEILING` | 0 (no ceiling) | Token ceiling per UTC day, when set above 0 |
 
-The default per-call timeout is 240 s because grok-4.7 writes about 45 tokens per second, so its single large specification call takes 110 to 120 s; a timeout close to that would fail healthy plans. Every model call is logged as a `planner_call` event (fields `sessionId`, `model`, `ms`, `outcome`, `attempts`, `usage`) and counted in `ultrathink_planner_calls_total{outcome}` and `ultrathink_planner_call_duration_seconds`; use them to see which stage is slow before raising a timeout.
+The per-call timeout is off by default. grok-4.7 writes about 45 tokens per second, so its single large specification call takes 110 to 120 s at low effort; a positive timeout close to that would fail healthy plans. Every model call is logged as a `planner_call` event (fields `sessionId`, `model`, `ms`, `outcome`, `attempts`, `usage`) and counted in `ultrathink_planner_calls_total{outcome}` and `ultrathink_planner_call_duration_seconds`; use them to see which stage is slow before setting a timeout.
 
-Chat clients wait through long polling (`ultrathink_result` waits up to 40 s per poll), so a plan of a few minutes is normal; a plan that needs more than the 10 minute limit will never complete.
+Chat clients wait through long polling (`ultrathink_result` waits up to 40 s per poll), so a plan of a few minutes is normal; with no plan timeout a plan runs until it completes.
 
 Switching models safely:
 

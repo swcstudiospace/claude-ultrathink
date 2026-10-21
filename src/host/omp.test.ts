@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Effort, Model } from "@oh-my-pi/pi-ai";
 import { writeSession } from "../claude/state.ts";
+import { runUplift } from "../uplift/run.ts";
 import type { TrackPlan } from "../track/types.ts";
 import { DEFAULT_SHIP_CONFIG, type ShipConfig } from "../ship/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
@@ -30,6 +31,48 @@ describe("omp extension", () => {
 	test("empty fast plan injects nothing", async () => {
 		const { run } = setup(async () => "");
 		expect(await run()).toBeUndefined();
+	});
+
+	test("with default options a plan that resolves after 60 ms is returned inline, not the fallback", async () => {
+		// Real wall-clock delay on purpose: the race is a platform setTimeout with no clock seam to drive it.
+		// The race window is the shipped 25 s default, passed explicitly because the harness always sets it; maxRunMs is left unset.
+		const { run, sent } = setup(async () => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 60);
+			await promise;
+			return "PLAN";
+		}, 25_000);
+		expect(await run()).toEqual({
+			message: { customType: "ultrathink-plan", content: "PLAN", display: true, attribution: "agent" },
+		});
+		await flush();
+		expect(sent).toHaveLength(0);
+	});
+
+	test("maxRunMs 0 starts no flight timer: a slow flight is not aborted and its plan still lands as an aside", async () => {
+		const runs: { request: OmpPlanRequest; signal: AbortSignal; gate: PromiseWithResolvers<string> }[] = [];
+		const { run, sent } = setup(
+			(request, signal) => {
+				const gate = Promise.withResolvers<string>();
+				runs.push({ request, signal, gate });
+				return gate.promise;
+			},
+			1,
+			{ maxRunMs: 0 },
+		);
+		expect(await run()).toEqual({ message: expect.objectContaining({ customType: "ultrathink-pending" }) });
+		// Real wall-clock pass on purpose: a zero-delay limit timer would fire during it, so only real time shows none was armed.
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, 30);
+		await promise;
+		expect(runs[0]?.signal.aborted).toBe(false);
+		expect(runs[0]?.request.isCurrent?.()).toBe(true);
+		expect(runs[0]?.request.deadline).toBeUndefined();
+		runs[0]?.gate.resolve("PLAN");
+		await flush();
+		expect(sent).toEqual([
+			{ message: { customType: "ultrathink-plan", content: "PLAN", display: true, attribution: "agent" }, options: { deliverAs: "aside" } },
+		]);
 	});
 
 	test("slow plan returns pending then delivers aside once", async () => {
@@ -885,6 +928,10 @@ describe("native binding (D-01, D-02, §7)", () => {
 			() => "resolved",
 			(error: unknown) => (error instanceof Error ? error.name : "non-error"),
 		);
+	/** No wait in a test: the backoff seam returns at once and records each wait. */
+	const instantSleep = (delays: number[]) => async (ms: number) => {
+		delays.push(ms);
+	};
 
 	test("every call runs on the flight's one snapshot through one host resolver: one system prompt, one timestamped user message, no tools, no per-call headers", async () => {
 		const live = fakeModel("acme", "Sol-1.Opaque");
@@ -936,7 +983,7 @@ describe("native binding (D-01, D-02, §7)", () => {
 		const live = fakeModel("acme", "sol-1");
 		const { runtime } = fakeRuntime([live]);
 		const rec = recorder(() => reply([{ type: "text", text: "PARTIAL" }], { stopReason: "error", errorMessage: "SECRET-PROVIDER-BODY", errorStatus: 429 }));
-		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {} });
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {}, sleep: instantSleep([]) });
 		const error = await engine.complete("s", "u").catch((caught: unknown) => caught);
 		expect(error).toMatchObject({ name: "NativeCompletionError", message: "omp-native completion failed (provider error, HTTP 429)" });
 		expect(engine.error()).toBe("omp-native completion failed (provider error, HTTP 429)");
@@ -989,6 +1036,91 @@ describe("native binding (D-01, D-02, §7)", () => {
 		});
 		const ignoring = await engineFor(flightOf(live, runtime), { completeSimple: stubborn.complete, providerDefaults: {} }, INTENT, late);
 		expect(await outcome(ignoring.complete("s", "u"))).toBe("AbortError");
+	});
+
+	test("retries a 429 once and then plans", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		const delays: number[] = [];
+		let failed = false;
+		const rec = recorder((call) => {
+			if (failed) return reply([{ type: "text", text: stageAnswer(userText(call)).text }]);
+			failed = true;
+			return reply([], { stopReason: "error", errorStatus: 429 });
+		});
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {}, sleep: instantSleep(delays) });
+		const uplift = await runUplift({ original: "add a widget", complete: engine.complete, report: engine.report });
+		expect(uplift).toMatchObject({ source: "llm", root: "BUILD_PROMPT", attempts: 2 });
+		expect(rec.calls).toHaveLength(2);
+		expect(userText(rec.calls[1]!)).toBe(userText(rec.calls[0]!));
+		expect(delays).toHaveLength(1);
+		expect(delays[0]).toBeGreaterThanOrEqual(2000);
+		expect(delays[0]).toBeLessThan(2500);
+	});
+
+	test("does not retry a 403", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		const delays: number[] = [];
+		const rec = recorder(() => reply([], { stopReason: "error", errorStatus: 403 }));
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {}, sleep: instantSleep(delays) });
+		const uplift = await runUplift({ original: "add a widget", complete: engine.complete, report: engine.report });
+		expect(uplift).toMatchObject({ source: "fallback", fallbackReason: "provider_error:403", rawReplyChars: 0, attempts: 1 });
+		expect(rec.calls).toHaveLength(1);
+		expect(delays).toHaveLength(0);
+	});
+
+	test("records empty_reply on an empty completion", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		const rec = recorder(() => reply([]));
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {} });
+		const uplift = await runUplift({ original: "add a widget", complete: engine.complete, report: engine.report });
+		expect(uplift).toMatchObject({ source: "fallback", fallbackReason: "empty_reply", rawReplyChars: 0, attempts: 1 });
+	});
+
+	// Real timers on purpose: the default backoff is a wall-clock wait, and the abort must cut it short, which a fake clock cannot show.
+	test("an abort during backoff stops with no further call", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		// Aborts 10 ms into the real backoff; no injected sleep, so the production wait is what gets interrupted.
+		const flight = new AbortController();
+		const rec = recorder(() => {
+			setTimeout(() => flight.abort(), 10);
+			return reply([], { stopReason: "error", errorStatus: 429 });
+		});
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {} }, INTENT, flight);
+		expect(await outcome(engine.complete("s", "u"))).toBe("AbortError");
+		expect(rec.calls).toHaveLength(1);
+	});
+
+	test("gives up after three attempts with the backoff between them", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		const delays: number[] = [];
+		const rec = recorder(() => reply([], { stopReason: "error", errorStatus: 503 }));
+		const engine = await engineFor(flightOf(live, runtime), { completeSimple: rec.complete, providerDefaults: {}, sleep: instantSleep(delays) });
+		const uplift = await runUplift({ original: "add a widget", complete: engine.complete, report: engine.report });
+		expect(uplift).toMatchObject({ source: "fallback", fallbackReason: "provider_error:503", attempts: 3 });
+		expect(rec.calls).toHaveLength(3);
+		expect(delays).toHaveLength(2);
+		expect(delays[0]).toBeGreaterThanOrEqual(2000);
+		expect(delays[0]).toBeLessThan(2500);
+		expect(delays[1]).toBeGreaterThanOrEqual(6000);
+		expect(delays[1]).toBeLessThan(7500);
+	});
+
+	test("a retry that would cross the flight deadline is not taken", async () => {
+		const live = fakeModel("acme", "sol-1");
+		const { runtime } = fakeRuntime([live]);
+		const delays: number[] = [];
+		const rec = recorder(() => reply([], { stopReason: "error", errorStatus: 429 }));
+		const request: OmpPlanRequest = { ...flightOf(live, runtime), deadline: Date.now() + 500 };
+		const engine = await engineFor(request, { completeSimple: rec.complete, providerDefaults: {}, sleep: instantSleep(delays) });
+		const uplift = await runUplift({ original: "add a widget", complete: engine.complete, report: engine.report });
+		expect(uplift).toMatchObject({ source: "fallback", fallbackReason: "provider_error:429", attempts: 1 });
+		expect(rec.calls).toHaveLength(1);
+		expect(delays).toHaveLength(0);
 	});
 
 	test("flight validity is checked before dispatch and after the answer", async () => {
