@@ -12,6 +12,7 @@ import { DEFAULT_REDIRECT_ORIGINS, type DurableFs, type OAuth, type OAuthOptions
 import type { UltrathinkConfig } from "../config/config.ts";
 import { openStore, type Store } from "../store/store.ts";
 import { createHandler } from "../routes/router.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../security/events.ts";
 
 const ORIGIN = "https://ultrathink.test";
 const RESOURCE = `${ORIGIN}/mcp`;
@@ -191,6 +192,8 @@ beforeAll(async () => {
 		auditWatchMs: 1000,
 		auditSinkQueue: 10000,
 		priorityReservePct: 25,
+		fairQueueDepth: 16,
+		fairQueueWaitMs: 1500,
 		adaptiveQuotaMinPct: 50,
 		lagTargetMs: 100,
 		replicaCapacityRps: 20,
@@ -1139,9 +1142,77 @@ describe("OAuth consent page and CSP", () => {
 		const clientId = await registered(h, { client_name: "Claude <script>alert(1)</script>" });
 		const { challenge } = pkcePair();
 		const html = await (await authorizeCall(h, clientId, challenge)).text();
-		expect(html).toContain('data-redirect-origin="https://claude.ai"');
+		// The shared encoder writes "/" as &#x2F;. A browser reads that back as the same origin.
+		expect(html).toContain('data-redirect-origin="https:&#x2F;&#x2F;claude.ai"');
 		expect(html).toContain('data-client-unverified="true"');
 		expect(html).not.toContain("<script>");
+	});
+
+	test("a hostile client name and the page message render inert", async () => {
+		const h = await makeHarness();
+		const hostileName = `<img src=x onerror="alert(1)">"'&`;
+		const clientId = await registered(h, { client_name: hostileName });
+		const { challenge } = pkcePair();
+		const consent = await authorizeCall(h, clientId, challenge);
+		const html = await consent.text();
+		expect(consent.status).toBe(200);
+		expect(html).not.toContain("<img");
+		expect(html).toContain("<strong>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&quot;&apos;&amp;</strong>");
+		// A wrong password re-renders the page with its alert. The hostile name stays inert on that page too.
+		const retryHtml = await (await approveWith(h, html, "not-the-password")).text();
+		expect(retryHtml).toContain('<p class="err">Incorrect password.</p>');
+		expect(retryHtml).not.toContain("<img");
+		expect(retryHtml).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("OAuth refused requests", () => {
+	test("a repeated token parameter is refused before the code is redeemed, and the refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const h = await makeHarness();
+			const clientId = await registered(h);
+			const { code, verifier, redirect } = await authorizedCode(h, clientId);
+			const repeated = await h.oauth.token(
+				new Request(`${ORIGIN}/oauth/token`, {
+					method: "POST",
+					headers: { "content-type": "application/x-www-form-urlencoded" },
+					body: new URLSearchParams([
+						["grant_type", "authorization_code"],
+						["code", code],
+						["code", "ut_code_bogus"],
+						["code_verifier", verifier],
+						["client_id", clientId],
+						["redirect_uri", redirect],
+						["resource", RESOURCE],
+					]).toString(),
+				}),
+				"203.0.113.50",
+			);
+			expect(repeated.status).toBe(400);
+			expect(await bodyOf(repeated)).toEqual({ error: "invalid_request", error_description: "code must appear once." });
+			expect(recorder.validation).toHaveLength(1);
+			expect(recorder.validation[0]).toMatchObject({ source: "oauth", resource: "/oauth/token", details: { field: "code", code: "DUPLICATE" } });
+			// The refused request never reached the code store, so the single-valued retry still redeems the code.
+			const redeemed = await tokenCall(h, { grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: redirect, resource: RESOURCE });
+			expect(redeemed.status).toBe(200);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });
 

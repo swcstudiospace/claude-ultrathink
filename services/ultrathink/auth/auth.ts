@@ -39,6 +39,8 @@
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
+import { getSecurityLogger } from "../security/events.ts";
+import { StringValidator } from "../security/validation.ts";
 
 export interface AuthOptions {
 	ownerPasswordHash: string;
@@ -108,14 +110,23 @@ const APPROVAL_ATTEMPTS_PER_WINDOW = 2;
 const APPROVAL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const MIN_SECRET_LENGTH = 32;
 const KEY_ID = /^[0-9a-f]{8}$/;
-const SESSION_EXPIRY = /^\d{1,16}$/;
-const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const MAX_TRACKED_KEYS = 10_000;
 const PRUNE_INTERVAL_MS = 60 * 1000;
 const OWNER_KEY = "owner";
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 const HASH_FORMAT = /^\$(?:argon2(?:id|i|d)|2[abxy]?)\$/;
 const FORWARDED_IP = /^[0-9A-Fa-f:.]{1,45}$/;
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+/** Longest password login accepts. A longer one is refused before any hashing. */
+export const MAX_PASSWORD_CHARS = 1024;
+const MAX_IDENTITY_CHARS = 64;
+const MAX_PRINCIPAL_INPUT_CHARS = 4096;
+const MAX_COOKIE_HEADER_CHARS = 8192;
+const MAX_SESSION_VALUE_CHARS = 256;
+const MAX_SIGNATURE_CHARS = 128;
+const PASSWORD_INPUT = new StringValidator({ allowEmpty: true, maxLength: MAX_PASSWORD_CHARS });
+const IDENTITY_INPUT = new StringValidator({ maxLength: MAX_IDENTITY_CHARS, pattern: NO_CONTROL });
+const SESSION_VALUE = new StringValidator({ maxLength: MAX_SESSION_VALUE_CHARS, pattern: /^[0-9a-f]{8}\.\d{1,16}\.[A-Za-z0-9_-]+$/ });
 
 /**
  * Key id of a session secret: the first 8 hex characters of
@@ -220,6 +231,11 @@ function retryAfterOf(hit: Hit | null, windowMs: number): number {
 	return hit ? hit.retryAfterSec : Math.ceil(windowMs / 1000);
 }
 
+/** Records a refused input on the security feed. Only the field and the validator code are recorded, never the value. */
+function refused(resource: string, field: string, code: string): void {
+	getSecurityLogger().logValidationFailure({ source: "auth", resource, details: { field, code } });
+}
+
 /** Lowest effective per-call scale; smaller finite values clamp up to it. */
 const MIN_REQUEST_SCALE = 0.1;
 
@@ -296,6 +312,10 @@ export function createAuth(options: AuthOptions): Auth {
 	function readCookie(req: Request): string | null {
 		const header = req.headers.get("cookie");
 		if (!header) return null;
+		if (header.length > MAX_COOKIE_HEADER_CHARS) {
+			refused("session", "cookie", "TOO_LONG");
+			return null;
+		}
 		for (const part of header.split(";")) {
 			const eq = part.indexOf("=");
 			if (eq < 0) continue;
@@ -306,6 +326,16 @@ export function createAuth(options: AuthOptions): Auth {
 
 	return {
 		async login({ password, clientIp }) {
+			const passwordVerdict = PASSWORD_INPUT.validate(password);
+			if (!passwordVerdict.valid) {
+				refused("login", "password", passwordVerdict.errors[0]?.code ?? "INVALID");
+				return { ok: false, reason: "invalid" };
+			}
+			const addressVerdict = IDENTITY_INPUT.validate(clientIp);
+			if (!addressVerdict.valid) {
+				refused("login", "clientIp", addressVerdict.errors[0]?.code ?? "INVALID");
+				return { ok: false, reason: "invalid" };
+			}
 			const perIp = loginsByIp.hit(clientIp, LOGIN_WINDOW_MS);
 			if (!perIp || perIp.count > LOGIN_ATTEMPTS_PER_IP) {
 				return { ok: false, reason: "rate_limited", retryAfterSec: retryAfterOf(perIp, LOGIN_WINDOW_MS) };
@@ -334,11 +364,14 @@ export function createAuth(options: AuthOptions): Auth {
 			const value = readCookie(req);
 			if (!value) return null;
 			// Exactly `<kid>.<expiresAt>.<mac>`; the pre-ring two-part layout is refused.
-			const parts = value.split(".");
-			if (parts.length !== 3) return null;
-			const [kid = "", expiresRaw = "", mac = ""] = parts;
+			const shape = SESSION_VALUE.validate(value);
+			if (!shape.valid) {
+				refused("session", "cookie", shape.errors[0]?.code ?? "INVALID");
+				return null;
+			}
+			const [kid = "", expiresRaw = "", mac = ""] = value.split(".");
 			const secret = ringSecret(kid);
-			if (secret === null || !SESSION_EXPIRY.test(expiresRaw) || !BASE64URL.test(mac)) return null;
+			if (secret === null) return null;
 			const expiresAt = Number(expiresRaw);
 			if (!Number.isSafeInteger(expiresAt) || expiresAt <= now()) return null;
 
@@ -353,6 +386,19 @@ export function createAuth(options: AuthOptions): Auth {
 		},
 
 		allowRequest({ clientIp, ownerId, principal, ownerLimit, scale }) {
+			// These arguments come from the router, never from a request: a bad one is a programming error, so it throws.
+			if (!IDENTITY_INPUT.validate(clientIp).valid || !IDENTITY_INPUT.validate(ownerId).valid) {
+				refused("limits", "identity", "INVALID");
+				throw new TypeError("request limit needs a client address and an owner id");
+			}
+			if (principal !== undefined && (typeof principal !== "string" || principal.length > MAX_PRINCIPAL_INPUT_CHARS)) {
+				refused("limits", "principal", "INVALID");
+				throw new TypeError("request limit principal must be a string of at most 4096 characters");
+			}
+			if (ownerLimit !== undefined && (!Number.isFinite(ownerLimit) || ownerLimit < 0)) {
+				refused("limits", "ownerLimit", "INVALID");
+				throw new TypeError("request limit owner limit must be a finite, non-negative number");
+			}
 			const factor = effectiveScale(scale);
 			const ip = requests.hit(`ip:${clientIp}`, REQUEST_WINDOW_MS);
 			if (!ip || ip.count > scaledLimit(IP_REQUESTS_PER_WINDOW, factor)) {
@@ -380,24 +426,41 @@ export function createAuth(options: AuthOptions): Auth {
 
 		signApproval(proof) {
 			const mac = approvalMac(sessionSecret, proof);
-			if (mac === null) throw new Error("invalid approval proof");
+			if (mac === null) {
+				refused("approval", "proof", "INVALID");
+				throw new Error("invalid approval proof");
+			}
 			return `${signingKid}.${mac}`;
 		},
 
 		verifyApproval(proof, signature) {
-			if (typeof signature !== "string" || signature.length === 0 || signature.length > 128) return false;
+			if (typeof signature !== "string" || signature.length === 0 || signature.length > MAX_SIGNATURE_CHARS) {
+				refused("approval", "signature", "INVALID");
+				return false;
+			}
 			const dot = signature.indexOf(".");
-			if (dot < 0) return false;
-			const secret = ringSecret(signature.slice(0, dot));
+			const kid = dot < 0 ? "" : signature.slice(0, dot);
+			if (!KEY_ID.test(kid)) {
+				refused("approval", "signature", "PATTERN_MISMATCH");
+				return false;
+			}
+			const secret = ringSecret(kid);
 			if (secret === null) return false;
 			const expected = approvalMac(secret, proof);
-			if (expected === null) return false;
+			if (expected === null) {
+				refused("approval", "proof", "INVALID");
+				return false;
+			}
 			const expectedBuf = Buffer.from(expected);
 			const actualBuf = Buffer.from(signature.slice(dot + 1));
 			return actualBuf.length === expectedBuf.length && timingSafeEqual(actualBuf, expectedBuf);
 		},
 
 		allowApprovalAttempt(clientIp) {
+			if (!IDENTITY_INPUT.validate(clientIp).valid) {
+				refused("approval", "clientIp", "INVALID");
+				throw new TypeError("approval attempt needs a client address");
+			}
 			const hit = approvalAttempts.hit(clientIp, APPROVAL_WINDOW_MS);
 			if (!hit || hit.count > APPROVAL_ATTEMPTS_PER_WINDOW) {
 				return { ok: false, retryAfterSec: retryAfterOf(hit, APPROVAL_WINDOW_MS) };
@@ -436,5 +499,6 @@ export function clientIpFrom(req: Request, peerIp: string, trustForwarded = LOOP
 	if (!trustForwarded) return limiterKey(peerIp);
 	const forwarded = req.headers.get("x-real-ip")?.trim();
 	if (forwarded && FORWARDED_IP.test(forwarded) && isIP(forwarded) !== 0) return limiterKey(forwarded);
+	if (forwarded) refused("client-ip", "x-real-ip", "PATTERN_MISMATCH");
 	return limiterKey(peerIp);
 }

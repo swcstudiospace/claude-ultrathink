@@ -15,6 +15,8 @@ import {
 } from "./oauth.ts";
 import { readStore, withStoreLock, writeStore } from "./store.ts";
 import type { OAuthClient } from "./store.ts";
+import type { McpProviderId } from "./providers.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../../services/ultrathink/security/events.ts";
 
 const NOW = 1_700_000_000_000;
 const REDIRECT = "http://127.0.0.1:8765/callback";
@@ -494,5 +496,43 @@ describe("recoverUnauthorized", () => {
 	test("api key -> false", async () => {
 		await setApiKey("greptile", "g", { storePath: path });
 		expect(await recoverUnauthorized("greptile", "Bearer g", { storePath: path })).toBe(false);
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a provider the table does not name and a pasted callback with a control character are refused before any request", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes());
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			// The type promises a provider id; a runtime caller can still pass anything.
+			const hostile: string = "notion\u0000";
+			await expect(beginLogin(hostile as McpProviderId, { ...deps, redirectUri: REDIRECT })).rejects.toThrow("unknown MCP provider");
+			expect(fake.calls).toHaveLength(0);
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			const requests = fake.calls.length;
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}\u0007`, deps)).rejects.toThrow("authorization callback is not valid text");
+			expect(fake.calls).toHaveLength(requests);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_oauth", resource: "oauth", details: { field: "provider", code: "INVALID_VALUE" } },
+				{ source: "mcp_oauth", resource: "oauth", details: { field: "callback", code: "PATTERN_MISMATCH" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });

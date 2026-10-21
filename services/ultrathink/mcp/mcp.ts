@@ -6,6 +6,8 @@ import { promptDefinitions, renderPrompt } from "./prompts.ts";
 import type { ResourceRegistry } from "./resources.ts";
 import { CONNECTOR_TOOL_DEFINITIONS, GRAPH_UI_META, LARGE_RESULT_META, READ_ONLY } from "./tools-connector.ts";
 import { compileSchema, type Validator } from "./validate.ts";
+import { getSecurityLogger } from "../security/events.ts";
+import { StringValidator } from "../security/validation.ts";
 
 /** Newest first: initialize answers with the requested version when listed here, otherwise the first. */
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
@@ -64,6 +66,19 @@ const JSONRPC = "2.0";
 const NOTIFICATION_PREFIX = "notifications/";
 const UPLIFT_TOOL = "ultrathink_uplift";
 const UI_EXTENSION = "io.modelcontextprotocol/ui";
+
+/** Text an id, a method or a text parameter may carry. Control characters are refused everywhere. */
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+const REQUEST_ID_TEXT = new StringValidator({ allowEmpty: true, maxLength: 256, pattern: NO_CONTROL });
+const METHOD_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+const NAME_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+/** The text parameter each method reads, with its bound. Only a string is checked; other values keep their existing handling. */
+const TEXT_PARAMS: Record<string, { field: string; validator: StringValidator }> = {
+	initialize: { field: "protocolVersion", validator: new StringValidator({ allowEmpty: true, maxLength: 64, pattern: NO_CONTROL }) },
+	"tools/call": { field: "name", validator: NAME_TEXT },
+	"prompts/get": { field: "name", validator: NAME_TEXT },
+	"resources/read": { field: "uri", validator: new StringValidator({ allowEmpty: true, maxLength: 2048, pattern: NO_CONTROL }) },
+};
 
 // Claude Code cuts server instructions at 4096 characters; each mode stays under the 3500 the tests pin.
 const CLIENT_PLANNING =
@@ -314,14 +329,42 @@ async function handleMessage(host: McpToolHost, message: unknown): Promise<Handl
 	if (typeof id !== "string" && !(typeof id === "number" && Number.isInteger(id))) {
 		return { reply: invalidRequest(), status: 400 };
 	}
+	const envelope = refusedEnvelope(id, method);
+	if (envelope !== null) {
+		getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: envelope });
+		return { reply: invalidRequest(), status: 400 };
+	}
 	// A request cannot be a notification: the client waits for an answer.
 	if (method.startsWith(NOTIFICATION_PREFIX)) return { reply: rpcError(id, METHOD_NOT_FOUND, "method not found") };
+	const param = refusedParams(method, message.params);
+	if (param !== null) {
+		getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: param });
+		return { reply: rpcError(id, INVALID_PARAMS, "invalid params") };
+	}
 	try {
 		return { reply: await dispatch(host, id, method, message.params) };
 	} catch {
 		// Host failures are reported without the thrown message or stack.
 		return { reply: rpcError(id, INTERNAL_ERROR, "internal error") };
 	}
+}
+
+/** The first refused field of a request's envelope: its id when that is a string too long or with a control character, else its method. */
+function refusedEnvelope(id: unknown, method: string): { field: string; code: string } | null {
+	if (typeof id === "string") {
+		const verdict = REQUEST_ID_TEXT.validate(id);
+		if (!verdict.valid) return { field: "id", code: verdict.errors[0]?.code ?? "INVALID" };
+	}
+	const verdict = METHOD_TEXT.validate(method);
+	return verdict.valid ? null : { field: "method", code: verdict.errors[0]?.code ?? "INVALID" };
+}
+
+/** The first text parameter a method reads, when it is a string too long or with a control character. Other values keep their existing handling. */
+function refusedParams(method: string, params: unknown): { field: string; code: string } | null {
+	const spec = Object.hasOwn(TEXT_PARAMS, method) ? TEXT_PARAMS[method] : undefined;
+	if (spec === undefined || !isRecord(params) || typeof params[spec.field] !== "string") return null;
+	const verdict = spec.validator.validate(params[spec.field]);
+	return verdict.valid ? null : { field: spec.field, code: verdict.errors[0]?.code ?? "INVALID" };
 }
 
 async function dispatch(host: McpToolHost, id: unknown, method: string, params: unknown): Promise<RpcResponse> {

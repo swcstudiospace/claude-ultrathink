@@ -15,6 +15,7 @@ import {
 	toolDefinitions,
 } from "./mcp.ts";
 import { createResourceRegistry, UI_RESOURCE_MIME_TYPE } from "./resources.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../security/events.ts";
 
 const SESSION_ID = "session-1";
 const PLANNED: ToolOutcome = { ok: true, data: { sessionId: SESSION_ID, status: "planned", pending: [] } };
@@ -1199,5 +1200,37 @@ describe("host failures", () => {
 		])) as RpcReply[];
 		expect(resultOf<ToolResult>(replies[0] as RpcReply).isError).toBe(false);
 		expect(replies[1]).toEqual({ jsonrpc: "2.0", id: "b", error: INTERNAL_ERROR });
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a tool name with a control character is refused before the host runs, and the refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect(await replyOf(host, toolCall("ultrathink_plan\u0000", { prompt: "Plan" }, 3))).toEqual({
+				jsonrpc: "2.0",
+				id: 3,
+				error: { code: -32602, message: "invalid params" },
+			});
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "PATTERN_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });

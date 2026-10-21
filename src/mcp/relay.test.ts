@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { createRelay, type RelayAuth, runStdioRelay } from "./relay.ts";
 import { createSseParser } from "./sse.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../../services/ultrathink/security/events.ts";
 
 const URL_ = "https://mcp.example.com/mcp";
 
@@ -86,6 +87,26 @@ describe("createSseParser", () => {
 		const parser = createSseParser((data) => got.push(data), 8);
 		parser.push("data:12\ndata:34\ndata:56\n\n");
 		expect(got).toEqual(["12\n34\n56"]);
+	});
+
+	test("a non-string chunk and an oversized line are refused before any event is dispatched, and each refusal is logged", () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const got: string[] = [];
+			const parser = createSseParser((data) => got.push(data), 8);
+			// The parser is typed for strings. A runtime caller can still pass bytes, and those are refused.
+			expect(() => parser.push(new TextEncoder().encode("data: 1\n\n") as unknown as string)).toThrow(TypeError);
+			expect(() => parser.push("x".repeat(9))).toThrow("SSE line too long");
+			expect(got).toEqual([]);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_sse", resource: "sse", details: { field: "chunk", code: "TYPE_MISMATCH" } },
+				{ source: "mcp_sse", resource: "sse", details: { field: "line", code: "TOO_LONG" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });
 
@@ -472,5 +493,59 @@ describe("runStdioRelay", () => {
 		const lines: string[] = [];
 		await runStdioRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h" }, input, (line) => lines.push(line));
 		expect(lines.map((line) => JSON.parse(line).id).sort()).toEqual([1, 2]);
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused stdin", () => {
+	test("a message the envelope rules refuse never reaches the upstream, and each refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const { fetch, calls } = fakeFetch((call) => json({ jsonrpc: "2.0", id: call.body.id, result: {} }));
+			const written: string[] = [];
+			const relay = createRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h", write: (line) => written.push(line) });
+			// A control character in the method is refused whole: it is answered with an error and nothing is posted.
+			await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/list\u0007" });
+			expect(calls).toHaveLength(0);
+			expect(written.map((line) => JSON.parse(line))).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "invalid request" } }]);
+
+			// A line past the cap arrives in two chunks. It is refused once, its tail is discarded, and the next line still relays.
+			const encoder = new TextEncoder();
+			const oversized = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: { pad: "x".repeat(120) } });
+			const good = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+			const input = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(oversized.slice(0, 100)));
+					controller.enqueue(encoder.encode(`${oversized.slice(100)}\n${good}\n`));
+					controller.close();
+				},
+			});
+			const lines: string[] = [];
+			await runStdioRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h", maxLineChars: 80 }, input, (line) => lines.push(line));
+			expect(lines.map((line) => JSON.parse(line))).toEqual([
+				{ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } },
+				{ jsonrpc: "2.0", id: 3, result: {} },
+			]);
+			expect(calls.map((call) => call.body.id)).toEqual([3]);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_relay", resource: "message", details: { field: "method", code: "PATTERN_MISMATCH" } },
+				{ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "TOO_LONG" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });
