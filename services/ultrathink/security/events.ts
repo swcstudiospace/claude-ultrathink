@@ -126,6 +126,28 @@ export class ConsoleSecurityEventLogger implements SecurityEventLogger {
 	}
 }
 
+/**
+ * Writes each event through the console logger, then hands it to `onEvent` (phase 68 streaming). A failing `onEvent`
+ * never reaches the caller: the request that raised the event continues.
+ */
+export class StreamingSecurityEventLogger extends ConsoleSecurityEventLogger {
+	private readonly onEvent: (event: SecurityEvent) => void;
+
+	constructor(logger: Logger, onEvent: (event: SecurityEvent) => void) {
+		super(logger);
+		this.onEvent = onEvent;
+	}
+
+	override log(event: SecurityEvent): void {
+		super.log(event);
+		try {
+			this.onEvent(event);
+		} catch {
+			// A stream failure must not change what the request sees.
+		}
+	}
+}
+
 let loggerInstance: SecurityEventLogger = new ConsoleSecurityEventLogger();
 
 export function getSecurityLogger(): SecurityEventLogger {

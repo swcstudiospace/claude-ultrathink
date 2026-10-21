@@ -2,7 +2,8 @@
 // Copyright (C) 2026 SWC Studio
 
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import pkg from "../../../package.json";
 import { type Auth, clientIpFrom } from "../auth/auth.ts";
@@ -18,18 +19,25 @@ import { type McpToolHost, type ToolOutcome, handleMcpPayload } from "../mcp/mcp
 import { createToolHost } from "../mcp/tool-host.ts";
 import type { PlanningInfo } from "../mcp/tools-connector.ts";
 import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "../mcp/transport.ts";
+import { type AnomalyAlert, DEFAULT_ANOMALY_RULES, createAnomalyDetector } from "../obs/anomaly.ts";
+import { type Fingerprint, createAuditWatch } from "../obs/audit-watch.ts";
 import { type AuditEvent, type AuditLog, auditPath, createAuditLog } from "../obs/audit.ts";
 import { runWithRequestContext } from "../obs/context.ts";
 import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../obs/log.ts";
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
 import { createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
+import { createAuditStreams } from "../obs/sinks/fanout.ts";
+import { createHttpTransport, createKafkaRestTransport } from "../obs/sinks/http.ts";
+import type { SinkEvent } from "../obs/sinks/queue.ts";
+import { createSyslogTransport } from "../obs/sinks/syslog.ts";
+import type { SinkTransport } from "../obs/sinks/types.ts";
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import {
-	ConsoleSecurityEventLogger,
 	ObjectValidator,
 	SecurityEventType,
 	type SecurityHeadersConfig,
+	StreamingSecurityEventLogger,
 	StringValidator,
 	type Validator,
 	buildSecurityHeaders,
@@ -58,6 +66,13 @@ export interface RouterDeps {
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	/** Test seam. Defaults to the state directory's audit log, which is absent when config.auditLog is off. */
 	audit?: AuditLog;
+	/** Test seam for the tamper watch and the prune sweep. Defaults to the real timers. */
+	timers?: {
+		setInterval: (run: () => void, intervalMs: number) => object;
+		clearInterval: (handle: object) => void;
+	};
+	/** Test seam. Replaces the sink transports that config builds (HTTP, Kafka REST and syslog). */
+	auditTransports?: SinkTransport[];
 }
 
 export interface App {
@@ -137,6 +152,9 @@ const RUNTIME_SAMPLE_MS = 5000;
 const RETENTION_SWEEP_MS = 60 * 60 * 1000;
 /** The WAL is folded into the main file this often, so a busy host does not grow it between sweeps. */
 const WAL_CHECKPOINT_MS = 10 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** How long shutdown lets queued audit and security envelopes reach their sinks. */
+const AUDIT_FLUSH_MS = 2000;
 
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 
@@ -339,11 +357,57 @@ function lazyLedger(store: Store, config: UltrathinkConfig, now: (() => number) 
 	};
 }
 
+/** Builds the sink transports that the config enables. The config has already validated every URL, token and port. */
+function transportsFromConfig(config: UltrathinkConfig): SinkTransport[] {
+	const transports: SinkTransport[] = [];
+	if (config.auditHttpUrl !== undefined) {
+		transports.push(createHttpTransport({ url: config.auditHttpUrl, ...(config.auditHttpToken === undefined ? {} : { token: config.auditHttpToken }) }));
+	}
+	if (config.auditKafkaRestUrl !== undefined && config.auditKafkaTopic !== undefined) {
+		transports.push(createKafkaRestTransport({ baseUrl: config.auditKafkaRestUrl, topic: config.auditKafkaTopic }));
+	}
+	if (config.auditSyslog !== undefined) {
+		transports.push(createSyslogTransport({ host: config.auditSyslog.host, port: config.auditSyslog.port, hostname: hostname(), appName: "ultrathink" }));
+	}
+	return transports;
+}
+
+/** The audit file's identity on disk, read the way the log reads it, so the watch sees a change made outside the service. */
+function diskFingerprint(path: string): Fingerprint | undefined {
+	try {
+		const stat = statSync(path);
+		return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+	} catch {
+		return undefined;
+	}
+}
+
 export function createApp(deps: RouterDeps): App {
 	const { config, store, auth } = deps;
 	const logger = deps.logger ?? createLogger();
-	const securityEvents = new ConsoleSecurityEventLogger(logger);
 	const metrics = deps.metrics ?? createMetrics();
+	const timers = deps.timers;
+	// Test seam for the tamper watch and the prune sweep; absent means the real timers.
+	const timerSeams =
+		timers === undefined
+			? {}
+			: {
+					setTimer: (run: () => void, intervalMs: number) => timers.setInterval(run, intervalMs),
+					clearTimer: (handle: object) => timers.clearInterval(handle),
+				};
+	// Set while a sink is failing, so each distinct failure is logged once until that sink delivers again.
+	let sinkFailureLogged: string | undefined;
+	const streams = createAuditStreams({
+		transports: deps.auditTransports ?? transportsFromConfig(config),
+		capacity: config.auditSinkQueue,
+		onEvent: (event) => onSinkEvent(event),
+	});
+	const securityEvents = new StreamingSecurityEventLogger(logger, (event) => streams.security(event));
+	// Anomaly alerts raised while a record is being appended wait here until that record has returned.
+	const detector = createAnomalyDetector({ rules: config.auditRules ?? DEFAULT_ANOMALY_RULES, now: deps.now });
+	const pendingAlerts: AnomalyAlert[] = [];
+	let appending = 0;
+	let raising = false;
 	// Every dropped record counts; the log line is written once per distinct message until an append succeeds.
 	let auditDrops = 0;
 	let auditLoggedMessage: string | undefined;
@@ -353,6 +417,8 @@ export function createApp(deps: RouterDeps): App {
 		(config.auditLog
 			? createAuditLog({
 					path: auditPath(config.stateDir),
+					anchorEvery: config.auditAnchorEvery,
+					segmentBytes: config.auditSegmentBytes,
 					onError: (error) => {
 						auditDrops += 1;
 						metrics.inc("ultrathink_audit_write_failures_total");
@@ -360,14 +426,69 @@ export function createApp(deps: RouterDeps): App {
 						auditLoggedMessage = error.message;
 						logger.error("audit_write_failed", { error: error.message });
 					},
-					onNotice: (message) => logger.info("audit_chain_notice", { message }),
+					onNotice: (notice) => {
+						logger.info("audit_chain_notice", { kind: notice.kind, message: notice.message });
+						switch (notice.kind) {
+							case "changed_outside":
+							case "moved_to":
+								raiseTamper(notice.message);
+								break;
+							case "pruned":
+								// Routine retention: the info line above is the whole record; it is not tamper.
+								break;
+						}
+					},
+					onAppend: (appended) => {
+						streams.audit(appended);
+						for (const alert of detector.observe(appended.event, appended.fields)) pendingAlerts.push(alert);
+					},
 				})
 			: undefined);
 	function record(event: AuditEvent, fields: Record<string, string | number | boolean> = {}): void {
 		const dropsBefore = auditDrops;
-		auditLog?.record(event, fields);
+		appending += 1;
+		try {
+			auditLog?.record(event, fields);
+		} finally {
+			appending -= 1;
+		}
 		// onError runs inside record(), so no new drop means this append landed.
 		if (auditDrops === dropsBefore) auditLoggedMessage = undefined;
+		raiseAnomalies();
+	}
+
+	function onSinkEvent(event: SinkEvent): void {
+		metrics.inc("ultrathink_audit_sink_events_total", { sink: event.sink, outcome: event.type }, event.count);
+		if (event.type === "sent") {
+			sinkFailureLogged = undefined;
+			return;
+		}
+		const key = `${event.sink}:${event.type}:${event.reason ?? ""}`;
+		if (key === sinkFailureLogged) return;
+		sinkFailureLogged = key;
+		logger.warn("audit_sink_failed", { sink: event.sink, outcome: event.type, count: event.count, reason: event.reason ?? "unknown" });
+	}
+
+	/** Raises every anomaly that arrived with the record just returned, in arrival order. Re-entry is a no-op. */
+	function raiseAnomalies(): void {
+		if (appending > 0 || raising) return;
+		raising = true;
+		try {
+			for (let alert = pendingAlerts.shift(); alert !== undefined; alert = pendingAlerts.shift()) {
+				const fields = { rule: alert.rule, key: alert.key, count: alert.count, windowSec: alert.windowSec };
+				record("anomaly_detected", fields);
+				metrics.inc("ultrathink_audit_anomalies_total", { rule: alert.rule });
+				streams.alert("anomaly_detected", fields);
+			}
+		} finally {
+			raising = false;
+		}
+	}
+
+	function raiseTamper(reason: string): void {
+		logger.error("audit_tamper_detected", { reason });
+		metrics.inc("ultrathink_audit_tamper_alerts_total");
+		streams.alert("audit_tamper_detected", { reason });
 	}
 	const oauth = createOAuth({
 		origin: config.publicOrigin,
@@ -896,6 +1017,8 @@ export function createApp(deps: RouterDeps): App {
 	let stopProbe: (() => void) | undefined;
 	let stopSweeper: (() => void) | undefined;
 	let stopCheckpoint: (() => void) | undefined;
+	let stopWatch: (() => void) | undefined;
+	let stopPrune: (() => void) | undefined;
 	let lifecycleStarted = false;
 
 	/** Starts the runtime probe and, when retention is enabled, the sweeper. Runs once; later calls change nothing. */
@@ -932,6 +1055,33 @@ export function createApp(deps: RouterDeps): App {
 			intervalMs: WAL_CHECKPOINT_MS,
 			onBlocked: () => logger.warn("wal_checkpoint_blocked", {}),
 		}).start();
+		const log = auditLog;
+		if (log !== undefined) {
+			stopWatch = createAuditWatch({
+				intervalMs: config.auditWatchMs,
+				stat: () => diskFingerprint(log.path),
+				acknowledged: () => {
+					const head = log.head();
+					return { fingerprint: log.fingerprint(), seq: head.seq, hash: head.hash };
+				},
+				scan: () => log.verify(),
+				onAlert: (alert) => raiseTamper(alert.reason),
+				onRecover: () => logger.info("audit_tamper_cleared", {}),
+				...timerSeams,
+			}).start();
+			if (config.auditRetentionDays > 0) {
+				const now = deps.now ?? Date.now;
+				stopPrune = createSweeper({
+					sweep: () => log.prune(now() - config.auditRetentionDays * DAY_MS),
+					intervalMs: RETENTION_SWEEP_MS,
+					onResult: (result) => {
+						if (result.segments > 0) logger.info("audit_segments_pruned", { segments: result.segments });
+					},
+					onError: (error) => logger.error("audit_prune_failed", { error: error.message }),
+					...timerSeams,
+				}).start();
+			}
+		}
 		refreshIntegrity();
 	}
 
@@ -945,7 +1095,12 @@ export function createApp(deps: RouterDeps): App {
 			stopProbe?.();
 			stopSweeper?.();
 			stopCheckpoint?.();
+			stopWatch?.();
+			stopPrune?.();
 			auditLog?.close();
+			// Queued envelopes get a bounded chance to reach the sinks; anything still queued after that is dropped.
+			if (!(await streams.flush(AUDIT_FLUSH_MS))) logger.warn("audit_sink_flush_incomplete", {});
+			streams.close();
 			await planner.shutdown();
 		},
 		planner,

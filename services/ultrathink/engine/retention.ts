@@ -41,13 +41,13 @@ export interface SweepResult {
 	disabled: boolean;
 }
 
-export interface SweeperOptions {
+export interface SweeperOptions<T = SweepResult> {
 	/** The sweep to run on each tick, typically `() => sweepStateDir(options)`. */
-	sweep: () => SweepResult;
+	sweep: () => T;
 	/** Time between runs. The first run happens one interval after `start()`, never at construction. */
 	intervalMs: number;
 	/** Receives the result of every completed run. */
-	onResult?: (result: SweepResult) => void;
+	onResult?: (result: T) => void;
 	/** Receives anything `sweep` or `onResult` throws. A throwing `onError` is ignored. */
 	onError?: (error: Error) => void;
 	/** Timer factory for tests; defaults to an unref'd `setInterval`. */
@@ -56,11 +56,11 @@ export interface SweeperOptions {
 	clearTimer?: (handle: object) => void;
 }
 
-export interface Sweeper {
+export interface Sweeper<T = SweepResult> {
 	/** Schedules periodic runs and returns an idempotent stop. Calling `start()` while running returns that stop. */
 	start(): () => void;
 	/** Runs one sweep immediately; `undefined` when it threw (routed to `onError`) or a run is already in progress. */
-	runNow(): SweepResult | undefined;
+	runNow(): T | undefined;
 }
 
 const DAY_MS = 86_400_000;
@@ -336,7 +336,7 @@ export function sweepStateDir(options: SweepOptions): SweepResult {
  * Throws only for invalid options (`intervalMs` not a positive finite number, `sweep` not a function). Nothing a
  * run throws escapes: it reaches `onError` and the next tick runs as usual.
  */
-export function createSweeper(options: SweeperOptions): Sweeper {
+export function createSweeper<T = SweepResult>(options: SweeperOptions<T>): Sweeper<T> {
 	if (typeof options.sweep !== "function") throw new TypeError("retention: sweep must be a function");
 	if (typeof options.intervalMs !== "number" || !Number.isFinite(options.intervalMs) || options.intervalMs <= 0) {
 		throw new RangeError("retention: intervalMs must be a positive finite number");
@@ -354,7 +354,7 @@ export function createSweeper(options: SweeperOptions): Sweeper {
 	let running = false;
 	let stop: (() => void) | undefined;
 
-	const runNow = (): SweepResult | undefined => {
+	const runNow = (): T | undefined => {
 		if (running) return undefined;
 		running = true;
 		try {

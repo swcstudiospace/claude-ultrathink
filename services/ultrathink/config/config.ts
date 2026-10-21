@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { isAbsolute } from "node:path";
+import { type AnomalyRule, parseAnomalyRules } from "../obs/anomaly.ts";
 
 export class ConfigError extends Error {
 	constructor(message: string) {
@@ -11,6 +12,12 @@ export class ConfigError extends Error {
 }
 
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+
+/** `host:port` of the syslog audit sink. */
+export interface AuditSyslogTarget {
+	readonly host: string;
+	readonly port: number;
+}
 
 export interface UltrathinkConfig {
 	publicOrigin: string;
@@ -53,6 +60,28 @@ export interface UltrathinkConfig {
 	retentionDays: number;
 	/** Whether the append-only audit log is written. */
 	auditLog: boolean;
+	/** Audit records between anchor records (hash-chain checkpoints). */
+	auditAnchorEvery: number;
+	/** Size at which the active audit file is sealed into a segment. */
+	auditSegmentBytes: number;
+	/** Days of sealed audit segments kept; 0 keeps all. */
+	auditRetentionDays: number;
+	/** Interval of the audit tamper watch. */
+	auditWatchMs: number;
+	/** Envelopes each audit sink may hold waiting before the oldest is dropped. */
+	auditSinkQueue: number;
+	/** Anomaly rules; absent means the built-in rules. */
+	auditRules?: AnomalyRule[];
+	/** HTTP audit sink endpoint: https, or http to 127.0.0.1 or localhost. */
+	auditHttpUrl?: string;
+	/** Token for the HTTP audit sink. Never echoed in errors. */
+	auditHttpToken?: string;
+	/** Syslog audit sink target. */
+	auditSyslog?: AuditSyslogTarget;
+	/** Kafka REST proxy endpoint; set together with auditKafkaTopic. */
+	auditKafkaRestUrl?: string;
+	/** Kafka topic; set together with auditKafkaRestUrl. */
+	auditKafkaTopic?: string;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -87,6 +116,12 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = "low";
 const OWNER_HASH_FORMAT =
 	/^(?:\$argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+|\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53})$/;
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
+const DEFAULT_AUDIT_ANCHOR_EVERY = 1000;
+const DEFAULT_AUDIT_SEGMENT_BYTES = 67108864;
+const DEFAULT_AUDIT_RETENTION_DAYS = 365;
+const DEFAULT_AUDIT_WATCH_MS = 1000;
+const DEFAULT_AUDIT_SINK_QUEUE = 10000;
+const MIN_AUDIT_HTTP_TOKEN_LENGTH = 16;
 
 function readOptional(
 	env: Record<string, string | undefined>,
@@ -355,6 +390,102 @@ function readStateDir(env: Record<string, string | undefined>): string {
 	return raw.replace(/(?<=.)\/+$/, "");
 }
 
+/** An http:// URL is accepted only for loopback, so audit records never leave the host in plaintext. */
+function readSinkUrl(env: Record<string, string | undefined>, name: string): string | undefined {
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return undefined;
+	}
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		throw new ConfigError(`${name} must be an absolute URL`);
+	}
+	if (url.username !== "" || url.password !== "") {
+		throw new ConfigError(`${name} must not contain credentials`);
+	}
+	if (url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS[url.hostname] === true)) {
+		return raw;
+	}
+	throw new ConfigError(`${name} must use https://, or http:// to 127.0.0.1 or localhost`);
+}
+
+function readAuditHttpToken(env: Record<string, string | undefined>): string | undefined {
+	const name = "ULTRATHINK_AUDIT_HTTP_TOKEN";
+	const token = readOptional(env, name);
+	if (token === undefined) {
+		return undefined;
+	}
+	if (token.length < MIN_AUDIT_HTTP_TOKEN_LENGTH) {
+		throw new ConfigError(`${name} must be at least ${MIN_AUDIT_HTTP_TOKEN_LENGTH} characters`);
+	}
+	if (!/^[\x21-\x7e]+$/.test(token)) {
+		throw new ConfigError(`${name} must contain only printable ASCII characters without spaces`);
+	}
+	return token;
+}
+
+/** `host:port`: host from letters, digits, '.', '_' and '-'; port from 1 to 65535. */
+function readAuditSyslog(env: Record<string, string | undefined>): AuditSyslogTarget | undefined {
+	const name = "ULTRATHINK_AUDIT_SYSLOG";
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return undefined;
+	}
+	const message = `${name} must be host:port with a port from 1 to 65535`;
+	const separator = raw.lastIndexOf(":");
+	if (separator <= 0) {
+		throw new ConfigError(message);
+	}
+	const host = raw.slice(0, separator);
+	const digits = raw.slice(separator + 1);
+	if (!/^[A-Za-z0-9._-]+$/.test(host) || !INTEGER_PATTERN.test(digits)) {
+		throw new ConfigError(message);
+	}
+	const port = Number(digits);
+	if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+		throw new ConfigError(message);
+	}
+	return { host, port };
+}
+
+/** Unset means the built-in rules. The JSON is parsed by the same validator the anomaly detector uses. */
+function readAuditRules(env: Record<string, string | undefined>): AnomalyRule[] | undefined {
+	const name = "ULTRATHINK_AUDIT_RULES";
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return undefined;
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		throw new ConfigError(`${name} must be a JSON array of anomaly rules`);
+	}
+	try {
+		return parseAnomalyRules(value);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : "invalid rule";
+		throw new ConfigError(`${name} is invalid: ${reason}`);
+	}
+}
+
+/** The Kafka REST sink needs both its URL and its topic, or neither. */
+function readKafkaSink(env: Record<string, string | undefined>): {
+	auditKafkaRestUrl: string | undefined;
+	auditKafkaTopic: string | undefined;
+} {
+	const auditKafkaRestUrl = readSinkUrl(env, "ULTRATHINK_AUDIT_KAFKA_REST_URL");
+	const auditKafkaTopic = readOptional(env, "ULTRATHINK_AUDIT_KAFKA_TOPIC");
+	if ((auditKafkaRestUrl === undefined) !== (auditKafkaTopic === undefined)) {
+		throw new ConfigError(
+			"ULTRATHINK_AUDIT_KAFKA_REST_URL and ULTRATHINK_AUDIT_KAFKA_TOPIC must be set together",
+		);
+	}
+	return { auditKafkaRestUrl, auditKafkaTopic };
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
@@ -441,6 +572,22 @@ export function loadConfig(
 		drainMs: readInteger(env, "ULTRATHINK_DRAIN_MS", 5000, 0, 60000),
 		retentionDays: readInteger(env, "ULTRATHINK_RETENTION_DAYS", 30, 0, 3650),
 		auditLog: readFlag(env, "ULTRATHINK_AUDIT_LOG") ?? true,
+		auditAnchorEvery: readInteger(env, "ULTRATHINK_AUDIT_ANCHOR_EVERY", DEFAULT_AUDIT_ANCHOR_EVERY, 1, 1000000),
+		auditSegmentBytes: readInteger(
+			env,
+			"ULTRATHINK_AUDIT_SEGMENT_BYTES",
+			DEFAULT_AUDIT_SEGMENT_BYTES,
+			1048576,
+			4294967296,
+		),
+		auditRetentionDays: readInteger(env, "ULTRATHINK_AUDIT_RETENTION_DAYS", DEFAULT_AUDIT_RETENTION_DAYS, 0, 36500),
+		auditWatchMs: readInteger(env, "ULTRATHINK_AUDIT_WATCH_MS", DEFAULT_AUDIT_WATCH_MS, 100, 1000),
+		auditSinkQueue: readInteger(env, "ULTRATHINK_AUDIT_SINK_QUEUE", DEFAULT_AUDIT_SINK_QUEUE, 1, 1000000),
+		auditRules: readAuditRules(env),
+		auditHttpUrl: readSinkUrl(env, "ULTRATHINK_AUDIT_HTTP_URL"),
+		auditHttpToken: readAuditHttpToken(env),
+		auditSyslog: readAuditSyslog(env),
+		...readKafkaSink(env),
 	};
 }
 

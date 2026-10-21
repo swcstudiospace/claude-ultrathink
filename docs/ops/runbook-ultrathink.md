@@ -465,3 +465,96 @@ When registrations are limited, wait for `Retry-After`. Restarting `ultrathink-w
 ### After changing tools
 
 Grok fetches a connector's tool list once and refreshes it only when the connector is re-authenticated (`https://github.com/xai-org/plugin-marketplace/issues/1402`); tell Grok users to reconnect after any release that changes a tool name, description or schema. Whether claude.ai re-fetches `tools/list` on its own is not verified: have Claude users remove and re-add the connector.
+
+## 14. Audit trail
+
+The audit log is `/var/lib/ultrathink/audit.jsonl` (`ULTRATHINK_STATE_DIR` plus `audit.jsonl`). Each line is one hash-chained record with `seq`, `ts`, `event`, `prev`, `hash` and sanitized `fields`. The file is the source of truth. SIEM sinks get a copy only after the record is fsynced, so a sink never holds a record the chain lost. `ULTRATHINK_AUDIT_LOG=0` turns the log off.
+
+### Environment
+
+| Variable | Default | Allowed |
+|---|---|---|
+| `ULTRATHINK_AUDIT_ANCHOR_EVERY` | 1000 | integer 1 to 1000000 |
+| `ULTRATHINK_AUDIT_SEGMENT_BYTES` | 67108864 (64 MiB) | integer 1048576 to 4294967296 |
+| `ULTRATHINK_AUDIT_RETENTION_DAYS` | 365 | integer 0 to 36500; 0 keeps every segment |
+| `ULTRATHINK_AUDIT_WATCH_MS` | 1000 | integer 100 to 1000 |
+| `ULTRATHINK_AUDIT_SINK_QUEUE` | 10000 | integer 1 to 1000000, per sink |
+| `ULTRATHINK_AUDIT_RULES` | built-in rules | JSON array of anomaly rules; replaces the built-ins |
+| `ULTRATHINK_AUDIT_HTTP_URL` | unset | `https://`, or `http://` to 127.0.0.1 or localhost; no credentials in the URL |
+| `ULTRATHINK_AUDIT_HTTP_TOKEN` | unset | at least 16 printable ASCII characters, no spaces |
+| `ULTRATHINK_AUDIT_SYSLOG` | unset | `host:port`, port 1 to 65535 |
+| `ULTRATHINK_AUDIT_KAFKA_REST_URL` | unset | same URL rule as the HTTP sink; requires the topic |
+| `ULTRATHINK_AUDIT_KAFKA_TOPIC` | unset | requires the REST URL, and the reverse |
+
+An invalid value stops startup with a `ConfigError` that names the variable. The token value is never printed.
+
+### Layout
+
+- **Anchors.** After every `ULTRATHINK_AUDIT_ANCHOR_EVERY` non-anchor records the log appends an `audit_anchor` record, `{through, root}`. `through` is the seq of the record before the anchor. `root` is a Merkle Mountain Range root over every record hash up to `through`, with RFC 6962 domain separation and no duplicated last leaf. An anchor is an ordinary chained record.
+- **Segments.** Before an append that would push the active file past `ULTRATHINK_AUDIT_SEGMENT_BYTES`, the active file is sealed: renamed to `audit-<firstSeq>-<lastSeq>.jsonl` in the same directory, mode 0400. The new active `audit.jsonl` starts with `prev` equal to the sealed file's last hash. A single record larger than the limit is still written, and no empty segment is created.
+- **Verification** reads the sealed segments and the active file as one chain, with global `seq` numbers.
+- **Quarantine.** A broken active file is moved to `audit.jsonl.corrupt-<time>` on open. Nothing prunes `.corrupt-*` files.
+
+### Prune boundary
+
+When `ULTRATHINK_AUDIT_RETENTION_DAYS` is above 0, an hourly sweep calls `prune(now - days)`. It deletes sealed segments oldest first while the segment's last record `ts` is older than the cutoff. It never deletes the active file or `.corrupt-*` files. It then appends `audit_retention_pruned` `{segments, fromSeq, throughSeq, throughHash}`, which carries the anchor frontier, so the remaining chain still verifies and later anchors still cover every record. With nothing eligible, the sweep writes nothing.
+
+A directory whose first remaining segment does not start at seq 1 verifies only when a retained `audit_retention_pruned` record names that segment's `seq - 1` and `prev`. Removing or editing that record makes verification fail.
+
+### Verify and off-host expectations
+
+```bash
+bun services/ultrathink/obs/audit-cli.ts verify /var/lib/ultrathink/audit.jsonl
+bun services/ultrathink/obs/audit-cli.ts verify /var/lib/ultrathink/audit.jsonl \
+  --expect 4210:<hash-from-off-host-copy> --expect 5000:<hash-from-off-host-copy>
+```
+
+`--expect <seq>:<hash>` is repeatable. The hash is the record's `hash` field, 64 lowercase hex characters. Exit codes: 0 means the chain is intact and every expectation is met; 1 means the chain is broken or unreadable, or an expectation failed, and prints `audit BROKEN: expected record <seq> hash <hash>, found <found|none>`; 2 is a usage error, including a malformed expectation. A file truncated before a stored record reports `found none`. Store the head pair (the last line's `seq` and `hash`) off-host on a schedule. That pair catches tail truncation and a full-file rewrite (see B5).
+
+### Tamper watch
+
+The watch ticks every `ULTRATHINK_AUDIT_WATCH_MS` (default 1000 ms). Each tick stats the file. If size, mtime and inode match the fingerprint the log wrote itself, nothing is scanned, so the service's own appends never alert. A different fingerprint triggers a full scan across the segments. A broken chain raises `chain_broken`. A disk head (seq, hash) that differs from the head the process acknowledged raises `head_mismatch`, as does a missing file while records exist. Every 60 ticks a full scan runs even when the stat matches.
+
+**Limit.** An in-place edit that keeps size and mtime (for example `touch -r`) is caught by the 60-tick scan: up to 60 seconds at the default interval, not within 1 second. A rewrite made while the service is stopped has no acknowledged head to compare against, and the service accepts the file it finds at start. Only off-host pairs catch that (B5).
+
+A tamper alert is logged as `audit_tamper_detected` at error level, counted in `ultrathink_audit_tamper_alerts_total`, and sent to the sinks as an alert envelope. It is not appended to the chain, because the chain is what is broken. Each reason alerts once until it clears; `audit_tamper_cleared` is then logged.
+
+### Anomaly rules
+
+Built-in rules, used when `ULTRATHINK_AUDIT_RULES` is unset:
+
+| Rule | Event | Count | Window | Keyed by |
+|---|---|---|---|---|
+| `login_failed` | `login_failed` | 10 | 300 s | `ip` |
+| `refresh_reuse_detected` | `refresh_reuse_detected` | 1 | 3600 s | `clientId` |
+| `rate_limited` | `rate_limited` | 50 | 300 s | `ip` |
+
+A key alerts at most once per window, and each rule tracks at most 10000 keys. A match appends `anomaly_detected` `{rule, key, count, windowSec}` after the triggering record, increments `ultrathink_audit_anomalies_total{rule}`, and sends an alert envelope. Audit's own events never count toward a rule.
+
+### Stream sinks
+
+Each configured sink receives three envelope kinds: `audit` (every acknowledged record, anchors included), `security` (security events, with only the top-level fields `type, name, severity, source, ip, userId, resource, action, correlationId, timestamp`; `details` and `userAgent` are dropped), and `alert` (tamper and anomaly). Syslog frames are RFC 5424 with RFC 6587 octet-counting over TCP, with PRI 134 for audit, 132 for security and 130 for alert. UDP is not offered.
+
+Each sink has its own queue of `ULTRATHINK_AUDIT_SINK_QUEUE` envelopes, so a slow sink does not hold back another. When a queue is full, the oldest queued envelope is dropped. Batches hold at most 100 envelopes and keep their order. Retryable failures (network errors, 408, 425, 429, 5xx) are retried up to 5 attempts, with a 500 ms backoff that doubles to a 30 s cap; a batch that still fails is dropped. Other 4xx responses and redirects are dropped at once. Each request times out after 10 s. At shutdown the service flushes for up to 2 s, then closes, and anything still queued is dropped. Drops and failures appear in `ultrathink_audit_sink_events_total{sink,outcome}` and as `audit_sink_failed` log lines. The record path never waits for a sink.
+
+### Blocked items
+
+These cannot be finished from the repo. Each names what must exist first. Until then the code path is present and the sink or step stays off.
+
+- **B1, SIEM endpoint (AUDIT-02).** Prerequisite: an ingest URL and token from the operator's SIEM tenant (for example Splunk HEC, Elastic or Sentinel).
+  1. Confirm the endpoint accepts NDJSON POSTs. The HTTP sink sends `Authorization: Bearer <token>`. If the SIEM expects another scheme, put a receiver-side adapter in front of it; the repo has none, and changing the transport is a code change.
+  2. `sudoedit /etc/ultrathink/ultrathink.env` (mode 0600): set `ULTRATHINK_AUDIT_HTTP_URL` and `ULTRATHINK_AUDIT_HTTP_TOKEN`. Never put the token on a command line.
+  3. `systemctl restart ultrathink-web`, then `curl -s 127.0.0.1:8795/readyz`.
+  4. Wait for one record to appear in the SIEM, and check that `ultrathink_audit_sink_events_total` with `outcome="sent"` rises.
+- **B2, Kafka via REST Proxy (AUDIT-02).** Prerequisite: a running Kafka cluster behind Confluent REST Proxy v2, reachable over https, and the topic created on it. The native broker protocol is not implemented, and no client dependency is approved. The router sends no bearer token to the Kafka transport, so the REST Proxy must be reachable without one (a private network or an allowlist); adding auth needs a code change.
+  1. Create the topic. Confirm `POST <url>/topics/<topic>` with `Content-Type: application/vnd.kafka.json.v2+json` is accepted from the VPS.
+  2. Set `ULTRATHINK_AUDIT_KAFKA_REST_URL` and `ULTRATHINK_AUDIT_KAFKA_TOPIC` together in the env file, then restart and probe as in B1.
+  3. Consume the topic and confirm envelopes arrive.
+- **B3, pager delivery (AUDIT-04).** Prerequisite: a pager or incident endpoint with account and routing key, owned by A13. The repo has no pager transport: alerts leave the process only as logs, metrics and sink envelopes. Until A13 wires delivery, alert in your monitoring stack on the `audit_tamper_detected` log events and on `ultrathink_audit_tamper_alerts_total` (scrape as in section 8).
+- **B4, host immutability (AUDIT-05).** Prerequisite: root on the VPS for `chattr`, or an S3-compatible bucket with Object Lock enabled. Neither exists in the repo.
+  - `chattr +a` on sealed segments only: `chattr +a /var/lib/ultrathink/audit-*.jsonl`. Do not set it on the active `audit.jsonl`: rotation renames that file, so rotation fails and the active file keeps growing. Verify with `lsattr /var/lib/ultrathink/audit-*.jsonl`.
+  - An attributed segment cannot be pruned. The prune fails and is logged as `audit_prune_failed`. Removing a segment for retention then needs `chattr -a` first; that is an operator decision, by design.
+  - Object Lock: upload each sealed segment with a retention period at least `ULTRATHINK_AUDIT_RETENTION_DAYS` long, using the bucket's own tooling. No job in the repo does this, so the copy is manual until one is written. Keep its credentials in a root-only file, not in the service env file.
+- **B5, off-host anchors (AUDIT-01).** Prerequisite: B1 or B2, or another store the VPS cannot rewrite. B4 protects the files on the host; B5 protects the `(seq, hash)` pairs. Without an off-host store, a whole-file rewrite that recomputes anchors and head, made while the service is stopped, is not detected. `chattr` on the VPS does not help, because root can undo it.
+  1. Each day, read the head with `tail -n 1 /var/lib/ultrathink/audit.jsonl` and copy its `seq` and `hash` to the off-host store.
+  2. Each day, run verify with the stored pairs: `bun services/ultrathink/obs/audit-cli.ts verify /var/lib/ultrathink/audit.jsonl --expect <seq>:<hash>`. Exit 1 means a stored record is missing or changed. Treat it as an incident: copy the file before any repair.

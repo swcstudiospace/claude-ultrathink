@@ -92,6 +92,11 @@ beforeAll(async () => {
 		drainMs: 5000,
 		retentionDays: 30,
 		auditLog: true,
+		auditAnchorEvery: 1000,
+		auditSegmentBytes: 67108864,
+		auditRetentionDays: 365,
+		auditWatchMs: 1000,
+		auditSinkQueue: 10000,
 	};
 	auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);

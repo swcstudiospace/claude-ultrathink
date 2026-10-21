@@ -659,3 +659,140 @@ describe("operations settings", () => {
 		expect(messageOf(() => loadConfig(env))).toContain("ULTRATHINK_AUDIT_LOG");
 	});
 });
+
+describe("audit sink configuration", () => {
+	test("defaults with no audit variables set match the documented table", () => {
+		const config = loadConfig(baseEnv());
+		expect(config.auditAnchorEvery).toBe(1000);
+		expect(config.auditSegmentBytes).toBe(67108864);
+		expect(config.auditRetentionDays).toBe(365);
+		expect(config.auditWatchMs).toBe(1000);
+		expect(config.auditSinkQueue).toBe(10000);
+		expect(config.auditRules).toBeUndefined();
+		expect(config.auditHttpUrl).toBeUndefined();
+		expect(config.auditHttpToken).toBeUndefined();
+		expect(config.auditSyslog).toBeUndefined();
+		expect(config.auditKafkaRestUrl).toBeUndefined();
+		expect(config.auditKafkaTopic).toBeUndefined();
+	});
+
+	const integerFields = [
+		{ name: "ULTRATHINK_AUDIT_ANCHOR_EVERY", field: "auditAnchorEvery", min: 1, max: 1000000 },
+		{ name: "ULTRATHINK_AUDIT_SEGMENT_BYTES", field: "auditSegmentBytes", min: 1048576, max: 4294967296 },
+		{ name: "ULTRATHINK_AUDIT_RETENTION_DAYS", field: "auditRetentionDays", min: 0, max: 36500 },
+		{ name: "ULTRATHINK_AUDIT_WATCH_MS", field: "auditWatchMs", min: 100, max: 1000 },
+		{ name: "ULTRATHINK_AUDIT_SINK_QUEUE", field: "auditSinkQueue", min: 1, max: 1000000 },
+	] as const;
+
+	for (const spec of integerFields) {
+		test(`${spec.name} accepts its lowest and highest value`, () => {
+			expect(loadConfig({ ...baseEnv(), [spec.name]: String(spec.min) })[spec.field]).toBe(spec.min);
+			expect(loadConfig({ ...baseEnv(), [spec.name]: String(spec.max) })[spec.field]).toBe(spec.max);
+		});
+
+		test(`${spec.name} rejects out-of-range or malformed values, naming the variable`, () => {
+			for (const value of [String(spec.min - 1), String(spec.max + 1), "1e3", "abc"]) {
+				expect(messageOf(() => loadConfig({ ...baseEnv(), [spec.name]: value }))).toContain(spec.name);
+			}
+		});
+	}
+
+	test("ULTRATHINK_AUDIT_WATCH_MS rejects 1001 and 99 by name", () => {
+		expect(messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_WATCH_MS: "1001" }))).toContain("ULTRATHINK_AUDIT_WATCH_MS");
+		expect(messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_WATCH_MS: "99" }))).toContain("ULTRATHINK_AUDIT_WATCH_MS");
+	});
+
+	test("ULTRATHINK_AUDIT_RULES returns the parsed rules for a valid array", () => {
+		const rules = [{ name: "login-burst", event: "login_failed", count: 5, windowSec: 60 }];
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_RULES: JSON.stringify(rules) }).auditRules).toEqual(rules);
+	});
+
+	test("ULTRATHINK_AUDIT_RULES rejects malformed JSON, non-array values and invalid rules, naming the variable", () => {
+		for (const value of ["[", '{"name":"login-burst"}', '[{"name":"login-burst"}]']) {
+			expect(messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_RULES: value }))).toContain("ULTRATHINK_AUDIT_RULES");
+		}
+	});
+
+	test("ULTRATHINK_AUDIT_HTTP_URL accepts https and loopback http", () => {
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_HTTP_URL: "https://siem.example.com/ingest" }).auditHttpUrl).toBe(
+			"https://siem.example.com/ingest",
+		);
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_HTTP_URL: "http://127.0.0.1:9" }).auditHttpUrl).toBe("http://127.0.0.1:9");
+	});
+
+	test("ULTRATHINK_AUDIT_HTTP_URL rejects plaintext, non-loopback, credentialed and malformed URLs", () => {
+		for (const value of [
+			"http://example.com",
+			"ftp://siem.example.com",
+			"https://user:secret@siem.example.com",
+			"http://user@127.0.0.1:9",
+			"not a url",
+		]) {
+			const message = messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_HTTP_URL: value }));
+			expect(message).toContain("ULTRATHINK_AUDIT_HTTP_URL");
+			expect(message).not.toContain("secret");
+		}
+	});
+
+	test("ULTRATHINK_AUDIT_HTTP_TOKEN accepts a printable token of 16 characters or more", () => {
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_HTTP_TOKEN: "abcdefghijklmnop" }).auditHttpToken).toBe("abcdefghijklmnop");
+	});
+
+	test("ULTRATHINK_AUDIT_HTTP_TOKEN rejects short or malformed tokens without echoing them", () => {
+		for (const token of ["short-token", "has space inside this token"]) {
+			const message = messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_HTTP_TOKEN: token }));
+			expect(message).toContain("ULTRATHINK_AUDIT_HTTP_TOKEN");
+			expect(message).not.toContain(token);
+		}
+	});
+
+	test("ULTRATHINK_AUDIT_SYSLOG parses host and port", () => {
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_SYSLOG: "siem.example.com:514" }).auditSyslog).toEqual({
+			host: "siem.example.com",
+			port: 514,
+		});
+	});
+
+	test("ULTRATHINK_AUDIT_SYSLOG rejects ports outside 1..65535 and malformed targets, naming the variable", () => {
+		for (const value of [
+			"siem.example.com:0",
+			"siem.example.com:70000",
+			"siem.example.com",
+			":514",
+			"siem.example.com:",
+			"siem.example.com:5x",
+			"bad host:514",
+		]) {
+			expect(messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_SYSLOG: value }))).toContain("ULTRATHINK_AUDIT_SYSLOG");
+		}
+	});
+
+	test("the Kafka REST sink needs its URL and its topic together", () => {
+		const config = loadConfig({
+			...baseEnv(),
+			ULTRATHINK_AUDIT_KAFKA_REST_URL: "https://kafka-rest.example.com",
+			ULTRATHINK_AUDIT_KAFKA_TOPIC: "audit",
+		});
+		expect(config.auditKafkaRestUrl).toBe("https://kafka-rest.example.com");
+		expect(config.auditKafkaTopic).toBe("audit");
+
+		const urlOnly = messageOf(() =>
+			loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_KAFKA_REST_URL: "https://kafka-rest.example.com" }),
+		);
+		expect(urlOnly).toContain("ULTRATHINK_AUDIT_KAFKA_TOPIC");
+
+		const topicOnly = messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_AUDIT_KAFKA_TOPIC: "audit" }));
+		expect(topicOnly).toContain("ULTRATHINK_AUDIT_KAFKA_REST_URL");
+	});
+
+	test("ULTRATHINK_AUDIT_KAFKA_REST_URL follows the HTTP URL rule", () => {
+		const message = messageOf(() =>
+			loadConfig({
+				...baseEnv(),
+				ULTRATHINK_AUDIT_KAFKA_REST_URL: "http://example.com",
+				ULTRATHINK_AUDIT_KAFKA_TOPIC: "audit",
+			}),
+		);
+		expect(message).toContain("ULTRATHINK_AUDIT_KAFKA_REST_URL");
+	});
+});
