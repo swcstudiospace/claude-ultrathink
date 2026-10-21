@@ -1,0 +1,40 @@
+{
+	"id": "upstream-latency-timeout",
+	"title": "A silent upstream trips the completer timeout while /healthz keeps answering",
+	"failureMode": "upstream_latency",
+	"kind": "inprocess",
+	"plan": { "steps": [{ "count": "forever", "fault": { "kind": "blackhole" } }] },
+	"config": { "timeoutMs": 50 },
+	"notes": "Load is POST /mcp, a JSON-RPC tools/call of ultrathink_uplift (the same route as upstream-5xx-breaker). config.timeoutMs applies to each HTTP attempt (engine/openrouter.ts). A timeout is not retried, so each call makes one attempt and reports outcome timeout. Each timeout is one breaker failure, and the breaker opens only at its own threshold (default 5, config.ts ULTRATHINK_BREAKER_FAILURES). Three requests stay below that threshold, so every call reports timeout; raising requests past the threshold would make later calls report upstream_unavailable instead. The harness must enable server planning and present the connector key; this template holds no credential.",
+	"load": {
+		"method": "POST",
+		"path": "/mcp",
+		"body": {
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": { "name": "ultrathink_uplift", "arguments": { "prompt": "chaos probe: outline a rollout plan" } }
+		},
+		"requests": 3,
+		"concurrency": 1
+	},
+	"hypotheses": [
+		{
+			"id": "calls-time-out",
+			"name": "Every planner call ends with outcome timeout",
+			"check": "metric",
+			"metric": "ultrathink_planner_calls_total",
+			"labels": { "outcome": "timeout" },
+			"op": "gte",
+			"value": 3
+		},
+		{
+			"id": "healthz-200",
+			"name": "/healthz keeps answering 200 while the upstream is silent",
+			"check": "status",
+			"path": "/healthz",
+			"equals": 200
+		}
+	],
+	"rollbackOnFail": false
+}

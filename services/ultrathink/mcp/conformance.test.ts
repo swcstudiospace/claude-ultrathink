@@ -191,6 +191,7 @@ async function openHttp(): Promise<HttpOpened> {
 		tls: undefined,
 		spiffeTrustDomain: "ultrathink.internal",
 		plaintextLoopback: true,
+		chaosEnabled: false,
 	};
 	const store: Store = openStore(config.dbPath);
 	const auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });

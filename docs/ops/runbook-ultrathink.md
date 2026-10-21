@@ -852,3 +852,82 @@ These need no outside resource, but they are not done.
 - **Prometheus scrape.** `deploy/observability/prometheus.yml` still scrapes `http://127.0.0.1:8795/metrics`, and no phase 69 unit changes it. The change is `scheme: https` with `tls_config` naming the CA and the ops leaf and key, and its owner has to make it. Any scraper that reads the ops leaf once needs a reload after that leaf renews every 12 hours; nothing in this repository reloads it.
 - **Alerts on leaf and intermediate expiry.** Section 8 has none. Prerequisite: the alert routing that section 16 already lists as open.
 - **Plans interrupted at renewal.** Each app-leaf renewal restarts `ultrathink-web` (17.3). There is no in-place reload, so a plan running at that moment is interrupted. Prerequisite: a design decision on zero-downtime rotation.
+
+## 18. Chaos experiments
+
+The chaos framework in `services/ultrathink/chaos/` checks that the service degrades as designed when its upstream or one of its processes fails. Fault injection is off by default and is never armed in production. Nothing runs on a schedule: scheduled runs are not shipped (see "Not shipped" below).
+
+### Gates
+
+Fault injection in the service is armed only when all three variables follow the rules below.
+
+| Variable | Default | Rule |
+|---|---|---|
+| `ULTRATHINK_CHAOS` | `0` | `0` or `1`; any other value stops startup and names the variable |
+| `ULTRATHINK_CHAOS_ENV` | unset | must be `staging` when `ULTRATHINK_CHAOS=1` |
+| `ULTRATHINK_CHAOS_PLAN` | unset | absolute path to a fault plan JSON file; requires `ULTRATHINK_CHAOS=1`; a relative path is refused |
+
+With `ULTRATHINK_CHAOS=1` and no `staging` marker, the service exits at startup with a `ConfigError` that names `ULTRATHINK_CHAOS_ENV`. The same check runs whenever the flag is set, so a production environment cannot arm it. The deploy units and environment files in the repository never set these variables.
+
+The CLI has its own gate, separate from the service. An `http` run against a host that is not loopback requires `ULTRATHINK_CHAOS_ENV=staging` in the environment of the CLI process. Without it the CLI exits 2 and sends no request. A rollback runs only when all four hold: a hypothesis failed, the template sets `rollbackOnFail`, `ULTRATHINK_CHAOS_ENV=staging`, and `--rollback-argv` was given. Otherwise the rollback is recorded as skipped.
+
+### Drivers
+
+- **`inprocess`** builds the real app inside the CLI process, with a temporary state directory and the template's fault plan at the OpenRouter seam. No upstream is reached, and the state directory is removed after the run. It does not read `ULTRATHINK_CHAOS`, because it never touches a running service. Its runs are deterministic.
+- **`http`** observes a URL that is already running. It is the only driver for operator templates. The CLI never executes an operator step. It prints the step and waits until someone types `confirmed`; no load is sent before that.
+
+### Commands
+
+```bash
+bun run chaos -- templates
+bun run chaos -- run upstream-5xx-breaker --driver inprocess --history /tmp/chaos-history.jsonl
+bun run chaos -- run sigterm-drain --driver http --base-url <staging-url> \
+  --rollback-argv '["deploy/ultrathink-release.sh","rollback"]'
+bun run chaos -- score upstream-5xx-breaker
+```
+
+`templates` lists id, failure mode, kind and hypothesis count. `run` exits 0 when every hypothesis passed, 1 when one failed, and 2 for a usage error or a refused gate. Each run appends one line to the history.
+
+The documented rollback argv is `deploy/ultrathink-release.sh rollback`. The CLI runs it from its working directory, so run the CLI from the release root. The script rewrites the production symlinks and restarts the unit, so it needs root on the staging host. The CLI does not elevate privileges: run it as root with `ULTRATHINK_CHAOS_ENV=staging` in that root environment, or the rollback is skipped.
+
+### Templates
+
+| Id | Failure mode | Kind | Hypotheses | Status |
+|---|---|---|---|---|
+| `upstream-5xx-breaker` | `upstream_5xx` | inprocess | `breaker-open`, `healthz-200` | runs in process |
+| `upstream-latency-timeout` | `upstream_latency` | inprocess | `calls-time-out`, `healthz-200` | runs in process |
+| `inflight-saturation` | `inflight_saturation` | inprocess | `overload-refused`, `readyz-200` | runs in process |
+| `sigterm-drain` | `sigterm_drain` | operator | `readyz-503-during-drain` | not yet run on staging |
+| `persistence-unavailable` | `persistence_unavailable` | operator | `healthz-503`, `healthz-error-persistence-unavailable` | BLOCKED, do not run |
+| `audit-corrupt` | `audit_corrupt` | operator | `readyz-200-after-audit-corrupt`, `healthz-200-after-audit-corrupt` | not yet run on staging |
+| `stale-journal-retention` | `stale_journal` | operator | `readyz-200-with-stale-journal`, `healthz-200-with-stale-journal` | not yet run on staging |
+
+Operator prerequisites, each performed by hand on the staging host:
+
+- **`sigterm-drain`.** Set `ULTRATHINK_DRAIN_MS` to at least 30000 in `/etc/ultrathink/ultrathink.env` and restart `ultrathink-web.service`; the default of 5000 is too short to observe. Then run `sudo systemctl kill --kill-who=main --signal=SIGTERM ultrathink-web.service` once. Do not `stop` or `restart` the unit during the run. `Restart=always` starts it again after the drain, and that restart falls outside the observation window.
+- **`audit-corrupt`.** While the unit runs, append one non-JSON line to `<stateDir>/audit.jsonl`, which is `/var/lib/ultrathink/audit.jsonl` unless `ULTRATHINK_STATE_DIR` is set. Readiness and health must not change, because audit is fail-open. The line also breaks the audit hash chain, so the tamper watch in section 14 is expected to alert. The hypotheses do not check that alert, and it has not been observed on staging.
+- **`stale-journal-retention`.** Create `journal/<valid-session-id>` under the state directory and age it with `touch -d` past `ULTRATHINK_RETENTION_DAYS` (use N+1 days if the environment sets N). The retention sweep runs on the maintenance schedule, not on a request, so this step does not force removal. The hypotheses check only readiness and liveness.
+- **`persistence-unavailable`: BLOCKED.** `store.ping()` runs `SELECT 1` on the SQLite handle that is already open. Changing the file's permissions or deleting it leaves that handle working, and no operator step makes `ping()` return false. The template needs a code seam in `services/ultrathink/store/store.ts`, which this phase does not change. Do not run it.
+
+### Reading `score`
+
+`score <id>` reads the history and prints:
+
+- `runs`: the number of runs recorded for that template.
+- `mean`: the resilience figure, the mean of the last 20 run scores for the template. A run scores 100 times the passed hypotheses divided by the total hypotheses.
+- `trend slope`: the least-squares slope of those same scores against run order, in points per run. A negative slope means scores are falling. It needs at least two runs; below that the line reads `trend: needs at least 2 runs`.
+- `latest`: the score of the most recent run.
+
+Unreadable history lines are left out of the figures and reported on stderr as `skipped N unreadable history line(s)`. With no runs the output is `<id>: no runs recorded`.
+
+The default history file is `<ULTRATHINK_STATE_DIR>/chaos/history.jsonl`, or `/var/lib/ultrathink/chaos/history.jsonl` when `ULTRATHINK_STATE_DIR` is unset. `run` and `score` both use it. Set `ULTRATHINK_STATE_DIR` or pass `--history PATH`. A history write that fails is reported with exit 2, after the experiment has already run.
+
+### Not shipped
+
+- **CHAOS-04, scheduled chaos.** No timer, unit or schedule exists. Scheduled runs need a staging environment with its own state directory and non-production secrets, and a signed chaos policy that names the blast radius, the abort criteria and an owner. The repository has none of these yet.
+- **Network-level faults.** TCP partitions and real latency need a staging host with `toxiproxy` or `tc netem` between the service and its upstream. The framework injects faults only at the OpenRouter seam.
+- **Long-horizon trend charts.** The trend covers the local run history only. A time-series store is needed for charts over longer periods.
+
+### Status
+
+The gates, templates, scoring, history and in-process runs are covered by `bun test services/ultrathink/config services/ultrathink/chaos`. The operator templates and the live rollback have not been run against a staging host.

@@ -110,6 +110,7 @@ beforeAll(async () => {
 		tls: undefined,
 		spiffeTrustDomain: "ultrathink.internal",
 		plaintextLoopback: true,
+		chaosEnabled: false,
 	};
 	auth = createAuth({ ownerPasswordHash, sessionSecret, cookieSecure: true });
 	store = openStore(config.dbPath);

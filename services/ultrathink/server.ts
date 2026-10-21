@@ -4,6 +4,7 @@
 import { accessSync, constants, existsSync } from "node:fs";
 import pkg from "../../package.json";
 import { createAuth } from "./auth/auth.ts";
+import { loadChaosFetch } from "./chaos/faults.ts";
 import { ConfigError, type TlsFiles, type UltrathinkConfig, loadConfig } from "./config/config.ts";
 import { createShutdown, installProcessHandlers } from "./lifecycle.ts";
 import { ToolDefinitionError, assertToolDefinitions } from "./mcp/definitions.ts";
@@ -109,7 +110,8 @@ const auth = createAuth({
 	previousSessionSecrets: config.sessionSecretPrevious,
 	cookieSecure: config.publicOrigin.startsWith("https://"),
 });
-const app = createApp({ config, store, auth, logger });
+const chaosFetch = loadChaosFetch(config);
+const app = createApp({ config, store, auth, logger, ...(chaosFetch ? { fetch: chaosFetch } : {}) });
 
 const listener: Listener =
 	config.tls === undefined ? startPlaintextListener(config, app) : startTlsListener(config.tls, config, app);

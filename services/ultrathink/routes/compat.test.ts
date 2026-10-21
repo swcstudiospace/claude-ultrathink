@@ -97,6 +97,7 @@ function harness(overrides: Partial<UltrathinkConfig> = {}): Harness {
 		tls: undefined,
 		spiffeTrustDomain: "ultrathink.internal",
 		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);

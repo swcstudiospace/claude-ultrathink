@@ -105,6 +105,7 @@ function baseConfig(dir: string, overrides: Partial<UltrathinkConfig> = {}): Ult
 		tls: undefined,
 		spiffeTrustDomain: "ultrathink.internal",
 		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 }

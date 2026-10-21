@@ -27,6 +27,7 @@
 		"uplift": "bun hooks/uplift.ts --ctl",
 		"setup": "bun scripts/setup.ts",
 		"mcp": "bun src/mcp/cli.ts",
+		"chaos": "bun services/ultrathink/chaos/cli.ts",
 		"ship": "bun src/ship/cli.ts"
 	},
 	"omp": {

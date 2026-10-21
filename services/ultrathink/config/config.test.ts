@@ -1032,3 +1032,78 @@ describe("mTLS and plaintext opt-in", () => {
 		expect(() => loadConfig({ ...tlsEnv(), ULTRATHINK_SPIFFE_TRUST_DOMAIN: "a".repeat(256) })).toThrow(ConfigError);
 	});
 });
+
+describe("loadConfig chaos gate", () => {
+	const PLAN = "/var/lib/ultrathink-chaos/plan.json";
+
+	function withEnv(extra: Record<string, string | undefined>): Record<string, string | undefined> {
+		return { ...baseEnv(), ...extra };
+	}
+
+	test("chaos is off by default and carries no plan path", () => {
+		const config = loadConfig(baseEnv());
+		expect(config.chaosEnabled).toBe(false);
+		expect(config.chaosEnv).toBeUndefined();
+		expect(config.chaosPlanPath).toBeUndefined();
+	});
+
+	test("ULTRATHINK_CHAOS=0 keeps chaos off", () => {
+		expect(loadConfig(withEnv({ ULTRATHINK_CHAOS: "0" })).chaosEnabled).toBe(false);
+	});
+
+	test("a blank plan path counts as unset while chaos is off", () => {
+		expect(loadConfig(withEnv({ ULTRATHINK_CHAOS_PLAN: "   " })).chaosPlanPath).toBeUndefined();
+	});
+
+	test("ULTRATHINK_CHAOS=1 with staging and an absolute plan path loads", () => {
+		const config = loadConfig(
+			withEnv({ ULTRATHINK_CHAOS: "1", ULTRATHINK_CHAOS_ENV: "staging", ULTRATHINK_CHAOS_PLAN: PLAN }),
+		);
+		expect(config.chaosEnabled).toBe(true);
+		expect(config.chaosEnv).toBe("staging");
+		expect(config.chaosPlanPath).toBe(PLAN);
+	});
+
+	test("ULTRATHINK_CHAOS=1 without ULTRATHINK_CHAOS_ENV throws naming the variable", () => {
+		const message = messageOf(() => loadConfig(withEnv({ ULTRATHINK_CHAOS: "1", ULTRATHINK_CHAOS_PLAN: PLAN })));
+		expect(message).toContain("ULTRATHINK_CHAOS_ENV");
+	});
+
+	test("ULTRATHINK_CHAOS=1 refuses a production environment", () => {
+		const message = messageOf(() =>
+			loadConfig(withEnv({ ULTRATHINK_CHAOS: "1", ULTRATHINK_CHAOS_ENV: "production", ULTRATHINK_CHAOS_PLAN: PLAN })),
+		);
+		expect(message).toContain("ULTRATHINK_CHAOS_ENV");
+	});
+
+	test("ULTRATHINK_CHAOS=1 without a plan path throws naming the variable", () => {
+		const message = messageOf(() => loadConfig(withEnv({ ULTRATHINK_CHAOS: "1", ULTRATHINK_CHAOS_ENV: "staging" })));
+		expect(message).toContain("ULTRATHINK_CHAOS_PLAN");
+	});
+
+	test("a relative plan path throws naming the variable and not the path", () => {
+		const relative = "plans/faults.json";
+		const message = messageOf(() =>
+			loadConfig(withEnv({ ULTRATHINK_CHAOS: "1", ULTRATHINK_CHAOS_ENV: "staging", ULTRATHINK_CHAOS_PLAN: relative })),
+		);
+		expect(message).toContain("ULTRATHINK_CHAOS_PLAN");
+		expect(message).not.toContain(relative);
+	});
+
+	test("a plan path without ULTRATHINK_CHAOS=1 throws naming the variable", () => {
+		const message = messageOf(() => loadConfig(withEnv({ ULTRATHINK_CHAOS_PLAN: PLAN })));
+		expect(message).toContain("ULTRATHINK_CHAOS_PLAN");
+	});
+
+	test("a plan path with ULTRATHINK_CHAOS=0 throws naming the variable", () => {
+		const message = messageOf(() =>
+			loadConfig(withEnv({ ULTRATHINK_CHAOS: "0", ULTRATHINK_CHAOS_ENV: "staging", ULTRATHINK_CHAOS_PLAN: PLAN })),
+		);
+		expect(message).toContain("ULTRATHINK_CHAOS_PLAN");
+	});
+
+	test("ULTRATHINK_CHAOS other than 0 or 1 throws naming the variable", () => {
+		const message = messageOf(() => loadConfig(withEnv({ ULTRATHINK_CHAOS: "true" })));
+		expect(message).toContain("ULTRATHINK_CHAOS must be 0 or 1");
+	});
+});

@@ -197,6 +197,7 @@ function setup(overrides: Partial<UltrathinkConfig> = {}, options: Partial<Headl
 		tls: undefined,
 		spiffeTrustDomain: "ultrathink.internal",
 		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);

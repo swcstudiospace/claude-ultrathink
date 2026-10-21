@@ -111,6 +111,12 @@ export interface UltrathinkConfig {
 	spiffeTrustDomain: string;
 	/** Set when the service may run without TLS: dev and local smoke only. */
 	plaintextLoopback: boolean;
+	/** Chaos gate (ULTRATHINK_CHAOS). Fault injection at the upstream seam is armed only when this is true. */
+	chaosEnabled: boolean;
+	/** ULTRATHINK_CHAOS_ENV; must be `staging` whenever chaos is enabled. */
+	chaosEnv?: string;
+	/** Absolute fault-plan path (ULTRATHINK_CHAOS_PLAN); required whenever chaos is enabled. */
+	chaosPlanPath?: string;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -604,6 +610,36 @@ function readSpiffeTrustDomain(env: Record<string, string | undefined>): string 
 	return domain;
 }
 
+/**
+ * Chaos gate. Fault injection is off unless ULTRATHINK_CHAOS=1. It is armed only with ULTRATHINK_CHAOS_ENV=staging and
+ * an absolute ULTRATHINK_CHAOS_PLAN. A plan path without the flag is refused, so a stray variable cannot arm it.
+ */
+function readChaosGate(env: Record<string, string | undefined>): {
+	chaosEnabled: boolean;
+	chaosEnv: string | undefined;
+	chaosPlanPath: string | undefined;
+} {
+	const chaosEnabled = readFlag(env, "ULTRATHINK_CHAOS") ?? false;
+	const chaosEnv = readOptional(env, "ULTRATHINK_CHAOS_ENV");
+	const chaosPlanPath = readOptional(env, "ULTRATHINK_CHAOS_PLAN");
+	if (!chaosEnabled) {
+		if (chaosPlanPath !== undefined) {
+			throw new ConfigError("ULTRATHINK_CHAOS_PLAN requires ULTRATHINK_CHAOS=1");
+		}
+		return { chaosEnabled, chaosEnv, chaosPlanPath };
+	}
+	if (chaosEnv !== "staging") {
+		throw new ConfigError("ULTRATHINK_CHAOS=1 requires ULTRATHINK_CHAOS_ENV=staging; chaos never runs outside staging");
+	}
+	if (chaosPlanPath === undefined) {
+		throw new ConfigError("ULTRATHINK_CHAOS=1 requires ULTRATHINK_CHAOS_PLAN to be set");
+	}
+	if (!isAbsolute(chaosPlanPath)) {
+		throw new ConfigError("ULTRATHINK_CHAOS_PLAN must be an absolute path");
+	}
+	return { chaosEnabled, chaosEnv, chaosPlanPath };
+}
+
 export function loadConfig(
 	env: Record<string, string | undefined> = process.env,
 ): UltrathinkConfig {
@@ -716,6 +752,7 @@ export function loadConfig(
 		tls: readTlsFiles(env, plaintextLoopback),
 		spiffeTrustDomain: readSpiffeTrustDomain(env),
 		plaintextLoopback,
+		...readChaosGate(env),
 		...readKafkaSink(env),
 	};
 }

@@ -1,0 +1,14 @@
+{
+	"id": "audit-corrupt",
+	"title": "Corrupt audit line leaves readiness and liveness unchanged",
+	"failureMode": "audit_corrupt",
+	"kind": "operator",
+	"operatorStep": "On the staging host, while the ultrathink-web unit is running, append one line of non-JSON bytes to its audit log with `printf 'not-json\\n' | sudo tee -a /var/lib/ultrathink/audit.jsonl > /dev/null`. If the staging unit sets ULTRATHINK_STATE_DIR, replace /var/lib/ultrathink with that absolute path; the audit file is always <stateDir>/audit.jsonl (services/ultrathink/obs/audit.ts auditPath).",
+	"notes": "Expected behaviour is fail-open for audit: a corrupt line must not change /readyz or /healthz (routes/router.ts readyz around line 880 and the healthz handler around line 1099 do not read the audit log). The audit log is written only when ULTRATHINK_AUDIT_LOG is on, which is the default. If the file does not exist yet, the appended line creates it. The hypotheses observe HTTP status only; they do not check that audit verification (obs/audit-cli.ts) reports the corruption.",
+	"load": { "method": "GET", "path": "/healthz", "requests": 1, "concurrency": 1 },
+	"hypotheses": [
+		{ "id": "readyz-200-after-audit-corrupt", "name": "/readyz still returns 200 after the audit line is corrupt", "check": "status", "path": "/readyz", "equals": 200 },
+		{ "id": "healthz-200-after-audit-corrupt", "name": "/healthz still returns 200 after the audit line is corrupt", "check": "status", "path": "/healthz", "equals": 200 }
+	],
+	"rollbackOnFail": true
+}
