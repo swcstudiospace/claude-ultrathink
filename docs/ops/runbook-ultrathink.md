@@ -137,9 +137,24 @@ cd /path/to/claude-ultrathink
 deploy/ultrathink-release.sh release <git-ref>      # for example: main, a tag, or a sha
 ```
 
-The script, in order: checks the TLS files of section 17 and refuses before it creates a release when one is missing, archives the commit into `/opt/ultrathink/releases/<sha>-<utc>`, runs `bun test services/ultrathink` there, starts the new release on port 8796 with the production environment but a throwaway state directory and probes `/healthz` and `/readyz` over mTLS, switches `current` atomically (the old release becomes `previous`), restarts `ultrathink-web`, probes both endpoints on the production port over mTLS, and rolls back by itself when any production probe fails. It keeps the 5 newest releases (never deleting `current` or `previous`). It refuses to run unless root.
+The script, in order: checks the TLS files of section 17 and refuses before it creates a release when one is missing, archives the commit into `/opt/ultrathink/releases/<sha>-<utc>`, runs `bun test services/ultrathink` there, then runs the security gate (`security_gate`: `scripts/security-gate.ts audit --root .`, section 19) and discards the release with `security gate failed; release discarded, nothing was switched` when it fails, starts the new release on port 8796 with the production environment but a throwaway state directory and probes `/healthz` and `/readyz` over mTLS, switches `current` atomically (the old release becomes `previous`), restarts `ultrathink-web`, probes both endpoints on the production port over mTLS, and rolls back by itself when any production probe fails. It keeps the 5 newest releases (never deleting `current` or `previous`). It refuses to run unless root.
 
 After a deploy that changed units or nginx, install the new copies (section 2, step 5) and reload. Unit changes need `systemctl daemon-reload` and a restart. The renewal units are installed the same way; section 17 gives their order.
+
+### Release gate evidence
+
+The release workflow (`.github/workflows/release.yml`) runs on a version tag. It creates the GitHub release only after the `Security gate` step passes, and it attaches the four evidence files it wrote to `security-evidence/`:
+
+| File | Written by | What it holds |
+|---|---|---|
+| `checks.json` | `security-gate.ts checks` | each name in `requiredChecks` with its status, read from the check runs of the tagged commit |
+| `audit.json` | `security-gate.ts audit` | `bun audit` results for `.` and `plugins/omp-token-opt` against `audit.level` |
+| `licenses.json` | `security-gate.ts licenses` | installed package licenses for both roots against `licenses.allow` |
+| `manifest.json` | `security-gate.ts report` | the release manifest that ties the other three files to the tag and the commit SHA |
+
+The required check names come from `requiredChecks` in `.github/security-policy.json`. They are the job names in `security-scan.yml` (`Dependency audit`, `License policy`, `Semgrep`), in `codeql.yml` (`Analyze (javascript-typescript)`, `Analyze (python)`) and in `ci.yml` (`Check and test (ubuntu-latest, Bun latest)`). A check that is absent, not completed or not `success` fails the gate.
+
+To refresh an allow entry: the audit gate blocks an advisory at or above `audit.level` unless an unexpired entry in `audit.allow` names its URL or numeric id, and the licenses gate waives a package only through an unexpired entry in `licenses.exceptions`. An expired entry fails the gate. To refresh one, confirm the reason still holds, set `expires` to a later `YYYY-MM-DD` (the entry is valid through that day) and update `reason`, all in `.github/security-policy.json`. A new audit entry is `{"advisory", "reason", "expires"}`; a new licenses entry is `{"name", "version", "license", "reason", "expires"}`. Each entry accepts a risk, so review it as you would code. The gate reads the policy from the commit it runs on, so an entry takes effect only in a commit that contains it.
 
 ## 4. Rollback
 
@@ -148,7 +163,7 @@ deploy/ultrathink-release.sh status
 deploy/ultrathink-release.sh rollback
 ```
 
-`rollback` points `current` at `previous`, swaps the two links so a second `rollback` returns to the newer release, restarts the service and probes it. It does not undo state changes: if a release migrated data that the older code cannot read, restore from a backup (section 5) as well.
+`rollback` points `current` at `previous`, swaps the two links so a second `rollback` returns to the newer release, restarts the service and probes it. It does not undo state changes: if a release migrated data that the older code cannot read, restore from a backup (section 5) as well. Rollback is not gated: it does not run the security gate (section 19) or the tests, and the release it switches to is not audited again.
 
 nginx rollback: `rm /etc/nginx/sites-enabled/ultrathink.swcstudio.space && nginx -t && systemctl reload nginx` takes the vhost offline; to revert a change instead, reinstall the previous conf from git.
 
@@ -931,3 +946,35 @@ The default history file is `<ULTRATHINK_STATE_DIR>/chaos/history.jsonl`, or `/v
 ### Status
 
 The gates, templates, scoring, history and in-process runs are covered by `bun test services/ultrathink/config services/ultrathink/chaos`. The operator templates and the live rollback have not been run against a staging host.
+
+## 19. Security scanning pipeline
+
+The pipeline is a set of gates that fail closed: a missing check run, an expired allow entry or a tool error fails the run. The gate CLI is `bun scripts/security-gate.ts <mode>` with the modes `audit`, `licenses`, `checks` and `report`, each writing one file to `--out`. Exit 0 passes, 1 is a policy failure (the evidence is still written), and 2 is a usage error, an unknown tool output shape or a tool error. Each run deletes its own evidence file first, so an older pass cannot survive.
+
+| Gate | Workflow or script | Runs | Blocks |
+|---|---|---|---|
+| Dependency audit | `.github/workflows/security-scan.yml`, job `Dependency audit` | `audit` on `.` and `plugins/omp-token-opt` | the pull request or push check |
+| License policy | `.github/workflows/security-scan.yml`, job `License policy` | `licenses` on both roots | the pull request or push check |
+| Semgrep | `.github/workflows/security-scan.yml`, job `Semgrep` | `semgrep --test` on `.semgrep/rules`, then a scan with `--error` (pinned `semgrep==1.182.0`) | the pull request or push check |
+| CodeQL | `.github/workflows/codeql.yml`, jobs `Analyze (javascript-typescript)` and `Analyze (python)` | CodeQL analysis | the pull request or push check |
+| Release gate | `.github/workflows/release.yml`, step `Security gate` | `checks`, `audit`, `licenses`, then `report` | creating the GitHub release |
+| VPS gate | `deploy/ultrathink-release.sh`, function `security_gate` | `audit --root .` | switching `current` to the new release |
+
+A check blocks a merge only once branch protection requires it, which is item SC1 below. Dependabot (`.github/dependabot.yml`) opens weekly grouped pull requests for the GitHub Actions versions, the root `bun` lockfile and the `plugins/omp-token-opt` lockfile.
+
+### Blocked and open items
+
+| Item | State | Prerequisite |
+|---|---|---|
+| SC1 required checks | BLOCKED (external) | A repository administrator marks the six `requiredChecks` names as required on `main` in branch protection. Until then no check blocks a merge. |
+| Semgrep findings | BLOCKED | `services/ultrathink/ui/graph-app.test.ts` calls `new Function` on repo-owned strings at lines 67, 140 and 223, and the rule `no-dynamic-code` (`.semgrep/rules/no-dynamic-code.yaml`) reports each one. The `Semgrep` job fails until a human approves a suppression for each. This phase adds no suppression. |
+| Tag ancestry | Open gap | The release gate reads check runs for the tagged commit. It does not check that the commit is reachable from `main`, and a `pull_request` run on that commit counts the same as a run on `main`. Until `release.yml` checks ancestry, tag only a commit that merged to `main` and passed there. |
+| Prerelease tag run | BLOCKED (external) | Operator approval. Pushing a tag such as `v1.5.0-rc.1` runs `release.yml` on GitHub and creates a prerelease. |
+| Red PR run | BLOCKED (external) | A temporary branch with `eval("1")` in `scripts/`, opened as a pull request and closed without merging, to show the `Semgrep` job fails on a finding. |
+| SC2 DAST | BLOCKED | A staging URL with TLS, non-production secrets, a test OAuth client and a ZAP target. No workflow is added. |
+| SC4 container image scanning | BLOCKED | A containerize decision and a registry. No Dockerfile is added. |
+| VPS gate scope | Known limit | `security_gate` runs `audit --root .` only. It does not audit `plugins/omp-token-opt`, and it runs neither `licenses` nor `checks`. Widening it is a change to `deploy/ultrathink-release.sh`, which this phase does not make. |
+
+### Status
+
+The workflows, the gate CLI and `.github/security-policy.json` are part of this phase's change. `semgrep` and `actionlint` are not installed on the host where this section was written, so the Semgrep rule tests, the Semgrep scan and the workflow lint have not run locally; the first run is the CI job. The red PR run and the prerelease tag run have not happened.

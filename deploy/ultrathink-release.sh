@@ -4,7 +4,7 @@
 #
 # Release management for ultrathink-web.
 #
-#   ultrathink-release.sh release <git-ref>   build, test, smoke-test, switch, verify; roll back on any failure
+#   ultrathink-release.sh release <git-ref>   build, test, security audit, smoke-test, switch, verify; roll back on any failure
 #   ultrathink-release.sh rollback            switch to the previous release and restart
 #   ultrathink-release.sh status              show the current and previous release
 #
@@ -39,6 +39,7 @@ SMOKE_PID=""
 SMOKE_STATE=""
 SMOKE_LOG=""
 TEST_STATE=""
+SEC_STATE=""
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -80,9 +81,17 @@ cleanup_test() {
 	TEST_STATE=""
 }
 
+cleanup_security() {
+	if [ -n "$SEC_STATE" ] && [ -d "$SEC_STATE" ]; then
+		rm -rf -- "$SEC_STATE"
+	fi
+	SEC_STATE=""
+}
+
 cleanup_all() {
 	cleanup_smoke
 	cleanup_test
+	cleanup_security
 }
 trap cleanup_all EXIT
 
@@ -249,6 +258,30 @@ run_tests() {
 	cleanup_test
 }
 
+# The dependency audit gate: `security-gate.ts audit` runs in the release tree before the switch. Same isolation as
+# run_tests: it runs as the service user, with HOME and the state directory in a throwaway directory outside the release
+# tree, so nothing it writes ships inside $CURRENT. Rollback never runs it.
+security_gate() {
+	local release="$1" sec_home
+	SEC_STATE="$(mktemp -d /var/tmp/ultrathink-security.XXXXXX)"
+	chown "$SERVICE_USER": "$SEC_STATE"
+	chmod 0700 "$SEC_STATE"
+	sec_home="$SEC_STATE/home"
+	mkdir "$sec_home"
+	chown "$SERVICE_USER": "$sec_home"
+	say "running security audit in $release as $SERVICE_USER"
+	if ! (
+		cd "$release"
+		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
+			env -i PATH=/usr/bin:/bin HOME="$sec_home" \
+			"$BUN" run scripts/security-gate.ts audit --root . --out "$SEC_STATE"
+	); then
+		cleanup_security
+		return 1
+	fi
+	cleanup_security
+}
+
 smoke_test() {
 	local release="$1" smoke_home
 	SMOKE_STATE="$(mktemp -d /var/tmp/ultrathink-smoke.XXXXXX)"
@@ -314,6 +347,11 @@ do_release() {
 	if ! run_tests "$release"; then
 		rm -rf -- "$release"
 		die "tests failed; release discarded, nothing was switched"
+	fi
+
+	if ! security_gate "$release"; then
+		rm -rf -- "$release"
+		die "security gate failed; release discarded, nothing was switched"
 	fi
 
 	if ! smoke_test "$release"; then

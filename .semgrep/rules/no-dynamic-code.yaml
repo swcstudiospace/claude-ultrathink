@@ -1,0 +1,16 @@
+rules:
+  - id: no-dynamic-code
+    message: >-
+      Dynamic code evaluation (eval or new Function) runs arbitrary strings as
+      code. Replace it with a static function, a lookup table, or a parser for
+      the specific input format.
+    severity: ERROR
+    languages:
+      - typescript
+      - javascript
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"

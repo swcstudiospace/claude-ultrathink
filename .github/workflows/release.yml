@@ -1,7 +1,9 @@
 # Creates a GitHub release when a semantic-version tag is pushed. It never publishes to a registry (the package
 # is private) and only runs for tags like v1.5.0 or v1.5.0-rc.1; milestone tags such as v1.3 do not match.
 # The tag is checked against package.json, every manifest and CHANGELOG.md, the gates run again, and the
-# release notes are the tag's CHANGELOG.md section.
+# release notes are the tag's CHANGELOG.md section. Before the release is created, the job also gates on the
+# required check runs for the tagged commit, the dependency audit and the license policy, and attaches that
+# evidence (security-evidence/) to the release.
 name: Release
 
 on:
@@ -20,6 +22,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,6 +64,30 @@ jobs:
       - name: Prime Agent bridge test
         run: python3 hosts/prime-agent/bridge_test.py
 
+      - name: Install plugin dependencies
+        working-directory: plugins/omp-token-opt
+        run: bun install --frozen-lockfile
+
+      - name: Collect required check runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          mkdir -p security-evidence
+          gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '.check_runs[] | {id,name,status,conclusion}' > security-evidence/checks.ndjson
+
+      # Any non-zero exit fails the job before the release is created.
+      - name: Security gate
+        env:
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          bun scripts/security-gate.ts checks --input security-evidence/checks.ndjson --out security-evidence
+          bun scripts/security-gate.ts audit --root . --root plugins/omp-token-opt --out security-evidence
+          bun scripts/security-gate.ts licenses --root . --root plugins/omp-token-opt --out security-evidence
+          bun scripts/security-gate.ts report --out security-evidence --sha "$SHA" --tag "$TAG"
+
       - name: Extract release notes
         run: bun scripts/release-check.ts --notes > RELEASE_NOTES.md
 
@@ -74,4 +101,4 @@ jobs:
           if [[ "$TAG" == *-* ]]; then
             flags+=(--prerelease)
           fi
-          gh release create "$TAG" --verify-tag --title "ultrathink ${TAG#v}" --notes-file RELEASE_NOTES.md "${flags[@]}"
+          gh release create "$TAG" --verify-tag --title "ultrathink ${TAG#v}" --notes-file RELEASE_NOTES.md "${flags[@]}" security-evidence/manifest.json security-evidence/audit.json security-evidence/licenses.json security-evidence/checks.json
