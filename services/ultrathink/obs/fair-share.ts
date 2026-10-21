@@ -7,10 +7,10 @@
 // slots and may not hold more than `perPrincipalMax` slots per principal.
 //
 // `acquire` refuses at once. `admit` waits instead: an over-budget admission joins a bounded FIFO queue for its
-// class, and a freed slot goes to the head of the highest-priority class whose head fits the budget. A class queue
-// is FIFO, so a head that does not fit holds back the rest of its class. An admission that fits takes a free slot at
-// once. A full queue refuses at once; an expired or aborted wait leaves the queue. Refusals and expiries are reported
-// to the security logger when one is given.
+// class, and a freed slot goes to the head of the highest-priority class whose head fits the budget. A waiter is
+// granted in arrival order within its class. An admission that fits takes a free slot at once, even when a waiter of
+// its class is blocked by its own principal cap. A full queue refuses at once; an expired or aborted wait leaves the
+// queue. Refusals and expiries are reported to the security logger when one is given.
 //
 // Construction throws `RangeError` for invalid options.
 
@@ -65,6 +65,12 @@ export type AdmitResult =
 	| { ok: false; reason: FairShareRefusal; cause: "queue_full" | "expired" }
 	| { ok: false; cause: "aborted" };
 
+/** Options for `admit`. `onWait` runs once, just before an admission joins its queue; it must not release pool slots. */
+export interface AdmitOptions {
+	signal?: AbortSignal;
+	onWait?: () => void;
+}
+
 export interface FairShare {
 	/**
 	 * Try to take one slot without waiting. Refusal changes nothing. The returned `release` frees the slot;
@@ -75,7 +81,7 @@ export interface FairShare {
 	 * Take one slot, waiting in the class queue when over budget. Resolves once: admitted, refused, expired or aborted.
 	 * A waiter is removed from its queue as soon as it settles, and its timer is cleared.
 	 */
-	admit(admission: Admission, options?: { signal?: AbortSignal }): Promise<AdmitResult>;
+	admit(admission: Admission, options?: AdmitOptions): Promise<AdmitResult>;
 	/** Slots currently held across all principals and classes. */
 	readonly held: number;
 	/** Admissions currently waiting across all classes. */
@@ -208,7 +214,7 @@ export function createFairShare(options: FairShareOptions): FairShare {
 			}
 			return { ok: true, release: take(admission) };
 		},
-		admit(admission, admitOptions = {}) {
+		admit(admission, admitOptions: AdmitOptions = {}) {
 			const signal = admitOptions.signal;
 			if (signal?.aborted) return Promise.resolve({ ok: false, cause: "aborted" });
 			const blocked = blockedBy(admission);
@@ -219,6 +225,7 @@ export function createFairShare(options: FairShareOptions): FairShare {
 				report(admission, blocked, "queue_full");
 				return Promise.resolve({ ok: false, reason: blocked, cause: "queue_full" });
 			}
+			admitOptions.onWait?.();
 			return new Promise<AdmitResult>((resolve) => {
 				const onAbort = (): void => {
 					if (!removeWaiter(waiter)) return;

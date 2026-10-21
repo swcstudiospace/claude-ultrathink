@@ -405,3 +405,44 @@ describe("createFairShare queue abort and timer cleanup", () => {
 		expect(() => createFairShare({ capacity: 2, reserve: 0, queue: { depth: 4, waitMs: 0 } })).toThrow(RangeError);
 	});
 });
+
+describe("createFairShare onWait", () => {
+	test("onWait runs once, before the admission queues, and not when the admission fits or is refused", async () => {
+		const fake = fakeTimers();
+		const pool = createFairShare({ capacity: 1, reserve: 0, queue: { depth: 1, waitMs: 1000, timers: fake.seam } });
+		let waits = 0;
+		const onWait = () => {
+			waits += 1;
+			expect(pool.queued).toBe(0);
+		};
+
+		const release = await heldSlot(pool, owner);
+		const waiting = pool.admit(connector("a"), { onWait });
+		expect(waits).toBe(1);
+		expect(pool.queued).toBe(1);
+
+		expect(await pool.admit(connector("b"), { onWait })).toMatchObject({ ok: false, cause: "queue_full" });
+		expect(waits).toBe(1);
+
+		release();
+		expect(await waiting).toMatchObject({ ok: true });
+		expect(waits).toBe(1);
+
+		const fits = createFairShare({ capacity: 2, reserve: 0, queue: { depth: 1, waitMs: 1000, timers: fake.seam } });
+		expect((await fits.admit(connector("c"), { onWait })).ok).toBe(true);
+		expect(waits).toBe(1);
+	});
+
+	test("an arrival that fits takes its slot even while a same-class waiter is blocked by its own principal cap", async () => {
+		const fake = fakeTimers();
+		const pool = createFairShare({ capacity: 4, reserve: 0, perPrincipalMax: 1, queue: { depth: 4, waitMs: 1000, timers: fake.seam } });
+		const release = await heldSlot(pool, connector("a"));
+		const blocked = pool.admit(connector("a"));
+		expect(pool.queued).toBe(1);
+		expect((await pool.admit(connector("b"))).ok).toBe(true);
+		expect(pool.held).toBe(2);
+
+		release();
+		expect(await blocked).toMatchObject({ ok: true });
+	});
+});

@@ -598,7 +598,10 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 	});
 
 	/** A fresh app over its own state directory: its own penalty table, pools, load history and auth windows. */
-	function build(overrides: Partial<UltrathinkConfig> = {}, extras: { stateDir?: string; planner?: HeadlessPlanner } = {}): { app: App; metrics: Metrics } {
+	function build(
+		overrides: Partial<UltrathinkConfig> = {},
+		extras: { stateDir?: string; planner?: HeadlessPlanner; onPoolEntry?: () => void } = {},
+	): { app: App; metrics: Metrics } {
 		const metrics = createMetrics();
 		const auth = createAuth({ ownerPasswordHash: config.ownerPasswordHash, sessionSecret: config.sessionSecret, cookieSecure: true });
 		const app = createApp({
@@ -609,6 +612,7 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 			metrics,
 			now: () => clock.ms,
 			...(extras.planner === undefined ? {} : { planner: extras.planner }),
+			...(extras.onPoolEntry === undefined ? {} : { onPoolEntry: extras.onPoolEntry }),
 		});
 		return { app, metrics };
 	}
@@ -792,6 +796,61 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 		gate.resolve();
 		expect((await holdA).status).toBe(200);
 		expect((await holdB).status).toBe(200);
+	});
+
+	test("a request waiting for a pool slot does not hold the outer inflight slot: an owner request still gets its reserved slot", async () => {
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const bothQueued = Promise.withResolvers<void>();
+		let entered = 0;
+		let pooled = 0;
+		const planner: HeadlessPlanner = {
+			enabled: true,
+			async start(input) {
+				entered += 1;
+				if (entered === 2) reached.resolve();
+				await gate.promise;
+				return { ok: true, data: { sessionId: String(input.sessionId ?? "held"), status: "running", pollAfterSec: 5 } };
+			},
+			async result() {
+				throw new Error("the stub planner is not asked for results in this test");
+			},
+			status: () => null,
+			async shutdown() {},
+			upstream: () => undefined,
+		};
+		// maxInflight 4 with a 50 % reserve: non-owner classes hold 2 pool slots, so the next two connectors queue.
+		// The queue is on (the build default depth 16); its 1500 ms timers are cleared when the queued requests are granted.
+		const { app, metrics } = build(
+			{ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50 },
+			{
+				planner,
+				onPoolEntry: () => {
+					pooled += 1;
+					// Four pool entries: two holds, then the two connectors that will queue.
+					if (pooled === 4) bothQueued.resolve();
+				},
+			},
+		);
+		const cookie = await ownerCookie(app);
+
+		const holdA = app.handle(connectorUplift(1), "198.51.100.1");
+		const holdB = app.handle(connectorUplift(2), "198.51.100.2");
+		await reached.promise;
+		const queuedC = app.handle(connectorUplift(3), "198.51.100.3");
+		const queuedD = app.handle(connectorUplift(4), "198.51.100.4");
+		await bothQueued.promise;
+		// The queued requests have given back their outer slots: only the two running holds count.
+		expect(metrics.sum("ultrathink_http_inflight")).toBe(2);
+
+		const owner = await ownerRun(app, cookie);
+		expect(owner.status).toBe(202);
+
+		gate.resolve();
+		expect((await holdA).status).toBe(200);
+		expect((await holdB).status).toBe(200);
+		expect((await queuedC).status).toBe(200);
+		expect((await queuedD).status).toBe(200);
 	});
 
 	test("a corrupt load-history.json starts the app empty and is logged; readiness and metrics still answer", async () => {
