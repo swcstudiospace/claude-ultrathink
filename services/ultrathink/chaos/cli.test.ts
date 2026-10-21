@@ -2,12 +2,12 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliDeps, runCli } from "./cli.ts";
 import { appendHistory } from "./history.ts";
-import type { HttpFetch } from "./observe.ts";
+import type { HttpFetch, HttpRequestInit } from "./observe.ts";
 import type { RunResult } from "./run.ts";
 
 const EXPERIMENTS = join(import.meta.dir, "experiments");
@@ -278,6 +278,83 @@ describe("run: production-safety gate", () => {
 
 		expect(code).toBe(2);
 		expect(h.stderr()).toContain("ULTRATHINK_CHAOS_ENV=staging");
+		expect(h.events).toEqual([]);
+	});
+});
+
+describe("run: TLS probe flags", () => {
+	function pemFiles(): { ca: string; cert: string; key: string } {
+		const dir = freshDir();
+		const files = { ca: join(dir, "ca.pem"), cert: join(dir, "probe.pem"), key: join(dir, "probe.key") };
+		writeFileSync(files.ca, "CA-PEM");
+		writeFileSync(files.cert, "CERT-PEM");
+		writeFileSync(files.key, "KEY-PEM");
+		return files;
+	}
+
+	test("the probe presents the client identity read from the PEM files", async () => {
+		const h = harness();
+		const files = pemFiles();
+		const seen: HttpRequestInit[] = [];
+		const deps: CliDeps = {
+			...h.deps,
+			fetch: async (_url, init) => {
+				seen.push(init);
+				return new Response("{}", { status: 200 });
+			},
+		};
+
+		const code = await runCli(
+			["run", "audit-corrupt", "--driver", "http", "--base-url", "https://127.0.0.1:9", "--ca-file", files.ca, "--client-cert", files.cert, "--client-key", files.key],
+			deps,
+		);
+
+		expect(code).toBe(0);
+		expect(seen.length).toBeGreaterThan(0);
+		for (const init of seen) expect(init.tls).toEqual({ ca: "CA-PEM", cert: "CERT-PEM", key: "KEY-PEM" });
+	});
+
+	test("TLS flags with the in-process driver exit 2 before anything runs", async () => {
+		const h = harness();
+		const files = pemFiles();
+
+		const code = await runCli(["run", "upstream-5xx-breaker", "--driver", "inprocess", "--ca-file", files.ca], h.deps);
+
+		expect(code).toBe(2);
+		expect(h.stderr()).toContain("apply to --driver http only");
+		expect(existsSync(h.historyPath)).toBe(false);
+	});
+
+	test("a client certificate without its key exits 2 and sends no request", async () => {
+		const h = harness();
+		const files = pemFiles();
+
+		const code = await runCli(["run", "audit-corrupt", "--driver", "http", "--base-url", "https://127.0.0.1:9", "--client-cert", files.cert], h.deps);
+
+		expect(code).toBe(2);
+		expect(h.stderr()).toContain("must be given together");
+		expect(h.events).toEqual([]);
+	});
+
+	test("TLS flags over plain http exit 2 and send no request", async () => {
+		const h = harness();
+		const files = pemFiles();
+
+		const code = await runCli(["run", "audit-corrupt", "--driver", "http", "--base-url", "http://127.0.0.1:9", "--ca-file", files.ca], h.deps);
+
+		expect(code).toBe(2);
+		expect(h.stderr()).toContain("need an https --base-url");
+		expect(h.events).toEqual([]);
+	});
+
+	test("an unreadable PEM file exits 2 before any request", async () => {
+		const h = harness();
+		const missing = join(freshDir(), "absent-ca.pem");
+
+		const code = await runCli(["run", "audit-corrupt", "--driver", "http", "--base-url", "https://127.0.0.1:9", "--ca-file", missing], h.deps);
+
+		expect(code).toBe(2);
+		expect(h.stderr()).toContain(`--ca-file cannot read ${missing}`);
 		expect(h.events).toEqual([]);
 	});
 });

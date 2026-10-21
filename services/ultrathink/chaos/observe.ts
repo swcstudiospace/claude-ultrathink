@@ -139,19 +139,44 @@ function sameLabels(actual: Record<string, string>, expected: Record<string, str
 	return keys.every((key) => Object.hasOwn(expected, key) && actual[key] === expected[key]);
 }
 
+/** A fetch init that may carry the TLS identity `httpTarget` passes to Bun. */
+export type HttpRequestInit = RequestInit & { tls?: HttpTlsOptions };
 /** The fetch shape `httpTarget` needs; tests inject a fake. */
-export type HttpFetch = (url: string, init: RequestInit) => Promise<Response>;
+export type HttpFetch = (url: string, init: HttpRequestInit) => Promise<Response>;
+
+/** Longest one request may take, from sending it until its body is read. A probe past it fails as a request error. */
+const REQUEST_DEADLINE_MS = 5000;
+
+/**
+ * PEM material for an https base URL. `ca` is the CA that must have signed the server's certificate. `cert` and `key`
+ * are the client identity presented to an mTLS listener. Server verification stays on in every case.
+ */
+export interface HttpTlsOptions {
+	ca?: string;
+	cert?: string;
+	key?: string;
+}
+
+export interface HttpTargetOptions {
+	/** Replaces the global fetch; tests inject a fake. */
+	fetch?: HttpFetch;
+	/** Deadline for each request. Defaults to REQUEST_DEADLINE_MS. */
+	timeoutMs?: number;
+	tls?: HttpTlsOptions;
+}
 
 /**
  * A target that talks HTTP(S) to a base URL. Only `http:` and `https:` are accepted, so a `file:` or other scheme is
- * rejected before any request is made.
+ * rejected before any request is made. Each request has one deadline that covers the response headers and the body.
  */
-export function httpTarget(baseUrl: string, fetchImpl: HttpFetch = fetch): ChaosTarget {
+export function httpTarget(baseUrl: string, options: HttpTargetOptions = {}): ChaosTarget {
+	const { fetch: fetchImpl = fetch, timeoutMs = REQUEST_DEADLINE_MS, tls } = options;
 	const base = new URL(baseUrl);
 	if (base.protocol !== "http:" && base.protocol !== "https:") {
 		throw new TypeError(`chaos http target must use http or https, not ${base.protocol}`);
 	}
 	const root = new URL(base.href.endsWith("/") ? base.href : `${base.href}/`);
+	const tlsInit = tls === undefined ? {} : { tls };
 	return {
 		async request(method, path, body) {
 			const headers: Record<string, string> = {};
@@ -161,9 +186,22 @@ export function httpTarget(baseUrl: string, fetchImpl: HttpFetch = fetch): Chaos
 				payload = JSON.stringify(body);
 			}
 			const url = new URL(path.replace(/^\/+/, ""), root);
-			const response = await fetchImpl(url.href, { method, headers, body: payload });
-			return { status: response.status, headers: response.headers, text: await response.text() };
+			const signal = AbortSignal.timeout(timeoutMs);
+			const deadlineMessage = `${method} ${path} got no complete response within ${timeoutMs} ms`;
+			const response = await untilAborted(fetchImpl(url.href, { method, headers, body: payload, signal, ...tlsInit }), signal, deadlineMessage);
+			const text = await untilAborted(response.text(), signal, deadlineMessage);
+			return { status: response.status, headers: response.headers, text };
 		},
 		async close() {},
 	};
+}
+
+// Settles with `work`, or rejects with an Error(`deadlineMessage`) once `signal` aborts first. The same signal cancels a real fetch.
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal, deadlineMessage: string): Promise<T> {
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	const onAbort = () => reject(new Error(deadlineMessage));
+	if (signal.aborted) onAbort();
+	else signal.addEventListener("abort", onAbort, { once: true });
+	work.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	return promise;
 }

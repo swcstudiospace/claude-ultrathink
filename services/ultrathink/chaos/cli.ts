@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { appendHistory, readHistory } from "./history.ts";
 import { createInProcessTarget } from "./inprocess.ts";
-import { type ChaosTarget, type HttpFetch, httpTarget } from "./observe.ts";
+import { type ChaosTarget, type HttpFetch, type HttpTlsOptions, httpTarget } from "./observe.ts";
 import { type RunResult, runTemplate } from "./run.ts";
 import { type ExperimentTemplate, loadTemplates } from "./schema.ts";
 import { resilience } from "./score.ts";
@@ -35,11 +35,12 @@ export interface CliDeps {
 
 const USAGE = [
 	"usage: chaos templates",
-	"       chaos run <id> --driver inprocess|http [--base-url URL] [--history PATH] [--rollback-argv JSON]",
+	"       chaos run <id> --driver inprocess|http [--base-url URL] [--ca-file PEM] [--client-cert PEM --client-key PEM] [--history PATH] [--rollback-argv JSON]",
 	"       chaos score <id> [--history PATH]",
 ].join("\n");
 
-const RUN_FLAGS = ["--driver", "--base-url", "--history", "--rollback-argv"] as const;
+const TLS_FLAGS = ["--ca-file", "--client-cert", "--client-key"] as const;
+const RUN_FLAGS = ["--driver", "--base-url", "--history", "--rollback-argv", ...TLS_FLAGS] as const;
 const SCORE_FLAGS = ["--history"] as const;
 
 class UsageError extends Error {}
@@ -95,7 +96,8 @@ async function runCommand(args: string[], deps: CliDeps): Promise<number> {
 		throw new UsageError(`${id} needs a human step and observes a running unit; run it with --driver http --base-url URL`);
 	}
 
-	const result = await execute({ template, driver, baseUrl, staging, rollbackArgv, deps });
+	const tls = readTlsFlags(flags, driver, baseUrl);
+	const result = await execute({ template, driver, baseUrl, staging, rollbackArgv, tls, deps });
 	const historyPath = flags.get("--history") ?? deps.historyPath;
 	const record = appendHistory(historyPath, result);
 	printRun(result, deps);
@@ -109,11 +111,12 @@ interface ExecuteOptions {
 	baseUrl: string | undefined;
 	staging: boolean;
 	rollbackArgv: string[] | undefined;
+	tls: HttpTlsOptions | undefined;
 	deps: CliDeps;
 }
 
 async function execute(options: ExecuteOptions): Promise<RunResult> {
-	const { template, driver, baseUrl, staging, rollbackArgv, deps } = options;
+	const { template, driver, baseUrl, staging, rollbackArgv, tls, deps } = options;
 	const common = {
 		template,
 		sleep: deps.sleep,
@@ -134,7 +137,7 @@ async function execute(options: ExecuteOptions): Promise<RunResult> {
 			rmSync(stateDir, { recursive: true, force: true });
 		}
 	}
-	const target: ChaosTarget = httpTarget(baseUrl ?? "", deps.fetch);
+	const target: ChaosTarget = httpTarget(baseUrl ?? "", { fetch: deps.fetch, tls });
 	try {
 		return await runTemplate({ ...common, target, driver: "http" });
 	} finally {
@@ -225,6 +228,34 @@ function parseRollbackArgv(raw: string | undefined): string[] | undefined {
 		argv.push(item);
 	}
 	return argv;
+}
+
+// The PEM files for an https probe. A client identity needs both halves. Nothing is read unless the run is http.
+function readTlsFlags(flags: Map<string, string>, driver: "inprocess" | "http", baseUrl: string | undefined): HttpTlsOptions | undefined {
+	if (!TLS_FLAGS.some((name) => flags.has(name))) return undefined;
+	if (driver !== "http") throw new UsageError("--ca-file, --client-cert and --client-key apply to --driver http only");
+	const certFile = flags.get("--client-cert");
+	const keyFile = flags.get("--client-key");
+	if ((certFile === undefined) !== (keyFile === undefined)) throw new UsageError("--client-cert and --client-key must be given together");
+	if (baseUrl === undefined || new URL(baseUrl).protocol !== "https:") {
+		throw new UsageError("--ca-file, --client-cert and --client-key need an https --base-url; no request was sent");
+	}
+	const tls: HttpTlsOptions = {};
+	const caFile = flags.get("--ca-file");
+	if (caFile !== undefined) tls.ca = readPem("--ca-file", caFile);
+	if (certFile !== undefined && keyFile !== undefined) {
+		tls.cert = readPem("--client-cert", certFile);
+		tls.key = readPem("--client-key", keyFile);
+	}
+	return tls;
+}
+
+function readPem(flag: string, file: string): string {
+	try {
+		return readFileSync(file, "utf8");
+	} catch {
+		throw new UsageError(`${flag} cannot read ${file}`);
+	}
 }
 
 function findTemplate(id: string, deps: CliDeps): ExperimentTemplate {
