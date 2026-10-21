@@ -4,7 +4,7 @@
 #
 # Release management for ultrathink-web.
 #
-#   ultrathink-release.sh release <git-ref>   build, test, security audit, smoke-test, switch, verify; roll back on any failure
+#   ultrathink-release.sh release <git-ref>   refuse a ref not on origin/main; build, test, security audit, smoke-test, switch, verify; roll back on any failure
 #   ultrathink-release.sh rollback            switch to the previous release and restart
 #   ultrathink-release.sh status              show the current and previous release
 #
@@ -313,6 +313,17 @@ smoke_test() {
 	cleanup_smoke
 }
 
+# The ancestry gate: the release commit must already be on origin/main. Runs the release workflow's check
+# (scripts/security-gate.ts ancestry) from the checkout with the pinned Bun and refuses on any failure. The gate exits 1
+# when the commit is not an ancestor and 2 when git cannot answer; both refuse, because the gate fails closed.
+ancestry_gate() {
+	local ref="$1" sha="$2"
+	if ! (cd "$REPO" && "$BUN" run scripts/security-gate.ts ancestry --sha "$sha"); then
+		die "ref $ref ($sha) is not on origin/main; release refused, nothing was archived"
+	fi
+	say "ancestry: $sha is on origin/main"
+}
+
 do_release() {
 	local ref="${1:-}" sha short stamp release old_current old_previous port
 	[ -n "$ref" ] || usage
@@ -324,7 +335,11 @@ do_release() {
 	check_tls_material
 	port="$(env_value ULTRATHINK_PORT 8795)"
 
+	say "fetching origin/main"
+	git -C "$REPO" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' ||
+		die "cannot fetch origin/main; release refused, nothing was archived"
 	sha="$(git -C "$REPO" rev-parse --verify "$ref^{commit}")" || die "cannot resolve git ref: $ref"
+	ancestry_gate "$ref" "$sha"
 	short="${sha:0:12}"
 	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 	release="$RELEASES/$short-$stamp"
