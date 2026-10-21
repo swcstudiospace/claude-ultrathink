@@ -955,7 +955,7 @@ Each item is open and names its prerequisite. Until the prerequisite exists, the
 
 Phase 69 puts the one internal hop, nginx to the app, and every loopback probe under mutual TLS. The app listens on `127.0.0.1:8795` with TLS only. A client reaches it only with a leaf certificate that chains to the internal CA, and the SPIFFE ID in that certificate selects what it may reach. Headers never set an identity.
 
-**Status.** The code, the nginx vhost, the systemd units and the release script carry this change. The issuing script `deploy/ultrathink-pki.sh` is not in the repository, so the certificate files cannot be created from it yet (see 17.8). Until the files exist, the TLS-only service refuses to start, and the release script stops before it switches `current`. Do not work around that with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`.
+**Status.** The code, the nginx vhost, the systemd units and the release script carry this change. The script `deploy/ultrathink-pki.sh` and its test `deploy/ultrathink-pki.test.ts` are in the repository, and the operator commands are in 17.8. Until the files exist, the TLS-only service refuses to start, and the release script stops before it switches `current`. Do not work around that with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`.
 
 ### 17.1 Identities and route policy
 
@@ -1069,14 +1069,14 @@ The edge leaf is refused on `/metrics` (expect 403). Testing it needs the edge k
 
 ### 17.8 Blocked items
 
-Each item is not built. Its prerequisite is named. Until the prerequisite exists, the matching part of this section is unverified.
+The items below are not built, except the PKI script in the first item. That script is built: its root commands run on an offline root machine, and its issuing commands run on the VPS. Each prerequisite is named. Until the prerequisite exists, the matching part of this section is unverified.
 
-- **Issuing script and its test: `deploy/ultrathink-pki.sh` and `deploy/ultrathink-pki.test.ts`.** The write to `deploy/` was refused by a protected-path guard, so neither file is in the repository, and nothing in this runbook assumes that either exists. Prerequisite: the operator supplies an executable script with the subcommands the phase plan specifies (`init-root`, `init-intermediate`, `sign-intermediate`, `issue`, `renew-if-due`) and its test. Until then no leaf can be issued, `ultrathink-cert-renew.sh` exits 1 with `PKI script not found`, the release script stops before its switch, and the TLS-only service cannot start.
+- **Issuing script and its test: `deploy/ultrathink-pki.sh` and `deploy/ultrathink-pki.test.ts`.** The script and its test exist in the repository. Operator commands, in order: `init-root <dir>` once on an offline root; `init-intermediate <tls-dir>`; `sign-intermediate <root-dir> <csr> <out.pem>` on the root machine; `issue <tls-dir> <name> <spiffe-id> [--ip] [--hours 1-24] [--group]`; and `renew-if-due <tls-dir> <name>...` from the renewal timer. They have not yet run on the VPS, so the checks listed in "Checks that need the VPS" remain open.
 - **Checks that need the VPS.** `nginx -t` with the files present, `systemd-analyze verify` on the renewal units, `systemd-analyze security ultrathink-web`, and `openssl verify` on the installed leaves. Prerequisite: root on the VPS and the files from the item above.
 - **Real SPIFFE identities (ZT-04 real SVIDs, ZT-06 SPIRE part).** Prerequisite: a SPIRE server and agent on the host, and a decision on who owns the `ultrathink.internal` trust domain. The local CA covers the authorization layer only.
 - **Service mesh and mesh-wide mTLS (ZT-02, and ZT-01 beyond the one hop).** Prerequisite: a Kubernetes cluster, a chosen mesh control plane (Istio or Linkerd), and more than one service to protect. The repository has one internal hop.
 - **Network policy at L3/L4 (ZT-05).** Prerequisite: root on `187.77.130.10` for `nft -c` and a rollback window that keeps SSH reachable, or a cluster with a NetworkPolicy-capable CNI. No ruleset is in the repository.
-- **ZT-03.** The roadmap has no criterion 3 text. Prerequisite: the orchestrator confirms the intended requirement.
+- **ZT-03.** The phase 69 roadmap has no success criterion 3, so ZT-03 is a documented gap and is not built. Adding the criterion text to the roadmap opens it. Prerequisite: the orchestrator confirms the intended requirement.
 
 ### 17.9 Open items
 
@@ -1186,7 +1186,8 @@ A check blocks a merge only once branch protection requires it, which is item SC
 |---|---|---|
 | SC1 required checks | BLOCKED (external) | A repository administrator marks the six `requiredChecks` names as required on `main` in branch protection. Until then no check blocks a merge. |
 | Semgrep findings | BLOCKED | `services/ultrathink/ui/graph-app.test.ts` calls `new Function` on repo-owned strings at lines 67, 140 and 223, and the rule `no-dynamic-code` (`.semgrep/rules/no-dynamic-code.yaml`) reports each one. The `Semgrep` job fails until a human approves a suppression for each. This phase adds no suppression. |
-| Tag ancestry | Open gap | The release gate reads check runs for the tagged commit. It does not check that the commit is reachable from `main`, and a `pull_request` run on that commit counts the same as a run on `main`. Until `release.yml` checks ancestry, tag only a commit that merged to `main` and passed there. |
+| Tag ancestry | Closed for release.yml | The workflow fetches origin/main and runs `scripts/security-gate.ts ancestry`, and refuses a tag whose commit is not an ancestor of origin/main. |
+| VPS release path | Open gap | `deploy/ultrathink-release.sh release <git-ref>` archives any ref and does not check ancestry, so tag and deploy only commits on main until it does. |
 | Prerelease tag run | BLOCKED (external) | Operator approval. Pushing a tag such as `v1.5.0-rc.1` runs `release.yml` on GitHub and creates a prerelease. |
 | Red PR run | BLOCKED (external) | A temporary branch with `eval("1")` in `scripts/`, opened as a pull request and closed without merging, to show the `Semgrep` job fails on a finding. |
 | SC2 DAST | BLOCKED | A staging URL with TLS, non-production secrets, a test OAuth client and a ZAP target. No workflow is added. |
@@ -1204,32 +1205,28 @@ Phase 75. Policy is Rego under `policy/`, tested with `opa test`, and evaluated 
 
 | Item | Status | Prerequisite |
 |---|---|---|
-| OPA pin, `policy/opa-pin.json` | BLOCKED. `version`, `sha256` and `url` are null. | An operator-approved fetch of the OPA release asset `opa_linux_amd64_static` and its published checksum. Verify the checksum before writing the pin. |
-| Rego execution | Not run on the machine where this section was written: `command -v opa` returned nothing. | The pinned binary, or the `policy.yml` CI job. |
-| `policy:check` | Fails closed until the pin is set. It refuses to download and exits 1 with `no verified OPA pin`. | The pin above, or an explicit `OPA_BIN`. |
+| OPA pin, `policy/opa-pin.json` | Set: version v1.21.3, asset opa_linux_amd64_static, sha256 add7c9dcf56e1ce1538426a6ee595ea1cc7ee830bbedd4c23219825b02b19a79, checked against the release's published opa_linux_amd64_static.sha256. | None on this host. A change of OPA version follows the steps in Pinning OPA. |
+| Rego execution | Run on this host, `bash policy/check.sh` passes end to end with the pinned binary (opa check --strict, opa test with 42 of 42 passing, collect, opa eval with no violations). The CI policy job has not run yet. | The first run of the `policy.yml` CI job. |
+| `policy:check` | Passes with the pinned binary, and fails closed when the pin is missing or mismatched. | None on this host. |
 | Drift units | Installed by hand and not enabled. | An operator with root on the host. Enabling them is a separate decision, recorded here when made. |
 | Maintenance unit in unit scope | Not in scope. The baseline result is recorded below. | Add it to `unit_scope` in `policy/units.rego` and cover it in `units_test.rego` in the same change, then run the Rego tests in CI. |
 
 ### Pinning OPA
+
+The pin is set to OPA v1.21.3, verified against the published checksum. Use these steps only to move to another OPA release.
 
 1. Choose the OPA release tag. Fetch the asset `opa_linux_amd64_static` and the release's published checksum. Both need operator approval.
 2. Run `sha256sum` on the asset and compare the digest with the published checksum. A mismatch stops the process.
 3. In a reviewed commit, set `version` (the tag), `sha256` (the verified 64-character hex) and `url` (`https://github.com/open-policy-agent/opa/releases/download/<tag>/opa_linux_amd64_static`) in `policy/opa-pin.json`.
 4. Run `bash policy/check.sh`. It downloads the asset again and checks the digest again before it runs the binary.
 
-On a host, the drift unit runs OPA from `OPA_BIN=/opt/ultrathink/bin/opa`. `check.sh` uses an explicit `OPA_BIN` as given, with no download and no digest check. Before installing a binary there, check its digest by hand against the pin:
-
-```
-sha256sum <verified-opa-binary>
-install -m 0755 <verified-opa-binary> /opt/ultrathink/bin/opa
-```
+`check.sh` runs only the binary the pin names. It downloads the asset, checks its sha256, and refuses a mismatch. `OPA_BIN` is ignored (a warning is printed), so no environment variable can run an unverified binary, including the drift unit.
 
 ### Running the check
 
 ```
 bash policy/check.sh                                  # or: bun run policy:check
 bash policy/check.sh --live http://127.0.0.1:8795/    # also collects the live response headers
-OPA_BIN=/path/to/opa bash policy/check.sh             # explicit binary, no digest check
 bun run policy:collect                                # prints the input document to stdout
 ```
 
@@ -1244,7 +1241,7 @@ install -m 0644 deploy/ultrathink-drift.service deploy/ultrathink-drift.timer /e
 systemctl daemon-reload
 ```
 
-Do not run `systemctl enable` or `enable --now` on these units until the enablement decision is recorded in this section. A manual run is `systemctl start ultrathink-drift.service`, then `journalctl -u ultrathink-drift -n 50 --no-pager`. While the OPA pin is unset, the unit's second `ExecStart` (`policy/check.sh --live`) fails, and the unit reports failure. That is expected until section "Pinning OPA" is complete.
+Do not run `systemctl enable` or `enable --now` on these units until the enablement decision is recorded in this section. A manual run is `systemctl start ultrathink-drift.service`, then `journalctl -u ultrathink-drift -n 50 --no-pager`. The first `ExecStart` runs `deploy/drift-check.sh`, which compares each installed unit with its copy in the repository and writes the report. Its `-` prefix means drift does not fail the unit. The second `ExecStart` runs `policy/check.sh --live` with the pinned OPA binary. It fails the unit when a check fails, when the pin is missing or mismatched, or when the live header probe fails.
 
 ### Reading the drift report
 
@@ -1282,5 +1279,5 @@ Each control in `policy/controls.json` is `PASS` (all evidence present, no pendi
 
 ### Maintenance unit baseline
 
-`deploy/ultrathink-maintenance.service` is not in `unit_scope`. Its baseline was checked when this section was written by evaluating U-R1 to U-R4 against the collector output, using a TypeScript comparison of the same rules, because Rego does not run here. Result: no violations, so the baseline passes. The unit stays out of `unit_scope` in this change because `policy/units.rego` is outside the I1 change set. Adding it is a follow-up change that goes through the Rego tests in CI.
+`deploy/ultrathink-maintenance.service` is not in `unit_scope`. Its baseline was checked when this section was written by evaluating U-R1 to U-R4 against the collector output, using a TypeScript comparison of the same rules. Result: no violations, so the baseline passes. Rego now runs on this host with the pinned binary, but this baseline has not been re-run with `opa eval`. The unit stays out of `unit_scope` in this change because `policy/units.rego` is outside the I1 change set. Adding it is a follow-up change that goes through the Rego tests in CI.
 
