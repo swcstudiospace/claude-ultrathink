@@ -309,6 +309,7 @@ sequenceDiagram
         X->>O: aside message at the next step boundary
     end
     Note over O,X: A newer prompt, an accepted /ultrathink-quick message, a model switch, a session switch or the end of the session cancels the flight, and nothing is delivered.
+```
 
 ### Omp native planning
 
