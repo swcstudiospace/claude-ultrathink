@@ -52,6 +52,7 @@ import {
 	buildSecurityHeaders,
 	createSecurityEvent,
 	readBodyPrefix,
+	setSecurityLogger,
 } from "../security/index.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
 import { createWalCheckpointer } from "../store/checkpoint.ts";
@@ -84,6 +85,8 @@ export interface RouterDeps {
 	auditTransports?: SinkTransport[];
 	/** Test seam. Receives the SERVER and client spans; absent means the OTLP exporter when ULTRATHINK_OTLP_ENDPOINT is set. */
 	spans?: SpanSink;
+	/** Test seam. Called as each admission enters the HTTP pool, before it may wait. */
+	onPoolEntry?: () => void;
 }
 
 export interface App {
@@ -126,6 +129,11 @@ type JsonRead = { ok: true; value: unknown } | { ok: false; response: Response }
 
 type AuthKind = "connector-key" | "bearer" | "session" | "none";
 
+/** The outer inflight slot a request holds. It is cleared while the request waits for a pool slot, so a queued request does not count against the process limit. */
+interface OuterSlot {
+	release?: () => void;
+}
+
 /** What one request learns about itself on the way through, for the access log. */
 interface RequestCtx {
 	reqId: string;
@@ -136,6 +144,7 @@ interface RequestCtx {
 	rpcMethod?: string;
 	mcpVersion?: string;
 	tool?: string;
+	outer: OuterSlot;
 }
 
 /** HEAD is allowed wherever GET is and is answered as that GET without the body. */
@@ -509,6 +518,8 @@ export function createApp(deps: RouterDeps): App {
 		onEvent: (event) => onSinkEvent(event),
 	});
 	const securityEvents = new StreamingSecurityEventLogger(logger, (event) => streams.security(event));
+	// Installed process-wide so the validation modules and every other caller reach the same SIEM-backed sink (phase 67 gap 3).
+	setSecurityLogger(securityEvents);
 	// Anomaly alerts raised while a record is being appended wait here until that record has returned.
 	const detector = createAnomalyDetector({ rules: config.auditRules ?? DEFAULT_ANOMALY_RULES, now: deps.now });
 	const pendingAlerts: AnomalyAlert[] = [];
@@ -622,11 +633,13 @@ export function createApp(deps: RouterDeps): App {
 				})
 			: undefined;
 	const inflight = createInflight(config.maxInflight);
-	// The HTTP pool refuses at once and keeps owner work ahead of connector and bearer work (CONTEXT decision 5).
+	// The HTTP pool admits, queues over-budget work within a bound, or refuses; owner work stays ahead of connector and bearer work (CONTEXT decision 5).
 	const httpShare = createFairShare({
 		capacity: config.maxInflight,
 		reserve: Math.floor((config.maxInflight * config.priorityReservePct) / 100),
 		perPrincipalMax: Math.ceil(config.maxInflight / 2),
+		queue: { depth: config.fairQueueDepth, waitMs: config.fairQueueWaitMs },
+		security: securityEvents,
 	});
 	const quota = createAdaptiveQuota({ minFactor: config.adaptiveQuotaMinPct / 100, lagTargetMs: config.lagTargetMs });
 	const clock = deps.now ?? Date.now;
@@ -638,6 +651,7 @@ export function createApp(deps: RouterDeps): App {
 		decayMs: PENALTY_DECAY_MS,
 		maxKeys: PENALTY_KEYS,
 		now: clock,
+		security: securityEvents,
 	});
 	const historyPath = join(config.stateDir, LOAD_HISTORY_FILE);
 	const history = restoreHistory(historyPath, logger);
@@ -723,15 +737,37 @@ export function createApp(deps: RouterDeps): App {
 	}
 
 	/**
-	 * Runs `work` while holding one HTTP pool slot for `admission`. A refused slot answers 429 with a one-second retry
-	 * and runs nothing. While `work` runs, the admission sits on the request context, so planner work it starts takes a
-	 * plan slot under the same class and principal.
+	 * Runs `work` while holding one HTTP pool slot for `admission`. A request that must wait gives its outer inflight slot
+	 * back while it waits and takes one again once the pool grants it; when none is free, the grant is returned and the
+	 * request answers 503, as at the outer limit. An expired or aborted wait answers 429 with a one-second retry and runs
+	 * nothing. While `work` runs, the admission sits on the request context, so planner work it starts takes a plan slot
+	 * under the same class and principal.
 	 */
-	async function admitted(admission: Admission, work: () => Promise<Response>): Promise<Response> {
-		const slot = httpShare.acquire(admission);
+	async function admitted(admission: Admission, ctx: RequestCtx, signal: AbortSignal, work: () => Promise<Response>): Promise<Response> {
+		let waited = false;
+		deps.onPoolEntry?.();
+		const slot = await httpShare.admit(admission, {
+			signal,
+			onWait: () => {
+				waited = true;
+				releaseOuter(ctx);
+			},
+		});
 		if (!slot.ok) {
-			metrics.inc("ultrathink_fair_share_refused_total", { class: admission.class, reason: slot.reason });
+			if ("reason" in slot) metrics.inc("ultrathink_fair_share_refused_total", { class: admission.class, reason: slot.reason });
 			return fail(429, "rate_limited", { "Retry-After": "1" });
+		}
+		if (waited) {
+			const outer = inflight.enter();
+			if (outer === null) {
+				// Same order as every finishing call: outer first, then the share slot a waiter may be woken by.
+				releaseOuter(ctx);
+				slot.release();
+				metrics.inc("ultrathink_overload_total");
+				return fail(503, "overloaded", { "Retry-After": "1" });
+			}
+			ctx.outer.release = outer;
+			metrics.gauge("ultrathink_http_inflight", inflight.count);
 		}
 		const context = currentRequestContext();
 		if (context) context.admission = admission;
@@ -739,8 +775,18 @@ export function createApp(deps: RouterDeps): App {
 			return await work();
 		} finally {
 			if (context) context.admission = undefined;
+			// Outer first: a waiter woken by the share release must see the outer slot already free, or its re-entry fails.
+			releaseOuter(ctx);
 			slot.release();
 		}
+	}
+
+	/** Gives back the request's outer inflight slot if it holds one. Idempotent; the only place the outer slot is released. */
+	function releaseOuter(ctx: RequestCtx): void {
+		const release = ctx.outer.release;
+		ctx.outer.release = undefined;
+		release?.();
+		metrics.gauge("ultrathink_http_inflight", inflight.count);
 	}
 
 	function authFailed(kind: string): void {
@@ -828,7 +874,7 @@ export function createApp(deps: RouterDeps): App {
 		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: session.ownerId, scale: quota.factor() });
 		if (!limit.ok) return rateLimited(ctx, "run", limit.retryAfterSec);
 
-		return await admitted({ principal: "owner", class: "owner" }, () => startRun(req, ctx, session));
+		return await admitted({ principal: "owner", class: "owner" }, ctx, req.signal, () => startRun(req, ctx, session));
 	}
 
 	/** Origin, envelope, input and flags, then the run is queued. Runs only while the owner holds a pool slot. */
@@ -1082,7 +1128,7 @@ export function createApp(deps: RouterDeps): App {
 		};
 		// Discovery and initialize are not pooled; a tool call or a batch holds one slot while it runs.
 		if (ctx.rpcMethod !== "tools/call" && ctx.rpcMethod !== "batch") return await answer();
-		return await admitted({ principal, class: ctx.authKind === "connector-key" ? "connector" : "bearer" }, answer);
+		return await admitted({ principal, class: ctx.authKind === "connector-key" ? "connector" : "bearer" }, ctx, req.signal, answer);
 	}
 
 	async function dispatch(req: Request, ctx: RequestCtx, target: Target | null): Promise<Response> {
@@ -1162,10 +1208,10 @@ export function createApp(deps: RouterDeps): App {
 			peerIp,
 			endpoint: "not_found",
 			authKind: "none",
+			outer: {},
 		};
 		return runWithRequestContext({ reqId: ctx.reqId, traceId: server.traceId, spanId: server.spanId, sampled: server.sampled }, async () => {
 			let response: Response;
-			let release: (() => void) | undefined;
 			try {
 				const target = matchPath(new URL(req.url).pathname);
 				if (target) ctx.endpoint = target.endpoint;
@@ -1184,7 +1230,7 @@ export function createApp(deps: RouterDeps): App {
 						metrics.inc("ultrathink_overload_total");
 						response = fail(503, "overloaded", { "Retry-After": "1" });
 					} else {
-						release = slot;
+						ctx.outer.release = slot;
 						if (!ungated) history.record(clock());
 						metrics.gauge("ultrathink_http_inflight", inflight.count);
 						response = await dispatch(req, ctx, target);
@@ -1195,8 +1241,7 @@ export function createApp(deps: RouterDeps): App {
 				logger.error("request_error", { reqId: ctx.reqId, correlationId, error, stack: true });
 				response = respond(500, { error: "internal_error", correlationId });
 			} finally {
-				release?.();
-				metrics.gauge("ultrathink_http_inflight", inflight.count);
+				releaseOuter(ctx);
 			}
 			response = withHeaders(response, { "X-Request-Id": ctx.reqId, traceparent: formatTraceparent(server) });
 

@@ -11,8 +11,11 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { chmodSync, existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import type { ApprovalProof, Auth } from "../auth/auth.ts";
+import { type ApprovalProof, type Auth, MAX_PASSWORD_CHARS } from "../auth/auth.ts";
 import type { AuditEvent } from "../obs/audit.ts";
+import { encodeHtml, encodeHtmlAttribute } from "../security/encoding.ts";
+import { getSecurityLogger } from "../security/events.ts";
+import { ArrayValidator, ObjectValidator, StringValidator, type Validator } from "../security/validation.ts";
 
 export const DEFAULT_REDIRECT_ORIGINS: readonly string[] = ["https://claude.ai", "https://claude.com", "https://grok.com", "https://console.x.ai"];
 
@@ -43,6 +46,54 @@ const SUPPORTED_GRANTS = ["authorization_code", "refresh_token"] as const;
 // RFC 7591 §2: a registration that omits grant_types may only use the authorization code grant.
 const DEFAULT_GRANT_TYPES: readonly string[] = ["authorization_code"];
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const MAX_CLIENT_ID_CHARS = 256;
+const MAX_SECRET_CHARS = 256;
+const MAX_SHORT_CHARS = 64;
+const MAX_STATE_CHARS = 512;
+const MAX_CHALLENGE_INPUT_CHARS = 256;
+const MAX_VERIFIER_INPUT_CHARS = 256;
+const MAX_CLIENT_NAME_INPUT_CHARS = 1024;
+/** No C0 control characters and no DEL: a text parameter carrying one is refused. */
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+/** What the registration schema yields once every field has passed. */
+type RegisterFields = { redirect_uris: string[]; token_endpoint_auth_method: string; grant_types: string[]; response_types: string[]; client_name: string };
+/** The parameters each endpoint reads. Each one is checked before its handler runs. */
+const REGISTER_BODY: Record<string, Validator<unknown>> = {
+	redirect_uris: new ArrayValidator(formText(MAX_REDIRECT_URI_CHARS), { minLength: 1, maxLength: MAX_REDIRECT_URIS }),
+	token_endpoint_auth_method: new StringValidator({ allowedValues: ["none"] }),
+	grant_types: new ArrayValidator(new StringValidator({ allowedValues: [...SUPPORTED_GRANTS] }), { minLength: 1 }),
+	response_types: new ArrayValidator(new StringValidator({ allowedValues: ["code"] })),
+	client_name: formText(MAX_CLIENT_NAME_INPUT_CHARS),
+};
+const TOKEN_FORM: Record<string, Validator<unknown>> = {
+	client_id: formText(MAX_CLIENT_ID_CHARS),
+	grant_type: formText(MAX_SHORT_CHARS),
+	code: formText(MAX_SECRET_CHARS),
+	code_verifier: formText(MAX_VERIFIER_INPUT_CHARS),
+	redirect_uri: formText(MAX_REDIRECT_URI_CHARS),
+	refresh_token: formText(MAX_SECRET_CHARS),
+	resource: formText(MAX_REDIRECT_URI_CHARS),
+};
+const REVOKE_FORM: Record<string, Validator<unknown>> = {
+	token: formText(MAX_SECRET_CHARS),
+	client_id: formText(MAX_CLIENT_ID_CHARS),
+};
+/** `scope` is not listed: cleanScope drops an invalid scope rather than refusing the request, and a test pins that. */
+const AUTHORIZE_QUERY: Record<string, Validator<unknown>> = {
+	client_id: formText(MAX_CLIENT_ID_CHARS),
+	redirect_uri: formText(MAX_REDIRECT_URI_CHARS),
+	response_type: formText(MAX_SHORT_CHARS),
+	state: formText(MAX_STATE_CHARS),
+	code_challenge: formText(MAX_CHALLENGE_INPUT_CHARS),
+	code_challenge_method: formText(MAX_SHORT_CHARS),
+	resource: formText(MAX_REDIRECT_URI_CHARS),
+};
+const AUTHORIZE_FORM: Record<string, Validator<unknown>> = {
+	req: formText(MAX_SECRET_CHARS),
+	nonce: formText(MAX_SECRET_CHARS),
+	action: formText(MAX_SHORT_CHARS),
+	password: new StringValidator({ allowEmpty: true, maxLength: MAX_PASSWORD_CHARS }),
+};
 
 const REGISTER_LIMIT = { max: 10, windowMs: 60 * 60 * 1000 };
 const AUTHORIZE_LIMIT = { max: 30, windowMs: 60 * 1000 };
@@ -198,16 +249,51 @@ function htmlPage(status: number, body: string, formAction = "'self'", headers: 
 }
 
 function errorPage(status: number, message: string, headers: Record<string, string> = {}): Response {
-	return htmlPage(status, page("Authorization failed", `<p class="err">${escapeHtml(message)}</p>`), "'self'", headers);
+	return htmlPage(status, page("Authorization failed", `<p class="err">${encodeHtml(message)}</p>`), "'self'", headers);
 }
 
 function page(title: string, content: string): string {
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;color:#111}input,button{font:inherit;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.4rem}button{margin-top:1rem;cursor:pointer}.err{color:#b00020}</style></head><body><h1>${escapeHtml(title)}</h1>${content}</body></html>`;
+	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${encodeHtml(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;color:#111}input,button{font:inherit;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.4rem}button{margin-top:1rem;cursor:pointer}.err{color:#b00020}</style></head><body><h1>${encodeHtml(title)}</h1>${content}</body></html>`;
 }
 
-function escapeHtml(value: string): string {
-	const map: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-	return value.replace(/[&<>"']/g, (char) => map[char] ?? char);
+/** Text in a form or query parameter: any characters but controls, at most `max` long. An absent one reads as "", which passes. */
+function formText(max: number): StringValidator {
+	return new StringValidator({ allowEmpty: true, maxLength: max, pattern: NO_CONTROL });
+}
+
+/** The schema's verdict: the typed value when every field passes, else the first refused field and its validator code. */
+function checkedFields<T extends Record<string, unknown>>(schema: Record<string, Validator<unknown>>, values: Record<string, unknown>): { value: T } | { refused: { field: string; code: string } } {
+	const verdict = new ObjectValidator<T>(schema, { allowExtraKeys: true, strict: true }).validate(values);
+	if (verdict.valid && verdict.value !== undefined) return { value: verdict.value };
+	// ObjectValidator reports a value's type rather than its key, so the refused field is found by checking each one.
+	for (const [field, validator] of Object.entries(schema)) {
+		const result = validator.validate(values[field]);
+		if (!result.valid) return { refused: { field, code: result.errors[0]?.code ?? "INVALID" } };
+	}
+	return { refused: { field: "body", code: "INVALID" } };
+}
+
+/** Form parameters checked against their schema. A name sent twice is refused first: RFC 6749 section 3.1 forbids it. */
+function formRefusal(form: URLSearchParams, schema: Record<string, Validator<unknown>>): { field: string; code: string } | null {
+	for (const name of Object.keys(schema)) {
+		if (form.getAll(name).length > 1) return { field: name, code: "DUPLICATE" };
+	}
+	const values: Record<string, unknown> = {};
+	for (const name of Object.keys(schema)) values[name] = form.get(name) ?? "";
+	const checked = checkedFields(schema, values);
+	return "refused" in checked ? checked.refused : null;
+}
+
+/** Records a refused request on the security feed: the endpoint, the field and the validator code, never the value. */
+function refusedInput(endpoint: string, field: string, code: string, ip?: string): void {
+	getSecurityLogger().logValidationFailure({ source: "oauth", resource: endpoint, ip, details: { field, code } });
+}
+
+/** Logs a refused form and answers with the 400 shape the endpoint already returns for a bad request. */
+function refuseForm(endpoint: string, refused: { field: string; code: string }, ip: string): Response {
+	refusedInput(endpoint, refused.field, refused.code, ip);
+	const description = refused.code === "DUPLICATE" ? `${refused.field} must appear once.` : `${refused.field} is not valid.`;
+	return oauthError(400, "invalid_request", description);
 }
 
 function digest(value: string): string {
@@ -414,6 +500,7 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	const path = join(options.stateDir, STATE_FILE);
 	const redirectOrigins = normalizeOrigins(options.redirectOrigins ?? DEFAULT_REDIRECT_ORIGINS);
 	const allowedRedirectOrigins = new Set(redirectOrigins);
+	const redirectHelp = `Register 1 to ${MAX_REDIRECT_URIS} redirect URIs: https on an allowed origin (${redirectOrigins.join(", ")}) or loopback http.`;
 	const maxClients = options.maxClients ?? MAX_CLIENTS;
 	// A fake clock means a test. Wall-clock polling would race that clock, so only production arms it.
 	const schedule = options.schedule ?? (options.now === undefined ? realSchedule : undefined);
@@ -624,11 +711,11 @@ export function createOAuth(options: OAuthOptions): OAuth {
 
 	function consentPage(requestId: string, nonce: string, clientName: string, redirectUri: string, message: string, status: number): Response {
 		const redirectOrigin = new URL(redirectUri).origin;
-		const alert = message === "" ? "" : `<p class="err">${escapeHtml(message)}</p>`;
+		const alert = message === "" ? "" : `<p class="err">${encodeHtml(message)}</p>`;
 		const content =
-			`<p data-approval-state="PENDING_APPROVAL">Allow <strong>${escapeHtml(clientName)}</strong> to use the ultrathink planning tools on this server? Enter the owner password to approve.</p>` +
-			`<p data-client-unverified="true">The client name was supplied by the client and is not verified. If you approve, you are sent back to <strong data-redirect-origin="${escapeHtml(redirectOrigin)}">${escapeHtml(redirectOrigin)}</strong>. Only approve if you recognize that address.</p>` +
-			`${alert}<form method="post" action="/oauth/authorize"><input type="hidden" name="req" value="${escapeHtml(requestId)}"><input type="hidden" name="nonce" value="${escapeHtml(nonce)}"><label>Owner password<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">Approve</button></form>`;
+			`<p data-approval-state="PENDING_APPROVAL">Allow <strong>${encodeHtml(clientName)}</strong> to use the ultrathink planning tools on this server? Enter the owner password to approve.</p>` +
+			`<p data-client-unverified="true">The client name was supplied by the client and is not verified. If you approve, you are sent back to <strong data-redirect-origin="${encodeHtmlAttribute(redirectOrigin)}">${encodeHtml(redirectOrigin)}</strong>. Only approve if you recognize that address.</p>` +
+			`${alert}<form method="post" action="/oauth/authorize"><input type="hidden" name="req" value="${encodeHtmlAttribute(requestId)}"><input type="hidden" name="nonce" value="${encodeHtmlAttribute(nonce)}"><label>Owner password<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">Approve</button></form>`;
 		return htmlPage(status, page("Authorize ultrathink", content), `'self' ${redirectOrigin}`);
 	}
 
@@ -641,6 +728,11 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	}
 
 	function authorizeGet(params: URLSearchParams): Response {
+		const refused = formRefusal(params, AUTHORIZE_QUERY);
+		if (refused !== null) {
+			refusedInput("/oauth/authorize", refused.field, refused.code);
+			return errorPage(400, "This authorization request is not valid. Start the connection again from your client.");
+		}
 		prune();
 		const clientId = params.get("client_id") ?? "";
 		const client = own(data.clients, clientId);
@@ -696,8 +788,18 @@ export function createOAuth(options: OAuthOptions): OAuth {
 
 	async function authorizePost(req: Request, ip: string): Promise<Response> {
 		const text = await readBodyText(req, MAX_FORM_BYTES);
-		if (text === null) return errorPage(413, "The request is too large.");
+		if (text === null) {
+			refusedInput("/oauth/authorize", "body", "TOO_LARGE");
+			return errorPage(413, "The request is too large.");
+		}
 		const form = new URLSearchParams(text);
+		const refused = formRefusal(form, AUTHORIZE_FORM);
+		if (refused !== null) {
+			refusedInput("/oauth/authorize", refused.field, refused.code);
+			// A malformed req or nonce names no pending request, so it gets the answer an unknown one gets.
+			if (refused.field === "password") return errorPage(400, "This request is not valid. Start the connection again from your client.");
+			return expiredResponse(form.get("action") === "poll");
+		}
 		const requestId = form.get("req") ?? "";
 		const nonce = form.get("nonce") ?? "";
 		const polling = form.get("action") === "poll";
@@ -858,42 +960,54 @@ export function createOAuth(options: OAuthOptions): OAuth {
 	async function register(req: Request, ip = UNKNOWN_IP): Promise<Response> {
 		const limit = registerLimiter.hit(ip);
 		if (!limit.ok) return oauthError(429, "temporarily_unavailable", "Too many registrations. Try again later.", rateLimited(limit.retryAfterSec));
-		if (!isJsonRequest(req)) return oauthError(415, "invalid_client_metadata", "Content-Type must be application/json.");
+		if (!isJsonRequest(req)) {
+			refusedInput("/oauth/register", "content-type", "UNSUPPORTED_MEDIA_TYPE", ip);
+			return oauthError(415, "invalid_client_metadata", "Content-Type must be application/json.");
+		}
 		const text = await readBodyText(req, MAX_FORM_BYTES);
-		if (text === null) return oauthError(413, "invalid_client_metadata", "The request is too large.");
+		if (text === null) {
+			refusedInput("/oauth/register", "body", "TOO_LARGE", ip);
+			return oauthError(413, "invalid_client_metadata", "The request is too large.");
+		}
 		let body: Record<string, unknown>;
 		try {
 			const parsed: unknown = JSON.parse(text);
 			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
 			body = parsed as Record<string, unknown>;
 		} catch {
+			refusedInput("/oauth/register", "body", "INVALID_JSON", ip);
 			return oauthError(400, "invalid_client_metadata", "The body must be a JSON object.");
 		}
-		const uris = body.redirect_uris;
-		if (!Array.isArray(uris) || uris.length === 0 || uris.length > MAX_REDIRECT_URIS || !uris.every((uri) => redirectAllowed(uri, allowedRedirectOrigins))) {
-			return oauthError(
-				400,
-				"invalid_redirect_uri",
-				`Register 1 to ${MAX_REDIRECT_URIS} redirect URIs: https on an allowed origin (${redirectOrigins.join(", ")}) or loopback http.`,
-			);
+		const values: Record<string, unknown> = {
+			redirect_uris: body.redirect_uris,
+			token_endpoint_auth_method: body.token_endpoint_auth_method === undefined ? "none" : body.token_endpoint_auth_method,
+			grant_types: body.grant_types ?? [...DEFAULT_GRANT_TYPES],
+			response_types: body.response_types ?? ["code"],
+			client_name: body.client_name ?? "",
+		};
+		const checked = checkedFields<RegisterFields>(REGISTER_BODY, values);
+		if ("refused" in checked) {
+			const { field, code } = checked.refused;
+			refusedInput("/oauth/register", field, code, ip);
+			if (field === "token_endpoint_auth_method") {
+				return oauthError(400, "invalid_client_metadata", "Only token_endpoint_auth_method none is supported (PKCE public clients).");
+			}
+			if (field === "grant_types") return oauthError(400, "invalid_client_metadata", "Supported grant types: authorization_code, refresh_token.");
+			if (field === "response_types") return oauthError(400, "invalid_client_metadata", "Only response_type code is supported.");
+			if (field === "client_name") return oauthError(400, "invalid_client_metadata", "client_name must be text without control characters.");
+			return oauthError(400, "invalid_redirect_uri", redirectHelp);
 		}
-		const redirectUris = [...new Set(uris as string[])];
-		if (body.token_endpoint_auth_method !== undefined && body.token_endpoint_auth_method !== "none") {
-			return oauthError(400, "invalid_client_metadata", "Only token_endpoint_auth_method none is supported (PKCE public clients).");
+		const fields = checked.value;
+		if (!fields.redirect_uris.every((uri) => redirectAllowed(uri, allowedRedirectOrigins))) {
+			refusedInput("/oauth/register", "redirect_uris", "NOT_ALLOWED", ip);
+			return oauthError(400, "invalid_redirect_uri", redirectHelp);
 		}
-		const grants = body.grant_types ?? [...DEFAULT_GRANT_TYPES];
-		if (!Array.isArray(grants) || grants.length === 0 || !grants.every((g) => (SUPPORTED_GRANTS as readonly unknown[]).includes(g))) {
-			return oauthError(400, "invalid_client_metadata", "Supported grant types: authorization_code, refresh_token.");
-		}
-		const grantTypes = [...new Set(grants as string[])];
-		const responseTypes = body.response_types ?? ["code"];
-		if (!Array.isArray(responseTypes) || !responseTypes.every((r) => r === "code")) {
-			return oauthError(400, "invalid_client_metadata", "Only response_type code is supported.");
-		}
+		const redirectUris = [...new Set(fields.redirect_uris)];
+		const grantTypes = [...new Set(fields.grant_types)];
 		if (!makeRoomForClient()) {
 			return oauthError(503, "temporarily_unavailable", "Client registration is full.");
 		}
-		const rawName = typeof body.client_name === "string" ? body.client_name.slice(0, MAX_NAME_CHARS) : "";
+		const rawName = fields.client_name.slice(0, MAX_NAME_CHARS);
 		const name = rawName.trim() === "" ? "MCP client" : rawName.trim();
 		const clientId = `ut_client_${randomBytes(16).toString("base64url")}`;
 		const issuedAt = now();
@@ -915,8 +1029,13 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		const limit = tokenLimiter.hit(ip);
 		if (!limit.ok) return oauthError(429, "temporarily_unavailable", "Too many token requests. Try again later.", rateLimited(limit.retryAfterSec));
 		const text = await readBodyText(req, MAX_FORM_BYTES);
-		if (text === null) return oauthError(400, "invalid_request", "The request body is too large.");
+		if (text === null) {
+			refusedInput("/oauth/token", "body", "TOO_LARGE", ip);
+			return oauthError(400, "invalid_request", "The request body is too large.");
+		}
 		const form = new URLSearchParams(text);
+		const refused = formRefusal(form, TOKEN_FORM);
+		if (refused !== null) return refuseForm("/oauth/token", refused, ip);
 		// The per-client budget keys on the client_id the body names, so it runs once the body is read.
 		const clientId = form.get("client_id") ?? "";
 		if (clientId !== "") {
@@ -942,8 +1061,13 @@ export function createOAuth(options: OAuthOptions): OAuth {
 		const limit = revokeLimiter.hit(ip);
 		if (!limit.ok) return oauthError(429, "temporarily_unavailable", "Too many revocation requests. Try again later.", rateLimited(limit.retryAfterSec));
 		const text = await readBodyText(req, MAX_FORM_BYTES);
-		if (text === null) return oauthError(400, "invalid_request", "The request body is too large.");
+		if (text === null) {
+			refusedInput("/oauth/revoke", "body", "TOO_LARGE", ip);
+			return oauthError(400, "invalid_request", "The request body is too large.");
+		}
 		const form = new URLSearchParams(text);
+		const refused = formRefusal(form, REVOKE_FORM);
+		if (refused !== null) return refuseForm("/oauth/revoke", refused, ip);
 		const presented = form.get("token") ?? "";
 		if (presented === "") return oauthError(400, "invalid_request", "token is required.");
 		const record = own(data.tokens, digest(presented));

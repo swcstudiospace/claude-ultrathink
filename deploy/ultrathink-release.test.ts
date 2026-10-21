@@ -5,7 +5,9 @@
 // guarded), so the real probe() and check_tls_material() run against a local Bun TLS server built in a temp directory.
 // Nothing here touches /etc, systemd, a service user or a production host. The probe's retry sleep is replaced by a
 // PATH stub that logs calls, so the 30-attempt budget is asserted by count and no wall-clock time is spent.
-import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
+// The release ancestry gate is tested by running `release` as a subprocess against a temp bare origin and clone. Only
+// root-only commands are stubbed on PATH; the gate under test is the real scripts/security-gate.ts, copied into the fixture.
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -323,3 +325,157 @@ for (const omitted of REQUIRED_TLS_FILES) {
 		expect(await checkTlsMaterial(dir)).toBe(1);
 	}, PROBE_TIMEOUT_MS);
 }
+
+// ---------- release ancestry gate (do_release) ----------
+// The release preflight needs flock, which the macOS runner lacks, and these tests run the real release path that the
+// Linux VPS uses. They are skipped off Linux for that reason.
+describe.skipIf(process.platform !== "linux")("release ancestry gate (do_release)", () => {
+	// `release` runs as a subprocess, so the real entry point and the real gate run. Root-only commands are stubbed on PATH:
+	// `id` reports root, `chown` does nothing, `setpriv` runs its command as the current user and `systemctl` does nothing.
+	// Every run stops at the ancestry gate, or continues past the archive step for a commit on origin/main.
+	const RELEASE_TIMEOUT_MS = 60_000;
+	const REPO_ROOT = resolve(import.meta.dir, "..");
+	// The real gate and its import closure (Node built-ins only), copied into each fixture checkout so it runs there.
+	const GATE_FILES = [
+		"scripts/security-gate.ts",
+		"src/decisions/client.ts",
+		"src/decisions/types.ts",
+		"src/grok/auth.ts",
+		"src/grok/types.ts",
+		"src/mcp/providers.ts",
+		"src/route-defaults.ts",
+	];
+	const RELEASE_STUBS: Record<string, string> = {
+		id: "#!/bin/sh\necho 0\n",
+		// The release tree is owned by root on the VPS; these tests check ancestry, not ownership, so chown is a no-op here.
+		chown: "#!/bin/sh\nexit 0\n",
+		setpriv: '#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ $# -gt 0 ] && shift\nexec "$@"\n',
+		systemctl: "#!/bin/sh\nexit 0\n",
+	};
+
+	// Runs git in cwd with a fixed identity, so fixtures never depend on the host's git configuration.
+	async function git(cwd: string, args: string[]): Promise<string> {
+		const proc = Bun.spawn({
+			cmd: ["git", ...args],
+			cwd,
+			env: scrubbedEnv({
+				GIT_AUTHOR_NAME: "ci",
+				GIT_AUTHOR_EMAIL: "ci@example.com",
+				GIT_COMMITTER_NAME: "ci",
+				GIT_COMMITTER_EMAIL: "ci@example.com",
+			}),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (exitCode !== 0) throw new Error(`git ${args[0]} exited ${exitCode}: ${stderr.trim()}`);
+		return stdout.trim();
+	}
+
+	// Stages everything in dir and commits it, returning the new HEAD.
+	async function commitAll(dir: string, message: string): Promise<string> {
+		await git(dir, ["add", "--all"]);
+		await git(dir, ["-c", "commit.gpgsign=false", "commit", "-q", "-m", message]);
+		return git(dir, ["rev-parse", "HEAD"]);
+	}
+
+	// Writes one file and commits it, returning the new HEAD.
+	async function commitFile(dir: string, name: string): Promise<string> {
+		writeFileSync(join(dir, name), `${name}\n`);
+		return commitAll(dir, name);
+	}
+
+	// A bare origin whose main is pushed from seed, and a clone of it: the release checkout. `side` is committed in the clone
+	// and never pushed, so it is not on origin/main. seed stays available to push later commits to origin.
+	async function makeReleaseRepos(dir: string) {
+		const origin = join(dir, "origin.git");
+		const seed = join(dir, "seed");
+		const clone = join(dir, "clone");
+		await git(dir, ["init", "-q", "--bare", "-b", "main", origin]);
+		await git(dir, ["init", "-q", "-b", "main", seed]);
+		for (const rel of GATE_FILES) {
+			mkdirSync(join(seed, rel, ".."), { recursive: true });
+			cpSync(join(REPO_ROOT, rel), join(seed, rel));
+		}
+		const mainSha = await commitAll(seed, "base");
+		await git(seed, ["push", "-q", origin, "main"]);
+		await git(dir, ["clone", "-q", origin, clone]);
+		await git(clone, ["checkout", "-q", "-b", "side"]);
+		const sideSha = await commitFile(clone, "side");
+		await git(clone, ["checkout", "-q", "main"]);
+		return { origin, seed, clone, mainSha, sideSha };
+	}
+
+	// One release fixture: repos, a bun wrapper, an env file, root-only stubs, and the environment for `release`.
+	async function setupRelease(name: string) {
+		const dir = join(work, name);
+		mkdirSync(dir, { recursive: true });
+		const repos = await makeReleaseRepos(dir);
+		const root = join(dir, "opt");
+		mkdirSync(join(root, "bin"), { recursive: true });
+		writeFileSync(join(root, "bin", "bun"), `#!/bin/sh\nexec '${process.execPath}' "$@"\n`);
+		chmodSync(join(root, "bin", "bun"), 0o755);
+		const envFile = join(dir, "ultrathink.env");
+		writeFileSync(envFile, "ULTRATHINK_PORT=8795\n");
+		const stubs = join(dir, "stubs");
+		mkdirSync(stubs);
+		for (const [tool, body] of Object.entries(RELEASE_STUBS)) {
+			writeFileSync(join(stubs, tool), body);
+			chmodSync(join(stubs, tool), 0o755);
+		}
+		const env = scrubbedEnv({
+			ULTRATHINK_ROOT: root,
+			ULTRATHINK_ENV_FILE: envFile,
+			ULTRATHINK_REPO: repos.clone,
+			ULTRATHINK_TLS_DIR: tlsReal,
+			ULTRATHINK_SERVICE_USER: "ultrathink",
+			PATH: `${stubs}:${process.env.PATH ?? ""}`,
+		});
+		return { root, repos, env };
+	}
+
+	// The prefix of the directory `release` archives a commit into: <short sha>-<utc stamp>.
+	function archivePrefix(root: string, sha: string): string {
+		return join(root, "releases", `${sha.slice(0, 12)}-`);
+	}
+
+	test("release refuses a ref that is not on origin/main before anything is archived", async () => {
+		const { root, repos, env } = await setupRelease("refused");
+		const result = await run(["bash", SCRIPT, "release", "side"], env);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`ancestry: ${repos.sideSha} is not an ancestor of origin/main`);
+		expect(result.stderr).toContain(`ref side (${repos.sideSha}) is not on origin/main; release refused, nothing was archived`);
+		expect(result.stdout).not.toContain("running tests");
+		expect(existsSync(join(root, "releases"))).toBe(false);
+	}, RELEASE_TIMEOUT_MS);
+
+	test("release passes the ancestry step for a ref on origin/main and goes on to archive it", async () => {
+		const { root, repos, env } = await setupRelease("on-main");
+		const result = await run(["bash", SCRIPT, "release", "main"], env);
+		expect(result.stdout).toContain(`ancestry: ${repos.mainSha} is on origin/main`);
+		expect(result.stderr).not.toContain("release refused");
+		expect(result.stdout).toContain(`running tests in ${archivePrefix(root, repos.mainSha)}`);
+	}, RELEASE_TIMEOUT_MS);
+
+	test("release refuses a local main that is ahead of origin/main, because only origin/main counts", async () => {
+		const { root, repos, env } = await setupRelease("local-ahead");
+		const aheadSha = await commitFile(repos.clone, "ahead");
+		const result = await run(["bash", SCRIPT, "release", "main"], env);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`ref main (${aheadSha}) is not on origin/main; release refused, nothing was archived`);
+		expect(existsSync(join(root, "releases"))).toBe(false);
+	}, RELEASE_TIMEOUT_MS);
+
+	test("release fetches origin/main before resolving, so a commit pushed after the clone passes", async () => {
+		const { root, repos, env } = await setupRelease("fetch-first");
+		const laterSha = await commitFile(repos.seed, "later");
+		await git(repos.seed, ["push", "-q", repos.origin, "main"]);
+		const result = await run(["bash", SCRIPT, "release", "origin/main"], env);
+		expect(result.stdout).toContain(`ancestry: ${laterSha} is on origin/main`);
+		expect(result.stdout).toContain(`running tests in ${archivePrefix(root, laterSha)}`);
+	}, RELEASE_TIMEOUT_MS);
+});

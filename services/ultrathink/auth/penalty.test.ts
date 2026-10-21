@@ -2,6 +2,8 @@
 // Copyright (C) 2026 SWC Studio
 
 import { describe, expect, test } from "bun:test";
+import { createLogger } from "../obs/log.ts";
+import { ConsoleSecurityEventLogger } from "../security/events.ts";
 import { createPenaltyLadder, type PenaltyLadder, type PenaltyOptions } from "./penalty.ts";
 
 const WINDOW_MS = 60_000;
@@ -177,5 +179,48 @@ describe("createPenaltyLadder", () => {
 		expect(() => ladderAt(clock, { maxKeys: 0 })).toThrow(RangeError);
 		expect(() => ladderAt(clock, { baseSec: 0 })).toThrow(RangeError);
 		expect(() => ladderAt(clock, { decayMs: Number.NaN })).toThrow(RangeError);
+	});
+});
+
+describe("createPenaltyLadder security events", () => {
+	/** Parsed log lines of the security logger, in emission order. */
+	function capture() {
+		const lines: string[] = [];
+		const security = new ConsoleSecurityEventLogger(createLogger({ write: (line) => lines.push(line) }));
+		const events = () => lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+		return { security, events };
+	}
+
+	test("each escalation emits one suspicious-activity event carrying the key, level and block; other failures emit nothing", () => {
+		const clock = { t: START };
+		const log = capture();
+		const ladder = ladderAt(clock, { security: log.security });
+
+		for (let i = 0; i < 3; i++) ladder.fail("ip");
+		expect(log.events()).toEqual([]);
+
+		expect(ladder.fail("ip")).toMatchObject({ escalated: true, level: 1, blockedSec: 60 });
+		expect(log.events()).toMatchObject([
+			{ event: "abuse.penalty_escalated", type: "suspicious_activity", severity: "high", ip: "ip", details: { level: 1, blockedSec: 60 } },
+		]);
+
+		for (let i = 0; i < 5; i++) ladder.fail("ip");
+		expect(log.events()).toHaveLength(1);
+
+		clock.t += 60_000;
+		failTimes(ladder, "ip", 4);
+		expect(log.events()).toHaveLength(2);
+		expect(log.events()[1]).toMatchObject({ event: "abuse.penalty_escalated", ip: "ip", details: { level: 2, blockedSec: 120 } });
+	});
+
+	test("the event carries only the key, the level, the block and the fixed event fields", () => {
+		const clock = { t: START };
+		const log = capture();
+		const ladder = ladderAt(clock, { security: log.security });
+		failTimes(ladder, "ip", 4);
+
+		const [event] = log.events();
+		expect(Object.keys(event ?? {}).sort()).toEqual(["correlationId", "details", "event", "ip", "level", "severity", "source", "timestamp", "ts", "type"]);
+		expect(Object.keys((event?.details ?? {}) as Record<string, unknown>).sort()).toEqual(["blockedSec", "eventType", "level"]);
 	});
 });

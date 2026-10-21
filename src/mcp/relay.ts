@@ -2,6 +2,8 @@
 // Copyright (C) 2026 SWC Studio
 import { readBodyPrefix, readBodyText } from "../net/body.ts";
 import { createSseParser } from "./sse.ts";
+import { getSecurityLogger } from "../../services/ultrathink/security/events.ts";
+import { StringValidator } from "../../services/ultrathink/security/validation.ts";
 
 export interface RelayAuth {
 	header(): Promise<string | undefined>;
@@ -47,6 +49,45 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 120_000;
 /** Every later message waits on the shared re-initialize, so it must settle on its own. */
 const REINIT_TIMEOUT_MS = 30_000;
+
+/** Text a request id or method may carry: bounded, and free of control characters. */
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+const ID_TEXT = new StringValidator({ allowEmpty: true, maxLength: 256, pattern: NO_CONTROL });
+const METHOD_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+
+function isObjectMessage(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The first refused field of one JSON-RPC 2.0 object, or null. A request, a notification and a response are all accepted. */
+function refusedEnvelope(message: unknown): { field: string; code: string } | null {
+	if (!isObjectMessage(message)) return { field: "message", code: "TYPE_MISMATCH" };
+	if (message.jsonrpc !== "2.0") return { field: "jsonrpc", code: "INVALID_VALUE" };
+	if (message.method !== undefined) {
+		const method = METHOD_TEXT.validate(message.method);
+		if (!method.valid) return { field: "method", code: method.errors[0]?.code ?? "INVALID" };
+	} else if (!("result" in message) && !("error" in message)) {
+		return { field: "message", code: "NOT_A_MESSAGE" };
+	}
+	if (message.id !== undefined && message.id !== null && typeof message.id !== "number") {
+		const id = ID_TEXT.validate(message.id);
+		if (!id.valid) return { field: "id", code: id.errors[0]?.code ?? "INVALID" };
+	}
+	return null;
+}
+
+/** A refused message is answered with -32600 only when it awaits an answer: a request, or any value that is not an object. A notification (no id) and a response (result or error) never are. */
+function awaitsAnswer(message: unknown): boolean {
+	if (!isObjectMessage(message)) return true;
+	if ("result" in message || "error" in message) return false;
+	return message.id !== undefined;
+}
+
+/** The id a -32600 answer echoes: the message's own id when it is a string or a number, otherwise null. */
+function answerId(message: unknown): string | number | null {
+	if (!isObjectMessage(message)) return null;
+	return typeof message.id === "string" || typeof message.id === "number" ? message.id : null;
+}
 
 function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 	const header = headers.get("retry-after")?.trim();
@@ -257,36 +298,66 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		}
 	};
 
+	const refuse = (message: unknown, refusal: { field: string; code: string }): void => {
+		getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "message", details: refusal });
+		if (awaitsAnswer(message)) writeError(answerId(message), -32600, "invalid request");
+	};
+
+	const forward = async (message: unknown, signal?: AbortSignal): Promise<void> => {
+		const rpc = asRpc(message);
+		const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
+		let replied = false;
+		const emit = (line: string): void => {
+			if (isRequest && !replied) {
+				const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
+				if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
+			}
+			options.write(line);
+		};
+		try {
+			await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
+		} catch (error) {
+			log("relay error");
+			if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
 	return {
 		async handle(message: unknown, signal?: AbortSignal): Promise<void> {
-			const rpc = asRpc(message);
-			const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
-			let replied = false;
-			const emit = (line: string): void => {
-				if (isRequest && !replied) {
-					const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
-					if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
+			if (!Array.isArray(message)) {
+				const refusal = refusedEnvelope(message);
+				if (refusal !== null) {
+					refuse(message, refusal);
+					return;
 				}
-				options.write(line);
-			};
-			try {
-				await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
-			} catch (error) {
-				log("relay error");
-				if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+				await forward(message, signal);
+				return;
 			}
+			if (message.length === 0) {
+				refuse(message, { field: "batch", code: "EMPTY" });
+				return;
+			}
+			// Each item is judged alone: a refused item is answered, and the valid items are still forwarded.
+			const valid: unknown[] = [];
+			for (const item of message) {
+				const refusal = refusedEnvelope(item);
+				if (refusal === null) valid.push(item);
+				else refuse(item, refusal);
+			}
+			if (valid.length > 0) await forward(valid, signal);
 		},
 	};
 }
 
 export async function runStdioRelay(
-	options: Omit<RelayOptions, "write">,
+	options: Omit<RelayOptions, "write"> & { maxLineChars?: number },
 	input: ReadableStream<Uint8Array> = Bun.stdin.stream(),
 	output: (line: string) => void = (line) => {
 		process.stdout.write(`${line}\n`);
 	},
 ): Promise<void> {
 	const relay = createRelay({ ...options, write: output });
+	const maxLineChars = options.maxLineChars ?? MAX_BODY_BYTES;
 	const inFlight = new Set<Promise<void>>();
 	const dispatch = (line: string): void => {
 		if (line.trim() === "") return;
@@ -294,6 +365,7 @@ export async function runStdioRelay(
 		try {
 			message = JSON.parse(line);
 		} catch {
+			getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "PARSE_ERROR" } });
 			output(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }));
 			return;
 		}
@@ -303,18 +375,35 @@ export async function runStdioRelay(
 		inFlight.add(task);
 		void task.finally(() => inFlight.delete(task));
 	};
+	// A line past the cap is refused whole. Its remainder is discarded up to the next newline, so buffering stays bounded.
+	const refuseLong = (): void => {
+		getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "TOO_LONG" } });
+		output(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } }));
+	};
 	const decoder = new TextDecoder();
 	let buffer = "";
+	let discarding = false;
 	for await (const chunk of input) {
 		buffer += decoder.decode(chunk, { stream: true });
 		let index = buffer.indexOf("\n");
 		while (index !== -1) {
-			dispatch(buffer.slice(0, index));
+			const line = buffer.slice(0, index);
 			buffer = buffer.slice(index + 1);
+			if (discarding) discarding = false;
+			else if (line.length > maxLineChars) refuseLong();
+			else dispatch(line);
 			index = buffer.indexOf("\n");
+		}
+		if (discarding) buffer = "";
+		else if (buffer.length > maxLineChars) {
+			refuseLong();
+			buffer = "";
+			discarding = true;
 		}
 	}
 	buffer += decoder.decode();
-	dispatch(buffer);
+	if (discarding) buffer = "";
+	else if (buffer.length > maxLineChars) refuseLong();
+	else dispatch(buffer);
 	while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
 }

@@ -63,6 +63,10 @@ export interface UltrathinkConfig {
 	maxInflight: number;
 	/** Share of `maxInflight` (percent, 0..90) that non-owner classes may not take, so owners always have headroom. */
 	priorityReservePct: number;
+	/** Over-budget HTTP requests that may wait per priority class; 0 refuses at once. */
+	fairQueueDepth: number;
+	/** Longest wait in the HTTP fair-share queue before the request is refused. */
+	fairQueueWaitMs: number;
 	/** Lowest percentage the adaptive quota may shrink the request windows to. */
 	adaptiveQuotaMinPct: number;
 	/** Event-loop lag above which the process counts as under pressure and the adaptive quota shrinks. */
@@ -725,6 +729,8 @@ export function loadConfig(
 		breakerOpenMs: readInteger(env, "ULTRATHINK_BREAKER_OPEN_MS", 30000, 1000, 600000),
 		maxInflight: readInteger(env, "ULTRATHINK_MAX_INFLIGHT", 256, 1, 10000),
 		priorityReservePct: readInteger(env, "ULTRATHINK_PRIORITY_RESERVE_PCT", 25, 0, 90),
+		fairQueueDepth: readInteger(env, "ULTRATHINK_FAIR_QUEUE_DEPTH", 16, 0, 1000),
+		fairQueueWaitMs: readInteger(env, "ULTRATHINK_FAIR_QUEUE_WAIT_MS", 1500, 1, 60000),
 		adaptiveQuotaMinPct: readInteger(env, "ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT", 50, 10, 100),
 		lagTargetMs: readInteger(env, "ULTRATHINK_LAG_TARGET_MS", 100, 10, 5000),
 		replicaCapacityRps: readInteger(env, "ULTRATHINK_REPLICA_CAPACITY_RPS", 20, 1, 100000),

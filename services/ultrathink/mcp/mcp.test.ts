@@ -15,6 +15,7 @@ import {
 	toolDefinitions,
 } from "./mcp.ts";
 import { createResourceRegistry, UI_RESOURCE_MIME_TYPE } from "./resources.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../security/events.ts";
 
 const SESSION_ID = "session-1";
 const PLANNED: ToolOutcome = { ok: true, data: { sessionId: SESSION_ID, status: "planned", pending: [] } };
@@ -1199,5 +1200,83 @@ describe("host failures", () => {
 		])) as RpcReply[];
 		expect(resultOf<ToolResult>(replies[0] as RpcReply).isError).toBe(false);
 		expect(replies[1]).toEqual({ jsonrpc: "2.0", id: "b", error: INTERNAL_ERROR });
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a tool name with a control character is refused before the host runs, and the refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect(await replyOf(host, toolCall("ultrathink_plan\u0000", { prompt: "Plan" }, 3))).toEqual({
+				jsonrpc: "2.0",
+				id: 3,
+				error: { code: -32602, message: "invalid params" },
+			});
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "PATTERN_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});
+
+describe("refused tool calls are logged", () => {
+	test("a numeric tool name is refused as unknown and logs one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect((await replyOf(host, toolCall(5, {}, 3))).error).toEqual(UNKNOWN_TOOL);
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that are not an object are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", "prompt", 3));
+			expect(resultOf<ToolResult>(reply).structuredContent).toEqual({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that fail the tool schema are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", {}, 4));
+			expect(resultOf<ToolResult>(reply).structuredContent).toMatchObject({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "INVALID_ARGUMENTS" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });

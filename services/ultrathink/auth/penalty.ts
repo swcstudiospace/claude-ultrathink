@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import type { SecurityEventLogger } from "../security/events.ts";
 
 /**
  * Progressive penalties for repeated failures per key (an IP address).
@@ -13,6 +14,8 @@
  * The table holds at most maxKeys keys. A new key that finds the table full
  * after pruning is reported untracked and stored nowhere: penalties fail open
  * there, while the rate windows already refuse new keys when full.
+ *
+ * Each escalation is also reported to the optional security logger as a suspicious-activity event.
  */
 
 export interface PenaltyOptions {
@@ -23,6 +26,8 @@ export interface PenaltyOptions {
 	decayMs: number;
 	maxKeys: number;
 	now: () => number;
+	/** Receives a suspicious-activity event at each escalation. Absent means no events. */
+	security?: SecurityEventLogger;
 }
 
 export interface PenaltyLadder {
@@ -67,7 +72,7 @@ function validate(options: PenaltyOptions): void {
 
 export function createPenaltyLadder(options: PenaltyOptions): PenaltyLadder {
 	validate(options);
-	const { windowMs, failuresPerWindow, baseSec, maxSec, decayMs, maxKeys, now } = options;
+	const { windowMs, failuresPerWindow, baseSec, maxSec, decayMs, maxKeys, now, security } = options;
 	const entries = new Map<string, Entry>();
 
 	const windowOf = (t: number): number => Math.floor(t / windowMs);
@@ -117,7 +122,9 @@ export function createPenaltyLadder(options: PenaltyOptions): PenaltyLadder {
 			const seconds = Math.min(maxSec, baseSec * 2 ** (entry.level - 1));
 			entry.blockedUntil = t + seconds * 1000;
 			entry.count = 0;
-			return { blockedSec: secondsUntil(entry.blockedUntil, t), escalated: true, level: entry.level, tracked: true };
+			const blockedSec = secondsUntil(entry.blockedUntil, t);
+			security?.logSuspiciousActivity({ name: "abuse.penalty_escalated", ip: key, details: { level: entry.level, blockedSec } });
+			return { blockedSec, escalated: true, level: entry.level, tracked: true };
 		},
 
 		blockedSec(key) {

@@ -3,7 +3,8 @@
 
 import { createHmac, randomBytes } from "node:crypto";
 import { beforeAll, describe, expect, test } from "bun:test";
-import { type Auth, type AuthOptions, clientIpFrom, createAuth, keyIdOf, sessionCookieName } from "./auth.ts";
+import { type Auth, type AuthOptions, MAX_PASSWORD_CHARS, clientIpFrom, createAuth, keyIdOf, sessionCookieName } from "./auth.ts";
+import { type SecurityEvent, type SecurityEventLogger, getSecurityLogger, setSecurityLogger } from "../security/events.ts";
 
 const PASSWORD = randomBytes(24).toString("base64url");
 const WRONG_PASSWORD = `${PASSWORD}-wrong`;
@@ -618,5 +619,40 @@ describe("clientIpFrom", () => {
 	test("reads X-Real-IP from loopback when trustForwarded is true or left to the default", () => {
 		expect(clientIpFrom(requestWithRealIp("198.51.100.9"), "127.0.0.1", true)).toBe("198.51.100.9");
 		expect(clientIpFrom(requestWithRealIp("198.51.100.9"), "127.0.0.1", undefined)).toBe("198.51.100.9");
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a hostile password is refused before the per-IP limit counts it, and each refusal is logged without the value", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const auth = makeAuth(makeClock());
+			const ip = "198.51.100.77";
+			const hostile = "x".repeat(MAX_PASSWORD_CHARS + 1);
+			// Twice the five attempts per IP the limiter allows. A refused attempt must spend none of them.
+			for (let i = 0; i < 10; i++) {
+				expect(await auth.login({ password: hostile, clientIp: ip })).toEqual({ ok: false, reason: "invalid" });
+			}
+			expect((await auth.login({ password: PASSWORD, clientIp: ip })).ok).toBe(true);
+			expect(recorder.validation).toHaveLength(10);
+			expect(recorder.validation[0]).toMatchObject({ source: "auth", resource: "login", details: { field: "password" } });
+			expect(JSON.stringify(recorder.validation)).not.toContain(hostile);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });
