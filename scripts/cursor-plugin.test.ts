@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EVENT, HOOK_FILE, isOwned } from "./cursor-hooks.ts";
+import { EVENT, HOOK_FILE, acquireHookLock, isOwned } from "./cursor-hooks.ts";
 import { gsdCommandNames } from "../src/cursor/pstack.ts";
 import {
 	GSD_COMMAND_DIR,
@@ -233,7 +234,7 @@ describe("shipped GSD commands", () => {
 			commands?: string[];
 		};
 		expect(manifest.skills).toBe("./skills/");
-		expect(manifest.commands).toEqual(["./commands", `./${GSD_COMMAND_DIR}`]);
+		expect(manifest.commands).toEqual(["./hosts/cursor/commands", `./${GSD_COMMAND_DIR}`]);
 		const dir = join(root, GSD_COMMAND_DIR);
 		const names = gsdCommandNames();
 		expect(readdirSync(dir).filter((name) => name.endsWith(".md")).sort()).toEqual(names.map((name) => `${name}.md`).sort());
@@ -244,4 +245,147 @@ describe("shipped GSD commands", () => {
 			expect(text.startsWith("/")).toBe(false);
 		}
 	});
+});
+
+function runShell(command: string, stdin: string, env: Record<string, string>): Promise<string> {
+	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	const child = spawn("/bin/sh", ["-c", command], { env, stdio: ["pipe", "pipe", "pipe"] });
+	let stdout = "";
+	child.stdout.on("data", (chunk) => {
+		stdout += chunk.toString("utf8");
+	});
+	child.on("error", reject);
+	child.on("close", () => resolve(stdout));
+	child.stdin.end(stdin);
+	return promise;
+}
+
+describe("installer restores and locks", () => {
+	test("a dangling symlink where a GSD command goes is left alone, and its target is not created", () => {
+		const cursorDir = mkdtempSync(join(tmpdir(), "cursor-plugin-dangle-"));
+		const root = mkdtempSync(join(tmpdir(), "ultrathink-root-"));
+		const outside = mkdtempSync(join(tmpdir(), "gsd-dangle-"));
+		try {
+			mkdirSync(join(root, "hosts", "cursor"), { recursive: true });
+			writeFileSync(join(root, "hosts", "cursor", PLAN_HOOK_FILE), "#!/usr/bin/env node\n");
+			const commands = join(cursorDir, "commands");
+			mkdirSync(commands, { recursive: true });
+			const target = join(outside, "gsd-ship.md");
+			const link = join(commands, "gsd-ship.md");
+			symlinkSync(target, link);
+			const logs: string[] = [];
+			expect(main(["install", "--cursor-dir", cursorDir], { env: {}, root, log: (line) => logs.push(line), nodeCandidates: [process.execPath] })).toBe(0);
+			expect(existsSync(target)).toBe(false);
+			expect(lstatSync(link).isSymbolicLink()).toBe(true);
+			expect(logs.some((line) => line.includes("left gsd-ship.md in place"))).toBe(true);
+			expect(readFileSync(join(commands, "gsd-quick.md"), "utf8")).toContain(GSD_MARKER);
+		} finally {
+			rmSync(cursorDir, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("a hook update that throws part way restores the staged hook and its root file", () => {
+		const cursorDir = mkdtempSync(join(tmpdir(), "cursor-plugin-restore-"));
+		const root = mkdtempSync(join(tmpdir(), "ultrathink-root-"));
+		const missing = mkdtempSync(join(tmpdir(), "ultrathink-gone-"));
+		try {
+			mkdirSync(join(root, "hosts", "cursor"), { recursive: true });
+			const source = join(root, "hosts", "cursor", PLAN_HOOK_FILE);
+			writeFileSync(source, "// previous planner\n");
+			const logs: string[] = [];
+			const deps = { env: {}, root, log: (line: string) => logs.push(line), nodeCandidates: [process.execPath] };
+			expect(main(["install", "--cursor-dir", cursorDir], deps)).toBe(0);
+			const staged = join(cursorDir, "hooks", PLAN_HOOK_FILE);
+			const rootFile = join(cursorDir, "hooks", PLAN_ROOT_FILE);
+			const previous = readFileSync(staged, "utf8");
+			// The new hook copies over the staged file, then writing the root file throws (its target directory is missing).
+			writeFileSync(source, "// new planner\n");
+			rmSync(rootFile);
+			symlinkSync(join(missing, "absent", "root.txt"), rootFile);
+			expect(main(["install", "--cursor-dir", cursorDir], deps)).toBe(1);
+			expect(readFileSync(staged, "utf8")).toBe(previous);
+			expect(logs.some((line) => line.includes("could not install the planner hook"))).toBe(true);
+		} finally {
+			rmSync(cursorDir, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+			rmSync(missing, { recursive: true, force: true });
+		}
+	});
+
+	test("remove deletes GSD command files only while it holds the hook lock", () => {
+		const cursorDir = mkdtempSync(join(tmpdir(), "cursor-plugin-lock-"));
+		const root = mkdtempSync(join(tmpdir(), "ultrathink-root-"));
+		try {
+			mkdirSync(join(root, "hosts", "cursor"), { recursive: true });
+			writeFileSync(join(root, "hosts", "cursor", PLAN_HOOK_FILE), "#!/usr/bin/env node\n");
+			const deps = { env: {}, root, log: () => {}, nodeCandidates: [process.execPath], lockWaitMs: 0 };
+			expect(main(["install", "--cursor-dir", cursorDir], deps)).toBe(0);
+			const quick = join(cursorDir, "commands", "gsd-quick.md");
+			const held = acquireHookLock(cursorDir, 0);
+			if (!("release" in held)) throw new Error(held.reason);
+			try {
+				expect(main(["remove", "--cursor-dir", cursorDir], deps)).toBe(1);
+				// Another update holds the lock, so nothing is deleted and the hook entry stays.
+				expect(existsSync(quick)).toBe(true);
+				expect(existsSync(join(cursorDir, "hooks", PLAN_HOOK_FILE))).toBe(true);
+			} finally {
+				held.release();
+			}
+			expect(main(["remove", "--cursor-dir", cursorDir], deps)).toBe(0);
+			expect(existsSync(quick)).toBe(false);
+		} finally {
+			rmSync(cursorDir, { recursive: true, force: true });
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("Cursor control commands", () => {
+	test("each control template runs the checkout's bin/ultrathink with host cursor, and none uses the Claude plugin root", () => {
+		const dir = join(import.meta.dir, "..", "hosts", "cursor", "commands");
+		const verbs = ["on", "off", "skip", "status", "track"];
+		const names = [...verbs.map((verb) => `ultrathink-${verb}`), "ultrathink-quick"];
+		expect(readdirSync(dir).filter((file) => file.endsWith(".md")).sort()).toEqual(names.map((name) => `${name}.md`).sort());
+		for (const name of names) {
+			const text = readFileSync(join(dir, `${name}.md`), "utf8");
+			expect(text).toContain(`name: ${name}\n`);
+			expect(text).not.toContain("CLAUDE_PLUGIN_ROOT");
+		}
+		for (const verb of verbs) {
+			const text = readFileSync(join(dir, `ultrathink-${verb}.md`), "utf8");
+			expect(text).toContain(`ULTRATHINK_HOST=cursor "$(cat "$HOME/.cursor/hooks/ultrathink-cursor-plan.root")/bin/ultrathink" ${verb} $ARGUMENTS`);
+			expect(text).toContain(`ULTRATHINK_HOST=cursor "<that directory>/bin/ultrathink" ${verb} $ARGUMENTS`);
+		}
+	});
+});
+
+describe("installed planner hook", () => {
+	test("the staged hook answers /ultrathink-status from its checkout with no ULTRATHINK_ROOT set", async () => {
+		const cursorDir = mkdtempSync(join(tmpdir(), "cursor-plugin-e2e-"));
+		const home = mkdtempSync(join(tmpdir(), "cursor-plugin-home-"));
+		const checkout = join(import.meta.dir, "..");
+		const node = Bun.which("node") ?? process.execPath;
+		try {
+			expect(main(["install", "--cursor-dir", cursorDir], { env: {}, root: checkout, log: () => {}, nodeCandidates: [node] })).toBe(0);
+			const hooks = JSON.parse(readFileSync(join(cursorDir, "hooks.json"), "utf8")) as { hooks: Record<string, unknown[]> };
+			const entry = hooks.hooks[EVENT]?.find(isPlanOwned) as { command?: string } | undefined;
+			if (typeof entry?.command !== "string") throw new Error("planner entry missing from hooks.json");
+			const stdout = await runShell(entry.command, JSON.stringify({ prompt: "/ultrathink-status", conversation_id: "e2e", workspace_roots: [home] }), {
+				PATH: process.env.PATH ?? "",
+				HOME: home,
+				BUN: process.execPath,
+				XDG_CONFIG_HOME: join(home, ".config"),
+				CLAUDE_CONFIG_DIR: join(home, ".claude"),
+			});
+			const reply = JSON.parse(stdout) as { continue?: boolean; user_message?: string };
+			expect(reply.continue).toBe(false);
+			expect(reply.user_message).toContain("Prompt Uplift");
+			expect(reply.user_message).toContain(join(home, ".cursor", "ultrathink"));
+		} finally {
+			rmSync(cursorDir, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	}, 60_000);
 });

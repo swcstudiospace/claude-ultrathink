@@ -10,16 +10,21 @@
 //     cursor_version, workspace_roots, user_email, transcript_path }
 //
 // Output:
-//   { continue?: boolean, additional_context?: string }
+//   { continue?: boolean, additional_context?: string, user_message?: string }
 //
 // The script does not plan itself. It sends one JSON request to
 // bin/run-bun hooks/engine.ts with host "cursor" and maps PlanResponse.context
-// into additional_context. Missing Bun, a planner error, a child session, or
-// a timeout prints {} and exits 0 so a hook bug never wedges Cursor.
+// into additional_context. A control command (/ultrathink-on, -off, -skip,
+// -track, -status) runs bin/ultrathink with host "cursor" and blocks the prompt
+// with that output as user_message, so the command is answered without a model
+// turn. Missing Bun, a planner error, a child session, or a timeout prints {}
+// and exits 0 so a hook bug never wedges Cursor.
 //
 // ULTRATHINK_ROOT is the checkout. The installer also writes that path beside
 // this file when the script is staged under ~/.cursor/hooks.
-// ULTRATHINK_CURSOR_BUDGET_MS caps the wait (default 180000).
+// ULTRATHINK_CURSOR_BUDGET_MS caps the wait (default 180000). A child that
+// ignores SIGTERM is killed KILL_GRACE_MS after the budget, so the hook returns
+// within the budget plus that grace.
 // ULTRATHINK_CHILD=1, SWARM_CHILD=1, or a non-empty SWARM_AGENT skips planning.
 //
 // No top-level import and no require: the file is ESM inside this repo
@@ -30,6 +35,13 @@
 
 const GRAPH_ID = /^ut-[0-9a-z]+-[0-9a-f]{8}$/;
 const DEFAULT_BUDGET_MS = 180000;
+/** Time a child gets after SIGTERM before SIGKILL. */
+const KILL_GRACE_MS = 1000;
+const MAX_OUTPUT_CHARS = 2_000_000;
+/** The control verbs this hook answers itself. `quick` is not one: it sends the message as typed. */
+const CONTROL_VERBS = new Set(["off", "on", "skip", "status", "track"]);
+/** `/ultrathink-<verb>`, `/ultrathink:<verb>`, `/ultrathink:ultrathink-<verb>` or `/ultrathink <verb>` at the start of the prompt. */
+const CONTROL_RE = /^\s*\/ultrathink(?:[-:](?:ultrathink-)?|\s+)([a-z]+)(?=\s|$)([\s\S]*)$/i;
 
 const SWARM_NOTE = [
 	"## Cursor swarm",
@@ -65,8 +77,19 @@ function planResponse(parsed) {
 	const context = typeof parsed.context === "string" ? parsed.context.trim() : "";
 	if (!context) return {};
 	const graphId = graphIdOf(parsed);
-	const note = graphId ? `${SWARM_NOTE}\nGraph ID: ${graphId}` : SWARM_NOTE;
-	return { continue: true, additional_context: `${context}\n\n${note}` };
+	// The swarm note hands work to a01-orchestrator with a Graph ID. Without a valid one there is nothing to hand over.
+	if (!graphId) return { continue: true, additional_context: context };
+	return { continue: true, additional_context: `${context}\n\n${SWARM_NOTE}\nGraph ID: ${graphId}` };
+}
+
+/** The bin/ultrathink arguments for a control command the hook answers, or undefined for any other prompt. */
+function controlOf(prompt) {
+	const match = CONTROL_RE.exec(prompt);
+	if (!match) return undefined;
+	const verb = match[1].toLowerCase();
+	if (!CONTROL_VERBS.has(verb)) return undefined;
+	const args = (match[2] ?? "").trim().split(/\s+/).filter(Boolean);
+	return [verb, ...args];
 }
 
 function promptOf(payload) {
@@ -127,69 +150,106 @@ async function pluginRoot(env, fs, path) {
 	return text.includes("\n") || text.includes("\0") ? "" : text;
 }
 
-function runEngine(spawn, root, body, budgetMs, env) {
+/**
+ * Runs one child in its own process group with `options.input` on stdin. Resolves with its exit code and stdout, or
+ * undefined when it cannot start or the budget passes. Past the budget, SIGTERM goes to the group and SIGKILL follows
+ * KILL_GRACE_MS later, so a child that ignores SIGTERM cannot hold the prompt.
+ */
+function runChild(spawn, file, args, options, budgetMs) {
 	return new Promise((resolve) => {
-		const path = requirePath(root);
 		let child;
 		try {
-			child = spawn(path.launcher, [path.engine], {
-				cwd: root,
-				env: { ...env, ULTRATHINK_HOST: "cursor" },
-				stdio: ["pipe", "pipe", "pipe"],
-				detached: true,
-			});
+			child = spawn(file, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], detached: true });
 		} catch {
-			resolve({});
+			resolve(undefined);
 			return;
 		}
 		let stdout = "";
 		let settled = false;
+		let killTimer;
 		const finish = (value) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			clearTimeout(budgetTimer);
 			resolve(value);
 		};
-		const stop = () => {
+		const signalGroup = (signal) => {
 			try {
-				if (child.pid) process.kill(-child.pid, "SIGTERM");
+				if (child.pid) process.kill(-child.pid, signal);
+				else child.kill(signal);
 			} catch {
 				try {
-					child.kill("SIGTERM");
+					child.kill(signal);
 				} catch {
 					// already gone
 				}
 			}
 		};
-		const timer = setTimeout(() => {
+		const stop = () => {
+			signalGroup("SIGTERM");
+			killTimer = setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS);
+		};
+		const budgetTimer = setTimeout(() => {
 			stop();
-			finish({});
+			finish(undefined);
 		}, budgetMs);
+		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk) => {
-			stdout += chunk.toString("utf8");
-			if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000);
+			stdout += chunk;
+			if (stdout.length > MAX_OUTPUT_CHARS) stdout = stdout.slice(-MAX_OUTPUT_CHARS);
 		});
-		child.on("error", () => finish({}));
-		child.on("close", () => {
-			const line = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
-			try {
-				finish(planResponse(JSON.parse(line)));
-			} catch {
-				finish({});
-			}
+		child.on("error", () => finish(undefined));
+		child.on("close", (code) => {
+			clearTimeout(killTimer);
+			finish({ code, stdout });
 		});
 		child.stdin.on("error", () => {});
 		try {
-			child.stdin.end(JSON.stringify(body));
+			child.stdin.end(options.input);
 		} catch {
 			stop();
-			finish({});
+			finish(undefined);
 		}
 	});
 }
 
 function requirePath(root) {
-	return { launcher: `${root}/bin/run-bun`, engine: `${root}/hooks/engine.ts` };
+	return {
+		launcher: `${root}/bin/run-bun`,
+		engine: `${root}/hooks/engine.ts`,
+		control: `${root}/bin/ultrathink`,
+	};
+}
+
+async function runEngine(spawn, root, body, budgetMs, env) {
+	const paths = requirePath(root);
+	const out = await runChild(
+		spawn,
+		paths.launcher,
+		[paths.engine],
+		{ cwd: root, env: { ...env, ULTRATHINK_HOST: "cursor" }, input: JSON.stringify(body) },
+		budgetMs,
+	);
+	if (!out) return {};
+	const line = out.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+	try {
+		return planResponse(JSON.parse(line));
+	} catch {
+		return {};
+	}
+}
+
+/** Runs `bin/ultrathink <verb> …` for host cursor. Its output is the reply; undefined when it fails or prints nothing. */
+async function runControl(spawn, root, argv, cwd, budgetMs, env) {
+	const out = await runChild(
+		spawn,
+		requirePath(root).control,
+		argv,
+		{ cwd, env: { ...env, ULTRATHINK_HOST: "cursor" }, input: "" },
+		budgetMs,
+	);
+	if (!out || out.code !== 0) return undefined;
+	return out.stdout.trim() || undefined;
 }
 
 async function readStdin() {
@@ -227,13 +287,14 @@ async function main() {
 		return;
 	}
 	const budget = positiveInt(process.env.ULTRATHINK_CURSOR_BUDGET_MS, DEFAULT_BUDGET_MS);
-	const response = await runEngine(
-		childProcess.spawn,
-		root,
-		requestBody(payload, cwdOf(payload, process.cwd())),
-		budget,
-		process.env,
-	);
+	const cwd = cwdOf(payload, process.cwd());
+	const control = controlOf(promptOf(payload));
+	if (control) {
+		const reply = await runControl(childProcess.spawn, root, control, cwd, budget, process.env);
+		emit(reply ? { continue: false, user_message: reply } : {});
+		return;
+	}
+	const response = await runEngine(childProcess.spawn, root, requestBody(payload, cwd), budget, process.env);
 	emit(response);
 }
 

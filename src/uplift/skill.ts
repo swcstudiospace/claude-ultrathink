@@ -286,6 +286,29 @@ function gsdPlanningTarget(name: string, instruction?: string): { text: string; 
 	return { text: `Run the "${name}" skill. ${planned.text}`, skill };
 }
 
+type SkipReason = "slash-command" | "ultrathink-skill" | "ultrathink-command" | "nested-child";
+
+/**
+ * Walks the slash commands stacked after a skill or a `/gsd-*` name. An ultrathink skill or command, or an installed
+ * ultrathink file, stops planning. Any other stacked command stays in the instruction. Checked before any fallback, so
+ * `/gsd-quick /ultrathink-quick …` is not planned even when no GSD file is installed.
+ */
+function walkStacked(args: string | undefined, lookup: SkillLookup): { skip: SkipReason } | { instruction?: string } {
+	let instruction = args;
+	for (let count = 1; count < MAX_STACKED_SKILLS && instruction?.startsWith("/"); count++) {
+		const stacked = parseSlashCommand(instruction);
+		if (!stacked) break;
+		if (isUltrathinkSkill(stacked.name)) return { skip: "ultrathink-skill" };
+		if (ULTRATHINK_COMMAND_RE.test(stacked.name)) return { skip: "ultrathink-command" };
+		const stackedFile = resolveSkillFile(stacked.name, lookup);
+		if (!stackedFile) break;
+		const stackedOwn = ownFile(stackedFile.path, lookup);
+		if (stackedOwn) return { skip: stackedOwn };
+		instruction = stacked.args;
+	}
+	return { instruction };
+}
+
 /**
  * What ultrathink plans for a prompt: the plain prompt, the instruction inside a skill invocation
  * (or the skill's objective for a bare one), or a skip for ultrathink's own skills and commands and non-skill slash commands.
@@ -317,19 +340,12 @@ export function planningTarget(
 	// `/gsd-*` and `/skill:gsd-*` are planned even when no skill or command file is installed.
 	// `/ultrathink-*` was already returned above. `/model` and other unknown commands still skip.
 	const gsdName = gsdCommandBareName(command.name);
-	if (!file && gsdName) return gsdPlanningTarget(gsdName, command.args);
-	if (!file) return { skip: "slash-command" };
-	let instruction = command.args;
-	for (let count = 1; count < MAX_STACKED_SKILLS && instruction?.startsWith("/"); count++) {
-		const stacked = parseSlashCommand(instruction);
-		if (!stacked) break;
-		if (isUltrathinkSkill(stacked.name)) return { skip: "ultrathink-skill" };
-		if (ULTRATHINK_COMMAND_RE.test(stacked.name)) return { skip: "ultrathink-command" };
-		const stackedFile = resolveSkillFile(stacked.name, lookup);
-		if (!stackedFile) break;
-		const stackedOwn = ownFile(stackedFile.path, lookup);
-		if (stackedOwn) return { skip: stackedOwn };
-		instruction = stacked.args;
+	if (!file && gsdName) {
+		const walked = walkStacked(command.args, lookup);
+		return "skip" in walked ? walked : gsdPlanningTarget(gsdName, command.args);
 	}
-	return targetFor({ name: command.name, instruction, summary: file.summary, source: "slash" });
+	if (!file) return { skip: "slash-command" };
+	const walked = walkStacked(command.args, lookup);
+	if ("skip" in walked) return walked;
+	return targetFor({ name: command.name, instruction: walked.instruction, summary: file.summary, source: "slash" });
 }

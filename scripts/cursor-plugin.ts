@@ -180,6 +180,8 @@ export interface MainDeps {
 	root: string;
 	log: (line: string) => void;
 	nodeCandidates: string[];
+	/** How long a hook update waits for the lock. Default HOOK_LOCK_WAIT_MS; tests pass 0. */
+	lockWaitMs?: number;
 	/** Runs one external argv. Default is spawnSync. Return status, or null when the binary cannot start. */
 	run?: (argv: string[]) => number | null;
 }
@@ -220,6 +222,16 @@ function commit(
 function defaultRun(argv: string[]): number | null {
 	const result = spawnSync(argv[0] ?? "", argv.slice(1), { stdio: "inherit" });
 	return result.error ? null : result.status;
+}
+
+/** True for any directory entry, a dangling symlink included. `existsSync` follows links, so it reports those as absent. */
+function entryExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function isRealFile(path: string): boolean {
@@ -264,7 +276,7 @@ export function installGsdCommands(cursorDir: string, log: (line: string) => voi
 		const dest = join(dir, `${name}.md`);
 		const body = renderGsdCommand(name);
 		try {
-			if (existsSync(dest)) {
+			if (entryExists(dest)) {
 				if (!isRealFile(dest)) {
 					log(`commands: left ${name}.md in place (not a regular file)`);
 					continue;
@@ -362,21 +374,27 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	const initial = readHooksFile(file);
 	if ("reason" in initial) return fail(log, initial.reason);
 
+	const lockWaitMs = deps.lockWaitMs ?? HOOK_LOCK_WAIT_MS;
 	if (command === "remove") {
-		const removedCommands = removeGsdCommands(cursorDir, log);
-		if (removePlanHook(initial.config).action === "not present" && !existsSync(staged) && !existsSync(rootFile)) {
-			log(
-				removedCommands === 0
-					? `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present`
-					: `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present; removed ${removedCommands} GSD command file(s)`,
-			);
+		if (!existsSync(cursorDir)) {
+			log(`hooks.json: no ${PLAN_MARKER} ${EVENT} entry present`);
 			return 0;
 		}
-		const locked = acquireHookLock(cursorDir, HOOK_LOCK_WAIT_MS);
+		// Command files and the hook entry change under one lock, so an install in progress cannot write files back.
+		const locked = acquireHookLock(cursorDir, lockWaitMs);
 		if ("reason" in locked) return fail(log, locked.reason);
 		try {
+			const removedCommands = removeGsdCommands(cursorDir, log);
 			const committed = commit(file, removePlanHook, log);
 			if (committed.code !== 0) return committed.code;
+			if (committed.action === "not present" && !existsSync(staged) && !existsSync(rootFile)) {
+				log(
+					removedCommands === 0
+						? `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present`
+						: `hooks.json: no ${PLAN_MARKER} ${EVENT} entry present; removed ${removedCommands} GSD command file(s)`,
+				);
+				return 0;
+			}
 			if (existsSync(staged)) {
 				rmSync(staged);
 				log(`unstaged ${staged}`);
@@ -402,24 +420,38 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 	const preview = upsertPlanHook(initial.config, wanted);
 	if (preview.reason) return fail(log, preview.reason);
 
-	const locked = acquireHookLock(cursorDir, HOOK_LOCK_WAIT_MS);
+	const locked = acquireHookLock(cursorDir, lockWaitMs);
 	if ("reason" in locked) return fail(log, locked.reason);
 	const previousHook = existsSync(staged) ? readFileSync(staged) : undefined;
 	const previousRoot = existsSync(rootFile) ? readFileSync(rootFile) : undefined;
-	try {
-		ensureDir(cursorDir, 0o700);
-		ensureDir(dirname(staged), 0o755);
-		copyFileSync(source, staged);
-		chmodSync(staged, 0o644);
-		writeFileSync(rootFile, `${root}\n`, { mode: 0o600 });
-		chmodSync(rootFile, 0o600);
-		log(`staged ${staged}`);
-		const committed = commit(file, (current) => upsertPlanHook(current, wanted), log);
-		if (committed.code !== 0) {
+	// Puts the staged hook and its root file back as they were. Runs after any failed or thrown step.
+	const restore = (): void => {
+		try {
 			if (previousHook === undefined) rmSync(staged, { force: true });
 			else writeFileSync(staged, previousHook);
 			if (previousRoot === undefined) rmSync(rootFile, { force: true });
 			else writeFileSync(rootFile, previousRoot);
+		} catch (error) {
+			log(`could not restore the previous planner files (${error instanceof Error ? error.message : String(error)})`);
+		}
+	};
+	try {
+		let committed: { code: number; action?: HookAction };
+		try {
+			ensureDir(cursorDir, 0o700);
+			ensureDir(dirname(staged), 0o755);
+			copyFileSync(source, staged);
+			chmodSync(staged, 0o644);
+			writeFileSync(rootFile, `${root}\n`, { mode: 0o600 });
+			chmodSync(rootFile, 0o600);
+			log(`staged ${staged}`);
+			committed = commit(file, (current) => upsertPlanHook(current, wanted), log);
+		} catch (error) {
+			restore();
+			return fail(log, `could not install the planner hook: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (committed.code !== 0) {
+			restore();
 			return committed.code;
 		}
 		log(
@@ -427,11 +459,11 @@ export function main(argv: string[], deps: Partial<MainDeps> = {}): number {
 				? `hooks.json: ${EVENT} entry already current`
 				: `hooks.json: ${EVENT} entry ${committed.action}`,
 		);
+		// Command files change under the same lock as the hook, so a remove cannot run between the two.
+		installGsdCommands(cursorDir, log);
 	} finally {
 		locked.release();
 	}
-
-	installGsdCommands(cursorDir, log);
 	const run = deps.run ?? defaultRun;
 	runExternal(externalSteps(env, target), log, run);
 	return 0;

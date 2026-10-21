@@ -294,6 +294,17 @@ describe("planningTarget", () => {
 		expect(planningTarget("/a /b /ultrathink-sync do x", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
 	});
 
+	test("a /gsd-* command stacked with an ultrathink command or skill is not planned, with no GSD file installed", () => {
+		expect(planningTarget("/gsd-quick /ultrathink-quick fix it", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/gsd-quick /ultrathink:ultrathink-status", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/gsd-quick /ultrathink-kickoff stateFile=/tmp/s.json", { cwd, home })).toEqual({
+			skip: "ultrathink-skill",
+		});
+		expect(planningTarget("/skill:gsd-fast /ultrathink-sync do x", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+		// Without an opt-out the GSD command is still planned, as before.
+		expect(planningTarget("/gsd-quick /notaskill do x", { cwd, home })).toMatchObject({ skill: { name: "gsd-quick" } });
+	});
+
 	test("an unresolvable stacked token stops stripping and stays in the instruction", () => {
 		put(join(home, ".claude/skills/a/SKILL.md"), "---\ndescription: skill a\n---\n");
 		put(join(home, ".claude/skills/b/SKILL.md"), "---\ndescription: skill b\n---\n");

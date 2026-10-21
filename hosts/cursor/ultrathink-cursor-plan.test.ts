@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,7 +38,7 @@ function runHook(
 	});
 }
 
-function fakeCheckout(script: string): string {
+function fakeCheckout(script: string, control?: string): string {
 	const root = mkdtempSync(join(tmpdir(), "ultrathink-cursor-"));
 	mkdirSync(join(root, "bin"), { recursive: true });
 	mkdirSync(join(root, "hooks"), { recursive: true });
@@ -46,6 +46,11 @@ function fakeCheckout(script: string): string {
 	const launcher = join(root, "bin", "run-bun");
 	writeFileSync(launcher, script);
 	chmodSync(launcher, 0o755);
+	if (control !== undefined) {
+		const cli = join(root, "bin", "ultrathink");
+		writeFileSync(cli, control);
+		chmodSync(cli, 0o755);
+	}
 	return root;
 }
 
@@ -101,6 +106,7 @@ printf '%s\\n' '{"context":"PLAN","graphId":"not-a-graph"}'
 			) as { additional_context?: string };
 			expect(response.additional_context).toContain("PLAN");
 			expect(response.additional_context).not.toContain("not-a-graph");
+			expect(response.additional_context).not.toContain("Cursor swarm");
 		} finally {
 			rmSync(loose, { recursive: true, force: true });
 		}
@@ -136,6 +142,96 @@ printf '%s\\n' '{"skipped":"trivial","context":"PLAN"}'
 			);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a child that ignores SIGTERM is killed after the grace, and the prompt still goes through", async () => {
+		const root = fakeCheckout("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n");
+		try {
+			const started = Date.now();
+			const response = await runHook({ prompt: "add /health" }, { ULTRATHINK_ROOT: root, ULTRATHINK_CURSOR_BUDGET_MS: "200" });
+			expect(JSON.parse(response.stdout)).toEqual({});
+			expect(Date.now() - started).toBeLessThan(5000);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a multi-byte character split across stdout chunks is kept intact", async () => {
+		// "é" is the two bytes \xc3 \xa9. The first chunk ends inside the character.
+		const root = fakeCheckout(`#!/bin/sh
+cat >/dev/null
+printf '{"context":"caf\\303'
+sleep 0.3
+printf '\\251 plan"}\\n'
+`);
+		try {
+			const response = JSON.parse((await runHook({ prompt: "add /health" }, { ULTRATHINK_ROOT: root, ULTRATHINK_CURSOR_BUDGET_MS: "5000" })).stdout) as {
+				additional_context?: string;
+			};
+			expect(response.additional_context).toBe("café plan");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a control command runs bin/ultrathink for host cursor and blocks the prompt with its output", async () => {
+		const root = fakeCheckout(
+			`#!/bin/sh
+cat >/dev/null
+touch "$ULTRATHINK_ROOT/engine-ran"
+printf '%s\\n' '{"context":"PLAN"}'
+`,
+			`#!/bin/sh
+printf 'host=%s args=%s\\n' "$ULTRATHINK_HOST" "$*"
+`,
+		);
+		try {
+			const env = { ULTRATHINK_ROOT: root, ULTRATHINK_CURSOR_BUDGET_MS: "5000", ULTRATHINK_HOST: "claude-code" };
+			expect(JSON.parse((await runHook({ prompt: "/ultrathink-track off" }, env)).stdout)).toEqual({
+				continue: false,
+				user_message: "host=cursor args=track off",
+			});
+			expect(JSON.parse((await runHook({ prompt: "/ultrathink:ultrathink-skip" }, env)).stdout)).toEqual({
+				continue: false,
+				user_message: "host=cursor args=skip",
+			});
+			expect(JSON.parse((await runHook({ prompt: "/ultrathink status" }, env)).stdout)).toEqual({
+				continue: false,
+				user_message: "host=cursor args=status",
+			});
+			// A control command never reaches the planner.
+			expect(existsSync(join(root, "engine-ran"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("/ultrathink-quick still goes to the planner, and a failed control run leaves the prompt unchanged", async () => {
+		const quick = fakeCheckout(
+			`#!/bin/sh
+cat >/dev/null
+printf '%s\\n' '{"skipped":"ultrathink-command"}'
+`,
+			`#!/bin/sh
+printf 'intercepted\\n'
+`,
+		);
+		const failing = fakeCheckout(
+			`#!/bin/sh
+cat >/dev/null
+printf '%s\\n' '{"context":"PLAN"}'
+`,
+			"#!/bin/sh\nexit 3\n",
+		);
+		try {
+			const quickEnv = { ULTRATHINK_ROOT: quick, ULTRATHINK_CURSOR_BUDGET_MS: "5000" };
+			expect(JSON.parse((await runHook({ prompt: "/ultrathink-quick fix the typo" }, quickEnv)).stdout)).toEqual({});
+			const failEnv = { ULTRATHINK_ROOT: failing, ULTRATHINK_CURSOR_BUDGET_MS: "5000" };
+			expect(JSON.parse((await runHook({ prompt: "/ultrathink-off" }, failEnv)).stdout)).toEqual({});
+		} finally {
+			rmSync(quick, { recursive: true, force: true });
+			rmSync(failing, { recursive: true, force: true });
 		}
 	});
 });

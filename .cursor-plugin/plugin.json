@@ -12,5 +12,5 @@
 	"license": "AGPL-3.0-or-later",
 	"keywords": ["planning", "prompt", "graph-of-thought", "substrate", "agent-swarm", "cursor"],
 	"skills": "./skills/",
-	"commands": ["./commands", "./hosts/cursor/gsd-commands"]
+	"commands": ["./hosts/cursor/commands", "./hosts/cursor/gsd-commands"]
 }
