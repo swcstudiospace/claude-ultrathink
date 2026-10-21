@@ -187,7 +187,7 @@ export function buildReport(controlsText: string, root: string): Report {
 }
 
 function cell(text: string): string {
-	return text.replace(/\|/g, "\\|").replace(/\n/g, " ");
+	return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
 function renderRefs(refs: Record<Framework, string[]>): string {

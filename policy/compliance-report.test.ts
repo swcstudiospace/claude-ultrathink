@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 //
-// Tests for policy/compliance-report.ts. Each case runs the real CLI in a child process. The failure cases build a temp
+// Tests for policy/compliance-report.ts. Most cases run the real CLI in a child process; the rendering case calls the exported renderer in-process. The failure cases build a temp
 // tree from the real evidence paths, so the removed file is the only difference from the repository.
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { buildReport, renderMarkdown } from "./compliance-report.ts";
 
 const REPO = resolve(import.meta.dir, "..");
 const SCRIPT = resolve(import.meta.dir, "compliance-report.ts");
@@ -101,4 +102,12 @@ test("--out writes the Markdown report to the file and leaves stdout empty", asy
 	expect(code).toBe(0);
 	expect(stdout).toBe("");
 	expect(readFileSync(out, "utf8")).toContain("# Compliance evidence report");
+});
+
+test("a title with a backslash and a pipe renders as an exact table cell: backslash escaped first, then pipe", () => {
+	const controls = JSON.stringify([
+		{ id: "TEST-1", title: "a\\b | c", refs: { soc2: [], iso27001: [], gdpr: [] }, evidence: [], pending: "test" },
+	]);
+	const markdown = renderMarkdown(buildReport(controls, REPO));
+	expect(statusRow(markdown, "TEST-1")).toBe("| `TEST-1` | a\\\\b \\| c | PENDING | 0/0 | 0 |");
 });
