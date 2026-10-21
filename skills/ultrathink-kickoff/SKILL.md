@@ -80,7 +80,7 @@ Keep every identifier/URL you created; steps 3 and 5 use them.
 
 ## 3. Optional: register the graph with an Agent Substrate server
 
-This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. Build it from the tracking refs, leaving out fields whose value is absent:
+This is an optional integration. Run it only when an MCP server named `substrate` is connected in this session and you have its `graph_register` tool; otherwise skip this step silently — do not log, mention or suggest it. When it is connected, call `graph_register` on it. It is idempotent by `graph_id`, so call it without checking for an earlier registration. On Cursor the session record's `host` is `cursor`; pass that as `surface` (the same rule as every other host: `claude-code` only when `host` is absent). Build it from the tracking refs, leaving out fields whose value is absent:
 
 | Field | Value |
 |---|---|
@@ -101,9 +101,10 @@ Without a `plan`, read `record.clarifications` instead of `plan.hitl`: blocking 
 - For every item in `plan.hitl.nonBlocking`: proceed with its `default` option and state the assumption plainly in your next message (do not ask about it).
 - For every item in `plan.hitl.blocking` (at most 4, already deduplicated): call the host's question tool **once** (`AskUserQuestion` in Claude Code, `ask` in Omp, `clarify` in Hermes), passing all of them together — each with its `header`, `question`, and `options` (the option matching `default` first). If no question tool is available, proceed with every blocking default and say so.
 - On Hermes, that one call is `clarify` with `{"questions": [{"question": "<header>: <question>", "choices": ["<default label>", "<other option label>", …]}]}` — at most 4 choices per question with the default first (Hermes labels the first choice Recommended and adds Other itself) and at most 5 questions. If an answer says no user is available (Hermes `-q`/`-z` modes) or the tool errors, proceed with every blocking default and say so.
-- Fold the answers (or stated assumptions) into the final prompt as a short "Clarifications" note.
+- Persist the user's answers into the spec before anything reads it (step 5 and any Cursor handoff): in `sessions/<id>.xml`, add `<ANSWER source="user">…</ANSWER>` (answer text XML-escaped) inside the `<CLARIFICATION>` of the question it answers, after `</OPTIONS>`. The `<CLARIFICATIONS>` block already holds one `<CLARIFICATION>` per blocking question. Replace an existing `<ANSWER>` rather than adding a second. If the block has no entry for a question, append one in the same format. An answer kept only in chat never reaches the spec, so the orchestrator would build the default instead. Stated assumptions need no entry: the default option already carries `recommended="true"`.
 
 ## 5. Set Implementing and emit the final prompt
+When the plan carries the Cursor swarm note (`## Cursor swarm`), do steps 1 and 4 only, then stop. The Cursor session hands the unit to `a01-orchestrator`, so do not emit the final prompt in steps 2 and 3 here.
 
 1. Set the Task `Status` to `"Implementing"`: `notion-update-page` on `tracking.notion.taskUrl` when present (skip silently when absent). If the Notion MCP tools are not available in this session, tell the user once to register them with `bun <repo>/scripts/mcp-register.ts` (or connect the official Notion MCP server), skip this update and continue — never block the work.
 2. The final prompt is the **full spec file** (`sessions/<id>.xml`, the spec path from the prompt context), which already carries the `<ISSUES>` block with identifiers and URLs. Do not use `plan.task.upliftedPrompt` — that copy is truncated to 1900 characters.
@@ -112,4 +113,4 @@ Without a `plan`, read `record.clarifications` instead of `plan.hitl`: blocking 
 
 ## 6. Proceed as normal
 
-Treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns (without a `plan` there are no URLs to pass). Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.
+Skip this section when the plan carries the Cursor swarm note (`## Cursor swarm`). The Cursor session hands the unit to `a01-orchestrator`, which dispatches the waves itself; dispatching them here would start the same work twice and let both sets of agents edit the same files. Otherwise, treat the spec as the actual task. Dispatch the graph's WORKFLOW waves as parallel subagents with the host's subagent tool (`Task` in Claude Code, `task` in Omp), passing each subagent the Linear/Notion URLs of the node(s) it owns (without a `plan` there are no URLs to pass). Reference issues in commits as `Refs <identifier>` and in PR bodies as `Fixes <identifier>`. Do not re-read this skill again this turn.

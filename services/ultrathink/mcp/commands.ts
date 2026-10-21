@@ -160,6 +160,12 @@ export const COMMAND_OVERLAY: Readonly<Record<string, OverlayEntry>> = {
 		reason: "clarifying questions are part of every plan result",
 		instead: "read the plan's questions",
 	},
+	"ultrathink-cursor": {
+		state: "unsupported",
+		tools: [],
+		reason: "it is a Cursor host command, and the connector has no Cursor session to run it in",
+		instead: "run it in Cursor with the ultrathink plugin installed",
+	},
 };
 
 /** The overlay entry of a name, own properties only: a name such as "constructor" is not a command. */

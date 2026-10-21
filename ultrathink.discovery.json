@@ -75,6 +75,16 @@
         "hooks/engine.ts"
       ],
       "delivery": "kernel-skill-return"
+    },
+    "cursor": {
+      "status": "source-present",
+      "entrypoints": [
+        ".cursor-plugin/plugin.json",
+        "hosts/cursor/ultrathink-cursor-plan.js",
+        "scripts/cursor-plugin.ts",
+        "hooks/engine.ts"
+      ],
+      "delivery": "hook-additional-context"
     }
   },
   "interfaces": {

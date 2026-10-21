@@ -204,7 +204,7 @@ describe("the new prompts", () => {
 
 describe("unsupported commands", () => {
 	test("are not listed but render an explanation that relays the reason and alternative and calls no tool", () => {
-		expect(UNSUPPORTED).toHaveLength(16);
+		expect(UNSUPPORTED).toHaveLength(17);
 		for (const name of UNSUPPORTED) {
 			const entry = COMMAND_OVERLAY[name];
 			const render = renderPrompt(name, {});

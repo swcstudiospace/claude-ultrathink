@@ -72,6 +72,14 @@ muse plugins remove ultrathink
 omp plugin uninstall ultrathink
 ```
 
+### Cursor
+
+```sh
+bun <clone>/scripts/cursor-plugin.ts remove
+```
+
+That deletes the `ultrathink-cursor-managed` `beforeSubmitPrompt` entry and the staged hook under `~/.cursor/hooks`. It leaves pstack and substrate hook entries. It does not remove Agent Swarm's `.cursor/agents` from a workspace.
+
 ### Prime Agent
 
 `scripts/setup.ts rollback` (step 2) removes the symlinks `hosts/prime-agent` in `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills/ultrathink` and the agent skills in `~/.agents/skills`. If you linked them manually, remove those symlinks:
@@ -167,6 +175,7 @@ Each host keeps its own state directory: control state, planned sessions, specs 
 | Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/ultrathink` |
 | Omp | `${PI_CODING_AGENT_DIR:-~/.omp/agent}/ultrathink` |
 | Prime Agent | `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/ultrathink` |
+| Cursor | `~/.cursor/ultrathink` |
 
 If you set `ULTRATHINK_STATE_DIR`, the state is in that directory instead. Unset the variable too.
 

@@ -44,6 +44,8 @@ export function stateDirForHost(host: HostId, env: Record<string, string | undef
 			const home = env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
 			return join(home, "ultrathink");
 		}
+		case "cursor":
+			return join(homedir(), ".cursor", "ultrathink");
 	}
 }
 

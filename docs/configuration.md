@@ -4,7 +4,7 @@ ultrathink reads JSON config files, a small per-host control file written by the
 
 Terms used on this page:
 
-- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent.
+- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp, Prime Agent or Cursor.
 - **Engine**: the model that writes the plan. On Omp with `think.engine: "auto"` it is the session's own live model, called inside Omp. Everywhere else, and on Omp with a named engine, it is Claude, Grok or Muse on its CLI route (Grok also over HTTP or a gateway you run).
 - **Graph of Thought**: the 5 to 8 reasoning nodes the engine builds for each prompt. Each node is filled with numbered rationale steps.
 - **HITL** (human in the loop): the clarifying questions the plan asks before work starts.
@@ -735,6 +735,7 @@ Each host keeps its own state. Planning never writes `.planning/` into the worki
 | Hermes Agent | `~/.hermes/ultrathink` (`$HERMES_HOME/ultrathink` when set) |
 | Muse Code | `~/.config/muse/ultrathink` (`$XDG_CONFIG_HOME/muse/ultrathink` when set) |
 | Omp | `~/.omp/agent/ultrathink` (`$PI_CODING_AGENT_DIR/ultrathink` when set) |
+| Cursor | `~/.cursor/ultrathink` |
 
 Empty or whitespace-only values count as unset. `ULTRATHINK_STATE_DIR` replaces the directory for every host, as long as it is not inside `.planning`. Use an absolute path for it: a relative path resolves against the session's working directory on most hosts, but against the ultrathink checkout on Hermes.
 

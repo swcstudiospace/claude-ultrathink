@@ -3,7 +3,7 @@
 	"version": "1.4.0",
 	"private": true,
 	"type": "module",
-	"description": "Plans every prompt into a spec + Graph of Thought, tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR, across Claude Code, Grok Build, Hermes Agent, Muse, Omp and Prime Agent.",
+	"description": "Plans every prompt into a spec + Graph of Thought, tracks it in Linear/Notion, and ships finished work through a Greptile-gated PR, across Claude Code, Grok Build, Hermes Agent, Muse, Omp, Prime Agent and Cursor.",
 	"license": "AGPL-3.0-or-later",
 	"author": "SWC Studio",
 	"homepage": "https://github.com/swcstudiospace/claude-ultrathink#readme",
@@ -14,7 +14,7 @@
 	"bugs": {
 		"url": "https://github.com/swcstudiospace/claude-ultrathink/issues"
 	},
-	"keywords": ["claude-code", "grok", "hermes", "muse", "omp", "prime-agent", "agent", "planning", "graph-of-thought", "linear", "notion", "greptile"],
+	"keywords": ["claude-code", "grok", "hermes", "muse", "omp", "prime-agent", "cursor", "agent", "planning", "graph-of-thought", "linear", "notion", "greptile"],
 	"engines": {
 		"bun": ">=1.2"
 	},
