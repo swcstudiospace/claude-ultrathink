@@ -177,7 +177,6 @@ beforeAll(async () => {
 		modelTimeoutMs: 120000,
 		planTimeoutMs: 600000,
 		modelMaxOutputTokens: 8000,
-		serverDecisions: false,
 		sessionSecretPrevious: [],
 		breakerFailures: 5,
 		breakerWindowMs: 60000,

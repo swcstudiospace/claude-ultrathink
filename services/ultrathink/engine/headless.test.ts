@@ -171,7 +171,6 @@ function setup(overrides: Partial<UltrathinkConfig> = {}, options: Partial<Headl
 		modelTimeoutMs: 5000,
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
-		serverDecisions: false,
 		sessionSecretPrevious: [],
 		breakerFailures: 5,
 		breakerWindowMs: 60000,
@@ -404,65 +403,6 @@ describe("headless planner: limits and lifecycle", () => {
 		h.clock.fire(60_000);
 		const result = await h.planner.result({ sessionId, waitSeconds: 30 });
 		expect(result).toMatchObject({ ok: true, data: { status: "failed", error: "timeout" } });
-	});
-
-	test("decision holds stay on the daily ceiling after their plans end, so a third plan runs without decisions", async () => {
-		const gate = Promise.withResolvers<void>();
-		const seen: Array<{ decisions: boolean; env: Record<string, string | undefined> }> = [];
-		const plan: typeof planPrompt = async (_request, env, options) => {
-			if (!options?.config) throw new Error("planPrompt was called without a config");
-			seen.push({ decisions: options.config.decisions.enabled, env: { ...env } });
-			await gate.promise;
-			throw new Error("held open by the test");
-		};
-		// Each hold is modelMaxOutputTokens x 18 (9 decision calls, two requests each) = 18000. The daily ceiling fits two, not three.
-		const h = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 1_000_000, dailyTokenCeiling: 40_000 }, { plan });
-		const first = randomUUID();
-		const second = randomUUID();
-		const starts = [h.planner.start({ prompt: PROMPT, sessionId: first }), h.planner.start({ prompt: PROMPT, sessionId: second })];
-		await flush();
-		h.clock.fire(15_000);
-		for (const start of await Promise.all(starts)) expect(start).toMatchObject({ ok: true, data: { status: "running" } });
-		expect(seen.map((call) => call.decisions)).toEqual([true, true]);
-		expect(seen[0]?.env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
-
-		// Both plans end. Their holds stay on the day at the reserved worst case, so a third hold would exceed the daily ceiling.
-		gate.resolve();
-		await h.planner.result({ sessionId: first, waitSeconds: 30 });
-		await h.planner.result({ sessionId: second, waitSeconds: 30 });
-		await h.planner.start({ prompt: PROMPT, sessionId: randomUUID() });
-		expect(seen.map((call) => call.decisions)).toEqual([true, true, false]);
-		expect(seen[2]?.env.ULTRATHINK_DECISIONS).toBe("0");
-		expect(seen[2]?.env.OPENROUTER_API_KEY).toBeUndefined();
-	});
-
-	test("a decision hold is granted only while the run keeps half its ceiling free for planning", async () => {
-		// The hold is modelMaxOutputTokens x 18 = 18000. Half the run ceiling must stay free, so the ceiling must be at least 36000.
-		const seen: Array<{ decisions: boolean; env: Record<string, string | undefined> }> = [];
-		const plan: typeof planPrompt = async (_request, env, options) => {
-			if (!options?.config) throw new Error("planPrompt was called without a config");
-			seen.push({ decisions: options.config.decisions.enabled, env: { ...env } });
-			throw new Error("stop after the decision hold is recorded");
-		};
-		const spentOn = (h: Harness, sessionId: string): number =>
-			createLedger(h.store, { runTokenCeiling: 1, dailyTokenCeiling: 1 }).spentForRun(String(jobFile(h.stateDir, sessionId).runId));
-
-		// 18000 is more than half of 30000: the plan runs with decisions off and no hold is recorded on its run.
-		const tight = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 30_000 }, { plan });
-		const tightId = randomUUID();
-		expect(await tight.planner.start({ prompt: PROMPT, sessionId: tightId })).toMatchObject({ ok: true });
-		expect(seen.at(-1)).toMatchObject({ decisions: false });
-		expect(seen.at(-1)?.env.ULTRATHINK_DECISIONS).toBe("0");
-		expect(seen.at(-1)?.env.OPENROUTER_API_KEY).toBeUndefined();
-		expect(spentOn(tight, tightId)).toBe(0);
-
-		// 18000 fits within half of 40000: the plan runs with decisions on and the hold is settled to its worst case on its run.
-		const roomy = setup({ serverDecisions: true, modelMaxOutputTokens: 1000, runTokenCeiling: 40_000 }, { plan });
-		const roomyId = randomUUID();
-		expect(await roomy.planner.start({ prompt: PROMPT, sessionId: roomyId })).toMatchObject({ ok: true });
-		expect(seen.at(-1)).toMatchObject({ decisions: true });
-		expect(seen.at(-1)?.env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
-		expect(spentOn(roomy, roomyId)).toBe(18_000);
 	});
 
 	test("an engine failure ends the job as failed with the code, never the response body", async () => {
@@ -858,22 +798,28 @@ describe("headless planner: isolation", () => {
 		expect(options.config).toMatchObject({ track: { enabled: false }, ship: { enabled: false }, hindsight: { enabled: false }, ragflow: { enabled: false }, teach: { enabled: false }, decisions: { enabled: false }, hitl: { knowledgeBase: false } });
 	});
 
-	test("serverDecisions leaves Jev on and hands it the key; the kill switches for everything else stay", async () => {
+	test("ULTRATHINK_SERVER_DECISIONS in the environment never gives a server plan the OpenRouter key or Jev", async () => {
 		let env: Record<string, string | undefined> = {};
+		let decisions: boolean | undefined;
 		const h = setup(
-			{ serverDecisions: true },
+			{},
 			{
+				// The operator's environment asks for decisions and holds the key; neither reaches the plan.
+				env: { PATH: process.env.PATH, ULTRATHINK_SERVER_DECISIONS: "1", OPENROUTER_API_KEY: FAKE_KEY },
 				// Not the real planPrompt: a live Jev gate would call out.
-				plan: async (_request, given) => {
+				plan: async (_request, given, options) => {
+					if (!options?.config) throw new Error("planPrompt was called without a config");
 					env = given ?? {};
+					decisions = options.config.decisions.enabled;
 					return { context: "", skipped: "precheck-skip" };
 				},
 			},
 		);
 		await h.planner.start({ prompt: PROMPT });
-		expect("ULTRATHINK_DECISIONS" in env).toBe(false);
-		expect(env.OPENROUTER_API_KEY).toBe(FAKE_KEY);
-		expect(env).toMatchObject({ ULTRATHINK_SHIP: "0", ULTRATHINK_HINDSIGHT: "0", ULTRATHINK_RAGFLOW: "0", SUBSTRATE_DISABLED: "1" });
+		expect(env.OPENROUTER_API_KEY).toBeUndefined();
+		expect(env.ULTRATHINK_SERVER_DECISIONS).toBeUndefined();
+		expect(env.ULTRATHINK_DECISIONS).toBe("0");
+		expect(decisions).toBe(false);
 	});
 
 	test("a hostile operator config changes nothing and nothing but OpenRouter is contacted", async () => {

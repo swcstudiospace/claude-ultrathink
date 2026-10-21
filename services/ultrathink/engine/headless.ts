@@ -6,7 +6,7 @@
  *
  * The plan never reads the operator's personal config or control state: the plugin config is built here and handed
  * over captured, the env is built from scratch, and tracking, substrate, Hindsight, RAGFlow, shipping, lessons and
- * (unless `serverDecisions`) Jev stay off. The only outbound traffic is the OpenRouter completer.
+ * Jev stay off. The only outbound traffic is the OpenRouter completer.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -14,7 +14,6 @@ import { join } from "node:path";
 import type { ClaudeCompleter } from "../../../src/claude/complete.ts";
 import { readSession } from "../../../src/claude/state.ts";
 import { defaultConfig, type UltrathinkConfig as PluginConfig } from "../../../src/config.ts";
-import { MAX_QUESTIONS, MAX_SETTLED } from "../../../src/hitl/types.ts";
 import type { ModelResolution, SelectedEngine } from "../../../src/host/engine.ts";
 import { GROKBOT_ENGINE_HOST, checkRecord, journalDir, readMeta } from "../../../src/host/grokbot.ts";
 import { type PlanResponse, planPrompt } from "../../../src/host/plan.ts";
@@ -125,8 +124,6 @@ interface Job extends JobFile {
 	reason?: AbortReason;
 	/** First non-abort completer failure, as a code. */
 	firstError?: string;
-	/** Ledger hold for this plan's Jev decisions, on the plan's run; present only while decisions are on for the plan. */
-	decisionsHold?: { reservationId: number; tokens: number };
 	seq: number;
 	settled: boolean;
 	done: Promise<void>;
@@ -153,12 +150,6 @@ const JOB_STATUSES: Record<string, true> = { running: true, planned: true, faile
 const ENGINE_SKIPS: Record<string, true> = { "uplift-failed": true, "engine-error": true };
 /** Variables with no secret and no config meaning that a plan may inherit. */
 const PASS_THROUGH_ENV = ["PATH", "TZ", "LANG", "LC_ALL", "TMPDIR"] as const;
-/** One plan's Jev calls: the plan gate, up to MAX_SETTLED knowledge checks and up to MAX_QUESTIONS blocking checks. */
-const DECISION_CALLS_PER_PLAN = 1 + MAX_SETTLED + MAX_QUESTIONS;
-/** A decision is at most two requests: its client retries one transient failure within the decision's budget. */
-const DECISION_REQUESTS_PER_CALL = 2;
-/** Worst-case multiplier on `modelMaxOutputTokens` that one plan's decisions hold. */
-const DECISION_REQUEST_CAP = DECISION_CALLS_PER_PLAN * DECISION_REQUESTS_PER_CALL;
 
 const fail = (code: JournalErrorCode, errors?: string[]): JournalResult<never> =>
 	errors ? { ok: false, code, errors } : { ok: false, code };
@@ -179,7 +170,7 @@ const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
 };
 
 /** The plugin config a server plan runs with: planning on, everything that reaches outside the model off. */
-function pluginConfig(job: Job): PluginConfig {
+function pluginConfig(): PluginConfig {
 	const config = defaultConfig();
 	config.uplift = { ...config.uplift, enabled: true, skipTrivial: false, echo: false };
 	config.claude = { ...config.claude, concurrency: 3, callTimeoutMs: 0, budgetMs: 0, echo: false };
@@ -190,7 +181,8 @@ function pluginConfig(job: Job): PluginConfig {
 	config.hindsight = { ...config.hindsight, enabled: false, url: "" };
 	config.ragflow = { ...config.ragflow, enabled: false, ground: false, url: "" };
 	config.teach = { ...config.teach, enabled: false, recall: false };
-	config.decisions = { ...config.decisions, enabled: job.decisionsHold !== undefined };
+	// Decision spend is not metered yet, so Jev stays off in every server plan.
+	config.decisions = { ...config.decisions, enabled: false };
 	config.substrate = { ...config.substrate, url: "" };
 	config.gateway = { ...config.gateway, url: "" };
 	config.notion = { dataSourceUrl: "" };
@@ -285,41 +277,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 		}
 	}
 
-	/**
-	 * Holds the decisions headroom for one plan on the plan's own run, atomically with the run and daily ceilings. Jev calls
-	 * OpenRouter from the plugin subprocess, so this hold is the only thing the ceilings can see. A hold is granted only if,
-	 * after reserving it, the run still has at least half of runTokenCeiling free for planning; otherwise, or when the
-	 * ledger refuses it, this plan runs without decisions.
-	 */
-	function holdDecisions(job: Job): void {
-		if (!config.serverDecisions) return;
-		const tokens = config.modelMaxOutputTokens * DECISION_REQUEST_CAP;
-		try {
-			// Runs before the plan's first model call, so this run's spend is still zero and nothing else writes to it.
-			if (ledger.spentForRun(job.runId) + tokens > config.runTokenCeiling / 2) return;
-			const { reservationId } = ledger.reserve({ runId: job.runId, phase: `decisions-${job.sessionId}`, attempt: 1, estimatedTokens: tokens });
-			job.decisionsHold = { reservationId, tokens };
-		} catch {
-			// Refused by a ceiling or the ledger is unavailable: this plan runs without decisions.
-		}
-	}
-
-	/**
-	 * Ends the hold when the plan ends. It settles to the amount reserved, the worst case, not to zero: decision spend is not
-	 * metered here, so the hold keeps counting against the run and the day. Idempotent.
-	 */
-	function releaseDecisions(job: Job): void {
-		const hold = job.decisionsHold;
-		if (hold === undefined) return;
-		job.decisionsHold = undefined;
-		try {
-			ledger.settle(hold.reservationId, hold.tokens);
-		} catch (error) {
-			opts.logger?.error("decisions_release_failed", { sessionId: job.sessionId, error });
-		}
-	}
-
-	function plannerEnv(job: Job): Record<string, string | undefined> {
+	function plannerEnv(): Record<string, string | undefined> {
 		const base = opts.env ?? process.env;
 		const env: Record<string, string | undefined> = {};
 		for (const key of PASS_THROUGH_ENV) if (base[key] !== undefined) env[key] = base[key];
@@ -331,14 +289,10 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 			ULTRATHINK_RAGFLOW: "0",
 			ULTRATHINK_TEACH: "0",
 			ULTRATHINK_GATEWAY: "0",
+			ULTRATHINK_DECISIONS: "0",
 			SUBSTRATE_DISABLED: "1",
 		});
-		if (job.decisionsHold !== undefined) {
-			// Jev reads its key from the env; hand it over only while this plan holds decisions headroom.
-			if (config.openRouterApiKey !== undefined) env.OPENROUTER_API_KEY = config.openRouterApiKey;
-		} else {
-			env.ULTRATHINK_DECISIONS = "0";
-		}
+		// The OpenRouter key never reaches a plan: decision spend is not metered, so Jev stays off here.
 		// ULTRATHINK_CHILD and ULTRATHINK_UPLIFT are not on the allowlist, so they cannot reach the plan.
 		return env;
 	}
@@ -514,41 +468,36 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 	}
 
 	async function execute(job: Job, prompt: string, model: string): Promise<void> {
-		holdDecisions(job);
+		const timer = new AbortController();
+		sleep(config.planTimeoutMs, timer.signal)
+			.then(() => {
+				if (timer.signal.aborted || job.settled) return;
+				job.reason ??= "timeout";
+				job.controller.abort();
+			})
+			.catch(() => {});
+		let outcome: Outcome;
 		try {
-			const timer = new AbortController();
-			sleep(config.planTimeoutMs, timer.signal)
-				.then(() => {
-					if (timer.signal.aborted || job.settled) return;
-					job.reason ??= "timeout";
-					job.controller.abort();
-				})
-				.catch(() => {});
-			let outcome: Outcome;
-			try {
-				const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(job), {
-					stateDir,
-					signal: job.controller.signal,
-					config: pluginConfig(job),
-					control: { enabled: true },
-					createTracker: () => undefined,
-					selectEngine: async (): Promise<SelectedEngine> => ({
-						label: `openrouter:${model}`,
-						complete: meteredCompleter(job, model),
-						error: () => job.firstError,
-						resolution: resolutionFor(model),
-					}),
-				});
-				outcome = judge(job, response);
-			} catch {
-				outcome = job.reason === undefined ? { status: "failed", error: job.firstError ?? "engine_error" } : abortOutcome(job);
-			} finally {
-				timer.abort();
-			}
-			finalize(job, outcome);
+			const response = await plan({ host: GROKBOT_ENGINE_HOST, session_id: job.sessionId, prompt, cwd }, plannerEnv(), {
+				stateDir,
+				signal: job.controller.signal,
+				config: pluginConfig(),
+				control: { enabled: true },
+				createTracker: () => undefined,
+				selectEngine: async (): Promise<SelectedEngine> => ({
+					label: `openrouter:${model}`,
+					complete: meteredCompleter(job, model),
+					error: () => job.firstError,
+					resolution: resolutionFor(model),
+				}),
+			});
+			outcome = judge(job, response);
+		} catch {
+			outcome = job.reason === undefined ? { status: "failed", error: job.firstError ?? "engine_error" } : abortOutcome(job);
 		} finally {
-			releaseDecisions(job);
+			timer.abort();
 		}
+		finalize(job, outcome);
 	}
 
 	async function waitFor(job: Job, ms: number): Promise<void> {

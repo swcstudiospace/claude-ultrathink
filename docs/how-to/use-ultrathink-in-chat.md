@@ -15,7 +15,7 @@ This guide connects a chat client to the hosted ultrathink server, or to the sam
 
 The chat model then reads the plan, asks you the questions that matter (or states the defaults it assumes), and carries out the plan.
 
-This path has no Notion, no Linear, no tracking, no shipping, and no Hindsight or RAGFlow lookups. The Jev decision gate is off unless the operator sets `ULTRATHINK_SERVER_DECISIONS=1`. Nothing is written to your repository or to any tracker.
+This path has no Notion, no Linear, no tracking, no shipping, and no Hindsight or RAGFlow lookups. The Jev decision gate is off: server-side decisions stay disabled until their spend is metered. Nothing is written to your repository or to any tracker.
 
 ## Two modes
 
@@ -288,7 +288,7 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_PLAN_TIMEOUT_MS` | `600000` | Timeout for one whole plan, 30000 to 1800000. |
 | `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
 | `ULTRATHINK_MODEL_REASONING_EFFORT` | `low` | `minimal`, `low`, `medium` or `high`, or `default`, which omits the parameter so the provider's own default applies. The pipeline already asks the model to write its reasoning steps, so hidden reasoning only adds minutes. |
-| `ULTRATHINK_SERVER_DECISIONS` | off | `1` turns on the Jev decision gate in server-side plans. Each plan holds 18 times `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` for decisions and grants the hold only while at least half of the run ceiling stays free for planning. To enable decisions, `ULTRATHINK_RUN_TOKEN_CEILING` must be at least 2 x 18 x `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` (at defaults, 288,000). Below that, each plan runs with decisions off. |
+| Server-side Jev decisions | off | Off until their spend is metered. Server-side plans never receive the OpenRouter key. |
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
 | `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | none | Comma list of extra https origins allowed in client redirect URIs. |
