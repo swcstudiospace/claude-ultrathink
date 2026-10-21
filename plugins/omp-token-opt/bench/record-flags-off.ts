@@ -5,7 +5,8 @@
  * The replay follows bench/run.ts measureTokens. For each fixture in sorted order it calls tool_call, then
  * tool_result, then message_end, all on one extension instance, so dedupe state carries across fixtures as it
  * does in run.ts. It makes no model, network, or graphify calls. The only external binary the plugin can reach
- * here is rtk, so PATH is set to an empty directory and rtk is absent on every machine. HOME is a temp directory,
+ * here is rtk, so the replay runs in a child process started with PATH set to an empty directory, and rtk is absent on every
+ * machine (Bun.which reads PATH once at process start, so changing PATH in-process would not hide it). HOME is a temp directory,
  * so ledger writes never reach the real home directory.
  *
  * Not replayed: the graph_query path (bench/run.ts measureGraphQuery). Its output depends on the contents of src/
@@ -69,9 +70,11 @@ const TIME_KEYS: Record<string, true> = { at: true, updatedAt: true };
 /** Tool-result fixture file names, sorted as bench/run.ts loads them. */
 export function listFixtureFiles(): string[] {
 	if (!existsSync(TOOL_RESULT_DIR)) throw new Error(`missing ${TOOL_RESULT_DIR}; run: bun bench/record.ts`);
-	return readdirSync(TOOL_RESULT_DIR)
+	const files = readdirSync(TOOL_RESULT_DIR)
 		.filter((file) => file.endsWith(".json"))
 		.sort();
+	if (files.length === 0) throw new Error(`no tool-result fixtures in ${TOOL_RESULT_DIR}; run: bun bench/record.ts`);
+	return files;
 }
 
 function loadFixture(file: string): FixtureFile {
@@ -146,70 +149,91 @@ function instantiate(emitted: EmittedEvent[], cwd: string): Hooks {
 	};
 }
 
-/** Runs body with a temp HOME, an empty PATH, and every TOKEN_OPT_* and flag variable unset, then restores env. */
-async function withHermeticEnv<T>(overrides: Readonly<Record<string, string>>, body: (home: string) => Promise<T>): Promise<T> {
-	const saved = { ...process.env };
+const REPLAY_CHILD_ARG = "--replay-child";
+
+/**
+ * Environment for the replay child: a temp HOME, an empty PATH, every TOKEN_OPT_* and flag variable unset, then overrides.
+ * Bun.which reads PATH once at process start, so the empty PATH only hides rtk from a process started with it.
+ */
+function hermeticEnv(home: string, emptyPath: string, overrides: Readonly<Record<string, string>>): Record<string, string> {
+	const flagVars = new Set<string>(FLAG_NAMES.map((name) => FLAG_ENV[name]));
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value === undefined || key.startsWith("TOKEN_OPT_") || flagVars.has(key)) continue;
+		env[key] = value;
+	}
+	return { ...env, HOME: home, PATH: emptyPath, ...overrides };
+}
+
+/**
+ * Replays every tool-result fixture through the extension in a child process started with the hermetic env, so an
+ * rtk on the parent's PATH is never found. overrides sets extra env on top of the flags-off base, which is how the
+ * sensitivity of a golden to a flag is checked. Callers that record or test goldens pass none.
+ */
+export async function replayFixtures(overrides: Readonly<Record<string, string>> = {}): Promise<FixtureReplay[]> {
 	const home = mkdtempSync(join(tmpdir(), "flags-off-home-"));
 	const emptyPath = mkdtempSync(join(tmpdir(), "flags-off-path-"));
 	try {
-		for (const key of Object.keys(process.env)) {
-			if (key.startsWith("TOKEN_OPT_")) delete process.env[key];
-		}
-		for (const name of FLAG_NAMES) delete process.env[FLAG_ENV[name]];
-		Object.assign(process.env, { HOME: home, PATH: emptyPath }, overrides);
-		return await body(home);
+		const proc = Bun.spawn([process.execPath, fileURLToPath(import.meta.url), REPLAY_CHILD_ARG], {
+			cwd: home,
+			env: hermeticEnv(home, emptyPath, overrides),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, err, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`flags-off replay child exited ${code}: ${err}`);
+		return JSON.parse(out) as FixtureReplay[];
 	} finally {
-		for (const key of Object.keys(process.env)) delete process.env[key];
-		Object.assign(process.env, saved);
 		rmSync(home, { recursive: true, force: true });
 		rmSync(emptyPath, { recursive: true, force: true });
 	}
 }
 
-/**
- * Replays every tool-result fixture through the extension. overrides sets extra env on top of the flags-off
- * base, which is how the sensitivity of a golden to a flag is checked. Callers that record or test goldens pass none.
- */
-export async function replayFixtures(overrides: Readonly<Record<string, string>> = {}): Promise<FixtureReplay[]> {
-	return withHermeticEnv(overrides, async (home) => {
-		const emitted: EmittedEvent[] = [];
-		const hooks = instantiate(emitted, home);
+/** Runs in the replay child. HOME, PATH and flag env were set by replayFixtures before this process started. */
+async function replayInProcess(): Promise<FixtureReplay[]> {
+	const home = process.env.HOME;
+	if (home === undefined || home === "") throw new Error("replay child needs HOME");
+	const emitted: EmittedEvent[] = [];
+	const hooks = instantiate(emitted, home);
+	emitted.length = 0;
+	const replays: FixtureReplay[] = [];
+	for (const file of listFixtureFiles()) {
+		const fixture = loadFixture(file);
 		emitted.length = 0;
-		const replays: FixtureReplay[] = [];
-		for (const file of listFixtureFiles()) {
-			const fixture = loadFixture(file);
-			emitted.length = 0;
-			const before = textOf(fixture.content);
-			const toolCall = await hooks.toolCall({
-				toolName: fixture.toolName,
-				input: structuredClone(fixture.input),
-				cwd: home,
-			});
-			const toolResult = hooks.toolResult({
-				toolName: fixture.toolName,
-				input: structuredClone(fixture.input),
-				isError: fixture.isError === true,
-				content: structuredClone(fixture.content),
-			});
-			hooks.messageEnd({
-				message: {
-					role: "assistant",
-					id: `flags-off-${file}`,
-					usage: { input: estimateTokens(before), output: 0, cacheRead: 0, cacheWrite: 0 },
-				},
-			});
-			// Lets fire-and-forget work (rtk delta refresh) settle before this fixture's events are read.
-			await Bun.sleep(0);
-			replays.push({
-				fixture: file,
-				tokens: { baseline: estimateTokens(before), current: estimateTokens(outputText(toolResult, before)) },
-				toolCall: toolCall ?? null,
-				toolResult: toolResult ?? null,
-				events: [...emitted],
-			});
-		}
-		return replays;
-	});
+		const before = textOf(fixture.content);
+		const toolCall = await hooks.toolCall({
+			toolName: fixture.toolName,
+			input: structuredClone(fixture.input),
+			cwd: home,
+		});
+		const toolResult = hooks.toolResult({
+			toolName: fixture.toolName,
+			input: structuredClone(fixture.input),
+			isError: fixture.isError === true,
+			content: structuredClone(fixture.content),
+		});
+		hooks.messageEnd({
+			message: {
+				role: "assistant",
+				id: `flags-off-${file}`,
+				usage: { input: estimateTokens(before), output: 0, cacheRead: 0, cacheWrite: 0 },
+			},
+		});
+		// Lets fire-and-forget work (rtk delta refresh) settle before this fixture's events are read.
+		await Bun.sleep(0);
+		replays.push({
+			fixture: file,
+			tokens: { baseline: estimateTokens(before), current: estimateTokens(outputText(toolResult, before)) },
+			toolCall: toolCall ?? null,
+			toolResult: toolResult ?? null,
+			events: [...emitted],
+		});
+	}
+	return replays;
 }
 
 /** Stable JSON: sorted keys, two-space indent, trailing newline. Equal replays give equal bytes. */
@@ -264,7 +288,14 @@ async function main(): Promise<void> {
 	);
 }
 
-if (import.meta.main) {
+if (import.meta.main && process.argv.includes(REPLAY_CHILD_ARG)) {
+	replayInProcess()
+		.then((replays) => process.stdout.write(JSON.stringify(replays)))
+		.catch((error: unknown) => {
+			console.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		});
+} else if (import.meta.main) {
 	main().catch((error: unknown) => {
 		console.error(error instanceof Error ? error.message : String(error));
 		process.exitCode = 1;
