@@ -1178,3 +1178,91 @@ A check blocks a merge only once branch protection requires it, which is item SC
 ### Status
 
 The workflows, the gate CLI and `.github/security-policy.json` are part of this phase's change. `semgrep` and `actionlint` are not installed on the host where this section was written, so the Semgrep rule tests, the Semgrep scan and the workflow lint have not run locally; the first run is the CI job. The red PR run and the prerelease tag run have not happened.
+## 20. Policy as code
+
+Phase 75. Policy is Rego under `policy/`, tested with `opa test`, and evaluated by the pinned OPA CLI against the repository and, when asked, against the live response headers. Drift detection is report only. The scope is the enumerated domains: the CI workflows, the web and drift units, and the security headers. Organisation-wide policy (GitHub rulesets, environment protection rules, cloud IAM) is not covered.
+
+### Status
+
+| Item | Status | Prerequisite |
+|---|---|---|
+| OPA pin, `policy/opa-pin.json` | BLOCKED. `version`, `sha256` and `url` are null. | An operator-approved fetch of the OPA release asset `opa_linux_amd64_static` and its published checksum. Verify the checksum before writing the pin. |
+| Rego execution | Not run on the machine where this section was written: `command -v opa` returned nothing. | The pinned binary, or the `policy.yml` CI job. |
+| `policy:check` | Fails closed until the pin is set. It refuses to download and exits 1 with `no verified OPA pin`. | The pin above, or an explicit `OPA_BIN`. |
+| Drift units | Installed by hand and not enabled. | An operator with root on the host. Enabling them is a separate decision, recorded here when made. |
+| Maintenance unit in unit scope | Not in scope. The baseline result is recorded below. | Add it to `unit_scope` in `policy/units.rego` and cover it in `units_test.rego` in the same change, then run the Rego tests in CI. |
+
+### Pinning OPA
+
+1. Choose the OPA release tag. Fetch the asset `opa_linux_amd64_static` and the release's published checksum. Both need operator approval.
+2. Run `sha256sum` on the asset and compare the digest with the published checksum. A mismatch stops the process.
+3. In a reviewed commit, set `version` (the tag), `sha256` (the verified 64-character hex) and `url` (`https://github.com/open-policy-agent/opa/releases/download/<tag>/opa_linux_amd64_static`) in `policy/opa-pin.json`.
+4. Run `bash policy/check.sh`. It downloads the asset again and checks the digest again before it runs the binary.
+
+On a host, the drift unit runs OPA from `OPA_BIN=/opt/ultrathink/bin/opa`. `check.sh` uses an explicit `OPA_BIN` as given, with no download and no digest check. Before installing a binary there, check its digest by hand against the pin:
+
+```
+sha256sum <verified-opa-binary>
+install -m 0755 <verified-opa-binary> /opt/ultrathink/bin/opa
+```
+
+### Running the check
+
+```
+bash policy/check.sh                                  # or: bun run policy:check
+bash policy/check.sh --live http://127.0.0.1:8795/    # also collects the live response headers
+OPA_BIN=/path/to/opa bash policy/check.sh             # explicit binary, no digest check
+bun run policy:collect                                # prints the input document to stdout
+```
+
+`check.sh` runs `opa check --strict` on every `.rego` file, then `opa test` on `policy/`, then evaluates `data.ultrathink.policy.violations` against the collected input. Exit 0 means every step passed and no violation was found. Exit 1 means a step failed, a checksum mismatched, the pin is unset, or violations were found. Exit 2 is a usage or configuration error.
+
+### Installing the drift units (by hand, not enabled)
+
+The drift units follow the convention of section 2 and the header of each file:
+
+```
+install -m 0644 deploy/ultrathink-drift.service deploy/ultrathink-drift.timer /etc/systemd/system/
+systemctl daemon-reload
+```
+
+Do not run `systemctl enable` or `enable --now` on these units until the enablement decision is recorded in this section. A manual run is `systemctl start ultrathink-drift.service`, then `journalctl -u ultrathink-drift -n 50 --no-pager`. While the OPA pin is unset, the unit's second `ExecStart` (`policy/check.sh --live`) fails, and the unit reports failure. That is expected until section "Pinning OPA" is complete.
+
+### Reading the drift report
+
+The unit writes `/var/lib/ultrathink-policy/drift-report.json`, its only write, and the state directory is created by `StateDirectory=`. Each unit is `ok` (byte-identical to the installed copy), `drift`, or `missing`. The report also has the live header result under `live`. `cat /var/lib/ultrathink-policy/drift-report.json` shows the last run. The drift script exits 1 on drift, a missing unit or a failed live check, and it still writes the report.
+
+### Remediation plan (manual, root)
+
+Drift remediation is manual. No unit installs anything (D2). To print the commands that would bring drifted units up to date:
+
+```
+bash /opt/ultrathink/current/deploy/drift-check.sh --unit-dir /opt/ultrathink/current/deploy --install-dir /etc/systemd/system --report /tmp/drift-plan.json --remediation-plan
+```
+
+The output is `install -m 0644 <unit> <install-dir>/` lines and `systemctl daemon-reload`. Missing units are reported, not planned. Review the printed commands, then an operator with root runs them. Automated remediation needs an approval gate, such as a GitHub environment with required reviewers. That is a repository-admin setting and is not configured.
+
+### Compliance report
+
+```
+bun run compliance                                              # Markdown to stdout, --root .
+bun policy/compliance-report.ts --root . --out compliance.md    # Markdown to a file
+bun policy/compliance-report.ts --root <tree> --controls <file> # another controls file
+```
+
+Each control in `policy/controls.json` is `PASS` (all evidence present, no pending reason), `PENDING` (a `pending` reason is set and no evidence is missing) or `FAIL` (an evidence path is missing or is not a regular file). The report records the sha256 of every present evidence file. Exit 0 means no FAIL, 1 means at least one FAIL (the report is still written), and 2 means a usage or schema error (no report). CI appends the report to the job summary. Result when this section was written: 6 PASS, 1 PENDING (`CRYPTO-BACKUP`), 0 FAIL, and the open finding `RET-D7`.
+
+### Open findings
+
+- **RET-D7 (retention).** Live runs are pruned after `ULTRATHINK_RETENTION_DAYS` (default 30). Archives are kept for `ULTRATHINK_BACKUP_KEEP` (default 14) and contain the pruned data. Off-host copies persist until the target's own cleanup removes them. The repository defines no erasure deadline that covers archives. This needs a retention decision from the data owner, then a change to the backup retention settings or to the erasure procedure.
+- **CRYPTO-BACKUP (PENDING).** Phase 74 DR-05 encrypts archives with `age` when a recipient is set. Customer key creation and custody (KMS, HSM or token, key owner, rotation) are not in the repository.
+- **Organisation-wide policy (C1).** GitHub rulesets, environment protection rules and cloud IAM are not in the repository. This needs an org admin export and an owner-provided inventory.
+- **Host runtime evidence (C2).** The drift timer must run on the production host, with a journal that shows a passing run.
+- **Remediation approval gate (C3).** Not configured. See the remediation section above.
+- **Auditor attestation (C5).** Not started. See `docs/ops/compliance-mapping.md` for the prerequisites.
+- **Rego verification.** The Rego rules run only in CI or after the pinned binary is installed.
+
+### Maintenance unit baseline
+
+`deploy/ultrathink-maintenance.service` is not in `unit_scope`. Its baseline was checked when this section was written by evaluating U-R1 to U-R4 against the collector output, using a TypeScript comparison of the same rules, because Rego does not run here. Result: no violations, so the baseline passes. The unit stays out of `unit_scope` in this change because `policy/units.rego` is outside the I1 change set. Adding it is a follow-up change that goes through the Rego tests in CI.
+
