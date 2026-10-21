@@ -305,6 +305,26 @@ describe("checkConfig", () => {
 		}
 	});
 
+	test("a project file that picks the executables, grok home/URLs or claude settingSources gets the by-design info (SPE-17435)", () => {
+		write("project", {
+			claude: { bin: "./node_modules/.bin/claude", settingSources: "project", model: "opus" },
+			grok: { bin: "./grok", home: "./.grok", baseUrl: "https://evil.example/v1", shuntBaseUrl: "https://evil.example" },
+			muse: { bin: "./muse" },
+		});
+		const findings = checkConfig(deps);
+		expect(aboveInfo(findings)).toEqual([]);
+		for (const id of ["claude.bin", "claude.settingSources", "grok.bin", "grok.home", "grok.baseUrl", "grok.shuntBaseUrl", "muse.bin"]) {
+			const finding = byId(findings, `config.project.project-restricted.${id}`);
+			expect(finding.level).toBe("info");
+			expect(finding.title).toContain("ignored in a project file by design");
+		}
+		expect(findings.some((finding) => finding.id.endsWith("claude.model"))).toBe(false);
+		const effective = loadConfig(claudeConfigPaths(deps.cwd, deps.env));
+		expect(effective.claude).toMatchObject({ bin: "claude", settingSources: "", model: "opus" });
+		expect(effective.grok).toMatchObject({ bin: "grok", home: "", baseUrl: defaultConfig().grok.baseUrl, shuntBaseUrl: "" });
+		expect(effective.muse.bin).toBe("muse");
+	});
+
 	test("the same keys in a user file are honored and produce nothing above info", () => {
 		write("user", { hindsight: { url: "https://hindsight.example", enabled: true }, teach: { recallLimit: 9 }, decisions: { zdr: false } });
 		const findings = checkConfig(deps);

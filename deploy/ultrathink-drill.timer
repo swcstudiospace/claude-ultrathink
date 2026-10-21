@@ -1,0 +1,14 @@
+# Installed as /etc/systemd/system/ultrathink-drill.timer. Starts the monthly restore drill; it is not enabled by the
+# release, the operator enables it (systemctl enable --now ultrathink-drill.timer) after the staging drill passes.
+
+[Unit]
+Description=Monthly ultrathink restore drill
+
+[Timer]
+OnCalendar=*-*-01 04:17:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=ultrathink-drill.service
+
+[Install]
+WantedBy=timers.target

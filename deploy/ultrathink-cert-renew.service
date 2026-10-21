@@ -1,0 +1,24 @@
+# Installed as /etc/systemd/system/ultrathink-cert-renew.service and started by ultrathink-cert-renew.timer.
+# Renews the internal TLS leaves (app, edge, ops) that are under 12 h from expiry, then restarts ultrathink-web for a
+# renewed app leaf or reloads nginx for a renewed edge leaf. See deploy/ultrathink-cert-renew.sh.
+# Run by hand: systemctl start ultrathink-cert-renew.service ; journalctl -u ultrathink-cert-renew -n 50 --no-pager
+
+[Unit]
+Description=Renew ultrathink internal TLS leaves that are under 12 h from expiry
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/ultrathink/current/deploy/ultrathink-cert-renew.sh
+
+# The hook writes only the leaf files under /etc/ultrathink/tls. The rest of the filesystem is read-only.
+# /var/log/nginx is writable so that `nginx -t` can open its default error log under ProtectSystem=strict (the
+# leading "-" skips the path when it is absent).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/ultrathink/tls -/var/log/nginx
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-cert-renew

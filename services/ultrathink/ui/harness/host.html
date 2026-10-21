@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>UltraThink graph app harness</title>
+<style>
+	body { margin: 0; padding: 12px 16px 32px; font: 14px/1.4 system-ui, sans-serif; background: Canvas; color: CanvasText; }
+	h1 { margin: 0 0 8px; font-size: 16px; }
+	form, .actions { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: end; margin: 0 0 8px; }
+	label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+	input, select, button { font: inherit; padding: 4px 8px; }
+	input[type="number"] { width: 6em; }
+	#desc { margin: 0 0 8px; opacity: .75; }
+	#stage { padding: 16px; margin: 8px 0; border: 1px dashed #888; overflow-x: auto; }
+	#stage.light { background: #faf9f5; }
+	#stage.dark { background: #262624; }
+	#frame { display: block; border: 0; background: transparent; width: 720px; height: 160px; }
+	#log { max-height: 280px; overflow: auto; margin: 0; padding: 8px; border: 1px solid #888; font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>UltraThink graph app: MCP Apps host harness</h1>
+<form id="controls" method="get">
+	<label>Fixture <select id="f-fixture" name="fixture"></select></label>
+	<label>Theme
+		<select id="f-theme" name="theme">
+			<option value="auto">auto (no host theme)</option>
+			<option value="light">light</option>
+			<option value="dark">dark</option>
+		</select>
+	</label>
+	<label>Display
+		<select id="f-display" name="display">
+			<option value="inline">inline (flexible height)</option>
+			<option value="fullscreen">fullscreen (fixed height)</option>
+		</select>
+	</label>
+	<label>Width px <input id="f-width" name="width" type="number" min="240" max="1600" value="720"></label>
+	<label>ui/message
+		<select id="f-message" name="message"><option value="1">supported</option><option value="0">not supported</option></select>
+	</label>
+	<label>ui/message form
+		<select id="f-msgform" name="msgform"><option value="array">content array</option><option value="object">content object</option></select>
+	</label>
+	<label>tools/call
+		<select id="f-tools" name="tools"><option value="1">supported</option><option value="0">not supported</option></select>
+	</label>
+	<label>Host styles
+		<select id="f-vars" name="vars"><option value="1">variables</option><option value="0">none</option></select>
+	</label>
+	<label>Failing polls <input id="f-fail" name="fail" type="number" min="0" max="40" value="0"></label>
+	<label>Poll delay ms <input id="f-delay" name="delay" type="number" min="0" max="30000" value="500"></label>
+	<label>Safe area px <input id="f-safe" name="safe" type="number" min="0" max="64" value="0"></label>
+	<button type="submit">Load</button>
+</form>
+<p id="desc"></p>
+<div class="actions">
+	<button type="button" id="b-theme">Toggle theme</button>
+	<button type="button" id="b-ping">Ping</button>
+	<button type="button" id="b-cancel">Send tool-cancelled</button>
+	<button type="button" id="b-teardown">Teardown</button>
+</div>
+<div id="stage"><iframe id="frame" title="MCP App view"></iframe></div>
+<pre id="log" aria-label="Message log"></pre>
+<script>
+(function () {
+	"use strict";
+	var params = new URLSearchParams(location.search);
+	function param(name, fallback) { var v = params.get(name); return v === null || v === "" ? fallback : v; }
+	function intParam(name, fallback, min, max) {
+		var n = parseInt(param(name, String(fallback)), 10);
+		if (!isFinite(n)) n = fallback;
+		return Math.min(max, Math.max(min, n));
+	}
+
+	var cfg = {
+		fixture: param("fixture", "diamond"),
+		theme: param("theme", "auto"),
+		display: param("display", "inline") === "fullscreen" ? "fullscreen" : "inline",
+		width: intParam("width", 720, 240, 1600),
+		message: param("message", "1") !== "0",
+		msgform: param("msgform", "array") === "object" ? "object" : "array",
+		tools: param("tools", "1") !== "0",
+		vars: param("vars", "1") !== "0",
+		fail: intParam("fail", 0, 0, 40),
+		delay: intParam("delay", 500, 0, 30000),
+		safe: intParam("safe", 0, 0, 64)
+	};
+	if (cfg.theme !== "light" && cfg.theme !== "dark") cfg.theme = "auto";
+
+	var logEl = document.getElementById("log");
+	var frame = document.getElementById("frame");
+	var stage = document.getElementById("stage");
+	var fx = null;
+	var failLeft = cfg.fail;
+	var hostId = 1000;
+	var waiting = new Map();
+
+	// Everything a driver needs to assert on, readable from the page.
+	var state = {
+		initializeParams: null, initializedAt: 0, ready: false, planned: false, violations: [], sizes: [],
+		messages: [], rejectedMessages: [], polls: [], pollCount: 0, pollIndex: 0, teardownAck: false, pingAck: false, theme: cfg.theme
+	};
+	window.__log = [];
+	window.__state = state;
+
+	function summary(msg) {
+		var s = msg.method ? msg.method : msg.error ? "error " + msg.error.code : "response";
+		if (msg.id !== undefined) s += " #" + msg.id;
+		return s;
+	}
+	function record(dir, msg) {
+		window.__log.push({ dir: dir, t: Math.round(performance.now()), msg: msg });
+		logEl.textContent += (logEl.textContent ? "\n" : "") + dir + " " + summary(msg);
+		logEl.scrollTop = logEl.scrollHeight;
+	}
+	function send(msg) {
+		msg.jsonrpc = "2.0";
+		record("out", msg);
+		// The app runs at an opaque origin (srcdoc + sandbox without allow-same-origin), so only "*" reaches it.
+		frame.contentWindow.postMessage(msg, "*");
+	}
+	function reply(id, result) { send({ id: id, result: result }); }
+	function replyError(id, code, message) { send({ id: id, error: { code: code, message: message } }); }
+	function later(ms, fn) { setTimeout(fn, ms); }
+
+	// ---- host context ------------------------------------------------------------------------------
+	var VARS = {
+		"--color-background-primary": "light-dark(#faf9f5, #262624)",
+		"--color-background-secondary": "light-dark(#f0eee6, #30302e)",
+		"--color-text-primary": "light-dark(#141413, #faf9f5)",
+		"--color-text-secondary": "light-dark(#3d3d3a, #c2c0b6)",
+		"--color-text-tertiary": "light-dark(#6b6a64, #9c9a92)",
+		"--color-text-info": "light-dark(#3266ad, #80aadd)",
+		"--color-text-danger": "light-dark(#7f2c28, #ee8884)",
+		"--color-text-success": "light-dark(#265b19, #7ab948)",
+		"--color-text-warning": "light-dark(#5a4815, #d1a041)",
+		"--color-border-primary": "light-dark(rgba(31,30,29,.4), rgba(222,220,209,.4))",
+		"--font-sans": "system-ui, sans-serif",
+		"--font-mono": "ui-monospace, monospace"
+	};
+	function hostContext() {
+		var c = {
+			displayMode: cfg.display,
+			availableDisplayModes: ["inline", "fullscreen"],
+			containerDimensions: cfg.display === "fullscreen" ? { height: frameHeightFixed(), width: cfg.width } : { maxHeight: 4000, width: cfg.width },
+			locale: "en-US",
+			timeZone: "UTC",
+			platform: "web",
+			userAgent: "ultrathink-harness",
+			toolInfo: { tool: { name: "ultrathink_uplift", inputSchema: { type: "object" } } }
+		};
+		if (state.theme !== "auto") {
+			c.theme = state.theme;
+			if (cfg.vars) c.styles = { variables: VARS };
+		}
+		if (cfg.safe > 0) c.safeAreaInsets = { top: cfg.safe, right: cfg.safe, bottom: cfg.safe, left: cfg.safe };
+		return c;
+	}
+	function hostCapabilities() {
+		var c = { openLinks: {}, serverResources: {}, logging: {}, updateModelContext: { text: {} }, sandbox: { permissions: {}, csp: {} } };
+		if (cfg.tools) c.serverTools = { listChanged: false };
+		if (cfg.message) c.message = { text: {} };
+		return c;
+	}
+	function frameHeightFixed() { return Math.max(320, window.innerHeight - 240); }
+	function applyStage() {
+		stage.className = state.theme === "auto" ? "" : state.theme;
+		frame.style.width = cfg.width + "px";
+		if (cfg.display === "fullscreen") frame.style.height = frameHeightFixed() + "px";
+	}
+
+	// ---- app -> host -----------------------------------------------------------------------------------
+	function onRequest(m) {
+		var p = m.params || {};
+		if (m.method === "ui/initialize") {
+			state.initializeParams = p;
+			reply(m.id, {
+				protocolVersion: "2026-01-26",
+				hostInfo: { name: "ultrathink-harness", version: "1.0.0" },
+				hostCapabilities: hostCapabilities(),
+				hostContext: hostContext()
+			});
+		} else if (m.method === "tools/call") {
+			onToolCall(m, p);
+		} else if (m.method === "ui/message") {
+			// Exactly one content shape is accepted, so both retry paths of the view can be exercised; the other draws -32602.
+			var isArray = Array.isArray(p.content);
+			if (isArray !== (cfg.msgform === "array")) {
+				state.rejectedMessages.push(p);
+				later(100, function () { replyError(m.id, -32602, "Invalid params: content must be " + (cfg.msgform === "array" ? "an array" : "a single object")); });
+				return;
+			}
+			state.messages.push(p);
+			if (param("msgfail", "0") === "1") later(100, function () { replyError(m.id, -32000, "Message sending denied"); });
+			else later(100, function () { reply(m.id, {}); });
+		} else if (m.method === "ping") {
+			reply(m.id, {});
+		} else {
+			replyError(m.id, -32601, "Method not found: " + m.method);
+		}
+	}
+	function onToolCall(m, p) {
+		var args = p.arguments || {};
+		state.polls.push({ name: p.name, arguments: args });
+		state.pollCount++;
+		if (!cfg.tools) { replyError(m.id, -32000, "tools/call is not supported by this host"); return; }
+		if (p.name !== "ultrathink_result") { replyError(m.id, -32602, "Unknown tool: " + p.name); return; }
+		if (failLeft > 0) {
+			failLeft--;
+			later(cfg.delay, function () { replyError(m.id, -32000, "harness: simulated failure"); });
+			return;
+		}
+		var list = fx.polls.length ? fx.polls : [fx.initial];
+		var result = list[Math.min(state.pollIndex, list.length - 1)];
+		state.pollIndex++;
+		later(cfg.delay, function () {
+			reply(m.id, result);
+			if (result.structuredContent && result.structuredContent.status !== "running") state.planned = true;
+		});
+	}
+	function onNotification(m) {
+		var p = m.params || {};
+		if (m.method === "ui/notifications/initialized") {
+			state.initializedAt = Math.round(performance.now());
+			send({ method: "ui/notifications/tool-input", params: { arguments: fx.args } });
+			send({ method: "ui/notifications/tool-result", params: fx.initial });
+			state.ready = true;
+		} else if (m.method === "ui/notifications/size-changed") {
+			state.sizes.push({ width: p.width, height: p.height });
+			if (cfg.display === "inline" && typeof p.height === "number") frame.style.height = Math.ceil(p.height) + "px";
+		}
+	}
+	window.addEventListener("message", function (event) {
+		if (event.source !== frame.contentWindow) return;
+		var m = event.data;
+		if (!m || m.jsonrpc !== "2.0") return;
+		record("in", m);
+		if (!state.initializedAt && m.method !== "ui/initialize" && m.method !== "ui/notifications/initialized") {
+			state.violations.push("message before initialized: " + summary(m));
+		}
+		if (typeof m.method === "string") {
+			if (m.id !== undefined && m.id !== null) onRequest(m); else onNotification(m);
+			return;
+		}
+		var w = waiting.get(m.id);
+		if (w) { waiting.delete(m.id); w(m); }
+	});
+
+	// ---- host -> app controls ---------------------------------------------------------------------------
+	function hostRequest(method, params) {
+		return new Promise(function (resolve) {
+			var id = hostId++;
+			waiting.set(id, resolve);
+			send({ id: id, method: method, params: params });
+		});
+	}
+	var api = {
+		frame: frame,
+		ping: function () { return hostRequest("ping", {}).then(function (m) { state.pingAck = !!m.result; return m; }); },
+		teardown: function () { return hostRequest("ui/resource-teardown", { reason: "harness" }).then(function (m) { state.teardownAck = !!m.result; return m; }); },
+		cancel: function () { send({ method: "ui/notifications/tool-cancelled", params: { reason: "harness cancelled" } }); },
+		setTheme: function (theme) {
+			state.theme = theme;
+			applyStage();
+			var patch = { theme: theme };
+			if (cfg.vars) patch.styles = { variables: VARS };
+			send({ method: "ui/notifications/host-context-changed", params: patch });
+		},
+		setWidth: function (w) {
+			cfg.width = w;
+			applyStage();
+			send({ method: "ui/notifications/host-context-changed", params: { containerDimensions: { maxHeight: 4000, width: w } } });
+		}
+	};
+	window.__host = api;
+
+	document.getElementById("b-ping").addEventListener("click", function () { api.ping(); });
+	document.getElementById("b-teardown").addEventListener("click", function () { api.teardown(); });
+	document.getElementById("b-cancel").addEventListener("click", function () { api.cancel(); });
+	document.getElementById("b-theme").addEventListener("click", function () {
+		api.setTheme(state.theme === "dark" ? "light" : "dark");
+	});
+
+	// ---- start: load the fixture list, fill the form, then mount the app --------------------------------------
+	function setValue(id, value) { document.getElementById(id).value = String(value); }
+	function field(id) { return document.getElementById(id); }
+	function boot(data) {
+		var names = data.names;
+		var select = field("f-fixture");
+		names.forEach(function (name) {
+			var o = document.createElement("option");
+			o.value = name;
+			o.textContent = name;
+			select.appendChild(o);
+		});
+		if (!data.fixtures[cfg.fixture]) cfg.fixture = names[0];
+		fx = data.fixtures[cfg.fixture];
+		setValue("f-fixture", cfg.fixture);
+		setValue("f-theme", cfg.theme);
+		setValue("f-display", cfg.display);
+		setValue("f-width", cfg.width);
+		setValue("f-message", cfg.message ? "1" : "0");
+		setValue("f-msgform", cfg.msgform);
+		setValue("f-tools", cfg.tools ? "1" : "0");
+		setValue("f-vars", cfg.vars ? "1" : "0");
+		setValue("f-fail", cfg.fail);
+		setValue("f-delay", cfg.delay);
+		setValue("f-safe", cfg.safe);
+		document.getElementById("desc").textContent = fx.name + ": " + fx.description;
+		applyStage();
+		// Scripts only, no allow-same-origin: the view runs at an opaque origin as under a real host, so it cannot reach
+		// this page or lift its own sandbox. Loaded as srcdoc because a same-origin src plus allow-scripts would be escapable.
+		frame.setAttribute("sandbox", "allow-scripts");
+		window.fetch("/app.html").then(function (r) { return r.text(); }).then(function (text) { frame.srcdoc = text; }, failLoad("/app.html"));
+	}
+	function failLoad(path) {
+		return function (error) { logEl.textContent = "Could not load " + path + ": " + error; };
+	}
+	// Same-origin requests to the harness itself; the host page is the only thing that may talk to the server.
+	window.fetch("/fixtures.json").then(function (r) { return r.json(); }).then(boot, failLoad("/fixtures.json"));
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Installed as /etc/systemd/system/ultrathink-maintenance.timer.
+# Enable: systemctl enable --now ultrathink-maintenance.timer ; list: systemctl list-timers ultrathink-maintenance
+# Rollback: systemctl disable --now ultrathink-maintenance.timer
+
+[Unit]
+Description=Daily ultrathink backup and state retention
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+# Spread the start so the job does not line up with other daily jobs on the host.
+RandomizedDelaySec=15min
+# A run missed while the host was off happens at the next boot.
+Persistent=true
+Unit=ultrathink-maintenance.service
+
+[Install]
+WantedBy=timers.target

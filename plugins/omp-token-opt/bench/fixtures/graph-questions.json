@@ -1,0 +1,14 @@
+{
+  "questions": [
+    "What does estimateTokens do?",
+    "How does readFlags choose flags?",
+    "Which function runs graphify?",
+    "How does the ledger persist session state?",
+    "What does shrinkToolText remove from tool output?",
+    "How is a long read skimmed before shrink?",
+    "What is the dedupe minimum for tool results?",
+    "How does read_span return archived skim lines?",
+    "What does rewriteWithRtk do with bash commands?",
+    "How is the graph_query tool registered?"
+  ]
+}

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { createRelay, type RelayAuth, runStdioRelay } from "./relay.ts";
 import { createSseParser } from "./sse.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../../services/ultrathink/security/events.ts";
 
 const URL_ = "https://mcp.example.com/mcp";
 
@@ -10,14 +11,25 @@ interface Call {
 	headers: Headers;
 	body: { id?: unknown; method?: string };
 	signal?: AbortSignal;
+	redirect?: RequestInit["redirect"];
 }
 
 function fakeFetch(respond: (call: Call, index: number) => Response): { fetch: typeof fetch; calls: Call[] } {
 	const calls: Call[] = [];
 	const impl = async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
-		const call = { headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)), signal: init?.signal ?? undefined };
+		const call: Call = {
+			headers: new Headers(init?.headers),
+			body: JSON.parse(String(init?.body)),
+			signal: init?.signal ?? undefined,
+			redirect: init?.redirect,
+		};
 		calls.push(call);
-		return respond(call, calls.length - 1);
+		const response = respond(call, calls.length - 1);
+		// As the real fetch does, a redirect is a network error when the caller asked for redirect: "error".
+		if (init?.redirect === "error" && response.status >= 300 && response.status < 400) {
+			throw new TypeError("fetch failed: redirect is not allowed");
+		}
+		return response;
 	};
 	return { fetch: impl as unknown as typeof fetch, calls };
 }
@@ -27,7 +39,11 @@ const json = (value: unknown, headers: Record<string, string> = {}): Response =>
 
 const staticAuth = (header?: string): RelayAuth => ({ header: async () => header, unauthorized: async () => false });
 
-function setup(respond: (call: Call, index: number) => Response, auth: RelayAuth = staticAuth("Bearer t")) {
+function setup(
+	respond: (call: Call, index: number) => Response,
+	auth: RelayAuth = staticAuth("Bearer t"),
+	timeouts: { requestTimeoutMs?: number; reinitTimeoutMs?: number } = {},
+) {
 	const { fetch, calls } = fakeFetch(respond);
 	const lines: string[] = [];
 	const relay = createRelay({
@@ -37,6 +53,7 @@ function setup(respond: (call: Call, index: number) => Response, auth: RelayAuth
 		userAgent: "ua/1",
 		loginHint: "run: login",
 		write: (line) => lines.push(line),
+		...timeouts,
 	});
 	return { relay, calls, lines, out: () => lines.map((line) => JSON.parse(line)) };
 }
@@ -50,6 +67,69 @@ describe("createSseParser", () => {
 		parser.push("\ndata: tail");
 		parser.end();
 		expect(got).toEqual(['{"a":\n1}', "tail"]);
+	});
+
+	test("an unterminated line beyond the cap throws instead of growing the buffer", () => {
+		const parser = createSseParser(() => {}, 8);
+		parser.push("data: ok\n");
+		parser.push("data: 12");
+		expect(() => parser.push("3")).toThrow("SSE line too long");
+	});
+
+	test("an event whose data outgrows the cap is refused, even when each line is short", () => {
+		const parser = createSseParser(() => {}, 8);
+		parser.push("data: 1234\n");
+		expect(() => parser.push("data: 5678\n")).toThrow("SSE event too large");
+	});
+
+	test("an event whose data is exactly the cap is delivered", () => {
+		const got: string[] = [];
+		const parser = createSseParser((data) => got.push(data), 8);
+		parser.push("data:12\ndata:34\ndata:56\n\n");
+		expect(got).toEqual(["12\n34\n56"]);
+	});
+
+	test("a non-string chunk and an oversized line are refused before any event is dispatched, and each refusal is logged", () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const got: string[] = [];
+			const parser = createSseParser((data) => got.push(data), 8);
+			// The parser is typed for strings. A runtime caller can still pass bytes, and those are refused.
+			expect(() => parser.push(new TextEncoder().encode("data: 1\n\n") as unknown as string)).toThrow(TypeError);
+			expect(() => parser.push("x".repeat(9))).toThrow("SSE line too long");
+			expect(got).toEqual([]);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_sse", resource: "sse", details: { field: "chunk", code: "TYPE_MISMATCH" } },
+				{ source: "mcp_sse", resource: "sse", details: { field: "line", code: "TOO_LONG" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});
+
+describe("createRelay redirects", () => {
+	test("every POST refuses redirects, including the retry after a 401", async () => {
+		const auth: RelayAuth = { header: async () => "Bearer t", unauthorized: async () => true };
+		const { relay, calls, out } = setup(
+			(_call, index) => (index === 0 ? new Response("", { status: 401 }) : json({ jsonrpc: "2.0", id: 1, result: {} })),
+			auth,
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "a" });
+		expect(calls.map((call) => call.redirect)).toEqual(["error", "error"]);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, result: {} }]);
+	});
+
+	test("a refused redirect is one transport error, and the POST is not repeated", async () => {
+		const { relay, calls, out } = setup(
+			() => new Response(null, { status: 302, headers: { location: "https://elsewhere.example.com/mcp" } }),
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 2, method: "a" });
+		expect(calls).toHaveLength(1);
+		expect(out()).toHaveLength(1);
+		expect(out()[0]).toHaveProperty("error");
 	});
 });
 
@@ -136,7 +216,7 @@ describe("createRelay", () => {
 		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, result: {} }]);
 	});
 
-	test("caller signal reaches every fetch for the message, including the 401 retry, but not the shared re-initialize", async () => {
+	test("caller signal reaches every fetch for the message, including the 401 retry, but the shared re-initialize has its own budget", async () => {
 		let token = "Bearer old";
 		const auth: RelayAuth = {
 			header: async () => token,
@@ -162,7 +242,7 @@ describe("createRelay", () => {
 		expect(toolCalls.every((call) => call.signal === controller.signal)).toBe(true);
 		const reinit = calls.slice(1).filter((call) => call.body.method !== "tools/call");
 		expect(reinit.map((call) => call.body.method)).toEqual(["initialize", "notifications/initialized"]);
-		expect(reinit.every((call) => call.signal === undefined)).toBe(true);
+		expect(reinit.every((call) => call.signal !== undefined && call.signal !== controller.signal)).toBe(true);
 	});
 
 	test("401 twice yields -32001 with login hint; notification writes nothing", async () => {
@@ -301,6 +381,78 @@ describe("createRelay", () => {
 		expect(lines.map((line) => JSON.parse(line).id).sort()).toEqual([0, 1, 2, 3]);
 	});
 
+	test("re-initialize whose upstream never closes the stream fails within its own budget", async () => {
+		let cancelled = false;
+		const { relay, out } = setup(
+			(call, index) => {
+				if (index === 0) return json({ jsonrpc: "2.0", id: 0, result: {} }, { "mcp-session-id": "s1" });
+				if (call.body.method === "initialize") {
+					const stream = new ReadableStream<Uint8Array>({
+						pull: () => new Promise<void>(() => {}),
+						cancel() {
+							cancelled = true;
+						},
+					});
+					return new Response(stream, { headers: { "content-type": "text/event-stream", "mcp-session-id": "s2" } });
+				}
+				return new Response("gone", { status: 404 });
+			},
+			staticAuth("Bearer t"),
+			{ reinitTimeoutMs: 50 },
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} });
+		const started = Date.now();
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/list" }, AbortSignal.timeout(5000));
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(cancelled).toBe(true);
+		expect(out()).toEqual([
+			{ jsonrpc: "2.0", id: 0, result: {} },
+			{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream HTTP 404" } },
+		]);
+	});
+
+	test("a request without a caller signal gives up on a stalled upstream after the default budget", async () => {
+		let cancelled = false;
+		const { relay, out } = setup(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull: () => new Promise<void>(() => {}),
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+			staticAuth("Bearer t"),
+			{ requestTimeoutMs: 50 },
+		);
+		const started = Date.now();
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/call" });
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(cancelled).toBe(true);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream unreachable" } }]);
+	});
+
+	test("a JSON response larger than the cap is refused without buffering it", async () => {
+		let pulled = 0;
+		const { relay, out } = setup(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulled++;
+							controller.enqueue(new Uint8Array(1024 * 1024).fill(32));
+						},
+					}),
+					{ headers: { "content-type": "application/json" } },
+				),
+		);
+		await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/call" });
+		expect(pulled).toBeLessThan(20);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "upstream unreachable" } }]);
+	});
+
 	test("SSE without the response yields -32000 after forwarded notifications", async () => {
 		const body = 'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":4}}\n\n';
 		const { relay, out } = setup(() => new Response(body, { headers: { "content-type": "text/event-stream" } }));
@@ -341,5 +493,95 @@ describe("runStdioRelay", () => {
 		const lines: string[] = [];
 		await runStdioRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h" }, input, (line) => lines.push(line));
 		expect(lines.map((line) => JSON.parse(line).id).sort()).toEqual([1, 2]);
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused stdin", () => {
+	test("a message the envelope rules refuse never reaches the upstream, and each refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const { fetch, calls } = fakeFetch((call) => json({ jsonrpc: "2.0", id: call.body.id, result: {} }));
+			const written: string[] = [];
+			const relay = createRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h", write: (line) => written.push(line) });
+			// A control character in the method is refused whole: it is answered with an error and nothing is posted.
+			await relay.handle({ jsonrpc: "2.0", id: 1, method: "tools/list\u0007" });
+			expect(calls).toHaveLength(0);
+			expect(written.map((line) => JSON.parse(line))).toEqual([{ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "invalid request" } }]);
+
+			// A line past the cap arrives in two chunks. It is refused once, its tail is discarded, and the next line still relays.
+			const encoder = new TextEncoder();
+			const oversized = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: { pad: "x".repeat(120) } });
+			const good = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+			const input = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(oversized.slice(0, 100)));
+					controller.enqueue(encoder.encode(`${oversized.slice(100)}\n${good}\n`));
+					controller.close();
+				},
+			});
+			const lines: string[] = [];
+			await runStdioRelay({ url: URL_, auth: staticAuth(), fetch, userAgent: "ua", loginHint: "h", maxLineChars: 80 }, input, (line) => lines.push(line));
+			expect(lines.map((line) => JSON.parse(line))).toEqual([
+				{ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } },
+				{ jsonrpc: "2.0", id: 3, result: {} },
+			]);
+			expect(calls.map((call) => call.body.id)).toEqual([3]);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_relay", resource: "message", details: { field: "method", code: "PATTERN_MISMATCH" } },
+				{ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "TOO_LONG" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});
+
+describe("envelope answers and batches", () => {
+	test("a notification is forwarded and never answered", async () => {
+		const { relay, calls, out } = setup(() => new Response(null, { status: 202 }));
+		await relay.handle({ jsonrpc: "2.0", method: "notifications/initialized" });
+		expect(calls.map((call) => call.body.method)).toEqual(["notifications/initialized"]);
+		expect(out()).toEqual([]);
+	});
+
+	test("a response, with a result or an error, is forwarded and never answered", async () => {
+		const { relay, calls, out } = setup(() => new Response(null, { status: 202 }));
+		await relay.handle({ jsonrpc: "2.0", id: 7, result: {} });
+		await relay.handle({ jsonrpc: "2.0", id: 8, error: { code: -1, message: "x" } });
+		expect(calls).toHaveLength(2);
+		expect(out()).toEqual([]);
+	});
+
+	test("a message with an id and no method is answered -32600 with that id and never forwarded", async () => {
+		const { relay, calls, out } = setup(() => json({ jsonrpc: "2.0", id: 0, result: {} }));
+		await relay.handle({ jsonrpc: "2.0", id: 7 });
+		expect(calls).toHaveLength(0);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 7, error: { code: -32600, message: "invalid request" } }]);
+	});
+
+	test("a batch with one invalid item forwards the valid ping and answers the invalid one with -32600 and a null id", async () => {
+		const { relay, calls, out } = setup(() => json([{ jsonrpc: "2.0", id: 1, result: {} }]));
+		await relay.handle([{ jsonrpc: "2.0", id: 1, method: "ping" }, 42]);
+		expect(calls).toHaveLength(1);
+		const forwarded: unknown = calls[0]?.body;
+		expect(forwarded).toEqual([{ jsonrpc: "2.0", id: 1, method: "ping" }]);
+		expect(out()).toEqual([
+			{ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } },
+			{ jsonrpc: "2.0", id: 1, result: {} },
+		]);
 	});
 });

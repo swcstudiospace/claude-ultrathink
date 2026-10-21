@@ -1,0 +1,68 @@
+# Installed as /etc/systemd/system/ultrathink-drift.service and started by ultrathink-drift.timer.
+# Daily and report only. It compares each installed ultrathink unit with deploy/ by sha256, then probes the live security
+# headers on the loopback listener over TLS, with the probe identity. It writes /var/lib/ultrathink-policy/drift-report.json and changes nothing else.
+# Run by hand: systemctl start ultrathink-drift.service ; journalctl -u ultrathink-drift -n 50 --no-pager
+# Read the last report: cat /var/lib/ultrathink-policy/drift-report.json
+# Remediation is manual. Print the install commands for drifted units with:
+#   bash /opt/ultrathink/current/deploy/drift-check.sh --unit-dir /opt/ultrathink/current/deploy --install-dir /etc/systemd/system --report /tmp/drift-plan.json --remediation-plan
+# An operator with root runs the printed commands. This unit never installs anything.
+#
+# The drift check exits 1 when a unit has drifted. The "-" prefix on its ExecStart keeps the live probe running on those
+# days, so the runtime evidence is still recorded. The drift itself stays visible in the report and in the journal (one
+# status line per unit). The live probe is what fails this unit.
+
+[Unit]
+Description=Ultrathink drift detection and live security header probe
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=ultrathink
+Group=ultrathink
+WorkingDirectory=/opt/ultrathink/current
+# Bun and some libraries read $HOME. ProtectHome hides /home and /root, so point it inside the state dir.
+Environment=HOME=/var/lib/ultrathink-policy
+# check.sh runs bun (/opt/ultrathink/bin/bun) to collect the policy input. OPA is the binary pinned in opa-pin.json.
+Environment=PATH=/opt/ultrathink/bin:/usr/local/bin:/usr/bin:/bin
+# The live probe is TLS only, and the listener accepts only the probe identity (the ops leaf, runbook section 17). systemd
+# reads those files as root and gives the unit copies under %d, so the unit user needs no access to /etc/ultrathink/tls
+# private keys.
+LoadCredential=ca.pem:/etc/ultrathink/tls/ca.pem
+LoadCredential=probe-cert.pem:/etc/ultrathink/tls/ops/cert.pem
+LoadCredential=probe-key.pem:/etc/ultrathink/tls/ops/key.pem
+ExecStart=-/usr/bin/bash /opt/ultrathink/current/deploy/drift-check.sh --unit-dir /opt/ultrathink/current/deploy --install-dir /etc/systemd/system --report /var/lib/ultrathink-policy/drift-report.json
+ExecStart=/usr/bin/bash /opt/ultrathink/current/policy/check.sh --live https://127.0.0.1:8795/ --live-ca %d/ca.pem --live-cert %d/probe-cert.pem --live-key %d/probe-key.pem
+
+# State: /var/lib/ultrathink-policy holds the report and the HOME directory. Only this unit writes it.
+StateDirectory=ultrathink-policy
+StateDirectoryMode=0700
+UMask=0077
+
+# Same sandbox as ultrathink-web.service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-drift

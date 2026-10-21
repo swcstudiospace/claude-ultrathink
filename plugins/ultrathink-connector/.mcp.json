@@ -1,0 +1,8 @@
+{
+	"mcpServers": {
+		"ultrathink": {
+			"type": "http",
+			"url": "https://ultrathink.swcstudio.space/mcp"
+		}
+	}
+}
