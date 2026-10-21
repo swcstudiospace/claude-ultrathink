@@ -280,12 +280,12 @@ dr_timing() {
 	printf 'step %s %sms\n' "$1" "$((now - $2))"
 }
 
-# dr_free_bytes DIR: bytes available to unprivileged users on the filesystem holding DIR (df -P -B1, field 4).
+# dr_free_bytes DIR: bytes available to unprivileged users on the filesystem holding DIR. It reads df -P -k, which is POSIX on GNU and BSD, where field 4 counts 1024-byte blocks.
 dr_free_bytes() {
 	local out _fs _total _used avail _rest
-	out="$(df -P -B1 -- "$1")" || return 1
+	out="$(df -P -k -- "$1")" || return 1
 	read -r _fs _total _used avail _rest <<<"$(printf '%s\n' "$out" | tail -n 1)"
-	printf '%s\n' "$avail"
+	printf '%s\n' "$((avail * 1024))"
 }
 
 # dr_snapshot_cli CMD ARGS...: runs store/snapshots-cli.ts. Names for pick, plan and next are read from stdin.
