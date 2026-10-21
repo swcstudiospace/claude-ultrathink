@@ -463,6 +463,23 @@ def state_path(session_id: str, env: dict[str, str] | None = None) -> Path:
 	return state_dir(env) / "sessions" / f"{safe_session_id(session_id)}.json"
 
 
+def legacy_state_path(session_id: str, env: dict[str, str] | None = None) -> Path:
+	"""Where earlier builds wrote a session's record: its id with characters a file name cannot hold replaced by `_`, case kept."""
+	legacy = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120] or "unknown"
+	return state_dir(env) / "sessions" / f"{legacy}.json"
+
+
+def session_record_path(session_id: str, env: dict[str, str] | None = None) -> Path:
+	"""The file holding this session's record, as src/claude/state.ts sessionRecordPath picks it: the current name, or the
+	earlier name when only that file exists and its stored sessionId is this id."""
+	current = state_path(session_id, env)
+	legacy = legacy_state_path(session_id, env)
+	if current.exists() or legacy == current or not legacy.exists():
+		return current
+	record = _read_record(legacy)
+	return legacy if record is not None and record.get("sessionId") == session_id else current
+
+
 def _is_planning_path(path: str) -> bool:
 	norm = path.replace("\\", "/").rstrip("/")
 	return norm == ".planning" or norm.endswith("/.planning") or "/.planning/" in norm
@@ -530,8 +547,10 @@ def _pr_event(payload: dict[str, Any], env: dict[str, str] | None) -> tuple[str,
 	if opened is None:
 		return None
 	session_id, url, by_child = opened
-	path = state_path(session_id, env)
+	path = session_record_path(session_id, env)
 	record = _read_record(path)
+	if record is not None and record.get("sessionId") != session_id:
+		record = None
 	if record is None or not isinstance(record.get("plan"), dict):
 		return None
 	graph_id = str(record["plan"].get("graphId") or "")
@@ -628,8 +647,10 @@ def sync_nudge(payload: dict[str, Any], env: dict[str, str] | None = None) -> di
 	session_id = str(payload.get("session_id") or "").strip()
 	if not session_id or payload.get("attempt"):
 		return None
-	path = state_path(session_id, env)
+	path = session_record_path(session_id, env)
 	record = _read_record(path)
+	if record is not None and record.get("sessionId") != session_id:
+		record = None
 	if record is None or record.get("synced") is True:
 		return None
 	plan_record = record.get("plan")

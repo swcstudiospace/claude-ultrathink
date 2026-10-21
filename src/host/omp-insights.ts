@@ -12,7 +12,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { readSession, sessionPath } from "../claude/state.ts";
+import { readSession, sessionRecordPath } from "../claude/state.ts";
 import { decisionsKilled } from "../decisions/gate.ts";
 import {
 	DECISION_POINTS,
@@ -452,7 +452,7 @@ export async function readInsightSnapshot(scope: InsightScope, ctx: TeachContext
 	// Jev: current-session envelope only.
 	let decisions: InsightDecision[] = [];
 	try {
-		if (!existsSync(sessionPath(scope.stateDir, scope.sessionId))) {
+		if (!existsSync(sessionRecordPath(scope.stateDir, scope.sessionId))) {
 			limitations.push(
 				"No saved Jev decisions for this session (no saved plan was found). This view reads the latest saved plan, not a complete history.",
 			);

@@ -11,7 +11,7 @@
 import { claudeConfigPaths, loadConfig } from "../src/config.ts";
 import { isChildInvocation } from "../src/claude/complete.ts";
 import { runPromptSubmit, type PromptSubmitInput } from "../src/claude/hook.ts";
-import { defaultStateDir, hostSessionId, readControl, sessionPath } from "../src/claude/state.ts";
+import { defaultStateDir, hostSessionId, readControl, readSkipOnce, sessionPath } from "../src/claude/state.ts";
 import { recentConversationFromTranscript } from "../src/claude/transcript.ts";
 import { parseUltrathinkCommand, runControl, takeSessionFlag, trackingEnabled, trackingOff } from "../src/uplift/commands.ts";
 import { planningTarget } from "../src/uplift/skill.ts";
@@ -109,6 +109,9 @@ async function main(): Promise<void> {
 	}
 	const config = loadConfig(claudeConfigPaths(cwd));
 	const state = readControl(stateDir);
+	// Read before the engine wait: a /ultrathink-skip typed while the engine is selected is for this session's next prompt.
+	const hookSession = hostSessionId(raw.session_id);
+	const armedSkip = hookSession !== undefined && readSkipOnce(stateDir, hookSession);
 	// Legacy route evidence only when the host's own envelope carries it (blank means unknown); nothing is read from a
 	// transcript (AD-4). selectEngine reads a session model for Hermes `auto` routing only, so other routes are unchanged.
 	const sessionModel = typeof envelope.model === "string" && envelope.model.trim() ? envelope.model.trim() : undefined;
@@ -134,6 +137,7 @@ async function main(): Promise<void> {
 		engineError: engine.error,
 		modelResolution: engine.resolution,
 		stateDir,
+		armedSkip,
 		surface: host,
 		conversation: recentConversationFromTranscript,
 		log,

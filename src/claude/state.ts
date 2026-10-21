@@ -160,6 +160,30 @@ export function sessionPath(dir: string, sessionId: string): string {
 	return join(dir, "sessions", `${safeSessionId(sessionId)}.json`);
 }
 
+/**
+ * Where earlier builds wrote this id's record: the id with characters a file name cannot hold replaced by `_`, its case
+ * kept. Only read as a fallback; a record found there is used only when its stored sessionId is this id, since on a
+ * case-insensitive file system `Claude-A.json` is also `claude-a.json`.
+ */
+export function legacySessionPath(dir: string, sessionId: string): string {
+	return join(dir, "sessions", `${sessionId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "unknown"}.json`);
+}
+
+/**
+ * The file that holds this session's record: its current name, or the earlier name when only that file exists and names
+ * this id. Otherwise the current name, which may not exist yet.
+ */
+export function sessionRecordPath(dir: string, sessionId: string): string {
+	const current = sessionPath(dir, sessionId);
+	if (existsSync(current)) return current;
+	const legacy = legacySessionPath(dir, sessionId);
+	if (legacy !== current && existsSync(legacy)) {
+		const raw = readJson(legacy) as { sessionId?: unknown } | undefined;
+		if (raw && typeof raw === "object" && raw.sessionId === sessionId) return legacy;
+	}
+	return current;
+}
+
 /** A fresh id for a turn whose host gave no session id: unique to that prompt, so no turn reads or writes another's state. */
 export function newTurnSessionId(): string {
 	return `turn-${randomUUID()}`;
@@ -197,10 +221,11 @@ export function clearSkipOnce(dir: string, sessionId: string): void {
 }
 
 export function readSession(dir: string, sessionId: string): SessionRecord | undefined {
-	const raw = readJson(sessionPath(dir, sessionId));
+	const raw = readJson(sessionRecordPath(dir, sessionId));
 	if (!raw || typeof raw !== "object") return undefined;
 	const rec = raw as Partial<SessionRecord>;
-	if (!rec.result || typeof rec.result !== "object") return undefined;
+	// A file names its session: on a case-insensitive file system another id's record can share this file's name.
+	if (rec.sessionId !== sessionId || !rec.result || typeof rec.result !== "object") return undefined;
 	return rec as SessionRecord;
 }
 

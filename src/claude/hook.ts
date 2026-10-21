@@ -73,8 +73,8 @@ export interface HookDeps {
 	modelResolution?: ModelResolution;
 	stateDir: string;
 	/**
-	 * The armed /ultrathink-skip of this session, when the caller already read it (planPrompt does, before its engine wait).
-	 * Given, the hook neither reads nor consumes the flag: the caller owns it. Absent, the hook reads and consumes it.
+	 * The session's armed /ultrathink-skip as the caller read it, before any engine wait (the Claude/Grok/Muse hook and
+	 * planPrompt both do). Absent, the hook reads it at its own start. Either way, a prompt skipped by it clears the flag.
 	 */
 	armedSkip?: boolean;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
@@ -449,9 +449,9 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	const cwd = input.cwd?.trim() || process.cwd();
 	const sessionId = hostSessionId(input.session_id) ?? newTurnSessionId();
 
-	// The armed skip belongs to this session alone; the global control file never carries one. A caller that read it already
-	// decided this prompt on what it saw, so a skip armed since then waits for the session's next prompt.
-	const callerOwnsSkip = deps.armedSkip !== undefined;
+	// The armed skip belongs to this session alone; the global control file never carries one. A caller that read it before
+	// an engine wait passes that value, so a skip armed during the wait waits for this session's next prompt. The prompt
+	// that consumes the flag clears it here.
 	const skipArmed = deps.armedSkip ?? readSkipOnce(deps.stateDir, sessionId);
 	const state: UpliftState = {
 		enabled: deps.control.enabled ?? deps.config.uplift.enabled,
@@ -459,7 +459,7 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 		skipTrivial: deps.config.uplift.skipTrivial,
 	};
 	const decision = decideUplift({ text: input.prompt ?? "", source: "user", idle: true }, state);
-	if (!callerOwnsSkip && skipArmed && !state.skipOnce) {
+	if (skipArmed && !state.skipOnce) {
 		try {
 			clearSkipOnce(deps.stateDir, sessionId);
 		} catch {

@@ -72,8 +72,8 @@ describe("writePlanCarrier", () => {
 	});
 });
 
-describe("uplift hook on Grok", () => {
-	function runHook(envelope: Record<string, unknown>): string {
+describe("uplift hook on Grok, Claude and Muse", () => {
+	function runHook(envelope: Record<string, unknown>, host = "grok-build"): string {
 		const home = join(dir, "home");
 		mkdirSync(home, { recursive: true });
 		const env: Record<string, string | undefined> = {};
@@ -82,7 +82,7 @@ describe("uplift hook on Grok", () => {
 		}
 		const proc = Bun.spawnSync([process.execPath, HOOK], {
 			cwd: dir,
-			env: { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ULTRATHINK_HOST: "grok-build", ULTRATHINK_STATE_DIR: stateDir },
+			env: { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ULTRATHINK_HOST: host, ULTRATHINK_STATE_DIR: stateDir },
 			stdin: Buffer.from(JSON.stringify({ hookEventName: "user_prompt_submit", cwd: dir, ...envelope })),
 			stdout: "pipe",
 			stderr: "pipe",
@@ -143,6 +143,17 @@ describe("uplift hook on Grok", () => {
 		expect(proc.stdout.toString()).toContain("Prompt Uplift will skip the next prompt in this session");
 		expect(readSkipOnce(stateDir, "Ctl-S1")).toBe(true);
 		expect(readSkipOnce(stateDir, "ctl-s1")).toBe(false);
+	});
+
+	test("the normal command branch arms the session its session_id names on every host that routes through this hook; without one it refuses", () => {
+		for (const host of ["claude-code", "muse", "grok-build"]) {
+			const sessionId = `${host}-Sess`;
+			const output = JSON.parse(runHook({ session_id: sessionId, prompt: "/ultrathink-skip" }, host));
+			expect(output).toMatchObject({ decision: "block", reason: "Prompt Uplift will skip the next prompt in this session" });
+			expect(readSkipOnce(stateDir, sessionId)).toBe(true);
+		}
+		const refused = JSON.parse(runHook({ prompt: "/ultrathink-skip" }, "claude-code"));
+		expect(refused.reason).toContain("needs a session id");
 	});
 });
 

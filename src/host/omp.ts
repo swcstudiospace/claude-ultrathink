@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import type { Api, AssistantMessage, Context, Effort, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { resolvePstack } from "../cursor/pstack.ts";
 import type { ClaudeCompleter } from "../claude/complete.ts";
-import { type ControlState, readControl, readSession, type SessionRecord, sessionPath, updateSession } from "../claude/state.ts";
+import { type ControlState, readControl, readSession, type SessionRecord, sessionRecordPath, updateSession } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig, normalizeSelectorField } from "../config.ts";
 import type { LegacyModelProvenance, UltrathinkConfig } from "../config.ts";
 import { DEFAULT_GROK_CONFIG } from "../grok/types.ts";
@@ -1376,7 +1376,7 @@ export function createOmpExtension(
 				pi.sendMessage(
 					{
 						customType: SYNC_TYPE,
-						content: `Ultrathink: a pull request was opened for the tracked task (${pr.url}). Invoke the ultrathink-sync skill now with stateFile=${sessionPath(dir, sessionId)} and prUrl=${pr.url} (graphId=${tracked.graphId}), so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues.`,
+						content: `Ultrathink: a pull request was opened for the tracked task (${pr.url}). Invoke the ultrathink-sync skill now with stateFile=${sessionRecordPath(dir, sessionId)} and prUrl=${pr.url} (graphId=${tracked.graphId}), so the tracked Notion Task row and Linear issues get the PR URL/number/branch and status. ultrathink-sync only updates existing rows; do not create new Notion rows or Linear issues.`,
 						display: true,
 						details: pr,
 						attribution: "agent",
@@ -1422,7 +1422,7 @@ export function createOmpExtension(
 				const config = options.shipConfig ? options.shipConfig(cwd) : loadConfig(claudeConfigPaths(cwd)).ship;
 				if (!shipApplies(config, record.skill?.name)) return;
 				const precheck = (options.shipPrecheck ?? shipPrecheck)(cwd);
-				const statePath = sessionPath(dir, sessionId);
+				const statePath = sessionRecordPath(dir, sessionId);
 				const nudge = shipNudge({ record, config, precheck, statePath });
 				if (!nudge) return;
 				nudgedGraphs.add(graphId);

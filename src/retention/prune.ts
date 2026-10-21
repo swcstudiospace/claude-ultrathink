@@ -10,7 +10,7 @@
 import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join } from "node:path";
 import { removeDeadLockCandidate, withFileLock, withLockMutation } from "../claude/atomic.ts";
-import { lastLockHeld, sessionPath } from "../claude/state.ts";
+import { lastLockHeld, legacySessionPath, sessionPath } from "../claude/state.ts";
 import { carrierPath } from "../host/carrier.ts";
 
 const DAY_MS = 86_400_000;
@@ -258,6 +258,34 @@ function readRecord(path: string): Record<string, unknown> | undefined {
 	}
 }
 
+/**
+ * Removes armed `/ultrathink-skip` flags nobody consumed: a flag older than the cutoff whose session is not protected and
+ * whose record is gone or older than the cutoff. A flag armed just now is kept even when its session has no record yet.
+ * A `.skip` file never belongs to a session group, so without this sweep abandoned flags would accumulate.
+ */
+function sweepSkipFlags(sweep: Sweep, stateDir: string, dir: string, names: string[], olderThanMs: number): void {
+	const keep = protectedStems(stateDir);
+	const suffix = ".skip";
+	for (const name of names) {
+		if (!name.endsWith(suffix) || name.length === suffix.length) continue;
+		const stem = name.slice(0, -suffix.length);
+		const path = join(dir, name);
+		const flag = statEntry(sweep, path, name);
+		if (!flag?.isFile() || sweep.now - flag.mtimeMs <= olderThanMs || keep.has(stem)) continue;
+		let recordNewest: number | undefined;
+		for (const extension of [".json", ".xml"]) {
+			const record = statEntry(sweep, join(dir, `${stem}${extension}`), `${stem}${extension}`);
+			if (record?.isFile()) recordNewest = Math.max(recordNewest ?? 0, record.mtimeMs);
+		}
+		if (recordNewest !== undefined && sweep.now - recordNewest <= olderThanMs) continue;
+		const current = statEntry(sweep, path, name);
+		if (!current?.isFile() || sweep.now - current.mtimeMs <= olderThanMs) continue;
+		if (!removeFile(sweep, path, name)) continue;
+		sweep.result.orphans.push({ name, bytes: current.size });
+		sweep.result.bytes += current.size;
+	}
+}
+
 /** A ship with a PR that has neither merged nor been given up on: its record is still being written. */
 function hasActiveShip(record: Record<string, unknown>): boolean {
 	const ship = record.ship;
@@ -280,6 +308,7 @@ function protectedStems(stateDir: string): Set<string> {
 		if (!record) continue;
 		if (typeof record.sessionId === "string" && record.sessionId) {
 			stems.add(basename(sessionPath(stateDir, record.sessionId), ".json"));
+			stems.add(basename(legacySessionPath(stateDir, record.sessionId), ".json"));
 		}
 		addPath(record.specPath);
 		addPath(record.statePath);
@@ -417,6 +446,7 @@ export function pruneSessions(options: PruneOptions): PruneResult {
 			: listEntries(sweep, sessionsDir, "sessions");
 		sweepOrphans(sweep, sessionsDir, names);
 		sweepSessions(sweep, options.stateDir, sessionsDir, names, options.olderThanMs);
+		sweepSkipFlags(sweep, options.stateDir, sessionsDir, names, options.olderThanMs);
 		if (bounded && !dryRun && names.length > 0) {
 			const last = names[names.length - 1];
 			if (last !== undefined) writeCursor(options.stateDir, last);

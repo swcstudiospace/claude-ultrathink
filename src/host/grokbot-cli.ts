@@ -16,7 +16,7 @@ import { runTeachCommand } from "../teach/cli.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
 import { workflowWaves } from "../think/graph.ts";
-import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionRecordPath, type SessionRecord } from "../claude/state.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../uplift/prompt.ts";
 import { runControl, takeSessionFlag, trackingOff } from "../uplift/commands.ts";
 import {
@@ -80,7 +80,7 @@ function session(args: string[]): string {
 }
 
 function statePathFor(stateDir: string, sessionId: string): string {
-	return sessionPath(stateDir, sessionId);
+	return sessionRecordPath(stateDir, sessionId);
 }
 
 function readRecord(stateDir: string, sessionId: string): { record: SessionRecord; path: string } {

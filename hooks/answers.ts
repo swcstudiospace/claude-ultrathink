@@ -9,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { writeFileAtomic } from "../src/claude/atomic.ts";
 import { isChildInvocation } from "../src/claude/complete.ts";
-import { defaultStateDir, sessionPath, updateSession } from "../src/claude/state.ts";
+import { defaultStateDir, sessionRecordPath, updateSession } from "../src/claude/state.ts";
 import { parseEnvelope } from "../src/host/envelope.ts";
 import { applyAnswers, type AskUserQuestionInput, type AskUserQuestionResponse } from "../src/hitl/answers.ts";
 import { injectClarificationsXml } from "../src/hitl/format.ts";
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
 	if (input.tool_name !== "AskUserQuestion" || !input.session_id) return;
 
 	const stateDir = defaultStateDir();
-	const xmlPath = sessionPath(stateDir, input.session_id).replace(/\.json$/, ".xml");
+	const xmlPath = sessionRecordPath(stateDir, input.session_id).replace(/\.json$/, ".xml");
 	let matched: Clarification[] = [];
 	// One locked read-apply-write, so a concurrent writer of this session record (ship, kickoff marks) is not overwritten.
 	const updated = updateSession(stateDir, input.session_id, (record) => {

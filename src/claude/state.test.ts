@@ -11,11 +11,13 @@ import type { ModelResolution } from "../host/engine.ts";
 import {
 	controlPath,
 	defaultStateDir,
+	legacySessionPath,
 	readControl,
 	readLast,
 	readSession,
 	type SessionRecord,
 	sessionPath,
+	sessionRecordPath,
 	updateSession,
 	writeControl,
 	writeSession,
@@ -83,6 +85,24 @@ describe("session records", () => {
 		expect(readSession(dir, "abc/../evil")).toEqual(record);
 		expect(readLast(dir)).toEqual(record);
 		expect(readSession(dir, "nope")).toBeUndefined();
+	});
+
+	test("a record saved under the earlier file name is read back for its own id; a file naming another id is not", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		const saved = { sessionId: "Claude-A", at: 1, result: { xml: "<X/>", original: "old answers", root: "X", source: "llm" as const } };
+		writeFileSync(legacySessionPath(dir, "Claude-A"), JSON.stringify(saved));
+		expect(legacySessionPath(dir, "Claude-A")).not.toBe(sessionPath(dir, "Claude-A"));
+		expect(sessionRecordPath(dir, "Claude-A")).toBe(legacySessionPath(dir, "Claude-A"));
+		expect(readSession(dir, "Claude-A")).toEqual(saved);
+		// On a case-insensitive file system the earlier name of `claude-a` is the same file, but it records another id.
+		writeFileSync(legacySessionPath(dir, "claude-a"), JSON.stringify({ ...saved, sessionId: "Claude-A" }));
+		expect(readSession(dir, "claude-a")).toBeUndefined();
+		// A replan writes the current name, and from then on that record is the one read.
+		const replanned = { ...saved, at: 2 };
+		writeSession(dir, replanned);
+		expect(sessionRecordPath(dir, "Claude-A")).toBe(sessionPath(dir, "Claude-A"));
+		expect(readSession(dir, "Claude-A")).toEqual(replanned);
 	});
 
 	test("round-trips a record carrying a track plan and kickoff/sync flags", () => {

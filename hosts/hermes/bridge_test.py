@@ -984,6 +984,19 @@ def test_control_forwards_the_session_to_skip_and_status_only():
 	assert bridge.safe_session_id("a/b") != bridge.safe_session_id("a_b")
 
 
+def test_a_record_saved_under_the_earlier_file_name_is_found_for_its_own_id():
+	with tempfile.TemporaryDirectory() as tmp:
+		env = {"ULTRATHINK_STATE_DIR": tmp}
+		sessions = Path(tmp) / "sessions"
+		sessions.mkdir(parents=True)
+		(sessions / "Claude-A.json").write_text(json.dumps({"sessionId": "Claude-A", "plan": {"graphId": "g1"}, "result": {}}))
+		assert bridge.session_record_path("Claude-A", env) == sessions / "Claude-A.json"
+		assert bridge._read_record(bridge.session_record_path("Claude-A", env))["plan"]["graphId"] == "g1"
+		# On a case-insensitive file system `claude-a.json` is the same file; it records another id, so it is not read for this one.
+		(sessions / "claude-a.json").write_text(json.dumps({"sessionId": "Claude-A", "plan": {}}))
+		assert bridge.session_record_path("claude-a", env) == bridge.state_path("claude-a", env)
+
+
 def test_quick_sends_the_message_once_without_a_plan():
 	with tempfile.TemporaryDirectory() as tmp:
 		engine = {"BUN": str(fake_bun(Path(tmp) / "bun"))}
@@ -1674,6 +1687,7 @@ if __name__ == "__main__":
 	test_control_commands_run_the_cli_as_hermes_and_return_its_text()
 	test_control_failures_come_back_as_one_line()
 	test_control_forwards_the_session_to_skip_and_status_only()
+	test_a_record_saved_under_the_earlier_file_name_is_found_for_its_own_id()
 	test_quick_sends_the_message_once_without_a_plan()
 	test_quick_skips_the_next_message_where_hermes_cannot_send_it()
 	test_registers_the_teach_hooks_tools_commands_and_skill_next_to_the_old_ones()

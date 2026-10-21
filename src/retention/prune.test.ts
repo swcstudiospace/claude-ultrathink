@@ -159,6 +159,35 @@ describe("pruneSessions", () => {
 		expect(result.kept).toBe(1);
 	});
 
+	test("a record saved under an earlier file name is kept while last.json points at its session", () => {
+		const state = makeState();
+		seed(state, "Claude-A", 300);
+		writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "Claude-A", result: {} }));
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.pruned).toEqual([]);
+		expect(sessionFiles(state)).toEqual(["Claude-A.json", "Claude-A.xml"]);
+	});
+
+	test("an abandoned skip flag goes once its record is gone or old; a fresh flag, a fresh record or a protected session keeps it", () => {
+		const state = makeState();
+		put(join(state, "sessions", "gone.skip"), "skip\n", 60 * DAY);
+		put(join(state, "sessions", "stale.skip"), "skip\n", 60 * DAY);
+		seed(state, "stale", 60);
+		put(join(state, "sessions", "fresh.skip"), "skip\n", 1 * DAY);
+		put(join(state, "sessions", "busy.skip"), "skip\n", 60 * DAY);
+		seed(state, "busy", 1);
+		put(join(state, "sessions", "pinned.skip"), "skip\n", 60 * DAY);
+		writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "pinned", result: {} }));
+		const dry = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, dryRun: true, now });
+		expect(dry.orphans.map((orphan) => orphan.name).sort()).toEqual(["gone.skip", "stale.skip"]);
+		expect(existsSync(join(state, "sessions", "gone.skip"))).toBe(true);
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.errors).toEqual([]);
+		expect(result.orphans.map((orphan) => orphan.name).sort()).toEqual(["gone.skip", "stale.skip"]);
+		expect(result.bytes).toBeGreaterThan(0);
+		expect(sessionFiles(state)).toEqual(["busy.json", "busy.skip", "busy.xml", "fresh.skip", "pinned.skip"]);
+	});
+
 	test("never follows or removes a symlink", () => {
 		const state = makeState();
 		const outside = makeState();

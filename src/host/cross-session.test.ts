@@ -294,6 +294,30 @@ describe("per-session /ultrathink-skip", () => {
 		expect(readSkipOnce(deps.stateDir, "desk-other")).toBe(false);
 		expect(readSkipOnce(deps.stateDir, "desk-20261020-1200-slug")).toBe(true);
 	});
+
+	test("a skip read before an engine wait is consumed by the prompt that read it, and cleared with it", async () => {
+		const deps = baseDeps();
+		expect(await runControl(["skip"], { stateDir: deps.stateDir, cwd: "/repo", sessionId: "W2" })).toContain("will skip");
+		const readBeforeWait = readSkipOnce(deps.stateDir, "W2");
+		expect(readBeforeWait).toBe(true);
+		const skipped = await runPromptSubmit({ session_id: "W2", cwd: "/repo", prompt: "add a widget" }, { ...deps, armedSkip: readBeforeWait });
+		expect(skipped.skipped).toBe("skip");
+		expect(readSkipOnce(deps.stateDir, "W2")).toBe(false);
+	});
+
+	test("a skip armed after the caller read the flag waits for the session's next prompt", async () => {
+		const deps = baseDeps();
+		// The caller read the flag (clear), then /ultrathink-skip is typed while the engine is being selected.
+		const readBeforeWait = readSkipOnce(deps.stateDir, "W1");
+		expect(readBeforeWait).toBe(false);
+		expect(await runControl(["skip"], { stateDir: deps.stateDir, cwd: "/repo", sessionId: "W1" })).toContain("will skip");
+		const during = await runPromptSubmit({ session_id: "W1", cwd: "/repo", prompt: "add a widget" }, { ...deps, armedSkip: readBeforeWait });
+		expect(during.skipped).toBeUndefined();
+		expect(readSkipOnce(deps.stateDir, "W1")).toBe(true);
+		const next = await runPromptSubmit({ session_id: "W1", cwd: "/repo", prompt: "add a button" }, deps);
+		expect(next.skipped).toBe("skip");
+		expect(readSkipOnce(deps.stateDir, "W1")).toBe(false);
+	});
 });
 
 describe("blank session ids", () => {
