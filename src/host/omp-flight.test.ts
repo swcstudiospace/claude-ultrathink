@@ -42,6 +42,24 @@ describe("flight lifecycle (D-12)", () => {
 		expect(planner.runs[0]?.signal.aborted).toBe(false);
 	});
 
+	test("an activity card is delivered nextTurn with triggerTurn false, so it never steers a running turn or starts one; the aside still carries the plan", async () => {
+		// Default delivery (no deliverAs) calls agent.steer while the session streams, which injects into the running turn.
+		let progress: ((event: ProgressEvent) => void) | undefined;
+		const gate = Promise.withResolvers<string>();
+		const { run, sent } = setup((_request, _signal, onEvent) => {
+			progress = onEvent;
+			return gate.promise;
+		}, 1);
+		expect(await run()).toEqual(PENDING_RESULT);
+		progress?.({ type: "activity", at: 2, notice: { v: 1, kind: "resource", title: "RAGFlow", source: "ragflow", outcome: "none", count: 0 } });
+		gate.resolve("PLAN");
+		await flush();
+		expect(sent).toEqual([
+			{ message: expect.objectContaining({ customType: "ultrathink-activity" }), options: { deliverAs: "nextTurn", triggerTurn: false } },
+			aside("PLAN"),
+		]);
+	});
+
 	test("the deadline releases a deferred prompt even when the native completer never settles", async () => {
 		const live = fakeModel("acme", "sol-1");
 		const { runtime } = fakeRuntime([live]);

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
-import { ACTIVITY_TYPE, INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SWARM_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { ACTIVITY_DELIVERY, ACTIVITY_TYPE, INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SWARM_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
 import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightDecision, type InsightSnapshot } from "./omp-insights.ts";
 import type { PlanView } from "./view.ts";
@@ -981,6 +981,10 @@ describe("activity card", () => {
 		const rows = renderActivity({ content: "ignored", details }, { expanded }, theme)?.render(width) ?? [];
 		return { rows, plain: rows.map((row) => Bun.stripANSI(row)).join("\n") };
 	};
+
+	test("cards are delivered nextTurn with triggerTurn false, so they never steer a streaming turn or start one", () => {
+		expect(ACTIVITY_DELIVERY).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
+	});
 
 	test("each kind names its header, and expanded renders the same bounded rows", () => {
 		const recall = { v: 1, kind: "teachable-recalled", title: "ignored title", source: "hindsight", outcome: "used", count: 2, names: ["Retry fetch", "Pin the lockfile"] };
