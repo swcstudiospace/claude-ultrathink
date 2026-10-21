@@ -53,7 +53,8 @@ violations contains {"rule": "U-R2", "file": file, "detail": "Service.SystemCall
 }
 
 # U-R3: RestrictAddressFamilies is a whitespace-separated list, so each token is checked. A line such as
-# "AF_INET AF_NETLINK" is caught. An empty entry resets the list to unrestricted, and the empty token is rejected.
+# "AF_INET AF_NETLINK" is caught. An empty entry resets the list to unrestricted, and the empty token is rejected. An
+# absent directive is rejected too: the list defaults to empty, and an empty list would pass.
 allowed_address_families := {"AF_INET", "AF_INET6", "AF_UNIX"}
 
 violations contains {"rule": "U-R3", "file": file, "detail": sprintf("Service.RestrictAddressFamilies token %s is not allowed", [family])} if {
@@ -61,6 +62,11 @@ violations contains {"rule": "U-R3", "file": file, "detail": sprintf("Service.Re
 	some entry in object.get(scope_service(file), "RestrictAddressFamilies", [])
 	some family in regex.split(`\s+`, trim_space(entry))
 	not family in allowed_address_families
+}
+
+violations contains {"rule": "U-R3", "file": file, "detail": "Service.RestrictAddressFamilies must be set"} if {
+	some file in unit_scope
+	not "RestrictAddressFamilies" in object.keys(scope_service(file))
 }
 
 # U-R4: User is present and is not root. Numeric uid 0 is root as well. Every entry is checked, so a repeated key

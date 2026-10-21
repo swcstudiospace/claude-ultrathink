@@ -109,6 +109,14 @@ test_u_r3_empty_entry_fails if {
 	unit_summary(vs) == {["U-R3", web_file]}
 }
 
+test_u_r3_missing_directive_fails if {
+	# With the directive removed, the service is unrestricted; the absent list must not pass as an empty one.
+	web := object.remove(hardened_service, ["RestrictAddressFamilies"])
+	inp := units_input(web, hardened_service)
+	vs := violations with input as inp
+	unit_summary(vs) == {["U-R3", web_file]}
+}
+
 # U-R4
 
 test_u_r4_root_user_fails if {
