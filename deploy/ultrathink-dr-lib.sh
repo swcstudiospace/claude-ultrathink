@@ -90,72 +90,78 @@ function quick(path) {
 	}
 }
 
+// bun -e on Bun 1.2 exits 0 when bun:sqlite throws synchronously, so every failure here is reported and exits 1.
 const action = process.env.UT_ACTION;
-if (action === "copy") {
-	const src = process.env.UT_SRC;
-	const dst = process.env.UT_DST;
-	const db = new Database(src);
-	try {
-		db.run("PRAGMA busy_timeout = 10000");
-		db.run("VACUUM INTO \u0027" + dst.replaceAll("\u0027", "\u0027\u0027") + "\u0027");
-	} finally {
-		db.close();
-	}
-	console.log("sqlite copy ok, integrity ok, tables: " + check(dst));
-} else if (action === "prune-db") {
-	// Child tables are found through foreign keys by the store module, so the schema is not duplicated here.
-	(async () => {
-		const { pruneRuns } = await import(process.env.UT_RETENTION_MODULE);
-		const cutoffMs = Date.now() - Number(process.env.UT_RETENTION_DAYS) * 86400000;
-		if (!Number.isFinite(cutoffMs)) throw new Error("bad retention window");
-		const db = new Database(process.env.UT_SRC);
+try {
+	if (action === "copy") {
+		const src = process.env.UT_SRC;
+		const dst = process.env.UT_DST;
+		const db = new Database(src);
 		try {
-			db.run("PRAGMA busy_timeout = 5000");
-			const result = pruneRuns(db, { cutoffMs, today: new Date().toISOString().slice(0, 10) });
-			console.log("database retention: removed " + result.runs + " runs, " + (result.rows.token_ledger ?? 0) + " ledger rows");
+			db.run("PRAGMA busy_timeout = 10000");
+			db.run("VACUUM INTO \u0027" + dst.replaceAll("\u0027", "\u0027\u0027") + "\u0027");
 		} finally {
 			db.close();
 		}
-	})().catch((error) => {
-		console.error(String(error && error.message ? error.message : error));
-		process.exit(1);
-	});
-} else if (action === "check") {
-	console.log("sqlite integrity ok, tables: " + check(process.env.UT_SRC));
-} else if (action === "quick") {
-	quick(process.env.UT_SRC);
-	console.log("sqlite quick ok");
-} else if (action === "compat") {
-	// The live file is never migrated: a scratch copy is opened with the openStore of this release, then removed.
-	(async () => {
-		const { openStore } = await import(process.env.UT_STORE_MODULE);
-		const { mkdtempSync, rmSync } = require("node:fs");
-		const { tmpdir } = require("node:os");
-		const { join } = require("node:path");
-		const scratch = mkdtempSync(join(tmpdir(), "ut-compat-"));
-		try {
-			const copy = join(scratch, "ultrathink.sqlite");
+		console.log("sqlite copy ok, integrity ok, tables: " + check(dst));
+	} else if (action === "prune-db") {
+		// Child tables are found through foreign keys by the store module, so the schema is not duplicated here.
+		(async () => {
+			const { pruneRuns } = await import(process.env.UT_RETENTION_MODULE);
+			const cutoffMs = Date.now() - Number(process.env.UT_RETENTION_DAYS) * 86400000;
+			if (!Number.isFinite(cutoffMs)) throw new Error("bad retention window");
 			const db = new Database(process.env.UT_SRC);
 			try {
-				db.run("PRAGMA busy_timeout = 10000");
-				db.run("VACUUM INTO \u0027" + copy.replaceAll("\u0027", "\u0027\u0027") + "\u0027");
+				db.run("PRAGMA busy_timeout = 5000");
+				const result = pruneRuns(db, { cutoffMs, today: new Date().toISOString().slice(0, 10) });
+				console.log("database retention: removed " + result.runs + " runs, " + (result.rows.token_ledger ?? 0) + " ledger rows");
 			} finally {
 				db.close();
 			}
-			openStore(copy).close();
-		} finally {
-			rmSync(scratch, { recursive: true, force: true });
-		}
-		console.log("compat ok");
-	})().catch((error) => {
-		console.error(String(error && error.message ? error.message : error));
-		process.exit(1);
-	});
-} else if (action === "json") {
-	JSON.parse(readFileSync(process.env.UT_SRC, "utf8"));
-	console.log("json ok");
-} else {
-	throw new Error("unknown action");
+		})().catch((error) => {
+			console.error(String(error && error.message ? error.message : error));
+			process.exit(1);
+		});
+	} else if (action === "check") {
+		console.log("sqlite integrity ok, tables: " + check(process.env.UT_SRC));
+	} else if (action === "quick") {
+		quick(process.env.UT_SRC);
+		console.log("sqlite quick ok");
+	} else if (action === "compat") {
+		// The live file is never migrated: a scratch copy is opened with the openStore of this release, then removed.
+		(async () => {
+			const { openStore } = await import(process.env.UT_STORE_MODULE);
+			const { mkdtempSync, rmSync } = require("node:fs");
+			const { tmpdir } = require("node:os");
+			const { join } = require("node:path");
+			const scratch = mkdtempSync(join(tmpdir(), "ut-compat-"));
+			try {
+				const copy = join(scratch, "ultrathink.sqlite");
+				const db = new Database(process.env.UT_SRC);
+				try {
+					db.run("PRAGMA busy_timeout = 10000");
+					db.run("VACUUM INTO \u0027" + copy.replaceAll("\u0027", "\u0027\u0027") + "\u0027");
+				} finally {
+					db.close();
+				}
+				openStore(copy).close();
+			} finally {
+				rmSync(scratch, { recursive: true, force: true });
+			}
+			console.log("compat ok");
+		})().catch((error) => {
+			console.error(String(error && error.message ? error.message : error));
+			process.exit(1);
+		});
+	} else if (action === "json") {
+		JSON.parse(readFileSync(process.env.UT_SRC, "utf8"));
+		console.log("json ok");
+	} else {
+		throw new Error("unknown action");
+	}
+} catch (error) {
+	console.error(String(error && error.message ? error.message : error));
+	process.exit(1);
 }
 '
 
