@@ -406,14 +406,19 @@ resume_units() {
 	RESUME_TIMERS=0
 }
 
-# sealed_names DIR: bare names of the sealed audit segments (audit-<first>-<last>.jsonl) in DIR, the pattern the backup
-# and snapshot scripts use. Regular files only.
+# is_sealed_name NAME: true for a sealed audit segment name (audit-<first>-<last>.jsonl), the pattern the backup and
+# snapshot scripts use.
+is_sealed_name() {
+	[[ "$1" =~ ^audit-[1-9][0-9]*-[1-9][0-9]*\.jsonl$ ]]
+}
+
+# sealed_names DIR: bare names of the sealed audit segments in DIR. Regular files only.
 sealed_names() {
 	local dir="$1" path name
 	for path in "$dir"/audit-*.jsonl; do
 		[ -f "$path" ] || continue
 		name="${path##*/}"
-		if [[ "$name" =~ ^audit-[1-9][0-9]*-[1-9][0-9]*\.jsonl$ ]]; then
+		if is_sealed_name "$name"; then
 			printf '%s\n' "$name"
 		fi
 	done
@@ -470,6 +475,9 @@ place_files() {
 		if [ -d "$STATE_DIR/$name" ]; then
 			find "$STATE_DIR/$name" -type d -exec chmod 0700 {} + || return 1
 			find "$STATE_DIR/$name" -type f -exec chmod 0600 {} + || return 1
+		elif is_sealed_name "$name"; then
+			# The log leaves sealed segments read-only; a full restore keeps that mode rather than the 0600 of the rest.
+			chmod 0400 -- "$STATE_DIR/$name" || return 1
 		else
 			chmod 0600 -- "$STATE_DIR/$name" || return 1
 		fi

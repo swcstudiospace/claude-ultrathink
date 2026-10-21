@@ -306,7 +306,8 @@ function readyProbe(s: Scenario): string {
 	return `file://${path}`;
 }
 
-describe("restore", () => {
+// The restore, drill and timer suites run the host script, which needs GNU tools and systemd. They run on Linux only, as the backup and snapshot suites do.
+describe.skipIf(process.platform !== "linux")("restore", () => {
 	test(
 		"refuses while ultrathink-web is active: exit 1, nothing moved, timers untouched",
 		() => {
@@ -390,6 +391,9 @@ describe("restore", () => {
 			expect(r.code).toBe(0);
 			for (const { name, text } of expected) {
 				expect(readFileSync(join(s.state, name), "utf8")).toBe(text);
+			}
+			for (const { name } of expected.filter(({ name }) => SEALED_RE.test(name))) {
+				expect(statSync(join(s.state, name)).mode & 0o777).toBe(0o400);
 			}
 			expect(existsSync(join(s.state, "audit-1-2.jsonl"))).toBe(false);
 			expect(readFileSync(join(preRestoreDir(s), "audit-1-2.jsonl"), "utf8")).toBe("stale host segment");
@@ -557,7 +561,7 @@ describe("restore", () => {
 	);
 });
 
-describe("drill", () => {
+describe.skipIf(process.platform !== "linux")("drill", () => {
 	test(
 		"a good ring snapshot passes the local leg, reports the off-host leg as SKIPPED, and removes its scratch",
 		() => {
@@ -624,7 +628,7 @@ describe("drill", () => {
 	);
 });
 
-describe("restore timers and readiness probe", () => {
+describe.skipIf(process.platform !== "linux")("restore timers and readiness probe", () => {
 	test(
 		"a host where the snapshot timer was inactive leaves it inactive: never started, stopped or enabled",
 		() => {
