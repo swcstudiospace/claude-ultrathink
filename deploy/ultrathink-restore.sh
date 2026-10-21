@@ -113,6 +113,33 @@ validate_iso() {
 	[[ "$1" =~ $ISO_UTC_RE ]] || dr_config_error "--at needs an ISO-8601 UTC time such as 2026-10-20T12:00:00Z"
 }
 
+# iso_to_ms ISO: prints the epoch milliseconds of a UTC time that validate_iso accepted. Shell arithmetic, not date -d:
+# BSD date (macOS) has neither -d nor %N, so the same --at must pick the same snapshot on both platforms.
+iso_to_ms() {
+	local s="$1" y m d H M S frac="" frac3 era yoe mp doy doe days secs
+	s="${s%Z}"
+	s="${s%+00:00}"
+	y="${s:0:4}"
+	m="${s:5:2}"
+	d="${s:8:2}"
+	H="${s:11:2}"
+	M="${s:14:2}"
+	S="${s:17:2}"
+	if [ "${s:19:1}" = "." ]; then frac="${s:20}"; fi
+	frac3="${frac}000"
+	frac3="${frac3:0:3}"
+	y=$((10#$y)); m=$((10#$m)); d=$((10#$d))
+	if [ "$m" -le 2 ]; then y=$((y - 1)); fi
+	if [ "$y" -ge 0 ]; then era=$((y / 400)); else era=$(((y - 399) / 400)); fi
+	yoe=$((y - era * 400))
+	if [ "$m" -gt 2 ]; then mp=$((m - 3)); else mp=$((m + 9)); fi
+	doy=$(((153 * mp + 2) / 5 + d - 1))
+	doe=$((yoe * 365 + yoe / 4 - yoe / 100 + doy))
+	days=$((era * 146097 + doe - 719468))
+	secs=$((days * 86400 + 10#$H * 3600 + 10#$M * 60 + 10#$S))
+	printf '%s\n' $((secs * 1000 + 10#$frac3))
+}
+
 validate_snapshot_name() {
 	case "$1" in */*) dr_config_error "--snapshot takes a file name, not a path" ;; esac
 	case "$1" in
@@ -183,7 +210,7 @@ list_named_files() {
 # Ring file names, newest first, one per line. Only regular files: tree directories and dot entries are not snapshots.
 ring_names() {
 	if [ -d "$SNAPSHOT_DIR" ]; then
-		list_named_files "$SNAPSHOT_DIR" 'ultrathink-*.sqlite' | cut -f1 | sort -r
+		list_named_files "$SNAPSHOT_DIR" 'ultrathink-*.sqlite' | cut -f1 | LC_ALL=C sort -r
 	fi
 }
 
@@ -227,7 +254,7 @@ select_source() {
 		[ -f "$SNAPSHOT_DIR/$name" ] || die "snapshot not found: $SNAPSHOT_DIR/$name"
 	else
 		if [ -n "$AT" ]; then
-			target="$(date -u -d "$AT" +%s%3N)" || die "cannot read --at $AT"
+			target="$(iso_to_ms "$AT")" || die "cannot read --at $AT"
 		else
 			target="$(dr_now_ms)"
 		fi
@@ -513,7 +540,7 @@ offhost_candidates() {
 # Runs in a subshell. Every step returns explicitly: a subshell inside `if` does not inherit set -e.
 offhost_leg() {
 	local work="$1" newest db top
-	newest="$(offhost_candidates | sort | tail -n 1 | cut -f2)"
+	newest="$(offhost_candidates | LC_ALL=C sort | tail -n 1 | cut -f2)"
 	if [ -z "$newest" ]; then
 		warn "no off-host copy in $BACKUP_DIR or $SNAPSHOT_DIR/.offhost"
 		return 1

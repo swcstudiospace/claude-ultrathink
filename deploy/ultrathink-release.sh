@@ -416,7 +416,7 @@ do_status() {
 	printf 'previous: %s\n' "$(previous_target || true)"
 	if [ -d "$RELEASES" ]; then
 		printf 'releases:\n'
-		find "$RELEASES" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do printf '  %s\n' "${dir##*/}"; done | sort -r
+		find "$RELEASES" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do printf '  %s\n' "${dir##*/}"; done | LC_ALL=C sort -r
 	fi
 }
 
