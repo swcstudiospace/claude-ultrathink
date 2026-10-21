@@ -25,6 +25,7 @@ export interface CreateTrackingDeps {
 	/** Notion data source uuid, without the `collection://` prefix; unset = Notion not configured, like `linearTeam`. */
 	notionDataSource?: string;
 	concurrency: number;
+	/** Whole creation budget in ms; 0 = no limit (no abort timer is created). */
 	budgetMs: number;
 	now?: () => number;
 	log?: (message: string) => void;
@@ -311,7 +312,7 @@ export async function createTracking(
 	if (refs.notion.taskUrl === undefined) delete refs.notion.taskUrl;
 	const controller = new AbortController();
 	const signal = controller.signal;
-	const timer = setTimeout(() => controller.abort(), Math.max(0, deps.budgetMs));
+	const timer = deps.budgetMs > 0 ? setTimeout(() => controller.abort(), deps.budgetMs) : undefined;
 	const emit = (error?: string) => {
 		if (!deps.progress) return;
 		try {

@@ -270,6 +270,25 @@ describe("createTracking", () => {
 		expect(refs.errors.some((error) => error.includes("budget exhausted"))).toBe(true);
 	});
 
+	test("budgetMs 0 means no limit: a slow client still completes every row without a budget error", async () => {
+		const fast = fakeLinear();
+		const linear: ToolCaller = {
+			async call(name, args, signal) {
+				// Real delay on purpose: the abort timer under test is a real setTimeout, which fake timers would not exercise.
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 40);
+				await promise;
+				return fast.call(name, args, signal);
+			},
+		};
+		const refs = await createTracking(makePlan(), GRAPH, undefined, deps({ linear, notion: fakeNotion(), budgetMs: 0 }));
+		expect(refs.status).toBe("complete");
+		expect(refs.errors).toEqual([]);
+		expect(Object.keys(refs.linear.nodes).sort()).toEqual(["n1", "n2", "n3"]);
+		expect(Object.keys(refs.linear.steps)).toHaveLength(6);
+		expect(Object.keys(refs.notion.steps)).toHaveLength(6);
+	});
+
 	test("Notion page URLs map to the right node and step keys with parent relations", async () => {
 		const notion = fakeNotion();
 		const refs = await createTracking(makePlan(), GRAPH, undefined, deps({ linear: fakeLinear(), notion, concurrency: 1 }));

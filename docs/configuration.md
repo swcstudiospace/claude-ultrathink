@@ -495,7 +495,7 @@ All keys are optional; write only the ones you change. This file shows every key
   "models": { "hosts": {}, "providerDefaults": {} },
   "notion": { "dataSourceUrl": "collection://<data source id>" },
   "linear": { "team": "<your Linear team>" },
-  "track": { "enabled": true, "budgetMs": 60000, "concurrency": 6 },
+  "track": { "enabled": true, "budgetMs": 0, "concurrency": 6 },
   "ship": {
     "enabled": false,
     "autoMerge": false,

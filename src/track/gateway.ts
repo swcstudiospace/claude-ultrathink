@@ -32,10 +32,11 @@ export function createGatewayTracker(
 		if (signal?.aborted) return undefined;
 		const clientDeps = { storePath: deps.storePath ?? defaultStorePath(), fetch: deps.fetch };
 		const clients: McpClient[] = [];
-		// Credential resolution can wait on the store lock and a token refresh; bound it by
-		// the same budget and the caller's signal so the prompt never waits past the budget.
+		// Credential resolution can wait on the store lock and a token refresh; bound it by the
+		// budget (none when `track.budgetMs` is 0) and the caller's signal so a set budget is never exceeded.
 		const stop = Promise.withResolvers<"stop">();
-		const timer = setTimeout(() => stop.resolve("stop"), config.track.budgetMs);
+		const budgetMs = config.track.budgetMs;
+		const timer = budgetMs > 0 ? setTimeout(() => stop.resolve("stop"), budgetMs) : undefined;
 		const onAbort = () => stop.resolve("stop");
 		signal?.addEventListener("abort", onAbort, { once: true });
 		const startedAt = Date.now();
@@ -48,8 +49,9 @@ export function createGatewayTracker(
 				stop.promise,
 			]);
 			if (auth === "stop" || signal?.aborted) return undefined;
-			const remainingMs = config.track.budgetMs - (Date.now() - startedAt);
-			if (remainingMs <= 0) return undefined;
+			// 0 means no limit: createTracking receives 0 and creates no abort timer.
+			const remainingMs = budgetMs > 0 ? budgetMs - (Date.now() - startedAt) : 0;
+			if (budgetMs > 0 && remainingMs <= 0) return undefined;
 			const [linearAuth, notionAuth] = auth;
 			if (linearAuth === undefined && notionAuth === undefined) return undefined;
 			const linear = linearAuth === undefined ? undefined : createMcpClient("linear", clientDeps);

@@ -178,7 +178,7 @@ describe("mergeConfig", () => {
 
 describe("track config", () => {
 	test("defaults", () => {
-		expect(defaultConfig().track).toEqual({ enabled: true, budgetMs: 60_000, concurrency: 6 });
+		expect(defaultConfig().track).toEqual({ enabled: true, budgetMs: 0, concurrency: 6 });
 	});
 
 	test("accepts valid overrides and rejects invalid values", () => {
@@ -188,8 +188,20 @@ describe("track config", () => {
 			budgetMs: 5000,
 			concurrency: 2,
 		});
-		expect(mergeConfig({ track: { enabled: "no", budgetMs: 0, concurrency: 0 } }, base).track).toEqual(base.track);
-		expect(mergeConfig({ track: { budgetMs: -1, concurrency: Number.NaN } }, base).track).toEqual(base.track);
+		expect(mergeConfig({ track: { enabled: "no", concurrency: 0 } }, base).track).toEqual(base.track);
+	});
+
+	test("an explicit budgetMs of 0 is accepted and means no limit, even over a set budget", () => {
+		const bounded = mergeConfig({ track: { budgetMs: 5000 } }, defaultConfig());
+		expect(bounded.track.budgetMs).toBe(5000);
+		expect(mergeConfig({ track: { budgetMs: 0 } }, bounded).track.budgetMs).toBe(0);
+	});
+
+	test("a negative or non-finite budgetMs falls back to the default", () => {
+		const bounded = mergeConfig({ track: { budgetMs: 5000 } }, defaultConfig());
+		expect(mergeConfig({ track: { budgetMs: -1 } }, defaultConfig()).track.budgetMs).toBe(0);
+		expect(mergeConfig({ track: { budgetMs: -1 } }, bounded).track.budgetMs).toBe(5000);
+		expect(mergeConfig({ track: { budgetMs: Number.NaN, concurrency: Number.NaN } }, defaultConfig()).track).toEqual(defaultConfig().track);
 	});
 });
 

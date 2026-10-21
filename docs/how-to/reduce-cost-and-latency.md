@@ -93,7 +93,7 @@ Tracking creates the Linear and Notion rows before the agent sees the plan, so i
 
 | Key | Default | Effect |
 |---|---|---|
-| `track.budgetMs` | `60000` | Longest the planner spends creating rows. Rows it did not finish are left to the `ultrathink-kickoff` skill, which the agent runs. |
+| `track.budgetMs` | `0` | Longest the planner spends creating rows; `0` means no limit. Rows it did not finish are left to the `ultrathink-kickoff` skill, which the agent runs. |
 | `track.concurrency` | `6` | Tracker calls at once. |
 | `track.enabled` | `true` | `false`, or `ULTRATHINK_TRACK=0`, stops the planner creating rows. The kickoff skill still creates them in the agent's turn, which costs agent tokens instead. |
 | `/ultrathink-track off` | | Stops all row creation for this host, the kickoff skill included. |

@@ -120,4 +120,26 @@ describe("createGatewayTracker", () => {
 		hang.resolve(new Response("{}", { status: 500 }));
 		await resolveAuthHeader("notion", { storePath: path, fetch: fakeFetch }).catch(() => undefined);
 	});
+
+	test("budgetMs 0 means no limit: a slow auth refresh is not cut and tracking proceeds", async () => {
+		writeStore(path, { version: 1, providers: { notion: expiredOauth("https://mcp.notion.com", Date.now()) } });
+		const urls: string[] = [];
+		const fakeFetch = (async (input: string | URL | Request) => {
+			const url = String(input);
+			urls.push(url);
+			if (!url.endsWith("/token")) return new Response("{}", { status: 500 });
+			// Real delay on purpose: the auth wait races a real setTimeout, which the budget-0 path must not arm.
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 80);
+			await promise;
+			return new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 });
+		}) as typeof fetch;
+		const config = configured({ dataSourceUrl: "collection://ds" });
+		config.track.budgetMs = 0;
+		const tracker = createGatewayTracker(config, { storePath: path, fetch: fakeFetch })!;
+		const emptyPlan: TrackPlan = { ...plan, issues: [], subIssues: [], linearIssues: [], linearSubIssues: [] };
+		const result = await tracker({ plan: emptyPlan });
+		expect(urls).toContain("https://mcp.notion.com/token");
+		expect(result).toBeDefined();
+	});
 });

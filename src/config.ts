@@ -75,7 +75,7 @@ export const DEFAULT_LINEAR_CONFIG: LinearConfig = {
 export interface TrackConfig {
 	/** Create Linear/Notion rows from the hook before the agent sees the prompt. */
 	enabled: boolean;
-	/** Whole tracker-creation budget in ms. */
+	/** Whole tracker-creation budget in ms. 0 = no limit: no timer is created and the run waits for every row. */
 	budgetMs: number;
 	/** Parallel tracker calls. */
 	concurrency: number;
@@ -83,7 +83,7 @@ export interface TrackConfig {
 
 export const DEFAULT_TRACK_CONFIG: TrackConfig = {
 	enabled: true,
-	budgetMs: 60_000,
+	budgetMs: 0,
 	concurrency: 6,
 };
 
@@ -461,7 +461,7 @@ function mergeTrack(track: Record<string, unknown> | undefined, defaults: TrackC
 	return {
 		enabled: typeof track.enabled === "boolean" ? track.enabled : defaults.enabled,
 		budgetMs:
-			typeof track.budgetMs === "number" && Number.isFinite(track.budgetMs) && track.budgetMs > 0
+			typeof track.budgetMs === "number" && Number.isFinite(track.budgetMs) && track.budgetMs >= 0
 				? track.budgetMs
 				: defaults.budgetMs,
 		concurrency:

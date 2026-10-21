@@ -196,7 +196,7 @@ If tracking is on and configured:
 - **Credentials.** `bin/ultrathink-mcp auth status` must show the configured provider as `ready`, and `bin/ultrathink-mcp check linear` (or `notion`) must print `OK <n> tools`. If no configured provider has credentials, tracking is skipped without a message. If one is logged in and the other isn't, tracking is `partial`, and `track complete` prints `! linear: login required` (or `! notion: login required`). For Linear, log in with `auth login linear` (OAuth) or store an API key from your Linear account settings with `auth set-key linear --stdin`. Notion takes `auth login notion` only.
 - **Linear team.** `linear.team` must name a team in the workspace that the Linear credential belongs to.
 - **Engine fallback.** A prompt whose summary says `fallback` is never tracked, so an engine outage doesn't fill your trackers with boilerplate.
-- **Partial tracking.** Creation is bounded by `track.budgetMs` (60 s). The summary then says `Tracking · partial (N missing) · kickoff will finish`, and `ultrathink-kickoff` runs `track complete` in the agent's turn. To finish a session by hand:
+- **Partial tracking.** Creation is bounded by `track.budgetMs` when it is set above 0 (the default 0 means no limit). The summary then says `Tracking · partial (N missing) · kickoff will finish`, and `ultrathink-kickoff` runs `track complete` in the agent's turn. To finish a session by hand:
 
   ```sh
   <clone>/bin/ultrathink-mcp track complete --state <state dir>/sessions/<id>.json
