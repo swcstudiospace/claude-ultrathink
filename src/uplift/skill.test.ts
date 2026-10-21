@@ -356,6 +356,15 @@ describe("Cursor skill and command folders and the pstack plugin cache", () => {
 		expect(planningTarget("/review do x", { cwd, home, host: "cursor" })).toMatchObject({ text: "do x", skill: { name: "review" } });
 	});
 
+	test("host cursor plans its own same-name skill, not the one in the Prime Agent folder", () => {
+		put(join(home, ".prime", "agent", "skills", "review", "SKILL.md"), "---\ndescription: prime review\n---\n");
+		put(join(home, ".cursor", "skills", "review", "SKILL.md"), "---\ndescription: cursor review\n---\n");
+		expect(planningTarget("/review do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "review", summary: "cursor review" },
+		});
+	});
+
 	test("host cursor plans a skill that the pstack plugin provides in Cursor's plugin cache", () => {
 		pstackPlugin("1.0.0", "architect");
 		expect(planningTarget("/architect design the cache", { cwd, home, host: "cursor" })).toMatchObject({

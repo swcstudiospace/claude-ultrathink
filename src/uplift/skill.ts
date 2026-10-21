@@ -246,15 +246,16 @@ export function resolveSkillFile(name: string, lookup: SkillLookup): { path: str
 		join(home, ".prime", "agent", "skills", normalized, "SKILL.md"),
 	];
 	if (lookup.host === "cursor") {
-		// Cursor's own project and personal skills and commands, then the newest pstack plugin's skills. Other hosts do not
-		// search these folders: a Cursor skill cannot run in Claude Code, so planning it there would plan a missing skill.
+		// Cursor's own project and personal skills and commands are checked first, so a same-name skill in another host's folder
+		// (Prime Agent, Claude, Grok, Omp, ...) never wins. Then the shared folders, then the newest pstack plugin's skills. Other hosts
+		// do not search Cursor's folders: a Cursor skill cannot run in Claude Code, so planning it there would plan a missing skill.
 		const cursorCandidates = [
 			join(lookup.cwd, ".cursor", "skills", normalized, "SKILL.md"),
 			join(lookup.cwd, ".cursor", "commands", `${normalized}.md`),
 			join(home, ".cursor", "skills", normalized, "SKILL.md"),
 			join(home, ".cursor", "commands", `${normalized}.md`),
 		];
-		for (const path of [...candidates, ...cursorCandidates]) {
+		for (const path of [...cursorCandidates, ...candidates]) {
 			const found = readSkill(path);
 			if (found) return found;
 		}
