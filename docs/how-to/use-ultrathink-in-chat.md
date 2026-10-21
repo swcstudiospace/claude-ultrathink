@@ -306,6 +306,8 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_BREAKER_OPEN_MS` | `30000` | How long an open breaker stays open before its next attempt, in milliseconds, 1000 to 600000. |
 | `ULTRATHINK_MAX_INFLIGHT` | `256` | Requests the server handles at once, 1 to 10000. |
 | `ULTRATHINK_PRIORITY_RESERVE_PCT` | `25` | Percent of `ULTRATHINK_MAX_INFLIGHT` slots held back as a reserve, 0 to 90. |
+| `ULTRATHINK_FAIR_QUEUE_DEPTH` | `16` | Over-budget requests wait in a queue of this depth per priority class, 0 to 1000; a full queue refuses as before. |
+| `ULTRATHINK_FAIR_QUEUE_WAIT_MS` | `1500` | Longest wait in milliseconds for a queued request, 1 to 60000; an expired wait refuses as before. |
 | `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT` | `50` | Lowest percent of the normal quota that the adaptive quota may reduce to under load, 10 to 100. |
 | `ULTRATHINK_LAG_TARGET_MS` | `100` | Lag target in milliseconds that the adaptive quota reacts to, 10 to 5000. |
 | `ULTRATHINK_REPLICA_CAPACITY_RPS` | `20` | Requests per second one replica can take. The recommended replica count metric is computed from it, 1 to 100000. |

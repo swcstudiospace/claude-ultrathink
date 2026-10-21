@@ -820,6 +820,8 @@ The HTTP pool has `capacity` = `ULTRATHINK_MAX_INFLIGHT` (default 256) and `rese
 | Variable | Default | Allowed | Effect |
 |---|---|---|---|
 | `ULTRATHINK_PRIORITY_RESERVE_PCT` | 25 | integer 0 to 90 | Share of the HTTP pool that non-owner classes may not take. 0 removes the reserve. |
+| `ULTRATHINK_FAIR_QUEUE_DEPTH` | 16 | integer 0 to 1000 | Over-budget HTTP requests wait in a bounded queue of this depth per priority class; a full queue refuses as before. 0 turns queueing off. |
+| `ULTRATHINK_FAIR_QUEUE_WAIT_MS` | 1500 | integer 1 to 60000 | Longest wait, in milliseconds, for a queued HTTP request; an expired wait refuses as before. |
 | `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT` | 50 | integer 10 to 100 | Lowest factor, in percent, applied to the IP, principal and owner windows. 100 keeps the windows at full size. |
 | `ULTRATHINK_LAG_TARGET_MS` | 100 | integer 10 to 5000 | Event-loop lag above which a probe sample counts as pressure. |
 | `ULTRATHINK_REPLICA_CAPACITY_RPS` | 20 | integer 1 to 100000 | Requests per second one replica serves. The replica recommendation divides by it. The default is an uncalibrated placeholder. |
