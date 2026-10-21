@@ -223,7 +223,7 @@ Each tick (`deploy/ultrathink-snapshot.sh tick`, run by `ultrathink-snapshot.ser
 
 1. Disk guard. The tick needs free space of at least the larger of `ULTRATHINK_SNAPSHOT_MIN_FREE_BYTES` (default 1 GiB) and twice the size of the database and its WAL. Below that it writes nothing and fails.
 2. `VACUUM INTO` a temporary file in the ring. The copy runs in one read transaction, so it is one consistent point in time. `integrity_check` runs on the copy, and the copy is renamed to `ultrathink-<stamp>.sqlite`.
-3. File layer (`ULTRATHINK_SNAPSHOT_TREE=1`, the default). `rsync --link-dest` copies `jobs/`, `sessions/`, `journal/`, `oauth.json` and `audit.jsonl` into `tree/ultrathink-<stamp>/`. Unchanged files are hard links to the previous tree. The database is copied before the files: a file written in between is an orphan, which is harmless. The reverse order could leave a row pointing at a file that was never copied.
+3. File layer (`ULTRATHINK_SNAPSHOT_TREE=1`, the default). `rsync --link-dest` copies `jobs/`, `sessions/`, `journal/`, `oauth.json`, `audit.jsonl` and its sealed `audit-*.jsonl` segments into `tree/ultrathink-<stamp>/`. Unchanged files are hard links to the previous tree. The database is copied before the files: a file written in between is an orphan, which is harmless. The reverse order could leave a row pointing at a file that was never copied.
 4. Off-host push, when it is due (see Encryption).
 5. Prune by policy (`services/ultrathink/store/snapshots.ts`): every snapshot for one hour, then the newest per five minutes up to `ULTRATHINK_SNAPSHOT_KEEP_HOURS` (default 24). The newest snapshot is never deleted. Entries dated in the future are kept and do not count as newest.
 
@@ -283,7 +283,7 @@ Caveats:
 
 The daily timer runs `deploy/ultrathink-backup.sh run` as user `ultrathink`:
 
-- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, `audit.jsonl` when present, and the `jobs/`, `sessions/` and `journal/` directories (saved plans and client-driven sessions live in the last two), with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file. The plaintext archive is verified in a 0700 staging directory before it is encrypted or moved into place.
+- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, the sealed `audit-*.jsonl` segments (copied before `audit.jsonl`; if a prune removes one mid-run, the copy fails and the run stops rather than writing a short archive), `audit.jsonl` when present, and the `jobs/`, `sessions/` and `journal/` directories (saved plans and client-driven sessions live in the last two), with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file. The plaintext archive is verified in a 0700 staging directory before it is encrypted or moved into place.
 - Archive `/var/backups/ultrathink/ultrathink-<utc>.tar.gz` (mode 0600 in a 0700 directory), 14 kept. With `ULTRATHINK_BACKUP_RECIPIENT` set, the archive is `ultrathink-<utc>.tar.gz.age` instead.
 - Optional rsync when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set in the env file. For ssh targets put the private key `id_ed25519` and a `known_hosts` file in `/var/lib/ultrathink/home/.ssh` (directory mode 0700, owner `ultrathink`); the script passes both paths to ssh explicitly because OpenSSH ignores `$HOME`. Set a recipient before the first push (see Encryption); without one nothing is pushed.
 - Retention: `journal/`, `sessions/` and `jobs/` entries, and the root-level `last.json` and `last-plan.json` plan copies, untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched. SQLite runs not updated within the same window are deleted with their phases and ledger rows in one transaction; the job prints `database retention: removed N runs, M ledger rows`. `deploy/ultrathink-backup.sh prune` runs only the retention part. In `run` the three steps (backup, file retention, database retention) are independent: a failed backup marks the unit failed but retention still runs. A backup killed before it could clean up leaves a `.work.*` staging directory in the backup directory; the next backup removes those older than a day.
@@ -345,7 +345,7 @@ Procedure:
 3. Read the output. It prints `source <label>`, one line per step (`step source`, `step guard`, `step verify`, `step compat`, `step place`, `step start`, `step probe`, each with milliseconds), `step total`, and `restore ok: <source>; pre-restore state at <dir>`. A restore from a ring snapshot whose tree directory is missing fails unless you add `--db-only`.
 4. If you used `--no-start`, run `systemctl start ultrathink-web` and check readiness (see Known limits for the probe).
 
-What restore does, in order (D12): refuse while the web unit runs; stop the snapshot and maintenance timers and services; verify the source (checksums, `quick_check`, `oauth.json` as JSON, and the audit chain of `audit.jsonl`); prove schema compatibility on a scratch copy, opened as the service user with the release's own store code; move the current state into `.pre-restore-<stamp>/`; place the source files with their modes; restart the timers; start the web unit unless `--no-start`.
+What restore does, in order (D12): refuse while the web unit runs; stop the snapshot and maintenance timers and services; verify the source (checksums, `quick_check`, `oauth.json` as JSON, every file the archive lists, and the audit chain of `audit.jsonl` with its sealed `audit-*.jsonl` segments); prove schema compatibility on a scratch copy, opened as the service user with the release's own store code; move the current state, including its sealed audit segments, into `.pre-restore-<stamp>/`; place the source files with their modes, sealed segments included; restart the timers; start the web unit unless `--no-start`.
 
 - Failure before placement (verify or compatibility check): exit 1, state unchanged.
 - Failure during placement: rolls back from `.pre-restore-<stamp>/`.
@@ -393,8 +393,8 @@ After a staging drill passes, enable the timer with `systemctl enable --now ultr
 
 ### Known limits of the current scripts
 
-- The readiness probe in `restore` and `promote` (`probe_web`) runs `curl -fs` against `ULTRATHINK_PROBE_URL` (default `http://127.0.0.1:8795/readyz`) with no client certificate. The production listener accepts TLS only and requires a client certificate (section 1, item 4). As written, the probe cannot pass on the production host. The restore then exits 1 after it has placed files, and `ultrathink-web` keeps running. Check readiness by hand with the ops identity: `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz`.
-- `restore` starts `ultrathink-snapshot.timer` and `ultrathink-maintenance.timer` at the end, whether or not they were enabled before. On a host that keeps the snapshot timer disabled, run `systemctl stop ultrathink-snapshot.timer` after the restore.
+- Readiness probe. `restore` and `promote` probe `ULTRATHINK_PROBE_URL` for up to 30 s, unless `restore` runs with `--no-start`. The default is `https://127.0.0.1:8795/readyz`, where the port is `ULTRATHINK_PORT`. For an https URL the probe pins `ca.pem` and presents the ops identity, `ops/cert.pem` and `ops/key.pem`, all under `ULTRATHINK_TLS_DIR` (default `/etc/ultrathink/tls`). The probe runs after the state is placed and `ultrathink-web` is started, so a missing file is found late: restore exits 1, the restored state stays in place, the previous state is in `.pre-restore-<stamp>/`, and `ultrathink-web` keeps running. Confirm the three files exist before you start a restore. To check readiness by hand, run `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz`.
+- Timers. `restore` stops the snapshot and maintenance timers and services that are active, and restarts only those. A timer that was inactive stays inactive, because restore never enables or starts one. No timer needs manual handling after a restore.
 
 ### Open items (BLOCKED)
 
@@ -539,7 +539,7 @@ The metric rows of this table are encoded as alert rules in `deploy/observabilit
 | Sessions | `/var/lib/ultrathink/sessions/` | Session records (request, specification) | Same 30 days; included in backups. The root `last.json` and `last-plan.json` copies of the latest plan follow the same window. |
 | Server planning jobs | `/var/lib/ultrathink/jobs/` | Job records and plan output | Same 30 days; included in backups. |
 | Scratch | `/var/lib/ultrathink/cwd/`, `home/` | Empty working directory and `$HOME` | Not pruned; hold no user data. |
-| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, `audit.jsonl`, `jobs/`, `sessions/`, `journal/` | 14 daily archives locally, as `.tar.gz` or, with `ULTRATHINK_BACKUP_RECIPIENT` set, `.tar.gz.age`; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
+| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, sealed audit segments, `audit.jsonl`, `jobs/`, `sessions/`, `journal/` | 14 daily archives locally, as `.tar.gz` or, with `ULTRATHINK_BACKUP_RECIPIENT` set, `.tar.gz.age`; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
 | Snapshot ring | `/var/backups/ultrathink/ring/` (`ULTRATHINK_SNAPSHOT_DIR`): `ultrathink-<stamp>.sqlite` and `tree/ultrathink-<stamp>/` | Plaintext prompts, OAuth state and audit lines | Every snapshot for one hour, then the newest per five minutes up to `ULTRATHINK_SNAPSHOT_KEEP_HOURS` (default 24). The newest is never deleted. |
 | Off-host staging copies | `/var/backups/ultrathink/ring/.offhost/` | Encrypted snapshot waiting to be pushed | Removed by the tick once older than 60 minutes. |
 | Pre-restore state | `/var/lib/ultrathink/.pre-restore-<stamp>/` | Plaintext copy of the state a restore replaced | Never pruned. Delete by hand after the restore is confirmed (section 5, "Pre-restore state"). |
@@ -734,11 +734,11 @@ An invalid value stops startup with a `ConfigError` that names the variable. The
 - **Anchors.** After every `ULTRATHINK_AUDIT_ANCHOR_EVERY` non-anchor records the log appends an `audit_anchor` record, `{through, root}`. `through` is the seq of the record before the anchor. `root` is a Merkle Mountain Range root over every record hash up to `through`, with RFC 6962 domain separation and no duplicated last leaf. An anchor is an ordinary chained record.
 - **Segments.** Before an append that would push the active file past `ULTRATHINK_AUDIT_SEGMENT_BYTES`, the active file is sealed: renamed to `audit-<firstSeq>-<lastSeq>.jsonl` in the same directory, mode 0400. The new active `audit.jsonl` starts with `prev` equal to the sealed file's last hash. A single record larger than the limit is still written, and no empty segment is created.
 - **Verification** reads the sealed segments and the active file as one chain, with global `seq` numbers.
-- **Quarantine.** A broken active file is moved to `audit.jsonl.corrupt-<time>` on open. Nothing prunes `.corrupt-*` files.
+- **Quarantine.** A broken active file is moved to `audit.jsonl.corrupt-<time>` on open. Nothing prunes `.corrupt-*` files. The new active file continues after the sealed segments. When every sealed segment has been pruned, it continues after the newest retention record in the damaged file's verified prefix, and the log refuses to start when there is none. Records in the damaged file that come after the point the new chain resumes from are kept only in the quarantine copy, and the live chain reuses their seq numbers.
 
 ### Prune boundary
 
-When `ULTRATHINK_AUDIT_RETENTION_DAYS` is above 0, an hourly sweep calls `prune(now - days)`. It deletes sealed segments oldest first while the segment's last record `ts` is older than the cutoff. It never deletes the active file or `.corrupt-*` files. It then appends `audit_retention_pruned` `{segments, fromSeq, throughSeq, throughHash}`, which carries the anchor frontier, so the remaining chain still verifies and later anchors still cover every record. With nothing eligible, the sweep writes nothing.
+When `ULTRATHINK_AUDIT_RETENTION_DAYS` is above 0, an hourly sweep calls `prune(now - days)`. It selects sealed segments oldest first while the segment's last record `ts` is older than the cutoff. For each one it appends an `audit_retention_pruned` record `{segments, fromSeq, throughSeq, throughHash}`, which carries the anchor frontier, so the remaining chain still verifies and later anchors still cover every record. All of these records are fsynced before the first deletion, and the segments are then deleted oldest first, so a crash at any point leaves a directory that verifies on restart. The sweep never deletes the active file or `.corrupt-*` files. With nothing eligible, the sweep writes nothing.
 
 A directory whose first remaining segment does not start at seq 1 verifies only when a retained `audit_retention_pruned` record names that segment's `seq - 1` and `prev`. Removing or editing that record makes verification fail.
 
@@ -754,7 +754,7 @@ bun services/ultrathink/obs/audit-cli.ts verify /var/lib/ultrathink/audit.jsonl 
 
 ### Tamper watch
 
-The watch ticks every `ULTRATHINK_AUDIT_WATCH_MS` (default 1000 ms). Each tick stats the file. If size, mtime and inode match the fingerprint the log wrote itself, nothing is scanned, so the service's own appends never alert. A different fingerprint triggers a full scan across the segments. A broken chain raises `chain_broken`. A disk head (seq, hash) that differs from the head the process acknowledged raises `head_mismatch`, as does a missing file while records exist. Every 60 ticks a full scan runs even when the stat matches.
+The watch ticks every `ULTRATHINK_AUDIT_WATCH_MS` (default 1000 ms). Each tick stats the file. If size, mtime and inode match the fingerprint the log wrote itself, nothing is scanned, so the service's own appends never alert. A different fingerprint triggers a full scan across the segments. A broken chain raises `chain_broken`. A disk head (seq, hash) that differs from the head the process acknowledged raises `head_mismatch`, as does a missing file while records exist. Every 60 ticks a full scan runs even when the stat matches. The scan runs in a worker thread, so it does not pause requests. A full scan due while another is still running is owed to the next tick that can start one. A scan that fails or does not answer within 120 seconds is logged as an error and gives no verdict; the next tick scans again.
 
 **Limit.** An in-place edit that keeps size and mtime (for example `touch -r`) is caught by the 60-tick scan: up to 60 seconds at the default interval, not within 1 second. A rewrite made while the service is stopped has no acknowledged head to compare against, and the service accepts the file it finds at start. Only off-host pairs catch that (B5).
 
@@ -777,6 +777,8 @@ A key alerts at most once per window, and each rule tracks at most 10000 keys. A
 Each configured sink receives three envelope kinds: `audit` (every acknowledged record, anchors included), `security` (security events, with only the top-level fields `type, name, severity, source, ip, userId, resource, action, correlationId, timestamp`; `details` and `userAgent` are dropped), and `alert` (tamper and anomaly). Syslog frames are RFC 5424 with RFC 6587 octet-counting over TCP, with PRI 134 for audit, 132 for security and 130 for alert. UDP is not offered.
 
 Each sink has its own queue of `ULTRATHINK_AUDIT_SINK_QUEUE` envelopes, so a slow sink does not hold back another. When a queue is full, the oldest queued envelope is dropped. Batches hold at most 100 envelopes and keep their order. Retryable failures (network errors, 408, 425, 429, 5xx) are retried up to 5 attempts, with a 500 ms backoff that doubles to a 30 s cap; a batch that still fails is dropped. Other 4xx responses and redirects are dropped at once. Each request times out after 10 s. At shutdown the service flushes for up to 2 s, then closes, and anything still queued is dropped. Drops and failures appear in `ultrathink_audit_sink_events_total{sink,outcome}` and as `audit_sink_failed` log lines. The record path never waits for a sink.
+
+Kafka REST Proxy answers HTTP 200 even when a record fails, so a per-record error in the response fails the whole batch. Delivery is at least once: a retried batch resends the records Kafka already accepted, so records can repeat in the topic. A batch dropped after a non-retryable error counts every record as dropped, including any the broker accepted, so `ultrathink_audit_sink_events_total` can overstate loss on a mixed batch.
 
 ### Blocked items
 
@@ -1109,6 +1111,8 @@ The CLI has its own gate, separate from the service. An `http` run against a hos
 - **`inprocess`** builds the real app inside the CLI process, with a temporary state directory and the template's fault plan at the OpenRouter seam. No upstream is reached, and the state directory is removed after the run. It does not read `ULTRATHINK_CHAOS`, because it never touches a running service. Its runs are deterministic.
 - **`http`** observes a URL that is already running. It is the only driver for operator templates. The CLI never executes an operator step. It prints the step and waits until someone types `confirmed`; no load is sent before that.
 
+Against an mTLS listener, pass the CA that signed the server and the client identity the listener requires: `--ca-file`, `--client-cert` and `--client-key`, each a PEM path. `--client-cert` and `--client-key` go together, and the base URL must be https. Server verification stays on. Each request has a 5 s deadline that covers the response headers and the body; a request past it fails. A load request that fails is not judged. A hypothesis whose read fails counts as failed, and its reason is recorded.
+
 ### Commands
 
 ```bash
@@ -1116,6 +1120,8 @@ bun run chaos -- templates
 bun run chaos -- run upstream-5xx-breaker --driver inprocess --history /tmp/chaos-history.jsonl
 bun run chaos -- run sigterm-drain --driver http --base-url <staging-url> \
   --rollback-argv '["deploy/ultrathink-release.sh","rollback"]'
+bun run chaos -- run sigterm-drain --driver http --base-url <staging-url> \
+  --ca-file <ca.pem> --client-cert <probe-cert.pem> --client-key <probe-key.pem>
 bun run chaos -- score upstream-5xx-breaker
 ```
 
@@ -1185,7 +1191,7 @@ A check blocks a merge only once branch protection requires it, which is item SC
 | Item | State | Prerequisite |
 |---|---|---|
 | SC1 required checks | BLOCKED (external) | A repository administrator marks the six `requiredChecks` names as required on `main` in branch protection. Until then no check blocks a merge. |
-| Semgrep findings | BLOCKED | `services/ultrathink/ui/graph-app.test.ts` calls `new Function` on repo-owned strings at lines 67, 140 and 223, and the rule `no-dynamic-code` (`.semgrep/rules/no-dynamic-code.yaml`) reports each one. The `Semgrep` job fails until a human approves a suppression for each. This phase adds no suppression. |
+| Semgrep findings | EXCLUDED for one test file | `.semgrep/rules/no-dynamic-code.yaml` sets `paths.exclude` to `services/ultrathink/ui/graph-app.test.ts`, so the rule skips that file and no other. The file calls `new Function` on the app's own static helpers from the served HTML at three sites. Inline `nosemgrep` comments did not clear the external Semgrep check on PR #46 head `d561385`, so they were removed. Approved for PR #46. |
 | Tag ancestry | Closed for release.yml | The workflow fetches origin/main and runs `scripts/security-gate.ts ancestry`, and refuses a tag whose commit is not an ancestor of origin/main. |
 | VPS release path | Open gap | `deploy/ultrathink-release.sh release <git-ref>` archives any ref and does not check ancestry, so tag and deploy only commits on main until it does. |
 | Prerelease tag run | BLOCKED (external) | Operator approval. Pushing a tag such as `v1.5.0-rc.1` runs `release.yml` on GitHub and creates a prerelease. |
