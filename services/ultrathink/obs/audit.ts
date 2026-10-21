@@ -167,7 +167,8 @@ export interface AuditLog {
 	 * `audit_retention_pruned` event. The event carries the anchor frontier over every deleted record, so anchors written
 	 * later still cover the whole chain. The active file and `.corrupt-*` evidence are never removed. Returns how many
 	 * segments were deleted; with none eligible nothing is written. Skipped (and reported) when the chain does not verify.
-	 * The event is written and fsynced before any segment is deleted; when it cannot be written, nothing is deleted.
+	 * One event per eligible segment is written and fsynced before the first deletion, and a segment is deleted only after the
+	 * event that names it is durable. When an event cannot be written, that segment and the later ones are kept.
 	 */
 	prune(cutoffMs: number): { segments: number };
 	/** Further `record()` calls are dropped, and each one is reported through `onError`. Idempotent. */
@@ -196,6 +197,14 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const RECORD_KEYS: readonly string[] = ["event", "fields", "hash", "prev", "seq", "ts"];
 
 type Primitive = string | number | boolean;
+
+/** The fields of one parsed record line, flat and primitive. */
+type RecordFields = Record<string, Primitive>;
+/** Reads of the active file stop at `bytes`, a size the verifier pinned at a line boundary. Sealed segments are read whole. */
+interface ReadPin {
+	readonly path: string;
+	readonly bytes: number;
+}
 
 export function auditPath(stateDir: string): string {
 	return `${stateDir}/audit.jsonl`;
@@ -344,6 +353,10 @@ interface ChainScan {
 	brokenIn: string;
 	/** Every file that holds records, in chain order (sealed segments first, the active file last). */
 	files: ScannedFile[];
+	/** Retention records verified in the active file, in order. Each names a boundary a sealed segment may need. */
+	retentions: RecordFields[];
+	/** The boundary the first retained segment needed, when it came from `carried` rather than from the chain. */
+	carriedUsed?: RecordFields;
 }
 
 interface ScanOptions {
@@ -351,13 +364,17 @@ interface ScanOptions {
 	onRecord?: (seq: number, hash: string) => void;
 	/** Reads the sealed segments only; used to continue after the active file was quarantined. */
 	sealedOnly?: boolean;
+	/** Reads the active file only up to this many bytes: a size the caller pinned at a line boundary. Sealed segments are read whole. */
+	activeBytes?: number;
+	/** Retention records the caller verified in a damaged active file; they stand in for a boundary no file in the chain holds now. */
+	carried?: readonly RecordFields[];
 }
 
 type ScanStep = { kind: "ok" } | { kind: "broken"; reason: string } | { kind: "io"; reason: string };
 
 // Calls `onLine` with each newline-terminated line of `file` in order, reading fixed-size chunks. The read stops at the
-// first line `onLine` rejects, which is reported as broken. Memory is bounded by the longest line.
-function eachLine(file: string, fs: AuditFs, onLine: (line: string) => string | undefined): ScanStep {
+// first line `onLine` rejects, which is reported as broken, or after `limit` bytes. Memory is bounded by the longest line.
+function eachLine(file: string, fs: AuditFs, onLine: (line: string) => string | undefined, limit = Number.POSITIVE_INFINITY): ScanStep {
 	let fd: number;
 	try {
 		fd = fs.openSync(file, "r");
@@ -368,9 +385,13 @@ function eachLine(file: string, fs: AuditFs, onLine: (line: string) => string | 
 		const chunk = Buffer.allocUnsafe(READ_CHUNK);
 		const pending: Buffer[] = [];
 		let pendingBytes = 0;
+		let remaining = limit;
 		for (;;) {
-			const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+			const want = Math.min(chunk.length, remaining);
+			if (want === 0) break;
+			const read = fs.readSync(fd, chunk, 0, want, null);
 			if (read === 0) break;
+			remaining -= read;
 			let start = 0;
 			for (let i = 0; i < read; i += 1) {
 				if (chunk[i] !== 0x0a) continue;
@@ -403,7 +424,7 @@ function eachLine(file: string, fs: AuditFs, onLine: (line: string) => string | 
 }
 
 /** The `fields` of the retained audit_retention_pruned record that names the boundary, or the first file failure met looking for it. */
-function findBoundaryRecord(files: readonly string[], fs: AuditFs, throughSeq: number, throughHash: string): { fields?: Record<string, unknown>; failure?: string } {
+function findBoundaryRecord(files: readonly string[], fs: AuditFs, throughSeq: number, throughHash: string, pin: ReadPin | undefined): { fields?: Record<string, unknown>; failure?: string } {
 	const found: { fields?: Record<string, unknown> } = {};
 	let failure: string | undefined;
 	for (const file of files) {
@@ -419,7 +440,7 @@ function findBoundaryRecord(files: readonly string[], fs: AuditFs, throughSeq: n
 				if (parsed.fields.throughSeq === throughSeq && parsed.fields.throughHash === throughHash) found.fields = parsed.fields;
 			}
 			return undefined;
-		});
+		}, pin?.path === file ? pin.bytes : undefined);
 		if (step.kind !== "ok" && failure === undefined) failure = step.reason;
 	}
 	return found.fields !== undefined ? { fields: found.fields } : { failure };
@@ -435,30 +456,55 @@ function decodeFrontier(text: unknown): { frontier: MerkleFrontier; text: string
 	}
 }
 
-type PrunedPrefix = { kind: "seeded"; frontier: MerkleFrontier; text: string } | { kind: "failed"; verdict: Extract<AuditVerification, { ok: false }> };
+type PrunedPrefix = { kind: "seeded"; frontier: MerkleFrontier; text: string; carried?: RecordFields } | { kind: "failed"; verdict: Extract<AuditVerification, { ok: false }> };
+
+/**
+ * The newest retention record in `retentions` whose frontier covers exactly the records through the boundary it names, or
+ * undefined when none does. The damaged file verified these records, so their hashes are already checked.
+ */
+function newestBoundary(retentions: readonly RecordFields[]): { seq: number; hash: string; fields: RecordFields; frontier: MerkleFrontier } | undefined {
+	for (let i = retentions.length - 1; i >= 0; i -= 1) {
+		const fields = retentions[i] as RecordFields;
+		const seq = fields.throughSeq;
+		const hash = fields.throughHash;
+		const seeded = decodeFrontier(fields.frontier);
+		if (typeof seq === "number" && typeof hash === "string" && seeded !== undefined && seeded.frontier.size === seq) return { seq, hash, fields, frontier: seeded.frontier };
+	}
+	return undefined;
+}
+
+/** The state a log resumes from: the last record it holds, its anchor frontier, and the records since its last anchor. */
+type Resume = Pick<ChainScan, "lastSeq" | "lastHash" | "frontier" | "sinceAnchor" | "activeFirst">;
 
 /**
  * Resolves a chain whose first retained record `head` is not seq 1. The boundary is the retained audit_retention_pruned
- * record that names it, and its `frontier` seeds the anchor frontier, so anchors after the boundary are checked against
- * every record before it. A missing record is the break a chain from genesis reports. A record whose frontier is missing
- * or invalid, and a file that cannot be read while looking for it, leave the chain unverifiable (brokenAt 0, fail closed).
+ * record that names it, found in the chain or else among the `carried` records a damaged active file verified before its
+ * break. Its `frontier` seeds the anchor frontier, so anchors after the boundary are checked against every record before
+ * it. A missing record is the break a chain from genesis reports. A record whose frontier is missing or invalid, and a
+ * file that cannot be read while looking for it, leave the chain unverifiable (brokenAt 0, fail closed).
  */
-function resolvePrunedPrefix(head: { seq: number; prev: string }, files: readonly string[], fs: AuditFs): PrunedPrefix {
-	const found = findBoundaryRecord(files, fs, head.seq - 1, head.prev);
-	if (found.fields === undefined) {
+function resolvePrunedPrefix(head: { seq: number; prev: string }, files: readonly string[], fs: AuditFs, carried: readonly RecordFields[], pin: ReadPin | undefined): PrunedPrefix {
+	const found = findBoundaryRecord(files, fs, head.seq - 1, head.prev, pin);
+	let fields: Record<string, unknown> | undefined = found.fields;
+	let fromCarried: RecordFields | undefined;
+	if (fields === undefined) {
+		fromCarried = carried.find((record) => record.throughSeq === head.seq - 1 && record.throughHash === head.prev);
+		fields = fromCarried;
+	}
+	if (fields === undefined) {
 		if (found.failure !== undefined) {
 			return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 0, reason: `cannot verify the records before seq ${head.seq}: ${found.failure}` } };
 		}
 		return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 1, reason: `seq ${head.seq} where 1 was expected` } };
 	}
-	const seeded = decodeFrontier(found.fields.frontier);
+	const seeded = decodeFrontier(fields.frontier);
 	if (seeded === undefined) {
 		return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 0, reason: `the audit_retention_pruned record for seq ${head.seq - 1} has no valid frontier; the records before seq ${head.seq} cannot be verified` } };
 	}
 	if (seeded.frontier.size !== head.seq - 1) {
 		return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 0, reason: `the audit_retention_pruned record for seq ${head.seq - 1} carries a frontier over ${seeded.frontier.size} records; the records before seq ${head.seq} cannot be verified` } };
 	}
-	return { kind: "seeded", ...seeded };
+	return { kind: "seeded", ...seeded, carried: fromCarried };
 }
 
 // Streams each file of the chain in fixed-size chunks and checks each line in turn; memory is bounded by the longest line.
@@ -466,6 +512,7 @@ function resolvePrunedPrefix(head: { seq: number; prev: string }, files: readonl
 function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainScan {
 	const chainFiles = listSegments(path, fs).map((segment) => segment.path);
 	if (!options.sealedOnly && fs.existsSync(path)) chainFiles.push(path);
+	const pin: ReadPin | undefined = options.activeBytes === undefined ? undefined : { path, bytes: options.activeBytes };
 	let frontier = createFrontier();
 	const files: ScannedFile[] = [];
 	let count = 0;
@@ -475,6 +522,8 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 	let started = false;
 	let boundary: { throughSeq: number; throughHash: string; frontier: string; file: string } | undefined;
 	let halt: AuditVerification | undefined;
+	const retentions: RecordFields[] = [];
+	let carriedUsed: RecordFields | undefined;
 
 	const finish = (verification: AuditVerification, brokenIn: string): ChainScan => {
 		const active = files.find((f) => f.path === path);
@@ -487,6 +536,8 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 			activeFirst: active?.firstSeq ?? lastSeq + 1,
 			brokenIn,
 			files,
+			retentions,
+			carriedUsed,
 		};
 	};
 
@@ -496,7 +547,7 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 			started = true;
 			const head = peekHead(line);
 			if (head !== undefined && head.seq > 1) {
-				const pruned = resolvePrunedPrefix(head, chainFiles, fs);
+				const pruned = resolvePrunedPrefix(head, chainFiles, fs, options.carried ?? [], pin);
 				if (pruned.kind === "failed") {
 					halt = pruned.verdict;
 					return { reason: pruned.verdict.reason };
@@ -504,7 +555,12 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 				lastSeq = head.seq - 1;
 				prev = head.prev;
 				frontier = pruned.frontier;
-				boundary = { throughSeq: lastSeq, throughHash: prev, frontier: pruned.text, file };
+				if (pruned.carried === undefined) {
+					boundary = { throughSeq: lastSeq, throughHash: prev, frontier: pruned.text, file };
+				} else {
+					// Attested by the verified prefix the caller carried; no record among the files being read names it.
+					carriedUsed = pruned.carried;
+				}
 			}
 		}
 		const checked = checkLine(line, lastSeq + 1, prev);
@@ -527,6 +583,7 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 		) {
 			boundary = undefined;
 		}
+		if (file === path && checked.event === RETENTION_EVENT) retentions.push(checked.fields);
 		frontier.push(checked.hash);
 		lastSeq += 1;
 		count += 1;
@@ -548,7 +605,7 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
 			fileLastTs = accepted.ts;
 			fileLastHash = accepted.hash;
 			return undefined;
-		});
+		}, pin?.path === file ? pin.bytes : undefined);
 		if (step.kind === "ok" && firstSeq > 0) {
 			files.push({ path: file, firstSeq, lastSeq: fileLastSeq, lastTs: fileLastTs, lastHash: fileLastHash, frontier: frontier.snapshot() });
 		}
@@ -573,8 +630,13 @@ function scanChain(path: string, fs: AuditFs, options: ScanOptions = {}): ChainS
  * file is an empty, intact chain. A file that cannot be opened or read is reported as broken at record 0 (an I/O
  * problem, not tampering). Usable by `audit-cli.ts` and by external monitoring.
  */
-export function verifyAuditFile(path: string): AuditVerification {
-	return scanChain(path, nodeFs).verification;
+export interface VerifyOptions {
+	/** Reads the active file only up to this many bytes, a size pinned at a line boundary. The tamper watch uses it while the log appends. */
+	activeBytes?: number;
+}
+
+export function verifyAuditFile(path: string, options: VerifyOptions = {}): AuditVerification {
+	return scanChain(path, nodeFs, { activeBytes: options.activeBytes }).verification;
 }
 
 /**
@@ -698,7 +760,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		expected = { fp: fingerprint };
 	};
 
-	const adopt = (scan: ChainScan): void => {
+	const adopt = (scan: Resume): void => {
 		seq = scan.lastSeq;
 		prev = scan.lastHash;
 		frontier = scan.frontier;
@@ -707,9 +769,11 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	};
 
 	/**
-	 * Moves a broken active file aside and continues after the sealed segments, which must verify on their own. Returns
-	 * the reason the log cannot continue (a broken sealed segment, or a file that cannot be quarantined), or undefined
-	 * once the state is adopted. Nothing is moved unless the sealed segments verify.
+	 * Moves a broken active file aside and continues after the sealed segments, which must verify on their own. A boundary
+	 * the sealed segments need can exist only in the damaged file's verified prefix (a retention record written before a
+	 * segment was deleted). That record is written again into the new active file, so the next start still verifies.
+	 * Returns the reason the log cannot continue (a broken sealed segment, or a file that cannot be quarantined), or
+	 * undefined once the state is adopted. Nothing is moved unless the sealed segments verify.
 	 */
 	function recoverFrom(check: ChainScan): string | undefined {
 		const verdict = check.verification;
@@ -717,17 +781,43 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		if (check.brokenIn !== path) {
 			return `sealed segment ${check.brokenIn} is broken at record ${verdict.brokenAt} (${verdict.reason}); the chain cannot continue`;
 		}
-		const sealed = scanChain(path, fs, { sealedOnly: true });
+		const sealed = scanChain(path, fs, { sealedOnly: true, carried: check.retentions });
 		if (!sealed.verification.ok) return `the sealed segments do not verify: ${sealed.verification.reason}`;
+		// With every sealed segment pruned, the newest boundary in the damaged file's verified prefix stands for them. Without
+		// one, nothing says where the chain resumes, so the log refuses to start rather than restart at seq 1.
+		let resume: Resume = sealed;
+		let carried: RecordFields | undefined = sealed.carriedUsed;
+		if (sealed.lastSeq === 0 && check.retentions.length > 0) {
+			const boundary = newestBoundary(check.retentions);
+			if (boundary === undefined) return `${path} is broken at record ${verdict.brokenAt} (${verdict.reason}) and holds no audit_retention_pruned record with a valid frontier; the chain cannot resume`;
+			resume = { lastSeq: boundary.seq, lastHash: boundary.hash, frontier: boundary.frontier, sinceAnchor: 0, activeFirst: boundary.seq + 1 };
+			carried = boundary.fields;
+		}
 		const quarantine = `${path}.corrupt-${stamp(now).replace(/[:.]/g, "-")}`;
 		try {
 			fs.renameSync(path, quarantine);
 		} catch (error) {
 			return `${path} is broken at record ${verdict.brokenAt} (${verdict.reason}) and cannot be quarantined: ${errorOf(error).message}`;
 		}
-		const next = sealed.lastSeq > 0 ? "continuing after the sealed segments" : "starting a new chain";
+		adopt(resume);
+		if (carried !== undefined) {
+			if (writeRecord(RETENTION_EVENT, carried, "carried boundary") === undefined) {
+				// Without the boundary the sealed segments would not verify on the next start, so the damaged file goes back.
+				try {
+					fs.renameSync(quarantine, path);
+				} catch {
+					// Stays at the quarantine path; the next start reports the missing boundary.
+				}
+				expected = undefined;
+				return `the boundary the sealed segments need could not be written to ${path}; the damaged file was left in place`;
+			}
+			// The copy is a non-anchor record, so it counts toward the next anchor exactly as it does on a reopen.
+			sinceAnchor += 1;
+		}
+		let next = "starting a new chain";
+		if (sealed.lastSeq > 0) next = "continuing after the sealed segments";
+		if (carried !== undefined) next = `continuing after the boundary at record ${resume.lastSeq}`;
 		notify("moved_to", `audit log: ${path} broken at record ${verdict.brokenAt} (${verdict.reason}); moved to ${quarantine}, ${next}`);
-		adopt(sealed);
 		return undefined;
 	}
 
@@ -846,6 +936,11 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	 */
 	function appendLine(event: AuditEvent, fields: Record<string, Primitive>, label: string): AuditRecord | undefined {
 		if (!ensureDisk()) return undefined;
+		return writeRecord(event, fields, label);
+	}
+
+	/** Writes one chained line without checking the disk first; the caller has just adopted the chain it extends. */
+	function writeRecord(event: AuditEvent, fields: Record<string, Primitive>, label: string): AuditRecord | undefined {
 		const nextSeq = seq + 1;
 		const ts = stamp(now);
 		const hash = hashRecord(nextSeq, ts, event, prev, fields);
@@ -924,17 +1019,16 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	}
 
 	/**
-	 * Writes one `audit_retention_pruned` record naming `files` as deleted: the first and last seq, the hash of the last one,
+	 * Writes one `audit_retention_pruned` record naming the chain through `file`: its last seq, the hash of its last record,
 	 * and the anchor frontier over every record through it. Undefined when the record was dropped (and reported).
 	 */
-	function retain(files: readonly ScannedFile[]): AuditRecord | undefined {
-		const last = files[files.length - 1] as ScannedFile;
-		const line = appendLine(RETENTION_EVENT, { segments: files.length, fromSeq: files[0]?.firstSeq ?? 0, throughSeq: last.lastSeq, throughHash: last.lastHash, frontier: JSON.stringify(last.frontier) }, "retention record");
+	function retain(file: ScannedFile): AuditRecord | undefined {
+		const line = appendLine(RETENTION_EVENT, { segments: 1, fromSeq: file.firstSeq, throughSeq: file.lastSeq, throughHash: file.lastHash, frontier: JSON.stringify(file.frontier) }, "retention record");
 		if (line !== undefined) commit(line);
 		return line;
 	}
 
-	/** Deletes the eligible sealed segments and records the boundary; see `AuditLog.prune`. */
+	/** Deletes the eligible sealed segments, each one only after the record that names it is durable; see `AuditLog.prune`. */
 	function prune(cutoffMs: number): { segments: number } {
 		if (closed) {
 			report(new Error("audit log: prune after close dropped"));
@@ -953,10 +1047,17 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			eligible.push(file);
 		}
 		if (eligible.length === 0) return { segments: 0 };
-		// The boundary is written and fsynced before the first delete. If it cannot be written, nothing is deleted.
-		if (retain(eligible) === undefined) return { segments: 0 };
-		const removed: ScannedFile[] = [];
+		// Every boundary is durable before the first deletion. Once eligible[i] is gone the chain starts at eligible[i + 1],
+		// whose boundary is the record naming eligible[i]. Those records are appended to the chain, so a crash at any later
+		// point finds the boundary the next retained segment needs (see recoverFrom for a damaged active file).
+		let written = 0;
 		for (const file of eligible) {
+			if (retain(file) === undefined) break;
+			written += 1;
+		}
+		if (written === 0) return { segments: 0 };
+		const removed: ScannedFile[] = [];
+		for (const file of eligible.slice(0, written)) {
 			try {
 				fs.unlinkSync(file.path);
 			} catch (error) {
@@ -964,14 +1065,16 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 				break;
 			}
 			removed.push(file);
+			// Synced before the next deletion, so the deleted segments are always a prefix of the chain on disk.
+			try {
+				fsyncDirectory(fs, path);
+			} catch (error) {
+				report(new Error(`audit log: prune stopped after ${file.path}: the directory was not synced: ${errorOf(error).message}`));
+				break;
+			}
 		}
 		const through = removed.at(-1);
-		// Nothing was deleted: the record above names segments that are still present. Its frontier is still correct, so
-		// verification is unaffected, and the next prune writes its own record.
 		if (through === undefined) return { segments: 0 };
-		// A delete failed after the boundary was written, so the chain now starts after `through`, which that record does not
-		// name. A second record names it, so the chain on disk still verifies.
-		if (removed.length < eligible.length) retain(removed);
 		notify("pruned", `audit log: pruned ${removed.length} sealed segment(s) through record ${through.lastSeq}`);
 		return { segments: removed.length };
 	}

@@ -464,3 +464,141 @@ describe("prune", () => {
 		expect(() => createAuditLog({ path, now: clock() })).toThrow(/cannot verify/);
 	});
 });
+
+describe("prune crash points and boundaries", () => {
+	/** A process that dies after `survivors` deletions: every later deletion fails, as it does once the process is gone. */
+	function dyingAfter(survivors: number): AuditFs {
+		let unlinks = 0;
+		return {
+			...nodeFs,
+			unlinkSync: ((target: nodeFs.PathLike) => {
+				if (unlinks >= survivors) throw Object.assign(new Error("EIO: process died"), { code: "EIO" });
+				unlinks += 1;
+				nodeFs.unlinkSync(target);
+			}) as typeof nodeFs.unlinkSync,
+		};
+	}
+
+	test("prune writes one boundary per deleted segment, each naming the chain through that segment", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const log = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		fill(log, 1, 300);
+		const lasts = sealedIn(dir).map((name) => Number(/-(\d+)\.jsonl$/.exec(name)?.[1]));
+		expect(lasts.length).toBeGreaterThanOrEqual(2);
+		expect(log.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: lasts.length });
+		const boundaries = records(path)
+			.filter((r) => r.event === "audit_retention_pruned")
+			.map((r) => r.fields.throughSeq);
+		expect(boundaries).toEqual(lasts);
+		// Crash point: after the last deletion. The restart comes up on the surviving chain.
+		const restarted = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		expect(restarted.verify().ok).toBe(true);
+		expect(sealedIn(dir)).toEqual([]);
+	}, 60_000);
+
+	test("a crash before the first deletion or between two deletions restarts and verifies", () => {
+		for (const survivors of [0, 1]) {
+			const dir = tempDir();
+			const path = auditPath(dir);
+			const writer = createAuditLog({ path, now: clock(), segmentBytes: MIB, fs: dyingAfter(survivors) });
+			fill(writer, 1, 300);
+			const eligible = sealedIn(dir).length;
+			expect(eligible).toBeGreaterThanOrEqual(2);
+			// Every boundary is durable before the first deletion, one per segment that will go.
+			expect(writer.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: survivors });
+			expect(records(path).filter((r) => r.event === "audit_retention_pruned")).toHaveLength(eligible);
+
+			// The process died at this point. Its restart must come up on what is on disk and verify it.
+			const restarted = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+			expect(restarted.verify().ok).toBe(true);
+			expect(sealedIn(dir)).toHaveLength(eligible - survivors);
+			restarted.record("login_ok", { n: 999 });
+			expect(verifyAuditFile(path).ok).toBe(true);
+		}
+	}, 60_000);
+
+	test("a crash halfway through writing a boundary leaves a torn tail that restarts and verifies", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		let armed = false;
+		const fs: AuditFs = {
+			...nodeFs,
+			writeSync: ((fd: number, data: Buffer, offset: number, length: number) => {
+				if (!armed) return nodeFs.writeSync(fd, data, offset, length);
+				// The process dies with half of the first boundary record on disk.
+				nodeFs.writeSync(fd, data, offset, Math.floor(length / 2));
+				throw Object.assign(new Error("EIO: process died"), { code: "EIO" });
+			}) as typeof nodeFs.writeSync,
+			truncateSync: ((target: nodeFs.PathLike, len?: number) => {
+				if (armed) throw Object.assign(new Error("EIO: process died"), { code: "EIO" });
+				nodeFs.truncateSync(target, len);
+			}) as typeof nodeFs.truncateSync,
+		};
+		const writer = createAuditLog({ path, now: clock(), segmentBytes: MIB, fs });
+		fill(writer, 1, 300);
+		const eligible = sealedIn(dir).length;
+		armed = true;
+		expect(writer.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: 0 });
+		armed = false;
+		// Nothing was deleted: the boundary never became whole, so every segment is still there.
+		expect(sealedIn(dir)).toHaveLength(eligible);
+
+		const restarted = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		expect(restarted.verify().ok).toBe(true);
+		expect(sealedIn(dir)).toHaveLength(eligible);
+		expect(readdirSync(dir).some((n) => n.includes(".corrupt-"))).toBe(true);
+	}, 60_000);
+
+	test("a torn final append after a deletion keeps the boundary the surviving segments need", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const writer = createAuditLog({ path, now: clock(), segmentBytes: MIB, fs: dyingAfter(1) });
+		fill(writer, 1, 300);
+		const eligible = sealedIn(dir).length;
+		expect(eligible).toBeGreaterThanOrEqual(2);
+		// One segment goes, then the process dies. Its boundary is in the active file, ahead of the records written next.
+		expect(writer.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: 1 });
+		writer.record("login_ok", { n: 1 });
+		// The crash tears the last append: only its first bytes reached the file.
+		nodeFs.appendFileSync(path, '{"seq":');
+
+		const restarted = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		expect(restarted.verify().ok).toBe(true);
+		expect(sealedIn(dir)).toHaveLength(eligible - 1);
+		// The damaged file is kept as evidence, and the boundary the surviving segment needs is carried into the new active file.
+		expect(readdirSync(dir).some((n) => n.includes(".corrupt-"))).toBe(true);
+		expect(records(path)[0]?.event).toBe("audit_retention_pruned");
+		restarted.record("login_ok", { n: 2 });
+		expect(verifyAuditFile(path).ok).toBe(true);
+	}, 60_000);
+
+	test("every sealed segment pruned and the active file torn: restart resumes from the newest boundary with no seq reused", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const writer = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		fill(writer, 1, 300);
+		expect(writer.prune(Number.MAX_SAFE_INTEGER).segments).toBeGreaterThanOrEqual(2);
+		expect(sealedIn(dir)).toEqual([]);
+		writer.record("login_ok", { n: 1 });
+		const boundary = records(path).filter((r) => r.event === "audit_retention_pruned").at(-1)?.fields.throughSeq as number;
+		writer.close();
+		// The crash tears the last append after the newest boundary was written.
+		nodeFs.appendFileSync(path, '{"seq":');
+
+		const restarted = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		expect(restarted.verify().ok).toBe(true);
+		expect(readdirSync(dir).some((n) => n.includes(".corrupt-"))).toBe(true);
+		restarted.record("login_ok", { n: 2 });
+		restarted.record("login_ok", { n: 3 });
+		// The live chain starts with the boundary's copy at the seq after it, and every later record takes the next seq once.
+		const live = records(path);
+		expect(live[0]?.event).toBe("audit_retention_pruned");
+		expect(live.map((r) => r.seq)).toEqual([boundary + 1, boundary + 2, boundary + 3]);
+		expect(verifyAuditFile(path)).toEqual({ ok: true, records: 3, lastHash: live.at(-1)?.hash as string });
+		expect(restarted.head().seq).toBe(boundary + 3);
+		// A further restart still verifies the chain it continued.
+		restarted.close();
+		expect(createAuditLog({ path, now: clock(), segmentBytes: MIB }).verify().ok).toBe(true);
+	}, 60_000);
+});
