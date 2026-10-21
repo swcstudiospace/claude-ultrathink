@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
 import { type HookDeps, runPromptSubmit } from "../claude/hook.ts";
-import { clearSkipOnce, newTurnSessionId, type ControlState, readControl, readSkipOnce, sessionPath } from "../claude/state.ts";
+import { clearSkipOnce, hostSessionId, newTurnSessionId, type ControlState, readControl, readSkipOnce, sessionPath } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
 import { decideUplift, isTrivial } from "../uplift/detect.ts";
@@ -112,7 +112,7 @@ export async function planPrompt(
 	if (skipped) return skip(skipped);
 	const cwd = request.cwd?.trim() || process.cwd();
 	// A host that gives no session id gets a fresh turn id: the same id names the record, spec and carrier this turn writes.
-	const sessionId = request.session_id?.trim() || newTurnSessionId();
+	const sessionId = hostSessionId(request.session_id) ?? newTurnSessionId();
 	if (request.invalidHost) {
 		// An entry handed a host it does not recognize gets a visible unresolved record, never a detected host's route,
 		// control or state. The record uses the §6 vocabulary only: diagnostic host "unknown", no transport, provider or
@@ -192,7 +192,7 @@ export async function planPrompt(
 			host,
 			sessionModel: request.model,
 			provider: request.provider,
-			sessionId: request.session_id?.trim() || undefined,
+			sessionId: hostSessionId(request.session_id),
 			signal: options.signal,
 			native: options.native,
 			purpose: "planning",
@@ -218,6 +218,7 @@ export async function planPrompt(
 				engineError: engine.error,
 				modelResolution: resolution,
 				stateDir,
+				armedSkip: skipArmed,
 				surface: host,
 				conversation: recentConversationFromTranscript,
 				brief: (input) =>

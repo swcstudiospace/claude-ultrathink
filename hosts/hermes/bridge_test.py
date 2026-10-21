@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 SWC Studio
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -963,6 +964,26 @@ def test_control_failures_come_back_as_one_line():
 			assert off("") == "Ultrathink off: no answer after 1s"
 
 
+def test_control_forwards_the_session_to_skip_and_status_only():
+	with tempfile.TemporaryDirectory() as tmp:
+		ctx = fake_ctx()
+		plugin.register(ctx)
+		with cli(fake_cli(Path(tmp))):
+			# The session a slash command runs in reaches the CLI for skip and status; other verbs get none.
+			assert ctx.commands["ultrathink-skip"]("", session_id=" H1 ") == f"hermes {bridge.state_dir()} skip --session H1"
+			assert ctx.commands["ultrathink-status"]("", sessionId="h2") == f"hermes {bridge.state_dir()} status --session h2"
+			assert ctx.commands["ultrathink-skip"]("") == f"hermes {bridge.state_dir()} skip"
+			assert ctx.commands["ultrathink-track"]("off", session_id="h1") == f"hermes {bridge.state_dir()} track off"
+	assert bridge.control_args(["skip"], "h1") == ["skip", "--session", "h1"]
+	assert plugin._command_session({"session_id": " h1 "}) == "h1"
+	assert plugin._command_session({"sessionId": "h2"}) == "h2"
+	assert plugin._command_session({"session_id": "  "}) is None
+	# The record stem matches src/claude/state.ts: a plain id keeps its name; any other id gets a lowercase slug and a hash.
+	assert bridge.safe_session_id("s1") == "s1"
+	assert bridge.safe_session_id("Claude-A") == f"claude-a~{hashlib.sha256(b'Claude-A').hexdigest()[:16]}"
+	assert bridge.safe_session_id("a/b") != bridge.safe_session_id("a_b")
+
+
 def test_quick_sends_the_message_once_without_a_plan():
 	with tempfile.TemporaryDirectory() as tmp:
 		engine = {"BUN": str(fake_bun(Path(tmp) / "bun"))}
@@ -1652,6 +1673,7 @@ if __name__ == "__main__":
 	test_skill_description_is_empty_without_frontmatter()
 	test_control_commands_run_the_cli_as_hermes_and_return_its_text()
 	test_control_failures_come_back_as_one_line()
+	test_control_forwards_the_session_to_skip_and_status_only()
 	test_quick_sends_the_message_once_without_a_plan()
 	test_quick_skips_the_next_message_where_hermes_cannot_send_it()
 	test_registers_the_teach_hooks_tools_commands_and_skill_next_to_the_old_ones()

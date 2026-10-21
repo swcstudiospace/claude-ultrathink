@@ -43,7 +43,7 @@ import { isChildInvocation } from "./complete.ts";
 import { formatPlanSkipNotice, formatPromptContext, formatSummary } from "./output.ts";
 import { JEV_PLAN_SKIP, planGate } from "./plan-gate.ts";
 import { shipApplies } from "../ship/policy.ts";
-import { clearSkipOnce, type ControlState, isTurnSessionId, newTurnSessionId, readSession, readSkipOnce, type SessionRecord, sessionPath, writeSession } from "./state.ts";
+import { clearSkipOnce, type ControlState, hostSessionId, isTurnSessionId, newTurnSessionId, readSession, readSkipOnce, type SessionRecord, sessionPath, writeSession } from "./state.ts";
 
 export interface PromptSubmitInput {
 	session_id?: string;
@@ -72,6 +72,11 @@ export interface HookDeps {
 	 */
 	modelResolution?: ModelResolution;
 	stateDir: string;
+	/**
+	 * The armed /ultrathink-skip of this session, when the caller already read it (planPrompt does, before its engine wait).
+	 * Given, the hook neither reads nor consumes the flag: the caller owns it. Absent, the hook reads and consumes it.
+	 */
+	armedSkip?: boolean;
 	clarify?: (opts: RunClarifyOptions) => Promise<Clarification[]>;
 	/** First error the completer threw (already redacted), surfaced in the summary. */
 	engineError?: () => string | undefined;
@@ -138,6 +143,19 @@ function specFile(stateDir: string, sessionId: string): string {
 }
 
 /**
+ * A replan keeps the session's edited repos and recalculates its mismatch against the new plan's label, so a session that
+ * already edited another repo neither forgets it nor repeats its warning (see recordEditAttribution in host/omp.ts).
+ */
+function carryRepoAttribution(prior: SessionRecord | undefined, record: SessionRecord): SessionRecord {
+	const workRepos = prior?.workRepos;
+	if (workRepos === undefined) return record;
+	if (!record.plan) return { ...record, workRepos };
+	const labelled = record.plan.task.repo ?? null;
+	if (workRepos.every((repo) => repo === labelled)) return { ...record, workRepos };
+	return { ...record, workRepos, repoMismatch: { labelled, edited: workRepos } };
+}
+
+/**
  * Saves a fresh plan record and its spec XML under the session's file lock, the
  * same lock `updateSession` (the answers/ship/mark updates) holds, so a locked
  * update can neither be overwritten by nor overwrite this save with stale
@@ -161,10 +179,11 @@ export function savePlanRecord(
 		statePath,
 		() => {
 			const base = record.clarifications ?? [];
-			const late = (readSession(stateDir, sessionId)?.clarifications ?? []).filter(
+			const prior = readSession(stateDir, sessionId);
+			const late = (prior?.clarifications ?? []).filter(
 				(c) => c.answer && c.source !== "knowledge",
 			);
-			let merged = record;
+			let merged = carryRepoAttribution(prior, record);
 			if (late.length > 0) {
 				const byQuestion = new Map<string, Clarification>(late.map((c) => [normalizeQuestion(c.question), c]));
 				const seen = new Set(base.map((c) => normalizeQuestion(c.question)));
@@ -174,7 +193,7 @@ export function savePlanRecord(
 				}
 				if (clarifications.some((c, index) => c !== base[index])) {
 					merged = {
-						...record,
+						...merged,
 						clarifications,
 						result: { ...record.result, xml: injectClarificationsXml(record.result.xml, clarifications) },
 					};
@@ -428,17 +447,19 @@ export async function runPromptSubmit(input: PromptSubmitInput, deps: HookDeps):
 	const started = now();
 	const log = deps.log ?? (() => {});
 	const cwd = input.cwd?.trim() || process.cwd();
-	const sessionId = input.session_id?.trim() || newTurnSessionId();
+	const sessionId = hostSessionId(input.session_id) ?? newTurnSessionId();
 
-	// The armed skip belongs to this session alone; the global control file never carries one.
-	const skipArmed = readSkipOnce(deps.stateDir, sessionId);
+	// The armed skip belongs to this session alone; the global control file never carries one. A caller that read it already
+	// decided this prompt on what it saw, so a skip armed since then waits for the session's next prompt.
+	const callerOwnsSkip = deps.armedSkip !== undefined;
+	const skipArmed = deps.armedSkip ?? readSkipOnce(deps.stateDir, sessionId);
 	const state: UpliftState = {
 		enabled: deps.control.enabled ?? deps.config.uplift.enabled,
 		skipOnce: skipArmed,
 		skipTrivial: deps.config.uplift.skipTrivial,
 	};
 	const decision = decideUplift({ text: input.prompt ?? "", source: "user", idle: true }, state);
-	if (skipArmed && !state.skipOnce) {
+	if (!callerOwnsSkip && skipArmed && !state.skipOnce) {
 		try {
 			clearSkipOnce(deps.stateDir, sessionId);
 		} catch {

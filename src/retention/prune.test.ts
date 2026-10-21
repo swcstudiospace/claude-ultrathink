@@ -3,8 +3,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { readLast, readSession, withLastLock, writeSession } from "../claude/state.ts";
+import { basename, dirname, join } from "node:path";
+import { readLast, readSession, sessionPath, withLastLock, writeSession } from "../claude/state.ts";
 import { pruneSessions, pruneSessionsBestEffort } from "./prune.ts";
 
 const DAY = 86_400_000;
@@ -152,7 +152,7 @@ describe("pruneSessions", () => {
 
 	test("a session id with unsafe characters is protected under its on-disk name", () => {
 		const state = makeState();
-		seed(state, "a_b", 300);
+		seed(state, basename(sessionPath(state, "a/b"), ".json"), 300);
 		writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "a/b", result: {} }));
 		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
 		expect(result.pruned).toEqual([]);

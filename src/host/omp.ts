@@ -504,7 +504,8 @@ const EDIT_HEADER_RE = /^\[(.+?)#[0-9A-Fa-f]{4}\]/gm;
 export function editTargets(toolName: string, input: Record<string, unknown>, cwd: string): string[] {
 	if (toolName === "write") {
 		const path = typeof input.path === "string" ? input.path.trim() : "";
-		return path ? [resolve(cwd, path)] : [];
+		// Omp's device calls (`write xd://<tool>`) name no local file, so they edit nothing on disk.
+		return path && !path.startsWith("xd://") ? [resolve(cwd, path)] : [];
 	}
 	const text = input.input;
 	if (toolName !== "edit" || typeof text !== "string") return [];

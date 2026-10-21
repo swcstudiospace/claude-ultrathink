@@ -293,6 +293,50 @@ describe("planPrompt", () => {
 		}
 	});
 
+	test("a /ultrathink-skip armed while the engine is selected waits for the next prompt, and does not cancel the one already planning", async () => {
+		const { root, env, options } = planHarness();
+		const stateDir = join(root, "state");
+		try {
+			const armedWhileSelecting = {
+				...options,
+				selectEngine: async (): Promise<SelectedEngine> => {
+					// The user types /ultrathink-skip for this session during the engine wait.
+					armSkipOnce(stateDir, "s1");
+					return { label: "stub", complete: stubComplete, error: () => undefined, resolution: STUB_RESOLUTION };
+				},
+			};
+			const planned = await planPrompt({ host: "claude-code", session_id: "s1", prompt: "add a widget", cwd: root }, env, armedWhileSelecting);
+			expect(planned.skipped).toBeUndefined();
+			expect(planned.context).not.toBe("");
+			expect(readSkipOnce(stateDir, "s1")).toBe(true);
+
+			// The armed skip applies to the session's next prompt, once.
+			expect(await planPrompt({ host: "claude-code", session_id: "s1", prompt: "add a button", cwd: root }, env, options)).toMatchObject({
+				context: "",
+				skipped: "precheck-skip",
+			});
+			expect(readSkipOnce(stateDir, "s1")).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("Prime Agent's unknown session id is no session: the plan gets a turn id, and no shared unknown record, spec or carrier is written", async () => {
+		const { root, env, options } = planHarness();
+		const stateDir = join(root, "state");
+		try {
+			const response = await planPrompt({ host: "prime-agent", session_id: "unknown", prompt: "add a widget", cwd: root }, env, options);
+			expect(response.skipped).toBeUndefined();
+			expect(response.specPath).toBeDefined();
+			expect(response.specPath).not.toContain("unknown");
+			expect(response.carrierPath).toBeUndefined();
+			expect(existsSync(join(stateDir, "sessions", "unknown.json"))).toBe(false);
+			expect(existsSync(join(stateDir, "sessions", "unknown.xml"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("uplift, the graph, every node fill and the HITL call share the one selected engine on every host, and the plan carries its record", async () => {
 		for (const host of ["claude-code", "grok-build", "hermes", "muse", "omp"] as const) {
 			const { root, env, options, calls } = planHarness();

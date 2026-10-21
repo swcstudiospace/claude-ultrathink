@@ -79,7 +79,7 @@ describe("session records", () => {
 		};
 		writeSession(dir, record);
 		expect(existsSync(sessionPath(dir, "abc/../evil"))).toBe(true);
-		expect(sessionPath(dir, "abc/../evil")).toContain("abc_.._evil.json");
+		expect(sessionPath(dir, "abc/../evil")).toMatch(/abc_\.\._evil~[0-9a-f]{16}\.json$/);
 		expect(readSession(dir, "abc/../evil")).toEqual(record);
 		expect(readLast(dir)).toEqual(record);
 		expect(readSession(dir, "nope")).toBeUndefined();

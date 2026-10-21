@@ -5,6 +5,7 @@
  * prompt with no session id gets a turn id of its own. Temp git repos only; every root is removed after each test.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import {
 	readControl,
 	readSession,
 	readSkipOnce,
+	skipOncePath,
 	sessionPath,
 	type SessionRecord,
 	updateSession,
@@ -179,6 +181,59 @@ describe("edit attribution", () => {
 		const inputs: Record<string, unknown>[] = [{ input: "+const x = 1;\nno header here" }, { input: "[not a header" }, {}, { input: 42 }];
 		for (const input of inputs) expect(editTargets("edit", input, root)).toEqual([]);
 		expect(readSession(dir, "s1")?.workRepos).toBeUndefined();
+	});
+
+	test("a write to an xd:// device path names no local file, and a plain relative write resolves against cwd", () => {
+		const root = tempRoot();
+		expect(editTargets("write", { path: "xd://mcp__tavus_pal_get" }, root)).toEqual([]);
+		expect(editTargets("write", { path: "src/a.ts" }, root)).toEqual([join(root, "src", "a.ts")]);
+	});
+
+	test("a replan keeps the session's edited repos and mismatch, so the next edit in the same set does not warn again", async () => {
+		const root = tempRoot();
+		const other = repoAt(root, "acme/other");
+		const deps = baseDeps();
+		await runPromptSubmit({ session_id: "s1", cwd: "/repo", prompt: "add a widget" }, deps);
+		const file = join(other, "src", "widget.ts");
+		expect(recordEditAttribution(deps.stateDir, "s1", file)).toContain("acme/other");
+		// Planning another prompt in the session writes a fresh record; the edit history and mismatch must survive it.
+		const replanned = await runPromptSubmit({ session_id: "s1", cwd: "/repo", prompt: "add a button" }, deps);
+		expect(replanned.record?.plan).toBeDefined();
+		expect(readSession(deps.stateDir, "s1")).toMatchObject({
+			workRepos: ["acme/other"],
+			repoMismatch: { labelled: "acme/widgets", edited: ["acme/other"] },
+		});
+		expect(recordEditAttribution(deps.stateDir, "s1", file)).toBeUndefined();
+	});
+});
+
+describe("session file names", () => {
+	test("a plain session id keeps its file name; any other id gets a lowercase name with a hash of the exact id", () => {
+		expect(sessionPath("/state", "s1")).toBe(join("/state", "sessions", "s1.json"));
+		const hash = createHash("sha256").update("Claude-A").digest("hex").slice(0, 16);
+		expect(sessionPath("/state", "Claude-A")).toBe(join("/state", "sessions", `claude-a~${hash}.json`));
+	});
+
+	test("ids that differ only in case or in characters a file name cannot hold never share a record or a skip flag", async () => {
+		const deps = baseDeps();
+		writeSession(deps.stateDir, plannedRecord("Claude-A", "acme/widgets"));
+		writeSession(deps.stateDir, plannedRecord("a/b", "acme/other"));
+		writeSession(deps.stateDir, plannedRecord("a_b", "acme/third"));
+		expect(readSession(deps.stateDir, "claude-a")).toBeUndefined();
+		expect(readSession(deps.stateDir, "Claude-A")?.plan?.task.repo).toBe("acme/widgets");
+		expect(readSession(deps.stateDir, "a/b")?.plan?.task.repo).toBe("acme/other");
+		expect(readSession(deps.stateDir, "a_b")?.plan?.task.repo).toBe("acme/third");
+		expect(await runControl(["skip"], { stateDir: deps.stateDir, cwd: "/repo", sessionId: "Claude-A" })).toContain("will skip");
+		expect(readSkipOnce(deps.stateDir, "claude-a")).toBe(false);
+		// macOS and Windows file systems ignore case: the two ids' skip flags must differ even after folding case.
+		expect(skipOncePath(deps.stateDir, "Claude-A").toLowerCase()).not.toBe(skipOncePath(deps.stateDir, "claude-a").toLowerCase());
+	});
+
+	test("Prime Agent's unknown placeholder is no session: the prompt gets a turn id and no unknown record is written", async () => {
+		const deps = baseDeps();
+		const planned = await runPromptSubmit({ session_id: "unknown", cwd: "/repo", prompt: "add a widget" }, deps);
+		expect(isTurnSessionId(planned.record?.sessionId ?? "")).toBe(true);
+		expect(existsSync(sessionPath(deps.stateDir, "unknown"))).toBe(false);
 	});
 });
 

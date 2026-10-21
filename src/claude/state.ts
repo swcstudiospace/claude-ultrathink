@@ -4,7 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
@@ -132,8 +132,28 @@ export function writeControl(dir: string, patch: ControlState): ControlState {
 	});
 }
 
+/** A plain session id keeps its name: lowercase, letters, digits, `_`, `.`, `-`, at most 120 characters. */
+const PLAIN_SESSION_ID_RE = /^[a-z0-9_.-]{1,120}$/;
+
+/**
+ * The file-name stem of a session id. Host ids are case-sensitive and may hold characters a file name cannot, and macOS
+ * and Windows ignore case: `Claude-A` and `claude-a` would then share one record and one skip flag. A plain id keeps its
+ * name; any other id gets a readable lowercase slug plus a hash of the exact id after `~`, which a plain id never holds.
+ * Every stem is lowercase, and distinct ids get distinct stems.
+ */
 function safeSessionId(id: string): string {
-	return id.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "unknown";
+	if (PLAIN_SESSION_ID_RE.test(id)) return id;
+	const slug = Array.from(id, (char) => (/[A-Za-z0-9_.-]/.test(char) ? char.toLowerCase() : "_")).join("").slice(0, 80);
+	return `${slug}~${createHash("sha256").update(id).digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * The host's session id, trimmed, or undefined when it names no session: blank, or Prime Agent's `unknown` placeholder
+ * for a kernel with no session. Such a prompt gets its own turn id, never a record or skip flag shared by every prompt.
+ */
+export function hostSessionId(id: string | undefined): string | undefined {
+	const trimmed = id?.trim();
+	return trimmed && trimmed !== "unknown" ? trimmed : undefined;
 }
 
 export function sessionPath(dir: string, sessionId: string): string {
