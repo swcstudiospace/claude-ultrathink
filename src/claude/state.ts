@@ -208,7 +208,9 @@ export function readSkipOnce(dir: string, sessionId: string): boolean {
 }
 
 export function armSkipOnce(dir: string, sessionId: string): void {
-	writeFileAtomic(skipOncePath(dir, sessionId), "skip\n");
+	// The session's record lock, which prune holds while it decides on and deletes a stale flag: an arm never lands between
+	// that decision and its delete. A lock that cannot be taken runs unlocked, as every session write does.
+	withFileLock(sessionPath(dir, sessionId), () => writeFileAtomic(skipOncePath(dir, sessionId), "skip\n"));
 }
 
 /** Clears the session's armed skip; an already clear session is left as it is. */

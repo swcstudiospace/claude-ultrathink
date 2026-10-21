@@ -269,20 +269,36 @@ function sweepSkipFlags(sweep: Sweep, stateDir: string, dir: string, names: stri
 	for (const name of names) {
 		if (!name.endsWith(suffix) || name.length === suffix.length) continue;
 		const stem = name.slice(0, -suffix.length);
+		if (keep.has(stem)) continue;
 		const path = join(dir, name);
-		const flag = statEntry(sweep, path, name);
-		if (!flag?.isFile() || sweep.now - flag.mtimeMs <= olderThanMs || keep.has(stem)) continue;
-		let recordNewest: number | undefined;
-		for (const extension of [".json", ".xml"]) {
-			const record = statEntry(sweep, join(dir, `${stem}${extension}`), `${stem}${extension}`);
-			if (record?.isFile()) recordNewest = Math.max(recordNewest ?? 0, record.mtimeMs);
+		// The decision and the delete run under the session record lock, the one armSkipOnce takes: a flag armed while this
+		// sweep decides is never deleted. A lock held by someone else means the session is live, so the flag is kept.
+		const attempt = (): void => {
+			const flag = statEntry(sweep, path, name);
+			if (!flag?.isFile() || sweep.now - flag.mtimeMs <= olderThanMs) return;
+			let recordNewest: number | undefined;
+			for (const extension of [".json", ".xml"]) {
+				const record = statEntry(sweep, join(dir, `${stem}${extension}`), `${stem}${extension}`);
+				if (record?.isFile()) recordNewest = Math.max(recordNewest ?? 0, record.mtimeMs);
+			}
+			if (recordNewest !== undefined && sweep.now - recordNewest <= olderThanMs) return;
+			if (!removeFile(sweep, path, name)) return;
+			sweep.result.orphans.push({ name, bytes: flag.size });
+			sweep.result.bytes += flag.size;
+		};
+		if (sweep.dryRun) {
+			attempt();
+			continue;
 		}
-		if (recordNewest !== undefined && sweep.now - recordNewest <= olderThanMs) continue;
-		const current = statEntry(sweep, path, name);
-		if (!current?.isFile() || sweep.now - current.mtimeMs <= olderThanMs) continue;
-		if (!removeFile(sweep, path, name)) continue;
-		sweep.result.orphans.push({ name, bytes: current.size });
-		sweep.result.bytes += current.size;
+		let locked = true;
+		withFileLock(
+			join(dir, `${stem}.json`),
+			() => {
+				if (locked) attempt();
+				else sweep.result.kept++;
+			},
+			{ timeoutMs: 0, log: () => { locked = false; } },
+		);
 	}
 }
 
@@ -308,7 +324,10 @@ function protectedStems(stateDir: string): Set<string> {
 		if (!record) continue;
 		if (typeof record.sessionId === "string" && record.sessionId) {
 			stems.add(basename(sessionPath(stateDir, record.sessionId), ".json"));
-			stems.add(basename(legacySessionPath(stateDir, record.sessionId), ".json"));
+			// The earlier name is a guess: `a/b` guesses `a_b`, which may be another session's file. Keep it only when the
+			// file there stores this same session id.
+			const legacy = legacySessionPath(stateDir, record.sessionId);
+			if (readRecord(legacy)?.sessionId === record.sessionId) stems.add(basename(legacy, ".json"));
 		}
 		addPath(record.specPath);
 		addPath(record.statePath);

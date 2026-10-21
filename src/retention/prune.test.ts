@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { readLast, readSession, sessionPath, withLastLock, writeSession } from "../claude/state.ts";
+import { legacySessionPath, readLast, readSession, readSkipOnce, sessionPath, withLastLock, writeSession } from "../claude/state.ts";
 import { pruneSessions, pruneSessionsBestEffort } from "./prune.ts";
 
 const DAY = 86_400_000;
@@ -186,6 +186,48 @@ describe("pruneSessions", () => {
 		expect(result.orphans.map((orphan) => orphan.name).sort()).toEqual(["gone.skip", "stale.skip"]);
 		expect(result.bytes).toBeGreaterThan(0);
 		expect(sessionFiles(state)).toEqual(["busy.json", "busy.skip", "busy.xml", "fresh.skip", "pinned.skip"]);
+	});
+
+	test("a guessed earlier name protects only a file that stores the same session id: a/b does not keep a_b's record", () => {
+		const state = makeState();
+		// `a_b` is a real session. `a/b` (named by last.json) guesses the earlier file name `a_b.json`, which is that session's.
+		seed(state, "a_b", 300);
+		writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "a/b", result: {} }));
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.pruned.map((session) => session.id)).toEqual(["a_b"]);
+		expect(sessionFiles(state)).toEqual([]);
+	});
+
+	test("the earlier-named record of a/b is kept while last.json names a/b", () => {
+		const state = makeState();
+		const earlier = legacySessionPath(state, "a/b");
+		expect(basename(earlier)).toBe("a_b.json");
+		put(earlier, JSON.stringify({ sessionId: "a/b", at: 1, result: { original: "old" } }), 300 * DAY);
+		writeFileSync(join(state, "last.json"), JSON.stringify({ sessionId: "a/b", result: {} }));
+		const result = pruneSessions({ stateDir: state, olderThanMs: 30 * DAY, now });
+		expect(result.pruned).toEqual([]);
+		expect(sessionFiles(state)).toEqual(["a_b.json"]);
+	});
+
+	test("the flag's check and delete run while the session record lock is held, the lock armSkipOnce takes", () => {
+		const state = makeState();
+		put(join(state, "sessions", "race.skip"), "skip\n", 60 * DAY);
+		const lock = join(state, "sessions", "race.json.lock");
+		let heldDuringDelete: boolean | undefined;
+		const result = pruneSessions({
+			stateDir: state,
+			olderThanMs: 30 * DAY,
+			now,
+			remove: (path) => {
+				// The window between prune's final check and this delete: a skip armed now must wait for this lock.
+				heldDuringDelete = existsSync(lock);
+				unlinkSync(path);
+			},
+		});
+		expect(heldDuringDelete).toBe(true);
+		expect(result.errors).toEqual([]);
+		expect(existsSync(lock)).toBe(false);
+		expect(readSkipOnce(state, "race")).toBe(false);
 	});
 
 	test("never follows or removes a symlink", () => {
