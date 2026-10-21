@@ -50,10 +50,12 @@ import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
 import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
-import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { ACTIVITY_TYPE, activityFallbackLine, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
+import { toActivityNotice } from "./activity-notice.ts";
+import { readActivity } from "../teach/activity.ts";
 import { confirmInsightLesson, installInsightSkill, previewInsightSkill, type InsightActionRuntime } from "./omp-insight-actions.ts";
 import { createInsightDashboard, type InsightDashboardCallbacks, type InsightPanel } from "./omp-dashboard.ts";
 import type { InsightActionResult, InsightScope, InsightSnapshot, LessonSelection, SkillPreview } from "./omp-insights.ts";
@@ -829,6 +831,8 @@ export function createOmpExtension(
 		// Set on session_shutdown and cleared on session_start/session_switch: a reply computed across an
 		// await must not be delivered into a host that no longer has a live session to receive it.
 		let shutDown = false;
+		let activityTimer: NodeJS.Timeout | undefined;
+		const activitySeen = new Set<string>();
 
 		const guard = (fn: () => void): void => {
 			try {
@@ -1241,9 +1245,55 @@ export function createOmpExtension(
 					});
 				}, 80);
 			});
+		const stopActivityPoll = (): void => {
+			if (activityTimer) {
+				clearInterval(activityTimer);
+				activityTimer = undefined;
+			}
+		};
+		const startActivityPoll = (ctx: ExtensionContext | undefined): void => {
+			stopActivityPoll();
+			if (!uiEnabled || shutDown || !ctx?.hasUI || ctx.mode !== "tui") return;
+			if (isSubagentSession(ctx, exists)) return;
+			const dir = stateDir(ctx.cwd || process.cwd());
+			// Receipts name the session whose observe run wrote them: this window publishes only its own session's.
+			const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+			if (sessionId === "") return;
+			try {
+				for (const row of readActivity(dir)) activitySeen.add(row.id);
+			} catch {
+				// fail-open: a missing or unreadable receipt log must not block the poller
+			}
+			const timer = setInterval(() => {
+				if (shutDown) return;
+				try {
+					for (const row of readActivity(dir)) {
+						if (row.sessionId !== sessionId || activitySeen.has(row.id)) continue;
+						activitySeen.add(row.id);
+						if (activitySeen.size > 200) {
+							const oldest = activitySeen.values().next().value;
+							if (oldest !== undefined) activitySeen.delete(oldest);
+						}
+						if (shutDown) return;
+						const { id: _id, sessionId: _owner, ...notice } = row;
+						guard(() =>
+							pi.sendMessage(
+								{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
+								{ triggerTurn: false },
+							),
+						);
+					}
+				} catch {
+					// fail-open: a receipt is display only
+				}
+			}, 2_000);
+			timer.unref?.();
+			activityTimer = timer;
+		};
 		pi.on("session_start", (_event, ctx) => {
 			shutDown = false;
 			attach(ctx);
+			startActivityPoll(ctx);
 			scheduleMount();
 			// The host already named this session. An invalid id is ignored; a throw must not block startup.
 			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
@@ -1255,11 +1305,13 @@ export function createOmpExtension(
 			guard(() => closeInsightForSwitch(ctx));
 			shutDown = false;
 			attach(ctx);
+			startActivityPoll(ctx);
 			scheduleMount();
 			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_shutdown", () => {
 			shutDown = true;
+			stopActivityPoll();
 			guard(endFlights);
 			guard(() => {
 				if (activeInsight) teardownInsight(activeInsight);
@@ -1537,6 +1589,19 @@ export function createOmpExtension(
 				guard(() => {
 					if (flight.timedOut || flight.settled || !owns(flight)) return;
 					if ((event.type === "begin" || event.type === "end") && event.modelResolution) observe(flight.sessionId, event.modelResolution);
+					if (event.type === "activity") {
+						barWrite(generation, () => {
+							if (shutDown) return;
+							const notice = toActivityNotice(event.notice);
+							if (!notice) return;
+							guard(() =>
+								pi.sendMessage(
+									{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
+									{ triggerTurn: false },
+								),
+							);
+						});
+					}
 					barWrite(generation, () => store.apply(event));
 					if (event.type === "end" && event.detail) flight.endDetail = event.detail;
 				});

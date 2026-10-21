@@ -452,7 +452,9 @@ describe("flight lifecycle (D-12)", () => {
 						expect(response.skipped).toBeUndefined();
 						expect(response.context).toContain("<BUILD_PROMPT>");
 						expect(readSession(stateDir, "s1")?.modelResolution?.modelId).toBe("sol-1");
-						expect(sent).toMatchObject([{ message: { content: response.context, customType: "ultrathink-plan" }, options: { deliverAs: "aside" } }]);
+						expect(sent).toHaveLength(2);
+						expect(sent[0]).toMatchObject({ message: { customType: "ultrathink-activity" } });
+						expect(sent[1]).toMatchObject({ message: { content: response.context, customType: "ultrathink-plan" }, options: { deliverAs: "aside" } });
 					}
 				} finally {
 					lookup.resolve(empty);

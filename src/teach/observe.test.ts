@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { QUESTIONS } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG, type DecisionsConfig } from "../decisions/types.ts";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
+import { readActivity } from "./activity.ts";
 import { DISTILL_SYSTEM, observeDigest, parseLessons } from "./observe.ts";
 import { openStore, storeDir } from "./store.ts";
 import {
@@ -552,6 +553,27 @@ describe("observeDigest auto-promotion (SKILL-03)", () => {
 			expect(drafts(stateDir)).toEqual([]);
 		} finally {
 			cleanup();
+		}
+	});
+});
+
+describe("observeDigest receipts", () => {
+	test("a stored lesson leaves a receipt for its session, and a capture that stored nothing leaves none", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ut-observe-receipts-"));
+		try {
+			const h = harness({ reply: lessonJson(GOOD, { ...GOOD, name: "Second" }) });
+			const stateDir = join(root, "state");
+			h.ctx.stateDir = stateDir;
+			const capture: CaptureFn = async (input, ctx) => {
+				const outcome = await h.capture(input, ctx);
+				return input.name === "Second" ? { ...outcome, created: false, retain: "off", reason: "teach store is unavailable" } : outcome;
+			};
+			await observeDigest(digest(), h.ctx, { capture });
+			const rows = readActivity(stateDir);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ sessionId: "sess-1", kind: "teachable-created", outcome: "created", names: [GOOD.name] });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -66,15 +66,45 @@ describe("createRemoteSink without url", () => {
 	});
 
 	test("a scheduled flush fires after flushMs without an explicit flush", async () => {
-		// Exception to the no-wall-clock rule: this exercises the real setTimeout scheduling path.
+		// Exception to the no-wall-clock rule: this exercises the real setTimeout path, and the sink exposes no awaitable
+		// completion for its file write. appendFile creates the file before writing, so wait on the sink's own counter.
 		const fallbackPath = join(dir, "timer.jsonl");
 		const sink = track({ fallbackPath, flushMs: 20 });
 		sink.push(row(0));
 		const deadline = Date.now() + 3000;
-		while (!existsSync(fallbackPath) && Date.now() < deadline) await Bun.sleep(10);
+		while (sink.stats().fellBack === 0 && Date.now() < deadline) await Bun.sleep(10);
 
+		expect(sink.stats()).toEqual({ queued: 0, sent: 0, dropped: 0, fellBack: 1 });
 		expect(jsonlLines(fallbackPath)).toHaveLength(1);
-		expect(sink.stats().queued).toBe(0);
+	});
+
+	test("the scheduled flush is armed for flushMs, unref'd, and spills when that timer fires", async () => {
+		// Deterministic timer check. The file-write completion below has no awaitable handle, so its poll is the one exception.
+		const fallbackPath = join(dir, "timer-capture.jsonl");
+		const realSetTimeout = globalThis.setTimeout;
+		const armed: Array<() => void> = [];
+		let unreffed = false;
+		const spy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay?: number, ...rest: unknown[]) => {
+			if (delay !== 37) return realSetTimeout(callback, delay, ...rest);
+			armed.push(callback);
+			return { unref: () => (unreffed = true) } as unknown as Timer;
+		}) as typeof setTimeout);
+		try {
+			const sink = track({ fallbackPath, flushMs: 37 });
+			sink.push(row(0));
+			expect(armed).toHaveLength(1);
+			expect(unreffed).toBe(true);
+			expect(existsSync(fallbackPath)).toBe(false);
+
+			armed[0]!();
+			const deadline = Date.now() + 3000;
+			while (sink.stats().fellBack === 0 && Date.now() < deadline) await Bun.sleep(10);
+
+			expect(sink.stats()).toEqual({ queued: 0, sent: 0, dropped: 0, fellBack: 1 });
+			expect(jsonlLines(fallbackPath)).toHaveLength(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	test("close flushes pending rows and later pushes are dropped", async () => {
