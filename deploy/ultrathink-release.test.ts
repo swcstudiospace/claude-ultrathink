@@ -5,7 +5,7 @@
 // guarded), so the real probe() and check_tls_material() run against a local Bun TLS server built in a temp directory.
 // Nothing here touches /etc, systemd, a service user or a production host. The probe's retry sleep is replaced by a
 // PATH stub that logs calls, so the 30-attempt budget is asserted by count and no wall-clock time is spent.
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -159,6 +159,9 @@ async function checkTlsMaterial(tlsDir: string): Promise<number> {
 	return result.exitCode;
 }
 
+// Bun 1.2 rejects a timeout argument to beforeAll, so the setup budget is this file's default hook timeout.
+setDefaultTimeout(PROBE_TIMEOUT_MS);
+
 beforeAll(async () => {
 	work = mkdtempSync(join(tmpdir(), "ultrathink-release-test-"));
 	caReal = join(work, "ca-real");
@@ -182,7 +185,7 @@ beforeAll(async () => {
 	writeFileSync(join(stubBin, "sleep"), '#!/bin/sh\nprintf "slept\\n" >>"$SLEEP_LOG"\n');
 	chmodSync(join(stubBin, "sleep"), 0o755);
 	sleepLog = join(work, "sleep.log");
-}, PROBE_TIMEOUT_MS);
+});
 
 afterAll(() => {
 	if (work !== "") rmSync(work, { recursive: true, force: true });

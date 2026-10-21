@@ -171,10 +171,19 @@ parse_restore_args() {
 	fi
 }
 
-# Ring file names, one per line. Only regular files: tree directories and dot entries are not snapshots.
+# Prints NAME<TAB>PATH for each regular file directly in DIR whose name matches PATTERN. A read loop replaces
+# find -printf, which BSD find (macOS) does not have.
+list_named_files() {
+	local dir="$1" pattern="$2" path
+	find "$dir" -mindepth 1 -maxdepth 1 -type f -name "$pattern" | while IFS= read -r path; do
+		printf '%s\t%s\n' "${path##*/}" "$path"
+	done
+}
+
+# Ring file names, newest first, one per line. Only regular files: tree directories and dot entries are not snapshots.
 ring_names() {
 	if [ -d "$SNAPSHOT_DIR" ]; then
-		find "$SNAPSHOT_DIR" -mindepth 1 -maxdepth 1 -type f -name 'ultrathink-*.sqlite' -printf '%f\n'
+		list_named_files "$SNAPSHOT_DIR" 'ultrathink-*.sqlite' | cut -f1 | sort -r
 	fi
 }
 
@@ -494,10 +503,10 @@ run_promote() {
 # Off-host copies, newest last: archives in the backup directory and sqlite copies under ring/.offhost.
 offhost_candidates() {
 	if [ -d "$BACKUP_DIR" ]; then
-		find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name 'ultrathink-*.tar.gz.age' -printf '%f\t%p\n'
+		list_named_files "$BACKUP_DIR" 'ultrathink-*.tar.gz.age'
 	fi
 	if [ -d "$SNAPSHOT_DIR/.offhost" ]; then
-		find "$SNAPSHOT_DIR/.offhost" -mindepth 1 -maxdepth 1 -type f -name 'ultrathink-*.sqlite.age' -printf '%f\t%p\n'
+		list_named_files "$SNAPSHOT_DIR/.offhost" 'ultrathink-*.sqlite.age'
 	fi
 }
 
