@@ -50,7 +50,7 @@ import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
 import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
-import { ACTIVITY_TYPE, activityFallbackLine, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { ACTIVITY_DELIVERY, ACTIVITY_TYPE, activityFallbackLine, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
@@ -1279,7 +1279,7 @@ export function createOmpExtension(
 						guard(() =>
 							pi.sendMessage(
 								{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
-								{ triggerTurn: false },
+								ACTIVITY_DELIVERY,
 							),
 						);
 					}
@@ -1597,7 +1597,7 @@ export function createOmpExtension(
 							guard(() =>
 								pi.sendMessage(
 									{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
-									{ triggerTurn: false },
+									ACTIVITY_DELIVERY,
 								),
 							);
 						});

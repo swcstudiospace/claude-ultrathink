@@ -19,6 +19,12 @@ export const INSIGHT_TYPE = "ultrathink-insight";
 export const SWARM_TYPE = "ultrathink-swarm";
 /** Display-only card of what a substrate flow accessed. Names and retain state only. */
 export const ACTIVITY_TYPE = "ultrathink-activity";
+/**
+ * Delivery for activity cards. Default delivery steers the running turn while the session streams, which injects the
+ * card into the model's context. `triggerTurn: false` alone only stops an idle turn start. `nextTurn` with
+ * `triggerTurn: false` neither steers nor starts a turn, and renders at once when idle.
+ */
+export const ACTIVITY_DELIVERY = { deliverAs: "nextTurn", triggerTurn: false } as const;
 
 /** Graph rows in the collapsed card; the graph degrades its layout to fit. */
 const COLLAPSED_GRAPH_ROWS = 18;
