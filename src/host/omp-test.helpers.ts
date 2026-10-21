@@ -296,7 +296,7 @@ export async function runChildLifetimeScenario(scenario: {
 	try {
 		const hostDir = fileURLToPath(new URL("./", import.meta.url));
 		const script = join(root, "lifetime-scenario.ts");
-		writeFileSync(script, childLifetimeSource(hostDir, scenario));
+		writeFileSync(script, childLifetimeSource(hostDir, scenario, root));
 		const proc = Bun.spawn([process.execPath, script], {
 			stdout: "pipe",
 			stderr: "pipe",
@@ -437,7 +437,7 @@ export async function runChildLifetimeScenario(scenario: {
  * microtask drains between callbacks; I/O and delivery use real started/completed/delivered
  * barriers, never the parent process clock. No paid provider, no live auth, disposable roots only.
  */
-function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; cancelHung: boolean; handoffOrder?: HandoffOrder }): string {
+function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; cancelHung: boolean; handoffOrder?: HandoffOrder }, parentRoot: string): string {
 	const ompPath = JSON.stringify(join(hostDir, "omp.ts"));
 	const helpersPath = JSON.stringify(join(hostDir, "omp-test.helpers.ts"));
 	const planPath = JSON.stringify(join(hostDir, "plan.ts"));
@@ -446,6 +446,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 	const maxRunMs = JSON.stringify(scenario.maxRunMs);
 	const cancelHung = JSON.stringify(scenario.cancelHung);
 	const handoffOrder = JSON.stringify(scenario.handoffOrder ?? null);
+	const parentRootPath = JSON.stringify(parentRoot);
 	return [
 		"import { createNativeEngineSelector } from " + ompPath + ";",
 		"import { fakeModel, fakeRuntime, isolatedPlanEnv, quietConfig, recorder, reply, setup, stageAnswer, userText } from " + helpersPath + ";",
@@ -455,8 +456,8 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"import type { PlanResponse } from " + planPath + ";",
 		"import type { ProgressEvent } from " + progressPath + ";",
 		"import { existsSync, mkdtempSync, rmSync } from 'node:fs';",
-		"import { tmpdir } from 'node:os';",
 		"import { join } from 'node:path';",
+		"const PARENT_ROOT: string = " + parentRootPath + ";",
 		"",
 		"const SCENARIO_MAX_RUN_MS: number | undefined = " + maxRunMs + ";",
 		"const SCENARIO_CANCEL_HUNG: boolean = " + cancelHung + ";",
@@ -952,7 +953,7 @@ function childLifetimeSource(hostDir: string, scenario: { maxRunMs?: number; can
 		"	const stashClearTimeout = globalThis.clearTimeout;",
 		"	globalThis.setTimeout = virtualSetTimeout as typeof setTimeout;",
 		"	globalThis.clearTimeout = virtualClearTimeout as typeof clearTimeout;",
-		"	const root = mkdtempSync(join(tmpdir(), 'ut-omp-life-child-'));",
+		"	const root = mkdtempSync(join(PARENT_ROOT, 'child-'));",
 		"	try {",
 		"		if (SCENARIO_HANDOFF_ORDER !== null) {",
 		"			check(SCENARIO_HANDOFF_ORDER === 'provider-first' || SCENARIO_HANDOFF_ORDER === 'race-first', 'unknown handoff order');",
