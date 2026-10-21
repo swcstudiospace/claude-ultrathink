@@ -4,7 +4,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 import { METRIC_FAMILIES } from "./metric-families.ts";
+import { createAnomalyDetector } from "./signal-anomaly.ts";
 
 // Repository root, three levels above services/ultrathink/obs/.
 const REPO_ROOT = new URL("../../../", import.meta.url);
@@ -74,4 +76,36 @@ describe("observability deploy contract", () => {
 			expect(panelsPerRow.get(row) ?? 0, `row "${row}" has a panel`).toBeGreaterThan(0);
 		}
 	});
+
+	test("a sustained runtime jump stays active long enough for UltrathinkAnomalyActive to fire", () => {
+		// The runtime sampler feeds each detector every 5 s (RUNTIME_SAMPLE_MS in routes/router.ts).
+		const SAMPLE_SECONDS = 5;
+		const rules = parseYaml(readFileSync(fileURLToPath(new URL("deploy/observability/rules.yml", REPO_ROOT)), "utf8")) as {
+			groups: Array<{ rules: Array<{ alert?: string; for?: string }> }>;
+		};
+		const alert = rules.groups.flatMap((group) => group.rules).find((rule) => rule.alert === "UltrathinkAnomalyActive");
+		const waitSeconds = durationSeconds(alert?.for);
+
+		const detector = createAnomalyDetector();
+		for (let sample = 0; sample < 40; sample += 1) detector.observe(1);
+		let activeSamples = 0;
+		let raised = false;
+		for (let sample = 0; sample < 1000; sample += 1) {
+			const state = detector.observe(2);
+			if (state.transition === "raised") raised = true;
+			if (state.active) activeSamples += 1;
+			if (state.transition === "cleared") break;
+		}
+
+		expect(raised).toBe(true);
+		// The gauge is 1 for activeSamples samples; the alert fires only if it stays 1 for its whole wait.
+		expect(waitSeconds).toBeLessThan(activeSamples * SAMPLE_SECONDS);
+	});
 });
+
+function durationSeconds(duration: string | undefined): number {
+	const match = /^(\d+)([smh])$/.exec(duration ?? "");
+	if (match === null) throw new Error(`unsupported duration ${duration ?? "(absent)"}`);
+	const unit = { s: 1, m: 60, h: 3600 }[match[2] as "s" | "m" | "h"];
+	return Number(match[1]) * unit;
+}

@@ -128,18 +128,18 @@ groups:
 
       - alert: UltrathinkAnomalyActive
         expr: 'ultrathink_anomaly_active == 1'
-        for: 10m
+        for: 5m
         labels:
           severity: ticket
         annotations:
           summary: "Anomaly detector active for signal {{ $labels.signal }}"
-          description: "In-process statistical detector on event-loop lag, RSS or heap used. Raised after 3 breaching samples and cleared after 5 calm ones."
+          description: "In-process statistical detector on event-loop lag, RSS or heap used. A breach is raised after 3 samples at 5 s and cleared after 5 calm samples. A sustained jump is adopted as the new baseline after 120 breaching samples (about 10 minutes), which clears it, so this rule waits 5 minutes to fire before that."
           runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
 
   - name: ultrathink-slo
     rules:
       - record: ultrathink:http_bad_ratio:30d
-        expr: 'sum(increase(ultrathink_http_requests_total{status_class="5xx"}[30d])) / sum(increase(ultrathink_http_requests_total[30d]))'
+        expr: '(sum(increase(ultrathink_http_requests_total{status_class="5xx"}[30d])) or vector(0)) / sum(increase(ultrathink_http_requests_total[30d]))'
 
       - alert: UltrathinkSLOBurnRatePage
         expr: 'ultrathink_slo_burn_rate{slo="http_availability",window="1h"} > 14.4 and on(slo) ultrathink_slo_burn_rate{slo="http_availability",window="5m"} > 14.4'
