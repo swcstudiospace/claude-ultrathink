@@ -937,6 +937,10 @@ describe("flight lifecycle (D-12)", () => {
 			let tracks = 0;
 			const events: ProgressEvent[] = [];
 			const oldCompleted = Promise.withResolvers<PlanResponse>();
+			// The race window is wall-clock time and decides only what a still-running prompt returns. This test pins
+			// cancellation, so the window is set past its budget: cancel settles the race first, and the timer is then cleared.
+			// At 10 ms a slow macOS run lets the race return the pending note before turn_start, which is valid but not this
+			// test's outcome.
 			const h = setup(async (request, signal, onEvent) => {
 				if (request.prompt === "add a widget immediately") return { context: "PLAN B" };
 				const response = await planPrompt(
@@ -958,7 +962,7 @@ describe("flight lifecycle (D-12)", () => {
 				);
 				oldCompleted.resolve(response);
 				return response;
-			}, 10, { stateDir, config: () => config }, { cwd: root, model: live, ...runtime });
+			}, 60_000, { stateDir, config: () => config }, { cwd: root, model: live, ...runtime });
 			const oldPromise = h.run("add a widget");
 			// The planner reaches its first model call only after a real event-loop turn on Bun 1.2, so await that call itself.
 			await firstCall.promise;
