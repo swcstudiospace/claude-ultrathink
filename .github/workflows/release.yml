@@ -1,9 +1,9 @@
 # Creates a GitHub release when a semantic-version tag is pushed. It never publishes to a registry (the package
 # is private) and only runs for tags like v1.5.0 or v1.5.0-rc.1; milestone tags such as v1.3 do not match.
 # The tag is checked against package.json, every manifest and CHANGELOG.md, the gates run again, and the
-# release notes are the tag's CHANGELOG.md section. Before the release is created, the job also gates on the
-# required check runs for the tagged commit, the dependency audit and the license policy, and attaches that
-# evidence (security-evidence/) to the release.
+# release notes are the tag's CHANGELOG.md section. Before the release is created, the job refuses a tag whose commit
+# is not on origin/main, then gates on the required check runs for the tagged commit, the dependency audit and the
+# license policy, and attaches that evidence (security-evidence/) to the release.
 name: Release
 
 on:
@@ -27,6 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -51,6 +52,20 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: bun scripts/release-check.ts --tag "$TAG"
+
+      # The tagged commit must already be on main. origin/main is fetched here because persist-credentials is off, so the
+      # token is passed through an extra header instead. Any failure stops the job before the release is created.
+      - name: Verify tagged commit is on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if ! git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'; then
+            echo "::error::cannot fetch origin/main; release refused" >&2
+            exit 1
+          fi
+          bun scripts/security-gate.ts ancestry --sha "$SHA"
 
       - name: Type check
         run: bun run check

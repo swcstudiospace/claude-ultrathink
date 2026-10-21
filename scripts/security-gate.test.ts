@@ -82,10 +82,10 @@ function writePolicy(dir: string, json: Record<string, unknown>): string {
 
 type Run = { code: number; out: string[]; err: string[] };
 
-function run(argv: string[], runAudit?: CliIo["runAudit"]): Run {
+function run(argv: string[], runAudit?: CliIo["runAudit"], root = REPO): Run {
 	const out: string[] = [];
 	const err: string[] = [];
-	const code = main(argv, { out: (line) => out.push(line), err: (line) => err.push(line), root: REPO, runAudit });
+	const code = main(argv, { out: (line) => out.push(line), err: (line) => err.push(line), root, runAudit });
 	return { code, out, err };
 }
 
@@ -609,6 +609,61 @@ describe("bun subprocess", () => {
 	});
 });
 
+describe("ancestry", () => {
+	const gitIdentity = ["-c", "user.name=test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false"];
+
+	function git(dir: string, ...args: string[]): string {
+		const result = Bun.spawnSync(["git", ...gitIdentity, ...args], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${new TextDecoder().decode(result.stderr)}`);
+		return new TextDecoder().decode(result.stdout).trim();
+	}
+
+	/** A repo whose origin/main is its first commit, the way the release job's fetch leaves it. */
+	function repoWithMain(): { dir: string; onMain: string } {
+		const dir = tempDir();
+		git(dir, "init", "-q");
+		git(dir, "symbolic-ref", "HEAD", "refs/heads/main");
+		git(dir, "commit", "-q", "--allow-empty", "-m", "on main");
+		const onMain = git(dir, "rev-parse", "HEAD");
+		git(dir, "update-ref", "refs/remotes/origin/main", onMain);
+		return { dir, onMain };
+	}
+
+	test("a tagged commit on origin/main passes", () => {
+		const { dir, onMain } = repoWithMain();
+		expect(run(["ancestry", "--sha", onMain], undefined, dir).code).toBe(0);
+	});
+
+	test("a tagged commit that is not on origin/main is refused with exit 1", () => {
+		const { dir } = repoWithMain();
+		git(dir, "checkout", "-q", "-b", "feature");
+		git(dir, "commit", "-q", "--allow-empty", "-m", "off main");
+		const offMain = git(dir, "rev-parse", "HEAD");
+		const result = run(["ancestry", "--sha", offMain], undefined, dir);
+		expect(result.code).toBe(1);
+		expect(result.err.join("\n")).toContain("is not an ancestor of origin/main");
+	});
+
+	test("a commit on origin/main with passing scan evidence proceeds through ancestry and report", () => {
+		const { dir, onMain } = repoWithMain();
+		const out = tempDir();
+		for (const gate of ["audit", "licenses", "checks"]) {
+			write(join(out, `${gate}.json`), JSON.stringify({ schema: 1, gate, status: "pass" }));
+		}
+		expect(run(["ancestry", "--sha", onMain], undefined, dir).code).toBe(0);
+		expect(run(["report", "--out", out, "--policy", SHIPPED_POLICY, "--sha", onMain], undefined, dir).code).toBe(0);
+		expect(evidence(join(out, "manifest.json")).status).toBe("pass");
+	});
+
+	test("a missing origin/main ref fails closed with exit 2, never a pass", () => {
+		const dir = tempDir();
+		git(dir, "init", "-q");
+		git(dir, "commit", "-q", "--allow-empty", "-m", "no remote");
+		const sha = git(dir, "rev-parse", "HEAD");
+		expect(run(["ancestry", "--sha", sha], undefined, dir).code).toBe(2);
+	});
+});
+
 describe("usage errors", () => {
 	const cases: string[][] = [
 		[],
@@ -621,6 +676,9 @@ describe("usage errors", () => {
 		["checks", "--input", "x", "--out", "y", "--root", REPO],
 		["report"],
 		["licenses", "--out", "x"],
+		["ancestry"],
+		["ancestry", "--sha", "HEAD"],
+		["ancestry", "--sha", "abc", "--out", "x"],
 	];
 	for (const argv of cases) {
 		test(`rejects ${JSON.stringify(argv)} with exit 2`, () => {

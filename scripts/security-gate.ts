@@ -4,11 +4,12 @@
 /**
  * scripts/security-gate.ts — the security gate for CI and releases.
  *
- * Four modes. Each of the first three writes one evidence file, and `report` reads all three:
+ * Five modes. Each of the first three writes one evidence file, and `report` reads all three. `ancestry` writes none:
  *   audit     bun audit JSON against the policy threshold and allow list  -> audit.json
  *   licenses  installed package licenses against the SPDX allow list       -> licenses.json
  *   checks    gh api check-run NDJSON against requiredChecks               -> checks.json
  *   report    reads the three files and writes the release manifest        -> manifest.json
+ *   ancestry  the tagged commit is an ancestor of origin/main    -> nothing; exit 1 when it is not
  *
  * Exit codes: 0 pass; 1 policy failure (evidence is still written); 2 usage error, unknown
  * tool output shape, or tool error. Fails closed: each run deletes its own evidence file first,
@@ -103,6 +104,7 @@ const USAGE = [
 	"       bun scripts/security-gate.ts licenses --root <dir>... --out <dir> [--policy <file>] [--today YYYY-MM-DD]",
 	"       bun scripts/security-gate.ts checks --input <ndjson> --out <dir> [--policy <file>]",
 	"       bun scripts/security-gate.ts report --out <dir> [--sha <sha>] [--tag <tag>] [--policy <file>]",
+	"       bun scripts/security-gate.ts ancestry --sha <sha>",
 ].join("\n");
 
 // ---------- shared helpers ----------
@@ -557,6 +559,29 @@ export function evaluateChecks(latest: ReadonlyMap<string, CheckRun>, policy: Po
 	return { status: checks.every((check) => check.status === "pass") ? "pass" : "fail", checks };
 }
 
+// ---------- ancestry ----------
+
+/** The ref a release commit must already be on. The release workflow fetches it before the gate runs. */
+export const MAIN_REF = "origin/main";
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * True when `sha` is an ancestor of origin/main. `git merge-base --is-ancestor` exits 0 for yes and 1 for no. Any other
+ * exit (missing ref, unknown commit, git not installed) throws, so an error can never read as "on main".
+ */
+export function isOnMain(
+	root: string,
+	sha: string,
+	spawn: SpawnSync = (cmd, options) => Bun.spawnSync(cmd, options),
+): boolean {
+	if (!FULL_SHA.test(sha)) throw new Error(`--sha must be a full lowercase 40-hex commit id, got "${sha}"`);
+	const result = spawn(["git", "merge-base", "--is-ancestor", sha, MAIN_REF], { cwd: root, stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode === 0) return true;
+	if (result.exitCode === 1) return false;
+	const detail = new TextDecoder().decode(result.stderr).trim();
+	throw new Error(`git merge-base exited ${result.exitCode ?? "without a code"}${detail === "" ? "" : `: ${detail}`}`);
+}
+
 // ---------- report ----------
 
 /** A missing evidence file is a failure; a present file that is not this gate's evidence is a shape error. */
@@ -590,8 +615,8 @@ export function buildManifest(
 
 // ---------- CLI ----------
 
-type Mode = "audit" | "licenses" | "checks" | "report";
-const MODES: readonly Mode[] = ["audit", "licenses", "checks", "report"];
+type Mode = "audit" | "licenses" | "checks" | "report" | "ancestry";
+const MODES: readonly Mode[] = ["audit", "licenses", "checks", "report", "ancestry"];
 
 type Options = {
 	roots: string[];
@@ -608,6 +633,7 @@ const ALLOWED_FLAGS: Record<Mode, readonly string[]> = {
 	licenses: ["--root", "--policy", "--today", "--out"],
 	checks: ["--input", "--policy", "--out"],
 	report: ["--out", "--sha", "--tag", "--policy"],
+	ancestry: ["--sha"],
 };
 
 const REQUIRED_FLAGS: Record<Mode, readonly string[]> = {
@@ -615,6 +641,7 @@ const REQUIRED_FLAGS: Record<Mode, readonly string[]> = {
 	licenses: ["--root", "--out"],
 	checks: ["--input", "--out"],
 	report: ["--out"],
+	ancestry: ["--sha"],
 };
 
 export function parseArgs(argv: readonly string[]): { mode: Mode; options: Options } {
@@ -783,6 +810,16 @@ function runReport(options: Options, io: CliIo): number {
 	return manifest.status === "pass" ? 0 : 1;
 }
 
+function runAncestry(options: Options, io: CliIo): number {
+	const sha = need(options.sha, "--sha");
+	if (!isOnMain(io.root, sha)) {
+		io.err(`ancestry: ${sha} is not an ancestor of ${MAIN_REF}; the release is refused`);
+		return 1;
+	}
+	io.out(`security-gate ancestry: ${sha} is an ancestor of ${MAIN_REF}`);
+	return 0;
+}
+
 /** Runs the CLI and returns its exit code: 0 pass, 1 policy failure, 2 usage error, unknown shape, or tool error. */
 export function main(argv: readonly string[], io: CliIo): number {
 	let parsed: { mode: Mode; options: Options };
@@ -803,6 +840,8 @@ export function main(argv: readonly string[], io: CliIo): number {
 				return runChecks(parsed.options, io);
 			case "report":
 				return runReport(parsed.options, io);
+			case "ancestry":
+				return runAncestry(parsed.options, io);
 		}
 	} catch (error) {
 		io.err(`security-gate ${parsed.mode}: ${messageOf(error)}`);
