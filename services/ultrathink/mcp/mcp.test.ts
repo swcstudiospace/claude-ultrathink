@@ -1234,3 +1234,49 @@ describe("refused input", () => {
 		}
 	});
 });
+
+describe("refused tool calls are logged", () => {
+	test("a numeric tool name is refused as unknown and logs one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect((await replyOf(host, toolCall(5, {}, 3))).error).toEqual(UNKNOWN_TOOL);
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that are not an object are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", "prompt", 3));
+			expect(resultOf<ToolResult>(reply).structuredContent).toEqual({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that fail the tool schema are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", {}, 4));
+			expect(resultOf<ToolResult>(reply).structuredContent).toMatchObject({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "INVALID_ARGUMENTS" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});

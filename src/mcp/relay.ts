@@ -76,15 +76,17 @@ function refusedEnvelope(message: unknown): { field: string; code: string } | nu
 	return null;
 }
 
-/** The first refused field of an incoming message: one JSON-RPC 2.0 object, or a non-empty batch of them. */
-function refusedMessage(message: unknown): { field: string; code: string } | null {
-	if (!Array.isArray(message)) return refusedEnvelope(message);
-	if (message.length === 0) return { field: "batch", code: "EMPTY" };
-	for (const item of message) {
-		const refusal = refusedEnvelope(item);
-		if (refusal !== null) return refusal;
-	}
-	return null;
+/** A refused message is answered with -32600 only when it awaits an answer: a request, or any value that is not an object. A notification (no id) and a response (result or error) never are. */
+function awaitsAnswer(message: unknown): boolean {
+	if (!isObjectMessage(message)) return true;
+	if ("result" in message || "error" in message) return false;
+	return message.id !== undefined;
+}
+
+/** The id a -32600 answer echoes: the message's own id when it is a string or a number, otherwise null. */
+function answerId(message: unknown): string | number | null {
+	if (!isObjectMessage(message)) return null;
+	return typeof message.id === "string" || typeof message.id === "number" ? message.id : null;
 }
 
 function retryAfterSeconds(headers: Headers, body: string): string | undefined {
@@ -296,35 +298,53 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		}
 	};
 
+	const refuse = (message: unknown, refusal: { field: string; code: string }): void => {
+		getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "message", details: refusal });
+		if (awaitsAnswer(message)) writeError(answerId(message), -32600, "invalid request");
+	};
+
+	const forward = async (message: unknown, signal?: AbortSignal): Promise<void> => {
+		const rpc = asRpc(message);
+		const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
+		let replied = false;
+		const emit = (line: string): void => {
+			if (isRequest && !replied) {
+				const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
+				if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
+			}
+			options.write(line);
+		};
+		try {
+			await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
+		} catch (error) {
+			log("relay error");
+			if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
 	return {
 		async handle(message: unknown, signal?: AbortSignal): Promise<void> {
-			const refusal = refusedMessage(message);
-			if (refusal !== null) {
-				getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "message", details: refusal });
-				// A request waits for an answer, so it is answered with an error. A notification and a response never are.
-				const awaitsAnswer = Array.isArray(message) || (isObjectMessage(message) && message.method !== undefined && message.id !== undefined);
-				if (awaitsAnswer) {
-					const id = isObjectMessage(message) && (typeof message.id === "string" || typeof message.id === "number") ? message.id : null;
-					writeError(id, -32600, "invalid request");
+			if (!Array.isArray(message)) {
+				const refusal = refusedEnvelope(message);
+				if (refusal !== null) {
+					refuse(message, refusal);
+					return;
 				}
+				await forward(message, signal);
 				return;
 			}
-			const rpc = asRpc(message);
-			const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
-			let replied = false;
-			const emit = (line: string): void => {
-				if (isRequest && !replied) {
-					const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
-					if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
-				}
-				options.write(line);
-			};
-			try {
-				await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
-			} catch (error) {
-				log("relay error");
-				if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+			if (message.length === 0) {
+				refuse(message, { field: "batch", code: "EMPTY" });
+				return;
 			}
+			// Each item is judged alone: a refused item is answered, and the valid items are still forwarded.
+			const valid: unknown[] = [];
+			for (const item of message) {
+				const refusal = refusedEnvelope(item);
+				if (refusal === null) valid.push(item);
+				else refuse(item, refusal);
+			}
+			if (valid.length > 0) await forward(valid, signal);
 		},
 	};
 }

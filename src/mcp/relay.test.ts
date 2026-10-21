@@ -549,3 +549,39 @@ describe("refused stdin", () => {
 		}
 	});
 });
+
+describe("envelope answers and batches", () => {
+	test("a notification is forwarded and never answered", async () => {
+		const { relay, calls, out } = setup(() => new Response(null, { status: 202 }));
+		await relay.handle({ jsonrpc: "2.0", method: "notifications/initialized" });
+		expect(calls.map((call) => call.body.method)).toEqual(["notifications/initialized"]);
+		expect(out()).toEqual([]);
+	});
+
+	test("a response, with a result or an error, is forwarded and never answered", async () => {
+		const { relay, calls, out } = setup(() => new Response(null, { status: 202 }));
+		await relay.handle({ jsonrpc: "2.0", id: 7, result: {} });
+		await relay.handle({ jsonrpc: "2.0", id: 8, error: { code: -1, message: "x" } });
+		expect(calls).toHaveLength(2);
+		expect(out()).toEqual([]);
+	});
+
+	test("a message with an id and no method is answered -32600 with that id and never forwarded", async () => {
+		const { relay, calls, out } = setup(() => json({ jsonrpc: "2.0", id: 0, result: {} }));
+		await relay.handle({ jsonrpc: "2.0", id: 7 });
+		expect(calls).toHaveLength(0);
+		expect(out()).toEqual([{ jsonrpc: "2.0", id: 7, error: { code: -32600, message: "invalid request" } }]);
+	});
+
+	test("a batch with one invalid item forwards the valid ping and answers the invalid one with -32600 and a null id", async () => {
+		const { relay, calls, out } = setup(() => json([{ jsonrpc: "2.0", id: 1, result: {} }]));
+		await relay.handle([{ jsonrpc: "2.0", id: 1, method: "ping" }, 42]);
+		expect(calls).toHaveLength(1);
+		const forwarded: unknown = calls[0]?.body;
+		expect(forwarded).toEqual([{ jsonrpc: "2.0", id: 1, method: "ping" }]);
+		expect(out()).toEqual([
+			{ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } },
+			{ jsonrpc: "2.0", id: 1, result: {} },
+		]);
+	});
+});

@@ -536,3 +536,61 @@ describe("refused input", () => {
 		}
 	});
 });
+
+describe("callback and token limits", () => {
+	test("a percent-encoded control character in a callback parameter is refused before the token request, and logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: "at-1" })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			const requests = fake.calls.length;
+			// The raw callback passes the text check: %07 is plain text there. It decodes to BEL, which must not reach the token endpoint.
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc%07&state=${pending.state}`, deps)).rejects.toThrow("authorization callback is not valid text");
+			expect(fake.calls).toHaveLength(requests);
+			expect(recorder.validation).toEqual([{ source: "mcp_oauth", resource: "oauth", details: { field: "code", code: "PATTERN_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("a 5000-character access token is accepted, sent, and recovered after a 401 without being refused", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const token = "a".repeat(5000);
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: token, refresh_token: "rt-1", expires_in: 3600 })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			await completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}`, deps);
+			const sent = await resolveAuthHeader("notion", deps);
+			expect(sent).toBe(`Bearer ${token}`);
+			const refreshed = fakeFetch(notionRoutes(() => json({ access_token: "b".repeat(5000), refresh_token: "rt-2", expires_in: 3600 })));
+			expect(await recoverUnauthorized("notion", sent, { fetch: refreshed.fetch, now: () => NOW, storePath: path })).toBe(true);
+			expect(refreshed.calls.some(c => c.url.endsWith("/token"))).toBe(true);
+			expect(recorder.validation).toEqual([]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("an access token over the limit is refused when accepted, logged, and nothing is stored", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: "a".repeat(8200) })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}`, deps)).rejects.toThrow("too long or malformed");
+			const cred = readStore(path).providers.notion;
+			expect(cred?.kind === "oauth" && cred.tokens).toBeUndefined();
+			expect(recorder.validation).toEqual([{ source: "mcp_oauth", resource: "oauth", details: { field: "access_token", code: "TOO_LONG" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});

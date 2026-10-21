@@ -331,14 +331,14 @@ async function handleMessage(host: McpToolHost, message: unknown): Promise<Handl
 	}
 	const envelope = refusedEnvelope(id, method);
 	if (envelope !== null) {
-		getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: envelope });
+		refusedRequest(envelope.field, envelope.code);
 		return { reply: invalidRequest(), status: 400 };
 	}
 	// A request cannot be a notification: the client waits for an answer.
 	if (method.startsWith(NOTIFICATION_PREFIX)) return { reply: rpcError(id, METHOD_NOT_FOUND, "method not found") };
 	const param = refusedParams(method, message.params);
 	if (param !== null) {
-		getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: param });
+		refusedRequest(param.field, param.code);
 		return { reply: rpcError(id, INVALID_PARAMS, "invalid params") };
 	}
 	try {
@@ -357,6 +357,11 @@ function refusedEnvelope(id: unknown, method: string): { field: string; code: st
 	}
 	const verdict = METHOD_TEXT.validate(method);
 	return verdict.valid ? null : { field: "method", code: verdict.errors[0]?.code ?? "INVALID" };
+}
+
+/** Records one refused request on the security feed. Only the field and the validator code are recorded, never the value. */
+function refusedRequest(field: string, code: string): void {
+	getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: { field, code } });
 }
 
 /** The first text parameter a method reads, when it is a string too long or with a control character. Other values keep their existing handling. */
@@ -445,8 +450,13 @@ async function callTool(
 	const args = isRecord(params) && "arguments" in params ? given : {};
 	const tool =
 		typeof name === "string" ? toolDefinitions(serverPlanning).find((candidate) => candidate.name === name) : undefined;
-	if (tool === undefined) return rpcError(id, INVALID_PARAMS, "unknown tool");
+	if (tool === undefined) {
+		// A name that is present but not a string is a refused request. A missing one is simply unknown.
+		if (name !== undefined && typeof name !== "string") refusedRequest("name", "TYPE_MISMATCH");
+		return rpcError(id, INVALID_PARAMS, "unknown tool");
+	}
 	if (!isRecord(args)) {
+		refusedRequest("arguments", "TYPE_MISMATCH");
 		return rpcResult(id, {
 			content: [{ type: "text", text: "invalid arguments" }],
 			structuredContent: { error: "invalid_arguments" },
@@ -455,6 +465,7 @@ async function callTool(
 	}
 	const verdict = validatorFor(tool)(args);
 	if (!verdict.ok) {
+		refusedRequest("arguments", "INVALID_ARGUMENTS");
 		return rpcResult(id, toolResult({ ok: false, code: "invalid_arguments", errors: [`${verdict.path}: ${verdict.reason}`] }));
 	}
 	return rpcResult(id, toolResult(await host.call(tool.name, args)));
