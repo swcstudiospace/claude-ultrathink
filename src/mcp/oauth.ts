@@ -4,7 +4,27 @@ import { createHash, randomBytes } from "node:crypto";
 import { MCP_PROVIDERS, PROVIDERS, USER_AGENT } from "./providers.ts";
 import type { McpProviderId, ProviderId } from "./providers.ts";
 import { readStore, withStoreLock, writeStore } from "./store.ts";
+import { readBodyPrefix } from "../net/body.ts";
 import type { CredentialStore, OAuthClient, OAuthTokens } from "./store.ts";
+import { getSecurityLogger } from "../../services/ultrathink/security/events.ts";
+import { StringValidator } from "../../services/ultrathink/security/validation.ts";
+
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+/** A callback as the user pasted it: trimmed, bounded, free of control characters. An empty one is allowed and carries no code. */
+const CALLBACK_TEXT = new StringValidator({ allowEmpty: true, trim: true, maxLength: 8192, pattern: NO_CONTROL });
+/** The longest access token accepted, sent or recovered. One limit covers all three, so a token that is accepted can always be recovered. */
+const MAX_ACCESS_TOKEN_CHARS = 8192;
+/** An authorization header carrying a token: "Bearer " plus the token, free of control characters. */
+const AUTH_HEADER = new StringValidator({ allowEmpty: true, maxLength: "Bearer ".length + MAX_ACCESS_TOKEN_CHARS, pattern: NO_CONTROL });
+/** A callback parameter once decoded: a percent-encoded control character is only visible at this point. */
+const DECODED_TEXT = new StringValidator({ allowEmpty: true, pattern: NO_CONTROL });
+/** A provider id must be one the MCP provider table names. */
+const PROVIDER_ID = new StringValidator({ allowedValues: Object.keys(MCP_PROVIDERS) });
+
+/** Records a refused input on the security feed with its field and validator code. The value is never recorded. */
+function refused(field: string, code: string): void {
+	getSecurityLogger().logValidationFailure({ source: "mcp_oauth", resource: "oauth", details: { field, code } });
+}
 
 export interface AuthDeps {
 	fetch?: typeof fetch;
@@ -33,6 +53,8 @@ export interface ProviderStatus {
 const REFRESH_SKEW_MS = 60_000;
 /** Bounds every request made while the store lock is held so a hung endpoint cannot outlive the lock. */
 const LOCKED_FETCH_TIMEOUT_MS = 15_000;
+/** Every OAuth metadata, token and registration body is read up to this many bytes; a larger one is unreadable. */
+const MAX_AUTH_BODY_BYTES = 1024 * 1024;
 
 class TokenEndpointError extends Error {
 	constructor(
@@ -46,17 +68,35 @@ class TokenEndpointError extends Error {
 	}
 }
 
+/** Discovered endpoints receive codes, verifiers and secrets, so anything but https is refused (RFC 8414 §2). */
+function isHttps(url: unknown): boolean {
+	try {
+		return typeof url === "string" && new URL(url).protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+/** A JSON object from a bounded read: undefined when the body is unreadable, longer than the cap, or not a JSON object. */
+async function readJsonObject(response: Response): Promise<Record<string, unknown> | undefined> {
+	try {
+		const prefix = await readBodyPrefix(response, MAX_AUTH_BODY_BYTES);
+		if (!prefix.complete) return undefined;
+		const value: unknown = JSON.parse(prefix.text);
+		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function getJson(url: string, deps: AuthDeps): Promise<Record<string, unknown> | undefined> {
 	const response = await (deps.fetch ?? fetch)(url, {
 		headers: { Accept: "application/json", "User-Agent": USER_AGENT },
 		signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+		redirect: "error",
 	});
 	if (!response.ok) return undefined;
-	try {
-		return (await response.json()) as Record<string, unknown>;
-	} catch {
-		return undefined;
-	}
+	return readJsonObject(response);
 }
 
 /** Store mutations always re-read inside the lock so a stale snapshot is never written. */
@@ -85,15 +125,18 @@ async function tokenRequest(client: OAuthClient, params: Record<string, string>,
 		},
 		body: body.toString(),
 		signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+		redirect: "error",
 	});
-	let json: Record<string, unknown> = {};
-	try {
-		json = (await response.json()) as Record<string, unknown>;
-	} catch {
-		// non-JSON body; status alone decides
-	}
+	// A body that is not a JSON object, or is longer than the cap, leaves json empty: the status decides.
+	const json = (await readJsonObject(response)) ?? {};
 	if (!response.ok || typeof json.access_token !== "string") {
 		throw new TokenEndpointError(response.status, typeof json.error === "string" ? json.error : undefined);
+	}
+	// The token must fit the header limit that recovery applies, or a token could be accepted and then never recovered.
+	const header = AUTH_HEADER.validate(`Bearer ${json.access_token}`);
+	if (!header.valid) {
+		refused("access_token", header.errors[0]?.code ?? "INVALID");
+		throw new Error("token endpoint returned an access token that is too long or malformed");
 	}
 	const now = (deps.now ?? Date.now)();
 	return {
@@ -133,6 +176,11 @@ async function refreshLocked(provider: McpProviderId, store: CredentialStore, de
 }
 
 export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { redirectUri: string }): Promise<PendingLogin> {
+	const providerCheck = PROVIDER_ID.validate(provider);
+	if (!providerCheck.valid) {
+		refused("provider", providerCheck.errors[0]?.code ?? "INVALID");
+		throw new Error("unknown MCP provider");
+	}
 	const info = MCP_PROVIDERS[provider];
 	if (!info.oauth) throw new Error(`${provider} does not support OAuth`);
 	const prm = await getJson(info.protectedResourceMetadata, deps);
@@ -144,6 +192,7 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 		Array.isArray(prm?.scopes_supported) && prm.scopes_supported.length > 0
 			? (prm.scopes_supported as string[])
 			: info.scopes;
+	if (!isHttps(issuer)) throw new Error(`${provider}: authorization server ${issuer} must use https`);
 	const asMeta =
 		(await getJson(`${issuer}/.well-known/oauth-authorization-server`, deps)) ??
 		(await getJson(`${issuer}/.well-known/openid-configuration`, deps));
@@ -157,13 +206,25 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 	const authorizationEndpoint = asMeta.authorization_endpoint;
 	const tokenEndpoint = asMeta.token_endpoint;
 	const registrationEndpoint = asMeta.registration_endpoint;
+	if (
+		!isHttps(authorizationEndpoint) ||
+		!isHttps(tokenEndpoint) ||
+		(typeof registrationEndpoint === "string" && !isHttps(registrationEndpoint))
+	) {
+		throw new Error(`${provider}: authorization server metadata at ${issuer} must use https`);
+	}
+	// RFC 8414 §2 and §3.3: the metadata must name the issuer it was fetched for, or it could be another server's.
+	if (typeof asMeta.issuer !== "string" || asMeta.issuer.replace(/\/$/, "") !== issuer) {
+		throw new Error(`${provider}: authorization server metadata issuer mismatch at ${issuer}`);
+	}
 
 	const client = await mutateStore(deps, async store => {
 		const existing = store.providers[provider];
 		if (
 			existing?.kind === "oauth" &&
 			existing.client.redirectUri === deps.redirectUri &&
-			existing.client.authorizationEndpoint === authorizationEndpoint
+			existing.client.authorizationEndpoint === authorizationEndpoint &&
+			isHttps(existing.client.tokenEndpoint)
 		) {
 			return existing.client;
 		}
@@ -181,8 +242,9 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 				token_endpoint_auth_method: "none",
 			}),
 			signal: AbortSignal.timeout(LOCKED_FETCH_TIMEOUT_MS),
+			redirect: "error",
 		});
-		const json = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+		const json = (await readJsonObject(response)) ?? {};
 		if (!response.ok || typeof json.client_id !== "string") {
 			throw new Error(
 				`${provider}: client registration failed: HTTP ${response.status}${typeof json.error === "string" ? ` (${json.error})` : ""}`,
@@ -219,17 +281,38 @@ export async function beginLogin(provider: McpProviderId, deps: AuthDeps & { red
 }
 
 export function parseCallback(input: string): { code?: string; state?: string; error?: string; bare?: boolean } {
-	const trimmed = input.trim();
+	const verdict = CALLBACK_TEXT.validate(input);
+	if (!verdict.valid) {
+		refused("callback", verdict.errors[0]?.code ?? "INVALID");
+		throw new Error("authorization callback is not valid text");
+	}
+	const trimmed = verdict.value ?? "";
 	let query: string;
-	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) query = new URL(trimmed).search;
-	else if (trimmed.includes("=")) query = trimmed;
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+		try {
+			query = new URL(trimmed).search;
+		} catch {
+			refused("callback", "INVALID_URL");
+			throw new Error("authorization callback is not a valid URL");
+		}
+	} else if (trimmed.includes("=")) query = trimmed;
 	else return trimmed ? { code: trimmed, bare: true } : {};
 	const params = new URLSearchParams(query.replace(/^[?#]/, ""));
-	return {
+	const parsed = {
 		code: params.get("code") ?? undefined,
 		state: params.get("state") ?? undefined,
 		error: params.get("error") ?? undefined,
 	};
+	// The raw text passed the check above, but a percent-encoded control character decodes only here, so each value is checked again.
+	for (const [field, value] of Object.entries(parsed)) {
+		if (value === undefined) continue;
+		const decoded = DECODED_TEXT.validate(value);
+		if (!decoded.valid) {
+			refused(field, decoded.errors[0]?.code ?? "INVALID");
+			throw new Error("authorization callback is not valid text");
+		}
+	}
+	return parsed;
 }
 
 export async function completeLogin(pending: PendingLogin, input: string, deps: AuthDeps): Promise<void> {
@@ -276,6 +359,11 @@ export async function logout(provider: ProviderId, deps: AuthDeps): Promise<void
 }
 
 export async function resolveAuthHeader(provider: McpProviderId, deps: AuthDeps): Promise<string | undefined> {
+	const providerCheck = PROVIDER_ID.validate(provider);
+	if (!providerCheck.valid) {
+		refused("provider", providerCheck.errors[0]?.code ?? "INVALID");
+		return undefined;
+	}
 	const now = deps.now ?? Date.now;
 	const credential = readStore(deps.storePath).providers[provider];
 	if (!credential) return undefined;
@@ -302,6 +390,16 @@ export async function recoverUnauthorized(
 	failedHeader: string | undefined,
 	deps: AuthDeps,
 ): Promise<boolean> {
+	const providerCheck = PROVIDER_ID.validate(provider);
+	if (!providerCheck.valid) {
+		refused("provider", providerCheck.errors[0]?.code ?? "INVALID");
+		return false;
+	}
+	const headerCheck = failedHeader === undefined ? null : AUTH_HEADER.validate(failedHeader);
+	if (headerCheck !== null && !headerCheck.valid) {
+		refused("failedHeader", headerCheck.errors[0]?.code ?? "INVALID");
+		return false;
+	}
 	const initial = readStore(deps.storePath).providers[provider];
 	if (initial?.kind !== "oauth") return false;
 	return mutateStore(deps, async store => {

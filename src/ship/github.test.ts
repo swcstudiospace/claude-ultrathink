@@ -37,8 +37,17 @@ describe("createGithub", () => {
 	test("push reports the first stderr line on failure", () => {
 		const { run, calls } = fakeRun(() => ({ exitCode: 1, stderr: "rejected: non-fast-forward\nhint" }));
 		expect(createGithub({ cwd: "/w", run }).push("feat")).toEqual({ ok: false, error: "rejected: non-fast-forward" });
-		expect(calls[0]?.argv).toEqual(["git", "push", "-u", "origin", "feat"]);
+		expect(calls[0]?.argv).toEqual(["git", "push", "-u", "origin", "refs/heads/feat:refs/heads/feat"]);
 		expect(calls[0]?.timeoutMs).toBe(180_000);
+	});
+
+	test("push and deleteRemoteBranch refuse a branch name that git would read as an option, without spawning", () => {
+		const { run, calls } = fakeRun(() => ({}));
+		const gh = createGithub({ cwd: "/w", run });
+		expect(gh.push("-f")).toEqual({ ok: false, error: 'refusing branch name "-f"' });
+		expect(gh.deleteRemoteBranch("--force")).toEqual({ ok: false, error: 'refusing branch name "--force"' });
+		expect(gh.syncBase({ base: "master", branch: "-f" })).toEqual({ ok: false, error: 'refusing branch name "-f"' });
+		expect(calls).toHaveLength(0);
 	});
 
 	test("findOpenPr returns none or the first PR", () => {
@@ -135,7 +144,7 @@ describe("createGithub", () => {
 	test("deleteRemoteBranch treats an already-deleted ref as ok", () => {
 		const { run, calls } = fakeRun(() => ({ exitCode: 1, stderr: "error: unable to delete 'feat': remote ref does not exist" }));
 		expect(createGithub({ cwd: "/w", run }).deleteRemoteBranch("feat")).toEqual({ ok: true });
-		expect(calls[0]?.argv).toEqual(["git", "push", "origin", "--delete", "feat"]);
+		expect(calls[0]?.argv).toEqual(["git", "push", "origin", ":refs/heads/feat"]);
 		const denied = fakeRun(() => ({ exitCode: 1, stderr: "permission denied" }));
 		expect(createGithub({ cwd: "/w", run: denied.run }).deleteRemoteBranch("feat")).toEqual({
 			ok: false,
@@ -412,23 +421,48 @@ describe("createGithub", () => {
 		expect(calls.length).toBe(1);
 	});
 
-	test("syncBase deletes the local branch when it exists and is not current", () => {
+	test("syncBase deletes the local branch with -d when it exists and is not current", () => {
 		const { run, calls } = fakeRun((argv) => (argv[1] === "rev-parse" && argv[2] === "--abbrev-ref" ? { stdout: "master\n" } : {}));
 		expect(createGithub({ cwd: "/w", run }).syncBase({ base: "master", branch: "feat" })).toEqual({ ok: true });
 		expect(calls.map((c) => c.argv)).toContainEqual(["git", "checkout", "master"]);
 		expect(calls.map((c) => c.argv)).toContainEqual(["git", "pull", "--ff-only", "origin", "master"]);
+		expect(calls.at(-1)?.argv).toEqual(["git", "branch", "-d", "feat"]);
+	});
+
+	test("syncBase reports a refused -d (unmerged local commits) instead of forcing -D", () => {
+		const { run, calls } = fakeRun((argv) =>
+			argv[2] === "--abbrev-ref"
+				? { stdout: "master\n" }
+				: argv[2] === "--verify"
+					? { stdout: "cafe1\n" }
+					: argv[1] === "branch"
+						? { exitCode: 1, stderr: "error: The branch 'feat' is not fully merged.\nhint: use -D" }
+						: {},
+		);
+		expect(createGithub({ cwd: "/w", run }).syncBase({ base: "master", branch: "feat", headSha: "beef2" })).toEqual({
+			ok: false,
+			error: "error: The branch 'feat' is not fully merged.",
+		});
+		expect(calls.filter((c) => c.argv[1] === "branch").map((c) => c.argv)).toEqual([["git", "branch", "-d", "feat"]]);
+	});
+
+	test("syncBase forces the delete only when the local tip is exactly the merged head", () => {
+		const { run, calls } = fakeRun((argv) =>
+			argv[2] === "--abbrev-ref" ? { stdout: "master\n" } : argv[2] === "--verify" ? { stdout: "beef2\n" } : {},
+		);
+		expect(createGithub({ cwd: "/w", run }).syncBase({ base: "master", branch: "feat", headSha: "beef2" })).toEqual({ ok: true });
 		expect(calls.at(-1)?.argv).toEqual(["git", "branch", "-D", "feat"]);
 	});
 
-	test("syncBase skips -D when still on the branch or branch is gone", () => {
+	test("syncBase skips the delete when still on the branch or branch is gone", () => {
 		const onBranch = fakeRun((argv) => (argv[2] === "--abbrev-ref" ? { stdout: "feat\n" } : {}));
 		createGithub({ cwd: "/w", run: onBranch.run }).syncBase({ base: "master", branch: "feat" });
-		expect(onBranch.calls.some((c) => c.argv.includes("-D"))).toBe(false);
+		expect(onBranch.calls.some((c) => c.argv[1] === "branch")).toBe(false);
 		const gone = fakeRun((argv) =>
 			argv[2] === "--verify" ? { exitCode: 1 } : argv[2] === "--abbrev-ref" ? { stdout: "master" } : {},
 		);
 		createGithub({ cwd: "/w", run: gone.run }).syncBase({ base: "master", branch: "feat" });
-		expect(gone.calls.some((c) => c.argv.includes("-D"))).toBe(false);
+		expect(gone.calls.some((c) => c.argv[1] === "branch")).toBe(false);
 	});
 
 	test("syncBase stops when checkout fails", () => {

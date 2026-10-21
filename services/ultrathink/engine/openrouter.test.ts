@@ -1,0 +1,912 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 SWC Studio
+
+import { describe, expect, test } from "bun:test";
+import { runWithRequestContext } from "../obs/context.ts";
+import type { FinishedSpan, SpanSink } from "../obs/otel.ts";
+import { createCircuitBreaker } from "./breaker.ts";
+import {
+	createOpenRouterCompleter,
+	MAX_RESPONSE_BYTES,
+	OpenRouterError,
+	type OpenRouterCallInfo,
+	type OpenRouterCompleter,
+	type OpenRouterCompleterOptions,
+	type OpenRouterErrorCode,
+	type OpenRouterUsage,
+} from "./openrouter.ts";
+
+const KEY = "sk-or-test-SECRETKEY-0123456789";
+const BODY_MARK = "UPSTREAM-BODY-MARK";
+const BASE = "https://router.example.test/api/v1";
+const REFERER = "https://ultrathink.example.test";
+
+interface Call {
+	url: string;
+	init: RequestInit;
+}
+
+type Step = (init: RequestInit) => Response | Promise<Response>;
+
+function scripted(steps: Step[]): { fetch: (input: string, init: RequestInit) => Promise<Response>; calls: Call[] } {
+	const calls: Call[] = [];
+	return {
+		calls,
+		fetch: async (input, init) => {
+			calls.push({ url: input, init });
+			const step = steps[calls.length - 1];
+			if (step === undefined) {
+				throw new Error("unscripted fetch call");
+			}
+			return step(init);
+		},
+	};
+}
+
+function completion(content: unknown, usage?: Record<string, unknown>): Step {
+	return () =>
+		new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content } }], ...(usage ? { usage } : {}) }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+}
+
+function status(code: number, headers: Record<string, string> = {}, body = BODY_MARK): Step {
+	return () => new Response(body, { status: code, headers });
+}
+
+function pendingUntilAbort(init: RequestInit): Promise<Response> {
+	const { promise, reject } = Promise.withResolvers<Response>();
+	init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+	return promise;
+}
+
+function setup(
+	steps: Step[],
+	overrides: Partial<OpenRouterCompleterOptions> = {},
+): { complete: OpenRouterCompleter; calls: Call[]; sleeps: number[] } {
+	const script = scripted(steps);
+	const sleeps: number[] = [];
+	const complete = createOpenRouterCompleter({
+		apiKey: KEY,
+		baseUrl: BASE,
+		model: "x-ai/grok-4.7",
+		maxOutputTokens: 1234,
+		timeoutMs: 5000,
+		referer: REFERER,
+		fetch: script.fetch,
+		sleep: async (ms) => {
+			sleeps.push(ms);
+		},
+		...overrides,
+	});
+	return { complete, calls: script.calls, sleeps };
+}
+
+async function failure(promise: Promise<unknown>): Promise<OpenRouterError> {
+	try {
+		await promise;
+	} catch (error) {
+		expect(error).toBeInstanceOf(OpenRouterError);
+		return error as OpenRouterError;
+	}
+	throw new Error("expected the completer to reject");
+}
+
+function expectNoLeak(error: OpenRouterError): void {
+	for (const text of [error.message, String(error), error.stack ?? "", JSON.stringify(error)]) {
+		expect(text).not.toContain(KEY);
+		expect(text).not.toContain(BODY_MARK);
+	}
+}
+
+describe("request shape", () => {
+	test("posts the exact URL, headers and body, and the key only appears in Authorization", async () => {
+		const { complete, calls } = setup([completion("hello")]);
+		expect(await complete("SYS", "USR")).toBe("hello");
+		expect(calls).toHaveLength(1);
+		const call = calls[0] as Call;
+		expect(call.url).toBe(`${BASE}/chat/completions`);
+		expect(call.init.method).toBe("POST");
+		expect(call.init.headers).toEqual({
+			Authorization: `Bearer ${KEY}`,
+			"Content-Type": "application/json",
+			"HTTP-Referer": REFERER,
+			"X-Title": "ultrathink",
+		});
+		expect(JSON.parse(call.init.body as string)).toEqual({
+			model: "x-ai/grok-4.7",
+			messages: [
+				{ role: "system", content: "SYS" },
+				{ role: "user", content: "USR" },
+			],
+			max_tokens: 1234,
+			usage: { include: true },
+		});
+		expect(call.init.body as string).not.toContain(KEY);
+		expect(call.url).not.toContain(KEY);
+		const others = Object.entries(call.init.headers as Record<string, string>).filter(([name]) => name !== "Authorization");
+		for (const [, value] of others) {
+			expect(value).not.toContain(KEY);
+		}
+	});
+
+	test("a trailing slash on the base URL does not double up", async () => {
+		const { complete, calls } = setup([completion("ok")], { baseUrl: `${BASE}/` });
+		await complete("s", "u");
+		expect((calls[0] as Call).url).toBe(`${BASE}/chat/completions`);
+	});
+
+	test("passes a signal to fetch that is not the caller's", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		const controller = new AbortController();
+		await complete("s", "u", controller.signal);
+		const sent = (calls[0] as Call).init.signal;
+		expect(sent).toBeInstanceOf(AbortSignal);
+		expect(sent).not.toBe(controller.signal);
+	});
+});
+
+describe("usage", () => {
+	test("onUsage receives prompt tokens, completion tokens and cost", async () => {
+		const seen: OpenRouterUsage[] = [];
+		const { complete } = setup([completion("hi", { prompt_tokens: 11, completion_tokens: 7, cost: 0.0021 })], {
+			onUsage: (usage) => seen.push(usage),
+		});
+		await complete("s", "u");
+		expect(seen).toEqual([{ promptTokens: 11, completionTokens: 7, costUsd: 0.0021 }]);
+	});
+
+	test("a response without cost omits costUsd; missing or invalid counts stay unknown, never zero", async () => {
+		const seen: OpenRouterUsage[] = [];
+		const { complete } = setup(
+			[
+				completion("a", { prompt_tokens: 3, completion_tokens: 4 }),
+				completion("b"),
+				completion("c", { prompt_tokens: "x", completion_tokens: -1, cost: "free" }),
+				completion("d", { prompt_tokens: 9 }),
+			],
+			{ onUsage: (usage) => seen.push(usage) },
+		);
+		await complete("s", "u");
+		await complete("s", "u");
+		await complete("s", "u");
+		await complete("s", "u");
+		expect(seen).toEqual([{ promptTokens: 3, completionTokens: 4 }, {}, {}, { promptTokens: 9 }]);
+		expect("costUsd" in (seen[0] as OpenRouterUsage)).toBe(false);
+	});
+
+	test("only the successful attempt is reported", async () => {
+		const seen: OpenRouterUsage[] = [];
+		const { complete } = setup([status(503), completion("fine", { prompt_tokens: 1, completion_tokens: 2 })], {
+			onUsage: (usage) => seen.push(usage),
+		});
+		await complete("s", "u");
+		expect(seen).toHaveLength(1);
+	});
+
+	test("failures never call onUsage", async () => {
+		const seen: OpenRouterUsage[] = [];
+		const { complete } = setup([status(401)], { onUsage: (usage) => seen.push(usage) });
+		await failure(complete("s", "u"));
+		expect(seen).toEqual([]);
+	});
+
+	test("a throwing onUsage does not fail a finished completion", async () => {
+		const { complete } = setup([completion("done", { prompt_tokens: 1, completion_tokens: 1 })], {
+			onUsage: () => {
+				throw new Error(`accounting broke ${KEY}`);
+			},
+		});
+		expect(await complete("s", "u")).toBe("done");
+	});
+});
+
+describe("status handling", () => {
+	test("401 and 403 map to auth without a retry", async () => {
+		for (const code of [401, 403]) {
+			const { complete, calls, sleeps } = setup([status(code), completion("never")]);
+			const error = await failure(complete("s", "u"));
+			expect(error.code).toBe("auth");
+			expect(error.status).toBe(code);
+			expect(calls).toHaveLength(1);
+			expect(sleeps).toEqual([]);
+			expectNoLeak(error);
+		}
+	});
+
+	test("other 4xx are upstream failures and are not retried", async () => {
+		for (const code of [400, 402, 404, 408, 422]) {
+			const { complete, calls, sleeps } = setup([status(code), completion("never")]);
+			const error = await failure(complete("s", "u"));
+			expect(error.code).toBe("upstream");
+			expect(calls).toHaveLength(1);
+			expect(sleeps).toEqual([]);
+			expectNoLeak(error);
+		}
+	});
+
+	test("429 honors Retry-After seconds and then succeeds", async () => {
+		const { complete, calls, sleeps } = setup([status(429, { "retry-after": "3" }), completion("after")]);
+		expect(await complete("s", "u")).toBe("after");
+		expect(calls).toHaveLength(2);
+		expect(sleeps).toEqual([3000]);
+	});
+
+	test("Retry-After is clamped to 20 seconds", async () => {
+		const { complete, sleeps } = setup([status(429, { "retry-after": "120" }), completion("after")]);
+		await complete("s", "u");
+		expect(sleeps).toEqual([20000]);
+	});
+
+	test("Retry-After accepts an HTTP date, clamped to the 0..20 s range", async () => {
+		const past = new Date(Date.now() - 60_000).toUTCString();
+		const future = new Date(Date.now() + 3_600_000).toUTCString();
+		const first = setup([status(429, { "retry-after": past }), completion("ok")]);
+		await first.complete("s", "u");
+		expect(first.sleeps).toEqual([0]);
+		const second = setup([status(503, { "retry-after": future }), completion("ok")]);
+		await second.complete("s", "u");
+		expect(second.sleeps).toEqual([20000]);
+	});
+
+	test("an unparseable Retry-After falls back to exponential backoff with jitter", async () => {
+		const { complete, sleeps } = setup([status(429, { "retry-after": "soon" }), status(429), completion("ok")]);
+		await complete("s", "u");
+		expect(sleeps).toHaveLength(2);
+		expect(sleeps[0] as number).toBeGreaterThanOrEqual(500);
+		expect(sleeps[0] as number).toBeLessThan(750);
+		expect(sleeps[1] as number).toBeGreaterThanOrEqual(1000);
+		expect(sleeps[1] as number).toBeLessThan(1250);
+	});
+
+	test("429 that never clears ends as rate_limited after three attempts", async () => {
+		const { complete, calls, sleeps } = setup([status(429), status(429), status(429), completion("never")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("rate_limited");
+		expect(calls).toHaveLength(3);
+		expect(sleeps).toHaveLength(2);
+		expectNoLeak(error);
+	});
+
+	test("5xx is retried twice and then reported as upstream", async () => {
+		const { complete, calls, sleeps } = setup([status(500), status(502), status(503), completion("never")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("upstream");
+		expect(error.status).toBe(503);
+		expect(calls).toHaveLength(3);
+		expect(sleeps).toHaveLength(2);
+		expectNoLeak(error);
+	});
+
+	test("a 5xx followed by success returns the text", async () => {
+		const { complete, calls } = setup([status(500), completion("recovered")]);
+		expect(await complete("s", "u")).toBe("recovered");
+		expect(calls).toHaveLength(2);
+	});
+});
+
+describe("network errors", () => {
+	test("a network error is retried and the call can still succeed", async () => {
+		const boom: Step = () => {
+			throw new TypeError(`connect ECONNRESET while sending ${KEY}`);
+		};
+		const { complete, calls, sleeps } = setup([boom, boom, completion("third time")]);
+		expect(await complete("s", "u")).toBe("third time");
+		expect(calls).toHaveLength(3);
+		expect(sleeps).toHaveLength(2);
+	});
+
+	test("a network error that persists is upstream and does not leak the underlying message", async () => {
+		const boom: Step = () => {
+			throw new TypeError(`connect ECONNRESET while sending ${KEY} ${BODY_MARK}`);
+		};
+		const { complete, calls } = setup([boom, boom, boom, completion("never")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("upstream");
+		expect(calls).toHaveLength(3);
+		expect(error.cause).toBeUndefined();
+		expectNoLeak(error);
+	});
+
+	test("a body that fails after a 200 is bad_response and is not retried", async () => {
+		const { complete, calls, sleeps } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('{"choices":['));
+							controller.error(new TypeError(`connection reset ${KEY} ${BODY_MARK}`));
+						},
+					}),
+					{ status: 200 },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
+
+	test("a text() that rejects after a 200 is bad_response and is not retried", async () => {
+		const { complete, calls, sleeps } = setup([
+			() => {
+				const response = new Response(BODY_MARK, { status: 200, headers: { "content-type": "application/json" } });
+				Object.defineProperty(response, "body", { value: null });
+				Object.defineProperty(response, "text", { value: () => Promise.reject(new TypeError(`socket closed ${KEY}`)) });
+				return response;
+			},
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
+});
+
+describe("timeout and abort", () => {
+	test("the per-call timeout cancels the request and is not retried", async () => {
+		const { complete, calls, sleeps } = setup([pendingUntilAbort, completion("never")], { timeoutMs: 10 });
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("timeout");
+		expect(calls).toHaveLength(1);
+		expect((calls[0] as Call).init.signal?.aborted).toBe(true);
+		expect(sleeps).toEqual([]);
+	});
+
+	test("a caller abort during the request cancels it and reports aborted", async () => {
+		const controller = new AbortController();
+		const { complete, calls, sleeps } = setup(
+			[
+				(init) => {
+					queueMicrotask(() => controller.abort());
+					return pendingUntilAbort(init);
+				},
+				completion("never"),
+			],
+			{ timeoutMs: 60_000 },
+		);
+		const error = await failure(complete("s", "u", controller.signal));
+		expect(error.code).toBe("aborted");
+		expect(calls).toHaveLength(1);
+		expect((calls[0] as Call).init.signal?.aborted).toBe(true);
+		expect(sleeps).toEqual([]);
+	});
+
+	test("an already aborted signal never reaches fetch", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const { complete, calls } = setup([completion("never")]);
+		const error = await failure(complete("s", "u", controller.signal));
+		expect(error.code).toBe("aborted");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("an abort during the backoff wait stops the retry", async () => {
+		const controller = new AbortController();
+		const script = scripted([status(503), completion("never")]);
+		const complete = createOpenRouterCompleter({
+			apiKey: KEY,
+			baseUrl: BASE,
+			model: "m",
+			maxOutputTokens: 256,
+			timeoutMs: 5000,
+			fetch: script.fetch,
+			sleep: async () => {
+				controller.abort();
+			},
+		});
+		const error = await failure(complete("s", "u", controller.signal));
+		expect(error.code).toBe("aborted");
+		expect(script.calls).toHaveLength(1);
+	});
+
+	test("an abort while the body is being read reports aborted", async () => {
+		const controller = new AbortController();
+		const { complete } = setup([
+			(init) => {
+				const stream = new ReadableStream<Uint8Array>({
+					start(streamController) {
+						init.signal?.addEventListener("abort", () => streamController.error(new DOMException("aborted", "AbortError")), { once: true });
+						queueMicrotask(() => controller.abort());
+					},
+				});
+				return new Response(stream, { status: 200 });
+			},
+		]);
+		const error = await failure(complete("s", "u", controller.signal));
+		expect(error.code).toBe("aborted");
+	});
+});
+
+describe("response validation", () => {
+	test("malformed JSON gives bad_response without a retry", async () => {
+		const { complete, calls } = setup([status(200, {}, `{"choices": [ ${BODY_MARK} ${KEY}`), completion("never")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(calls).toHaveLength(1);
+		expectNoLeak(error);
+	});
+
+	test("JSON without a usable message gives bad_response", async () => {
+		const bodies = [
+			"null",
+			"[]",
+			"42",
+			`{"error":{"message":"${BODY_MARK}"}}`,
+			`{"choices":[]}`,
+			`{"choices":[null]}`,
+			`{"choices":[{}]}`,
+			`{"choices":[{"message":{}}]}`,
+			`{"choices":[{"message":{"content":42}}]}`,
+		];
+		for (const body of bodies) {
+			const { complete, calls } = setup([status(200, {}, body), completion("never")]);
+			const error = await failure(complete("s", "u"));
+			expect(error.code).toBe("bad_response");
+			expect(calls).toHaveLength(1);
+			expectNoLeak(error);
+		}
+	});
+
+	test("empty, blank or null content gives empty without a retry", async () => {
+		for (const content of ["", "  \n\t ", null, []]) {
+			const { complete, calls } = setup([completion(content), completion("never")]);
+			const error = await failure(complete("s", "u"));
+			expect(error.code).toBe("empty");
+			expect(calls).toHaveLength(1);
+		}
+	});
+
+	test("content parts are joined into text", async () => {
+		const { complete } = setup([completion([{ type: "text", text: "one " }, { type: "image" }, { type: "text", text: "two" }])]);
+		expect(await complete("s", "u")).toBe("one two");
+	});
+
+	test("every failure carries one of the documented codes", async () => {
+		const codes: OpenRouterErrorCode[] = [];
+		for (const step of [status(401), status(429), status(500), status(200, {}, "not json"), completion("")]) {
+			const { complete } = setup([step, step, step]);
+			codes.push((await failure(complete("s", "u"))).code);
+		}
+		expect(codes).toEqual(["auth", "rate_limited", "upstream", "bad_response", "empty"]);
+	});
+
+	test("a body at the byte cap is still parsed", async () => {
+		const frame = (pad: string): string => JSON.stringify({ choices: [{ message: { content: "fits" } }], pad });
+		const body = frame("x".repeat(MAX_RESPONSE_BYTES - frame("").length));
+		expect(new TextEncoder().encode(body).byteLength).toBe(MAX_RESPONSE_BYTES);
+		const { complete } = setup([status(200, {}, body)]);
+		expect(await complete("s", "u")).toBe("fits");
+	});
+
+	test("a streamed body over the byte cap is bad_response, cancelled early and not retried", async () => {
+		// About 1 MiB per chunk; sixteen caps' worth are available, so a full read would show in the pull count.
+		const chunk = new TextEncoder().encode(`{"choices":[{"message":{"content":"${BODY_MARK.repeat(Math.floor((1024 * 1024) / BODY_MARK.length))}`);
+		const available = Math.ceil((MAX_RESPONSE_BYTES / chunk.byteLength) * 16);
+		let pulls = 0;
+		let cancelled = false;
+		const { complete, calls, sleeps } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulls += 1;
+							if (pulls >= available) controller.close();
+							else controller.enqueue(chunk);
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ status: 200 },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(cancelled).toBe(true);
+		// One chunk over the cap, plus whatever the stream read ahead; nowhere near the 16x available.
+		expect(pulls).toBeLessThanOrEqual(MAX_RESPONSE_BYTES / chunk.byteLength + 2);
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
+
+	test("a declared content-length over the byte cap is cancelled before the body is read", async () => {
+		let pulls = 0;
+		let cancelled = false;
+		const { complete, calls } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulls += 1;
+							controller.enqueue(new TextEncoder().encode(BODY_MARK));
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ status: 200, headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(cancelled).toBe(true);
+		expect(pulls).toBeLessThanOrEqual(1);
+		expect(calls).toHaveLength(1);
+		expectNoLeak(error);
+	});
+});
+
+describe("reasoning effort", () => {
+	test("the option is sent as reasoning.effort next to the other fields", async () => {
+		const { complete, calls } = setup([completion("ok")], { reasoningEffort: "low" });
+		await complete("SYS", "USR");
+		expect(JSON.parse((calls[0] as Call).init.body as string)).toEqual({
+			model: "x-ai/grok-4.7",
+			messages: [
+				{ role: "system", content: "SYS" },
+				{ role: "user", content: "USR" },
+			],
+			max_tokens: 1234,
+			usage: { include: true },
+			reasoning: { effort: "low" },
+		});
+	});
+
+	test("every effort value is passed through unchanged", async () => {
+		for (const effort of ["minimal", "low", "medium", "high"] as const) {
+			const { complete, calls } = setup([completion("ok")], { reasoningEffort: effort });
+			await complete("s", "u");
+			expect(JSON.parse((calls[0] as Call).init.body as string).reasoning).toEqual({ effort });
+		}
+	});
+
+	test("without the option the body has no reasoning key", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await complete("s", "u");
+		expect("reasoning" in JSON.parse((calls[0] as Call).init.body as string)).toBe(false);
+	});
+});
+
+describe("onCall", () => {
+	function recorded(
+		steps: Step[],
+		overrides: Partial<OpenRouterCompleterOptions> = {},
+	): { complete: OpenRouterCompleter; infos: OpenRouterCallInfo[] } {
+		const infos: OpenRouterCallInfo[] = [];
+		const { complete } = setup(steps, { onCall: (info) => infos.push(info), ...overrides });
+		return { complete, infos };
+	}
+
+	test("success reports ok with one attempt and a non-negative duration", async () => {
+		const { complete, infos } = recorded([completion("fine")]);
+		await complete("s", "u");
+		expect(infos).toHaveLength(1);
+		const info = infos[0] as OpenRouterCallInfo;
+		expect(info.outcome).toBe("ok");
+		expect(info.attempts).toBe(1);
+		expect(info.status).toBeUndefined();
+		expect(Number.isFinite(info.ms)).toBe(true);
+		expect(info.ms).toBeGreaterThanOrEqual(0);
+	});
+
+	test("a retried 429 then success reports once with two attempts", async () => {
+		const { complete, infos } = recorded([status(429, { "retry-after": "1" }), completion("fine")]);
+		await complete("s", "u");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "ok", attempts: 2 });
+	});
+
+	test("a terminal auth error reports the code and status once, before the throw", async () => {
+		const { complete, infos } = recorded([status(401)]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("auth");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "auth", status: 401, attempts: 1 });
+	});
+
+	test("exhausted retries report the final error and all attempts", async () => {
+		const { complete, infos } = recorded([status(500), status(502), status(503)]);
+		await failure(complete("s", "u"));
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "upstream", status: 503, attempts: 3 });
+	});
+
+	test("a timeout reports timeout with one attempt", async () => {
+		const { complete, infos } = recorded([pendingUntilAbort], { timeoutMs: 10 });
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("timeout");
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "timeout", attempts: 1 });
+	});
+
+	test("an already aborted signal reports aborted with zero attempts", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const { complete, infos } = recorded([completion("never")]);
+		await failure(complete("s", "u", controller.signal));
+		expect(infos).toHaveLength(1);
+		expect(infos[0]).toMatchObject({ outcome: "aborted", attempts: 0 });
+	});
+
+	test("the info carries only the documented fields, never the key or a body", async () => {
+		const { complete, infos } = recorded([status(500), completion("secret answer")]);
+		await complete("s", "u");
+		const json = JSON.stringify(infos);
+		expect(Object.keys(infos[0] as OpenRouterCallInfo).sort()).toEqual(["attempts", "ms", "outcome"]);
+		expect(json).not.toContain(KEY);
+		expect(json).not.toContain(BODY_MARK);
+		expect(json).not.toContain("secret answer");
+	});
+
+	test("a throwing hook does not change a success", async () => {
+		const { complete } = setup([completion("fine")], {
+			onCall: () => {
+				throw new Error(`hook broke ${KEY}`);
+			},
+		});
+		expect(await complete("s", "u")).toBe("fine");
+	});
+
+	test("a throwing hook does not change the thrown error", async () => {
+		const { complete } = setup([status(401)], {
+			onCall: () => {
+				throw new Error(`hook broke ${KEY}`);
+			},
+		});
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("auth");
+		expectNoLeak(error);
+	});
+});
+
+describe("circuit breaker", () => {
+	const OPEN_MS = 30000;
+
+	function tripped(steps: Step[]) {
+		const clock = { t: 1_000_000 };
+		const breaker = createCircuitBreaker({ failureThreshold: 2, windowMs: 60000, openMs: OPEN_MS, now: () => clock.t });
+		const infos: OpenRouterCallInfo[] = [];
+		const harness = setup(steps, { breaker, onCall: (info) => infos.push(info) });
+		return { ...harness, breaker, clock, infos };
+	}
+
+	test("two 503s open the breaker: the first call stops retrying, the second is refused without fetch", async () => {
+		const { complete, calls, sleeps, breaker, infos } = tripped([status(503), status(503)]);
+		const first = await failure(complete("s", "u"));
+		expect(first.code).toBe("upstream_unavailable");
+		expect(first.retryAfterMs).toBe(OPEN_MS);
+		expect(calls).toHaveLength(2);
+		expect(sleeps).toHaveLength(1);
+		expect(breaker.state()).toBe("open");
+		expect(infos[0]).toMatchObject({ outcome: "upstream_unavailable", attempts: 2 });
+		expect(infos[0]?.status).toBeUndefined();
+
+		const second = await failure(complete("s", "u"));
+		expect(second.code).toBe("upstream_unavailable");
+		expect(second.retryAfterMs).toBeGreaterThan(0);
+		expect(second.message).toBe("openrouter upstream_unavailable");
+		expectNoLeak(second);
+		expect(calls).toHaveLength(2);
+		expect(sleeps).toHaveLength(1);
+		expect(infos).toHaveLength(2);
+		expect(infos[1]).toMatchObject({ outcome: "upstream_unavailable", attempts: 0 });
+	});
+
+	test("the breaker is shared: another completer on the same breaker is refused too", async () => {
+		const { complete, breaker } = tripped([status(503), status(503)]);
+		await failure(complete("s", "u"));
+		const other = setup([completion("never")], { breaker });
+		const error = await failure(other.complete("s", "u"));
+		expect(error.code).toBe("upstream_unavailable");
+		expect(other.calls).toHaveLength(0);
+	});
+
+	test("auth failures do not count toward opening", async () => {
+		const { complete, breaker } = tripped([status(401), status(401), completion("fine")]);
+		expect((await failure(complete("s", "u"))).code).toBe("auth");
+		expect((await failure(complete("s", "u"))).code).toBe("auth");
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+	});
+
+	test("caller aborts do not count toward opening", async () => {
+		const { complete, breaker } = tripped([pendingUntilAbort, pendingUntilAbort, completion("fine")]);
+		for (let i = 0; i < 2; i += 1) {
+			const controller = new AbortController();
+			const pending = complete("s", "u", controller.signal);
+			controller.abort();
+			expect((await failure(pending)).code).toBe("aborted");
+		}
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+	});
+
+	test("timeouts count toward opening", async () => {
+		const clock = { t: 0 };
+		const breaker = createCircuitBreaker({ failureThreshold: 2, windowMs: 60000, openMs: OPEN_MS, now: () => clock.t });
+		const { complete, calls } = setup([pendingUntilAbort, pendingUntilAbort, completion("never")], { breaker, timeoutMs: 10 });
+		expect((await failure(complete("s", "u"))).code).toBe("timeout");
+		expect((await failure(complete("s", "u"))).code).toBe("timeout");
+		expect(breaker.state()).toBe("open");
+		expect((await failure(complete("s", "u"))).code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(2);
+	});
+
+	test("a success after the open period closes the breaker again", async () => {
+		const { complete, calls, breaker, clock, infos } = tripped([status(503), status(503), completion("fine"), completion("again")]);
+		await failure(complete("s", "u"));
+		clock.t += OPEN_MS - 1;
+		expect((await failure(complete("s", "u"))).code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(2);
+		clock.t += 1;
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+		expect(await complete("s", "u")).toBe("again");
+		expect(calls).toHaveLength(4);
+		expect(infos.map((info) => info.outcome)).toEqual(["upstream_unavailable", "upstream_unavailable", "ok", "ok"]);
+	});
+
+	test("a failed probe re-opens the breaker", async () => {
+		const { complete, calls, breaker, clock } = tripped([status(503), status(503), status(502)]);
+		await failure(complete("s", "u"));
+		clock.t += OPEN_MS;
+		const probe = await failure(complete("s", "u"));
+		expect(probe.code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(3);
+		expect(breaker.state()).toBe("open");
+		expect(breaker.snapshot().openedAt).toBe(clock.t);
+	});
+
+	test("a parse failure after a 200 releases the slot as ignored and the breaker stays closed", async () => {
+		const { complete, breaker } = tripped([status(503), status(200, { "content-type": "application/json" }, "{not json")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(1);
+	});
+
+	test("without a breaker every outcome and field is unchanged", async () => {
+		const { complete } = setup([status(503), status(503), status(503)]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("upstream");
+		expect(error.retryAfterMs).toBeUndefined();
+	});
+});
+
+describe("trace propagation", () => {
+	const CTX = { reqId: "req-trace-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+	const TRACEPARENT = /^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/;
+
+	function traceparentOf(call: Call): string | undefined {
+		return (call.init.headers as Record<string, string>).traceparent;
+	}
+
+	test("sends a traceparent with the request's trace id and a fresh span id", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const header = traceparentOf(calls[0] as Call);
+		expect(header).toMatch(TRACEPARENT);
+		expect(header?.split("-")[2]).not.toBe(CTX.spanId);
+	});
+
+	test("each attempt gets its own span id under the same trace", async () => {
+		const { complete, calls } = setup([status(500), completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		expect(calls).toHaveLength(2);
+		const first = traceparentOf(calls[0] as Call);
+		const second = traceparentOf(calls[1] as Call);
+		expect(first).toMatch(TRACEPARENT);
+		expect(second).toMatch(TRACEPARENT);
+		expect(first).not.toBe(second);
+	});
+
+	test("the traceparent never carries the key or the body", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("SYS-PROMPT", "USR-PROMPT"));
+		const header = traceparentOf(calls[0] as Call) ?? "";
+		expect(header).not.toContain(KEY);
+		expect(header).not.toContain("PROMPT");
+	});
+
+	test("sends no traceparent outside a request context", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await complete("s", "u");
+		expect(Object.keys((calls[0] as Call).init.headers as Record<string, string>)).not.toContain("traceparent");
+	});
+
+	test("an unsampled inbound trace stays unsampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-00$/);
+	});
+
+	test("a sampled or undefined inbound trace is sent sampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok"), completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: true }, () => complete("s", "u"));
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(TRACEPARENT);
+		expect(traceparentOf(calls[1] as Call)).toMatch(TRACEPARENT);
+	});
+});
+
+describe("client span", () => {
+	const CTX = { reqId: "req-span-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+
+	/** A sink that keeps every span it is handed; with `throws`, it also throws after keeping it. */
+	function recorder(throws = false): { sink: SpanSink; spans: FinishedSpan[] } {
+		const spans: FinishedSpan[] = [];
+		const sink: SpanSink = {
+			record: (span) => {
+				spans.push(span);
+				if (throws) throw new Error("sink failure");
+			},
+		};
+		return { sink, spans };
+	}
+
+	test("records a CLIENT span whose id is the parent-id the upstream received", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sent = (calls[0] as Call).init.headers as Record<string, string>;
+		const span = spans[0] as FinishedSpan;
+		expect(spans).toHaveLength(1);
+		expect(span.spanId).toBe(sent.traceparent?.split("-")[2] ?? "");
+		expect(span.traceId).toBe(CTX.traceId);
+		expect(span.parentSpanId).toBe(CTX.spanId);
+		expect(span.kind).toBe(3);
+		expect(span.name).toBe("POST chat/completions");
+		expect(span.error).toBe(false);
+	});
+
+	test("a 500 then a 200 gives two spans: the first is an error, the second is not", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([status(500), completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sentIds = calls.map((call) => (call.init.headers as Record<string, string>).traceparent?.split("-")[2] ?? "");
+		expect(spans.map((span) => span.error)).toEqual([true, false]);
+		expect(spans.map((span) => span.spanId)).toEqual(sentIds);
+		expect(spans.map((span) => span.attributes["ultrathink.attempt"])).toEqual([1, 2]);
+	});
+
+	test("no request context and an unsampled context each record no span", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok"), completion("ok")], { spans: sink });
+		await complete("s", "u");
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(spans).toHaveLength(0);
+	});
+
+	test("attributes name the method and the host only, never the key, path, query or headers", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok")], { spans: sink, baseUrl: "https://openrouter.test/api/v1?x=1" });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const span = spans[0] as FinishedSpan;
+		expect(span.attributes).toEqual({
+			"http.request.method": "POST",
+			"server.address": "openrouter.test",
+			"http.response.status_code": 200,
+			"ultrathink.attempt": 1,
+		});
+		expect(JSON.stringify(span.attributes)).not.toContain(KEY);
+	});
+
+	test("a sink whose record throws still yields the successful completion", async () => {
+		const { sink, spans } = recorder(true);
+		const { complete } = setup([completion("ok")], { spans: sink });
+		expect(await runWithRequestContext(CTX, () => complete("s", "u"))).toBe("ok");
+		expect(spans).toHaveLength(1);
+	});
+});

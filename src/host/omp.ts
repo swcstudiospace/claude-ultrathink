@@ -9,7 +9,7 @@
  * each flight owns its own cancellation and outer time limit. A tool result that opens a PR for a planned session gets
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,7 +49,7 @@ import {
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
-import { type BarState, type BarStore, createBarComponent, createBarStore } from "./omp-ui.ts";
+import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
 import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
@@ -210,6 +210,8 @@ export interface ExtensionAPI {
 		},
 	): void;
 	registerMessageRenderer?: Parameters<typeof registerUltrathinkRenderers>[0]["registerMessageRenderer"];
+	/** Omp's shared event bus, absent on older hosts; handlers run synchronously inside `emit`. */
+	events?: { emit(channel: string, data: unknown): void; on(channel: string, handler: (data: unknown) => void): () => void };
 }
 
 export interface OmpPlanRequest {
@@ -799,6 +801,28 @@ export function createOmpExtension(
 			if (generation === latestGeneration) guard(fn);
 		};
 		const store: BarStore = createBarStore();
+		try {
+			pi.events?.on("substrate:status", (data) => {
+				const substrate = parseSubstrateStatus(data);
+				if (substrate !== undefined) store.setSubstrate(substrate);
+			});
+			pi.events?.emit("substrate:status-request", {});
+		} catch {}
+		try {
+			const live = join(homedir(), ".omp", "agent", "token-opt", "live.json");
+			if (existsSync(live)) {
+				const savings = parseTokenSavings(JSON.parse(readFileSync(live, "utf8")));
+				if (savings !== undefined) store.setSavings(savings);
+			}
+		} catch {
+			// a missing or unreadable snapshot must not block planning
+		}
+		try {
+			pi.events?.on("token-opt:savings", (data) => {
+				const savings = parseTokenSavings(data);
+				if (savings !== undefined) store.setSavings(savings);
+			});
+		} catch {}
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;
 		let timerStarted = false;
@@ -870,6 +894,7 @@ export function createOmpExtension(
 		/** Observe the active session before a paused planner can resume into tracking or persistence. */
 		const observeFlights = (ctx: ExtensionContext): void => {
 			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			guard(() => store.setLiveSession(sessionId));
 			const cwd = ctx?.cwd || process.cwd();
 			// A prompt observed in another session/cwd orphans the dashboard: drop it silently here
 			// (the switch handler explains); planner-flight handling below is unchanged.
@@ -1220,6 +1245,8 @@ export function createOmpExtension(
 			shutDown = false;
 			attach(ctx);
 			scheduleMount();
+			// The host already named this session. An invalid id is ignored; a throw must not block startup.
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_switch", (_event, ctx) => {
 			// The old session's flights would deliver into the new one: cancel and suppress them.
@@ -1229,6 +1256,7 @@ export function createOmpExtension(
 			shutDown = false;
 			attach(ctx);
 			scheduleMount();
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_shutdown", () => {
 			shutDown = true;
@@ -1503,6 +1531,7 @@ export function createOmpExtension(
 			// A reentrant session/model cancellation of this flight during the previous abort runs synchronously
 			// above: a flight that lost ownership there admits no planner and schedules no outer timer.
 			if (flight.cancelled) return flight;
+			guard(() => store.setLiveSession(request.sessionId));
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
 				guard(() => {
@@ -1612,6 +1641,7 @@ export function createOmpExtension(
 				const prompt = event?.prompt ?? "";
 				const cwd = ctx?.cwd || process.cwd();
 				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				guard(() => store.setLiveSession(sessionId));
 				const submission = turns.get(sessionId) ?? 0;
 				if (quick) {
 					if (quick.sessionId === sessionId && quick.text === prompt.trim() && (quick.submission ?? submission) === submission) {

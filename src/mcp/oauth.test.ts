@@ -15,6 +15,8 @@ import {
 } from "./oauth.ts";
 import { readStore, withStoreLock, writeStore } from "./store.ts";
 import type { OAuthClient } from "./store.ts";
+import type { McpProviderId } from "./providers.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../../services/ultrathink/security/events.ts";
 
 const NOW = 1_700_000_000_000;
 const REDIRECT = "http://127.0.0.1:8765/callback";
@@ -30,6 +32,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 interface Call {
 	url: string;
 	body?: string;
+	redirect?: RequestInit["redirect"];
 }
 
 function fakeFetch(routes: Record<string, (body: string | undefined) => Response>): {
@@ -40,7 +43,7 @@ function fakeFetch(routes: Record<string, (body: string | undefined) => Response
 	const impl = async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
 		const body = typeof init?.body === "string" ? init.body : undefined;
-		calls.push({ url, body });
+		calls.push({ url, body, redirect: init?.redirect });
 		const route = routes[url];
 		return route ? route(body) : new Response("nf", { status: 404 });
 	};
@@ -235,12 +238,65 @@ describe("login", () => {
 		expect(await resolveAuthHeader("notion", deps)).toBe("Bearer at-1");
 	});
 
+	test("discovered metadata that does not name its issuer is refused", async () => {
+		const fake = fakeFetch({
+			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
+				json({ authorization_servers: ["https://mcp.linear.app"] }),
+			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
+				json({ authorization_endpoint: "https://mcp.linear.app/authorize", token_endpoint: "https://mcp.linear.app/token" }),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		await expect(beginLogin("linear", { ...deps, redirectUri: REDIRECT })).rejects.toThrow("issuer mismatch");
+	});
+
+	test("a token response of exactly the body cap is read", async () => {
+		const body = (padding: number) => JSON.stringify({ access_token: "at-1", pad: "x".repeat(padding) });
+		const cap = 1024 * 1024;
+		const fake = fakeFetch(notionRoutes(() => new Response(body(cap - body(0).length), { headers: { "content-type": "application/json" } })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await completeLogin(pending, "X", deps);
+		expect(await resolveAuthHeader("notion", deps)).toBe("Bearer at-1");
+	});
+
+	test("a token response one byte over the body cap is refused", async () => {
+		const body = (padding: number) => JSON.stringify({ access_token: "at-1", pad: "x".repeat(padding) });
+		const cap = 1024 * 1024;
+		const fake = fakeFetch(notionRoutes(() => new Response(body(cap - body(0).length + 1), { headers: { "content-type": "application/json" } })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await expect(completeLogin(pending, "X", deps)).rejects.toThrow();
+	});
+
+	test("an unreadable metadata body falls back to the next discovery document", async () => {
+		const broken = new Response(new ReadableStream({ pull: (controller) => controller.error(new Error("connection reset")) }), {
+			headers: { "content-type": "application/json" },
+		});
+		const fake = fakeFetch({
+			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
+				json({ authorization_servers: ["https://mcp.linear.app"] }),
+			"https://mcp.linear.app/.well-known/oauth-authorization-server": () => broken,
+			"https://mcp.linear.app/.well-known/openid-configuration": () =>
+				json({
+					issuer: "https://mcp.linear.app",
+					authorization_endpoint: "https://mcp.linear.app/authorize",
+					token_endpoint: "https://mcp.linear.app/token",
+					registration_endpoint: "https://mcp.linear.app/register",
+				}),
+			"https://mcp.linear.app/register": () => json({ client_id: "lin-cid" }, 201),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("linear", { ...deps, redirectUri: REDIRECT });
+		expect(pending.client.clientId).toBe("lin-cid");
+	});
+
 	test("beginLogin keeps an existing api key or live tokens usable", async () => {
 		const linearRoutes = {
 			"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp": () =>
 				json({ authorization_servers: ["https://mcp.linear.app"] }),
 			"https://mcp.linear.app/.well-known/oauth-authorization-server": () =>
 				json({
+					issuer: "https://mcp.linear.app",
 					authorization_endpoint: "https://mcp.linear.app/authorize",
 					token_endpoint: "https://mcp.linear.app/token",
 					registration_endpoint: "https://mcp.linear.app/register",
@@ -271,6 +327,86 @@ describe("login", () => {
 		expect((error as Error).message).toContain("invalid_request");
 		expect((error as Error).message).not.toContain("SECRETCODE");
 		expect((error as Error).message).not.toContain(pending.verifier);
+	});
+
+	test("discovery, token and registration fetches never follow redirects", async () => {
+		const fake = fakeFetch(notionRoutes(() => json({ access_token: "at-1" })));
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+		const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+		await completeLogin(pending, "X", deps);
+		expect(fake.calls.length).toBeGreaterThanOrEqual(4);
+		expect(fake.calls.every(c => c.redirect === "error")).toBe(true);
+	});
+
+	test("metadata with an http token endpoint is rejected before any registration or token request", async () => {
+		const fake = fakeFetch({
+			...notionRoutes(() => json({ access_token: "at-1" })),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					issuer: "https://mcp.notion.com",
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "http://mcp.notion.com/token",
+					registration_endpoint: "https://mcp.notion.com/register",
+				}),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", deps)).rejects.toThrow("must use https");
+		expect(fake.calls.some(c => c.url.endsWith("/register") || c.url.endsWith("/token"))).toBe(false);
+		expect(readStore(path).providers.notion).toBeUndefined();
+	});
+
+	test("an http authorization server or registration endpoint is rejected", async () => {
+		const httpAs = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-protected-resource/mcp": () =>
+				json({ resource: "https://mcp.notion.com/mcp", authorization_servers: ["http://mcp.notion.com"] }),
+		});
+		const deps = { now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", { ...deps, fetch: httpAs.fetch })).rejects.toThrow("must use https");
+		expect(httpAs.calls.some(c => c.url.startsWith("http://"))).toBe(false);
+
+		const httpDcr = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "https://mcp.notion.com/token",
+					registration_endpoint: "http://mcp.notion.com/register",
+				}),
+		});
+		await expect(beginLogin("notion", { ...deps, fetch: httpDcr.fetch })).rejects.toThrow("must use https");
+		expect(httpDcr.calls.some(c => c.url.startsWith("http://"))).toBe(false);
+	});
+
+	test("metadata naming a different issuer is rejected", async () => {
+		const fake = fakeFetch({
+			...notionRoutes(),
+			"https://mcp.notion.com/.well-known/oauth-authorization-server": () =>
+				json({
+					issuer: "https://evil.example",
+					authorization_endpoint: "https://mcp.notion.com/authorize",
+					token_endpoint: "https://mcp.notion.com/token",
+					registration_endpoint: "https://mcp.notion.com/register",
+				}),
+		});
+		const deps = { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT };
+		await expect(beginLogin("notion", deps)).rejects.toThrow("issuer mismatch");
+		expect(fake.calls.some(c => c.url.endsWith("/register"))).toBe(false);
+	});
+
+	test("a stored client with an http token endpoint is re-registered instead of reused", async () => {
+		writeStore(path, {
+			version: 1,
+			providers: {
+				notion: { kind: "oauth", client: { ...client, tokenEndpoint: "http://mcp.notion.com/token" }, updatedAt: NOW },
+			},
+		});
+		const fake = fakeFetch(notionRoutes());
+		const pending = await beginLogin("notion", { fetch: fake.fetch, now: () => NOW, storePath: path, redirectUri: REDIRECT });
+		expect(fake.calls.filter(c => c.url.endsWith("/register"))).toHaveLength(1);
+		expect(pending.client.tokenEndpoint).toBe("https://mcp.notion.com/token");
+		const cred = readStore(path).providers.notion;
+		expect(cred?.kind === "oauth" && cred.client.tokenEndpoint).toBe("https://mcp.notion.com/token");
 	});
 });
 
@@ -360,5 +496,101 @@ describe("recoverUnauthorized", () => {
 	test("api key -> false", async () => {
 		await setApiKey("greptile", "g", { storePath: path });
 		expect(await recoverUnauthorized("greptile", "Bearer g", { storePath: path })).toBe(false);
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a provider the table does not name and a pasted callback with a control character are refused before any request", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes());
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			// The type promises a provider id; a runtime caller can still pass anything.
+			const hostile: string = "notion\u0000";
+			await expect(beginLogin(hostile as McpProviderId, { ...deps, redirectUri: REDIRECT })).rejects.toThrow("unknown MCP provider");
+			expect(fake.calls).toHaveLength(0);
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			const requests = fake.calls.length;
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}\u0007`, deps)).rejects.toThrow("authorization callback is not valid text");
+			expect(fake.calls).toHaveLength(requests);
+			expect(recorder.validation).toEqual([
+				{ source: "mcp_oauth", resource: "oauth", details: { field: "provider", code: "INVALID_VALUE" } },
+				{ source: "mcp_oauth", resource: "oauth", details: { field: "callback", code: "PATTERN_MISMATCH" } },
+			]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});
+
+describe("callback and token limits", () => {
+	test("a percent-encoded control character in a callback parameter is refused before the token request, and logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: "at-1" })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			const requests = fake.calls.length;
+			// The raw callback passes the text check: %07 is plain text there. It decodes to BEL, which must not reach the token endpoint.
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc%07&state=${pending.state}`, deps)).rejects.toThrow("authorization callback is not valid text");
+			expect(fake.calls).toHaveLength(requests);
+			expect(recorder.validation).toEqual([{ source: "mcp_oauth", resource: "oauth", details: { field: "code", code: "PATTERN_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("a 5000-character access token is accepted, sent, and recovered after a 401 without being refused", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const token = "a".repeat(5000);
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: token, refresh_token: "rt-1", expires_in: 3600 })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			await completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}`, deps);
+			const sent = await resolveAuthHeader("notion", deps);
+			expect(sent).toBe(`Bearer ${token}`);
+			const refreshed = fakeFetch(notionRoutes(() => json({ access_token: "b".repeat(5000), refresh_token: "rt-2", expires_in: 3600 })));
+			expect(await recoverUnauthorized("notion", sent, { fetch: refreshed.fetch, now: () => NOW, storePath: path })).toBe(true);
+			expect(refreshed.calls.some(c => c.url.endsWith("/token"))).toBe(true);
+			expect(recorder.validation).toEqual([]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("an access token over the limit is refused when accepted, logged, and nothing is stored", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const fake = fakeFetch(notionRoutes(() => json({ access_token: "a".repeat(8200) })));
+			const deps = { fetch: fake.fetch, now: () => NOW, storePath: path };
+			const pending = await beginLogin("notion", { ...deps, redirectUri: REDIRECT });
+			await expect(completeLogin(pending, `${REDIRECT}?code=abc&state=${pending.state}`, deps)).rejects.toThrow("too long or malformed");
+			const cred = readStore(path).providers.notion;
+			expect(cred?.kind === "oauth" && cred.tokens).toBeUndefined();
+			expect(recorder.validation).toEqual([{ source: "mcp_oauth", resource: "oauth", details: { field: "access_token", code: "TOO_LONG" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });

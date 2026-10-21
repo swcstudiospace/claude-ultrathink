@@ -436,4 +436,45 @@ describe("createTracking", () => {
 		expect(n3?.args.blockedBy).toEqual([first.linear.nodes.n1?.identifier, refs.linear.nodes.n2?.identifier]);
 		expect(refs.linear.nodes.n3).toBeDefined();
 	});
+
+	test("node ids that are prototype keys are created, tracked and adopted like any other", async () => {
+		const graph: ThoughtGraph = {
+			goal: "g",
+			nodes: [
+				{ id: "constructor", title: "A", kind: "understand", question: "q1", dependsOn: [] },
+				{ id: "__proto__", title: "B", kind: "synthesize", question: "q2", dependsOn: ["constructor"] },
+			],
+		};
+		const plan: TrackPlan = {
+			...makePlan(),
+			issues: [],
+			subIssues: [],
+			linearIssues: graph.nodes.map((node) => ({ nodeId: node.id, title: node.title, description: `desc ${node.id}` })),
+			linearSubIssues: [],
+		};
+		const linear = fakeLinear();
+		const refs = await createTracking(plan, graph, undefined, deps({ linear, notionDataSource: undefined }));
+		const saves = linear.calls.filter((call) => call.name === "save_issue");
+		expect(saves.map((call) => call.args.title)).toEqual(["[constructor] A", "[__proto__] B"]);
+		// A non-literal key keeps TypeScript from resolving `constructor` to Object.prototype's member.
+		const constructorKey: string = "constructor";
+		expect(saves[1]?.args.blockedBy).toEqual([refs.linear.nodes[constructorKey]?.identifier]);
+		expect(refs.status).toBe("complete");
+		expect(Object.keys(refs.linear.nodes).sort()).toEqual(["__proto__", "constructor"]);
+		expect(Object.getPrototypeOf(refs.linear.nodes)).toBeNull();
+
+		const failing = fakeLinear({ throwOn: (args) => args.title === "[constructor] A" });
+		const failed = await createTracking(plan, graph, undefined, deps({ linear: failing, notionDataSource: undefined }));
+		expect(failing.calls.filter((call) => call.name === "save_issue")).toHaveLength(1);
+		expect(failed.status).not.toBe("complete");
+		expect(Object.keys(failed.linear.nodes)).toEqual([]);
+		expect(failed.errors).toEqual(["linear constructor: HTTP 500", "linear __proto__: dependency missing"]);
+
+		const listed = () => [{ identifier: "ENG-90", url: "https://linear.app/org/issue/ENG-90/x", title: "t", description: "d\n\nultrathink graph g-1 · node __proto__" }];
+		const adopting = fakeLinear({ listed });
+		const adopted = await createTracking(plan, graph, failed, deps({ linear: adopting, notionDataSource: undefined }));
+		expect(adopted.linear.nodes["__proto__"]?.identifier).toBe("ENG-90");
+		expect(adopting.calls.filter((call) => call.name === "save_issue").map((call) => call.args.title)).toEqual(["[constructor] A"]);
+		expect(adopted.status).toBe("complete");
+	});
 });

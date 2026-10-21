@@ -1,0 +1,1 @@
+{"synthetic-high-fixture":[{"id":900001,"url":"https://github.com/advisories/GHSA-synthetic-high-0001","title":"Synthetic high advisory for gate tests","severity":"high","vulnerable_versions":"<1.0.0","cwe":["CWE-79"],"cvss":{"score":7.5,"vectorString":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"}}]}

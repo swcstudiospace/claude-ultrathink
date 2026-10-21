@@ -62,4 +62,30 @@ describe("recentConversationFromTranscript", () => {
 		expect(recentConversationFromTranscript(join(dir, "missing.jsonl"))).toBe("");
 		expect(recentConversationFromTranscript(undefined)).toBe("");
 	});
+
+	test("reads only the last 256 KiB of a large transcript and drops the cut first line", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-transcript-"));
+		dirs.push(dir);
+		const path = join(dir, "big.jsonl");
+		// A long session: an early user turn, then well over 256 KiB of non-conversation
+		// entries (so a whole-file read would still surface the early turn), then a last turn.
+		const filler = JSON.stringify({ type: "summary", summary: "x".repeat(1024) });
+		const lines = [line("user", "HEAD-MARKER first turn")];
+		for (let i = 0; i < 600; i++) lines.push(filler);
+		lines.push(line("assistant", [{ type: "text", text: "TAIL-MARKER last turn" }]));
+		const text = `${lines.join("\n")}\n`;
+		expect(text.length).toBeGreaterThan(256 * 1024);
+		writeFileSync(path, text);
+		const out = recentConversationFromTranscript(path);
+		expect(out).toBe("Assistant: TAIL-MARKER last turn");
+		expect(out).not.toContain("HEAD-MARKER");
+	});
+
+	test("an empty transcript yields an empty string", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-transcript-"));
+		dirs.push(dir);
+		const path = join(dir, "empty.jsonl");
+		writeFileSync(path, "");
+		expect(recentConversationFromTranscript(path)).toBe("");
+	});
 });
