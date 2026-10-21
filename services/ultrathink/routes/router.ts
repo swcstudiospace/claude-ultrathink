@@ -52,6 +52,7 @@ import {
 	buildSecurityHeaders,
 	createSecurityEvent,
 	readBodyPrefix,
+	setSecurityLogger,
 } from "../security/index.ts";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
 import { createWalCheckpointer } from "../store/checkpoint.ts";
@@ -509,6 +510,8 @@ export function createApp(deps: RouterDeps): App {
 		onEvent: (event) => onSinkEvent(event),
 	});
 	const securityEvents = new StreamingSecurityEventLogger(logger, (event) => streams.security(event));
+	// Installed process-wide so the validation modules and every other caller reach the same SIEM-backed sink (phase 67 gap 3).
+	setSecurityLogger(securityEvents);
 	// Anomaly alerts raised while a record is being appended wait here until that record has returned.
 	const detector = createAnomalyDetector({ rules: config.auditRules ?? DEFAULT_ANOMALY_RULES, now: deps.now });
 	const pendingAlerts: AnomalyAlert[] = [];
@@ -622,11 +625,13 @@ export function createApp(deps: RouterDeps): App {
 				})
 			: undefined;
 	const inflight = createInflight(config.maxInflight);
-	// The HTTP pool refuses at once and keeps owner work ahead of connector and bearer work (CONTEXT decision 5).
+	// The HTTP pool admits, queues over-budget work within a bound, or refuses; owner work stays ahead of connector and bearer work (CONTEXT decision 5).
 	const httpShare = createFairShare({
 		capacity: config.maxInflight,
 		reserve: Math.floor((config.maxInflight * config.priorityReservePct) / 100),
 		perPrincipalMax: Math.ceil(config.maxInflight / 2),
+		queue: { depth: config.fairQueueDepth, waitMs: config.fairQueueWaitMs },
+		security: securityEvents,
 	});
 	const quota = createAdaptiveQuota({ minFactor: config.adaptiveQuotaMinPct / 100, lagTargetMs: config.lagTargetMs });
 	const clock = deps.now ?? Date.now;
@@ -638,6 +643,7 @@ export function createApp(deps: RouterDeps): App {
 		decayMs: PENALTY_DECAY_MS,
 		maxKeys: PENALTY_KEYS,
 		now: clock,
+		security: securityEvents,
 	});
 	const historyPath = join(config.stateDir, LOAD_HISTORY_FILE);
 	const history = restoreHistory(historyPath, logger);
@@ -723,14 +729,15 @@ export function createApp(deps: RouterDeps): App {
 	}
 
 	/**
-	 * Runs `work` while holding one HTTP pool slot for `admission`. A refused slot answers 429 with a one-second retry
+	 * Runs `work` while holding one HTTP pool slot for `admission`. An over-budget request waits in the pool queue until
+	 * a slot frees, its wait expires, or `signal` aborts. A refused or expired request answers 429 with a one-second retry
 	 * and runs nothing. While `work` runs, the admission sits on the request context, so planner work it starts takes a
 	 * plan slot under the same class and principal.
 	 */
-	async function admitted(admission: Admission, work: () => Promise<Response>): Promise<Response> {
-		const slot = httpShare.acquire(admission);
+	async function admitted(admission: Admission, signal: AbortSignal, work: () => Promise<Response>): Promise<Response> {
+		const slot = await httpShare.admit(admission, { signal });
 		if (!slot.ok) {
-			metrics.inc("ultrathink_fair_share_refused_total", { class: admission.class, reason: slot.reason });
+			if ("reason" in slot) metrics.inc("ultrathink_fair_share_refused_total", { class: admission.class, reason: slot.reason });
 			return fail(429, "rate_limited", { "Retry-After": "1" });
 		}
 		const context = currentRequestContext();
@@ -828,7 +835,7 @@ export function createApp(deps: RouterDeps): App {
 		const limit = auth.allowRequest({ clientIp: ctx.ip, ownerId: session.ownerId, scale: quota.factor() });
 		if (!limit.ok) return rateLimited(ctx, "run", limit.retryAfterSec);
 
-		return await admitted({ principal: "owner", class: "owner" }, () => startRun(req, ctx, session));
+		return await admitted({ principal: "owner", class: "owner" }, req.signal, () => startRun(req, ctx, session));
 	}
 
 	/** Origin, envelope, input and flags, then the run is queued. Runs only while the owner holds a pool slot. */
@@ -1082,7 +1089,7 @@ export function createApp(deps: RouterDeps): App {
 		};
 		// Discovery and initialize are not pooled; a tool call or a batch holds one slot while it runs.
 		if (ctx.rpcMethod !== "tools/call" && ctx.rpcMethod !== "batch") return await answer();
-		return await admitted({ principal, class: ctx.authKind === "connector-key" ? "connector" : "bearer" }, answer);
+		return await admitted({ principal, class: ctx.authKind === "connector-key" ? "connector" : "bearer" }, req.signal, answer);
 	}
 
 	async function dispatch(req: Request, ctx: RequestCtx, target: Target | null): Promise<Response> {

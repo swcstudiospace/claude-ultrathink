@@ -14,6 +14,7 @@ import { createLogger } from "../obs/log.ts";
 import { createMetrics, type Metrics } from "../obs/metrics.ts";
 import type { RuntimeSample } from "../obs/runtime.ts";
 import { type App, SECURITY_HEADERS, createApp, createHandler } from "./router.ts";
+import { getSecurityLogger } from "../security/events.ts";
 
 /** A header the security module sets, read from the exported constant. A missing one is a broken build, not a value to compare. */
 function requiredHeader(name: string): string {
@@ -101,6 +102,8 @@ beforeAll(async () => {
 		auditWatchMs: 1000,
 		auditSinkQueue: 10000,
 		priorityReservePct: 25,
+		fairQueueDepth: 16,
+		fairQueueWaitMs: 1500,
 		adaptiveQuotaMinPct: 50,
 		lagTargetMs: 100,
 		replicaCapacityRps: 20,
@@ -728,7 +731,7 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 			upstream: () => undefined,
 		};
 		// maxInflight 4 with a 50 % reserve: the reserve is 2, so non-owner classes may hold 2 slots.
-		const { app, metrics } = build({ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50 }, { planner });
+		const { app, metrics } = build({ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50, fairQueueDepth: 0 }, { planner });
 		const cookie = await ownerCookie(app);
 
 		const holdA = app.handle(connectorUplift(1), "198.51.100.1");
@@ -748,6 +751,47 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 		expect((await holdB).status).toBe(200);
 		// Both holds have released their slots, so a connector is admitted again.
 		expect((await app.handle(connectorUplift(4), "198.51.100.3")).status).toBe(200);
+	});
+
+	test("the security logger the app installs writes fair-share refusals to the app's writer", async () => {
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		let entered = 0;
+		const planner: HeadlessPlanner = {
+			enabled: true,
+			async start(input) {
+				entered += 1;
+				if (entered === 2) reached.resolve();
+				await gate.promise;
+				return { ok: true, data: { sessionId: String(input.sessionId ?? "held"), status: "running", pollAfterSec: 5 } };
+			},
+			async result() {
+				throw new Error("the stub planner is not asked for results in this test");
+			},
+			status: () => null,
+			async shutdown() {},
+			upstream: () => undefined,
+		};
+		// maxInflight 4 with a 50 % reserve, and no queue: the third connector is refused at once.
+		const { app } = build({ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50, fairQueueDepth: 0 }, { planner });
+		const eventNames = () =>
+			logLines.map((line) => {
+				const parsed: unknown = JSON.parse(line);
+				return typeof parsed === "object" && parsed !== null && "event" in parsed ? parsed.event : undefined;
+			});
+
+		getSecurityLogger().logRateLimitExceeded({ name: "test.installed", details: {} });
+		expect(eventNames()).toContain("test.installed");
+
+		const holdA = app.handle(connectorUplift(1), "198.51.100.1");
+		const holdB = app.handle(connectorUplift(2), "198.51.100.2");
+		await reached.promise;
+		expect((await app.handle(connectorUplift(3), "198.51.100.3")).status).toBe(429);
+		expect(eventNames()).toContain("rate_limit.fair_share_refused");
+
+		gate.resolve();
+		expect((await holdA).status).toBe(200);
+		expect((await holdB).status).toBe(200);
 	});
 
 	test("a corrupt load-history.json starts the app empty and is logged; readiness and metrics still answer", async () => {

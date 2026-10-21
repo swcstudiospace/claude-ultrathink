@@ -182,6 +182,8 @@ async function openHttp(): Promise<HttpOpened> {
 		auditWatchMs: 1000,
 		auditSinkQueue: 10000,
 		priorityReservePct: 25,
+		fairQueueDepth: 16,
+		fairQueueWaitMs: 1500,
 		adaptiveQuotaMinPct: 50,
 		lagTargetMs: 100,
 		replicaCapacityRps: 20,

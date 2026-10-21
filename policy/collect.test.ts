@@ -262,6 +262,8 @@ describe("live mode against the real router", () => {
 			openRouterBaseUrl: "https://openrouter.ai/api/v1",
 			serverPlanning: false,
 			maxConcurrentPlans: 2,
+			fairQueueDepth: 16,
+			fairQueueWaitMs: 1500,
 			modelTimeoutMs: 120000,
 			planTimeoutMs: 600000,
 			modelMaxOutputTokens: 8000,

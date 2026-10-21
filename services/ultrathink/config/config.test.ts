@@ -835,6 +835,8 @@ describe("rate limiting settings", () => {
 		{ name: "ULTRATHINK_LAG_TARGET_MS", field: "lagTargetMs", min: "10", max: "5000" },
 		{ name: "ULTRATHINK_REPLICA_CAPACITY_RPS", field: "replicaCapacityRps", min: "1", max: "100000" },
 		{ name: "ULTRATHINK_ABUSE_FAILURES_PER_MINUTE", field: "abuseFailuresPerMinute", min: "1", max: "10000" },
+		{ name: "ULTRATHINK_FAIR_QUEUE_DEPTH", field: "fairQueueDepth", min: "0", max: "1000" },
+		{ name: "ULTRATHINK_FAIR_QUEUE_WAIT_MS", field: "fairQueueWaitMs", min: "1", max: "60000" },
 	] as const;
 
 	for (const range of ranges) {
