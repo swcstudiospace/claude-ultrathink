@@ -325,33 +325,41 @@ export function lastRefreshMessage(lastPath: string): string {
 	return `could not refresh ${lastPath}; the session was saved, but ctl last may still show the previous plan`;
 }
 
-/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
-export function writeSession(dir: string, record: SessionRecord): string | undefined {
-	writeJson(sessionPath(dir, record.sessionId), record);
+/** Writes `record` to `path` and mirrors it to last.json. Returns a warning when `last.json` could not be refreshed; the record file is still saved. */
+function saveSessionFile(dir: string, path: string, record: SessionRecord): string | undefined {
+	writeJson(path, record);
 	const last = join(dir, "last.json");
 	if (!withLastLock(last, () => writeJson(last, record))) return lastRefreshMessage(last);
 	return undefined;
 }
 
+/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
+export function writeSession(dir: string, record: SessionRecord): string | undefined {
+	return saveSessionFile(dir, sessionPath(dir, record.sessionId), record);
+}
+
 /**
- * Locked read-mutate-write of one session record (the session file and last.json). Returns the written record, or
- * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` must not write the
- * same session file itself.
+ * Locked read-mutate-write of one session record (the record file and last.json). Returns the written record, or
+ * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` receives the path
+ * readers resolve for this id (`sessionRecordPath`), so any sidecar it writes beside the JSON pairs with it. The
+ * record is written back to that same path: a record still under its earlier name keeps its JSON beside its XML, and
+ * never splits onto the new name. `mutate` must not write the record file itself.
  */
 export function updateSession(
 	dir: string,
 	sessionId: string,
-	mutate: (record: SessionRecord) => SessionRecord | undefined,
+	mutate: (record: SessionRecord, recordPath: string) => SessionRecord | undefined,
 	lock?: LockOptions,
 ): SessionRecord | undefined {
 	return withFileLock(
 		sessionPath(dir, sessionId),
 		() => {
+			const recordPath = sessionRecordPath(dir, sessionId);
 			const record = readSession(dir, sessionId);
 			if (!record) return undefined;
-			const next = mutate(record);
+			const next = mutate(record, recordPath);
 			if (!next) return undefined;
-			writeSession(dir, next);
+			saveSessionFile(dir, recordPath, next);
 			return next;
 		},
 		lock,

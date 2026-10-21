@@ -8,6 +8,7 @@ import type { DecisionRecord } from "../decisions/types.ts";
 import { shipNudge } from "../ship/nudge.ts";
 import { DEFAULT_SHIP_CONFIG } from "../ship/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
+import { main as mcpMain } from "../mcp/cli.ts";
 import {
 	controlPath,
 	defaultStateDir,
@@ -505,5 +506,53 @@ describe("the HITL answers hook", () => {
 		expect(exit).toBe(0);
 		expect(stdout).toBe("");
 		expect(existsSync(sessionPath(dir, "ghost"))).toBe(false);
+	});
+});
+
+describe("a legacy-only session record through the answers hook", () => {
+	test("the answer and a later write through the original stateFile stay in one JSON/XML pair", async () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		const sessionId = "Claude-A";
+		const legacy = legacySessionPath(dir, sessionId);
+		const legacyXml = legacy.replace(/\.json$/, ".xml");
+		const xml = "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>";
+		writeFileSync(legacy, JSON.stringify({ sessionId, at: 1, kickedOff: false, result: { xml, original: "x", root: "BUILD_PROMPT", source: "llm" } }));
+		writeFileSync(legacyXml, `${xml}\n`);
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+
+		const envelope = {
+			session_id: sessionId,
+			tool_name: "AskUserQuestion",
+			tool_input: { questions: [{ question: "Which database?", header: "Database", options: [{ label: "Postgres" }, { label: "SQLite" }] }] },
+			tool_response: { answers: { "Which database?": "Postgres" } },
+		};
+		const proc = Bun.spawn([process.execPath, ANSWERS_HOOK], {
+			cwd: join(dir, ".."),
+			env: { PATH: process.env.PATH, HOME: dir, ULTRATHINK_STATE_DIR: dir },
+			stdin: new TextEncoder().encode(JSON.stringify(envelope)),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		expect(exit).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({ systemMessage: "HITL · 1 answer(s) recorded" });
+
+		// The answer stays in the legacy pair: the readers keep selecting it and the new name is never created.
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+		expect(existsSync(sessionPath(dir, sessionId))).toBe(false);
+		const answered = readSession(dir, sessionId);
+		expect(answered?.clarifications?.[0]).toMatchObject({ question: "Which database?", answer: "Postgres" });
+		expect(answered?.result.xml).toContain("Postgres");
+		expect(readFileSync(legacyXml, "utf8")).toBe(`${answered?.result.xml}\n`);
+
+		// A command holding the original stateFile (the legacy JSON) writes into that same record and XML pair.
+		expect(await mcpMain(["session", "mark", "--state", legacy, "kicked-off"])).toBe(0);
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+		expect(existsSync(sessionPath(dir, sessionId))).toBe(false);
+		const marked = readSession(dir, sessionId);
+		expect(marked?.kickedOff).toBe(true);
+		expect(marked?.clarifications?.[0]).toMatchObject({ question: "Which database?", answer: "Postgres" });
+		expect(readFileSync(legacyXml, "utf8")).toBe(`${marked?.result.xml}\n`);
 	});
 });
