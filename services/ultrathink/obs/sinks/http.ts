@@ -3,7 +3,13 @@
 
 // HTTP and Kafka REST sink transports (AUDIT-02). Both POST envelopes and classify the outcome
 // for the sink queue: 2xx is delivered, 408/425/429/5xx and network errors are retryable, every
-// other status and any redirect are not. Error reasons never carry the token or a URL.
+// other status and any redirect are not. Retries stop at the queue's maxAttempts (5 in fanout.ts), so a batch
+// that keeps failing is eventually dropped. A Kafka 2xx is delivered only when no record in its body reports an
+// error. Kafka delivery is at least once: a retryable batch failure resends the whole batch, so records Kafka
+// already accepted can arrive again. A Kafka batch is classified by its first failing record. That record's error
+// code decides retryable or not, and the whole batch is reported as one failure with that code. A record with an
+// error but no numeric error_code is retryable, since its cause is unknown. A non-retryable mixed batch reports
+// its full count as dropped, though some of its records were accepted. Error reasons never carry the token or a URL.
 
 import type { SendResult, SinkEnvelope, SinkTransport } from "./types.ts";
 
@@ -73,6 +79,7 @@ async function postJson(args: {
 	readonly body: string;
 	readonly fetchImpl: typeof fetch;
 	readonly signal: AbortSignal;
+	readonly readBody?: (text: string) => SendResult;
 }): Promise<SendResult> {
 	if (args.signal.aborted) return { ok: false, retryable: true, reason: "aborted" };
 	const headers: Record<string, string> = { "content-type": args.contentType };
@@ -86,8 +93,12 @@ async function postJson(args: {
 			redirect: "error",
 			signal: args.signal,
 		});
-		void res.body?.cancel().catch(() => undefined);
-		return classifyStatus(res.status);
+		const status = classifyStatus(res.status);
+		if (!status.ok || args.readBody === undefined) {
+			void res.body?.cancel().catch(() => undefined);
+			return status;
+		}
+		return args.readBody(await res.text());
 	} catch (err) {
 		// Bun rejects redirect: "error" with UnexpectedRedirect before any request reaches the other origin.
 		if (!args.signal.aborted && (err as { code?: unknown } | null)?.code === "UnexpectedRedirect") {
@@ -95,6 +106,28 @@ async function postJson(args: {
 		}
 		return networkFailure(err, args.signal);
 	}
+}
+
+/** Reads a Kafka REST v2 produce response. A 200 can still fail records: each `offsets` entry carries its own error. */
+function classifyKafkaProduce(text: string): SendResult {
+	let body: unknown;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		return { ok: false, retryable: true, reason: "kafka response unreadable" };
+	}
+	const offsets = (body as { offsets?: unknown } | null)?.offsets;
+	if (!Array.isArray(offsets)) return { ok: false, retryable: true, reason: "kafka response unreadable" };
+	for (const entry of offsets as unknown[]) {
+		const record = (entry ?? {}) as { error_code?: unknown; error?: unknown };
+		if ((record.error_code ?? null) === null && (record.error ?? null) === null) continue;
+		const code = record.error_code;
+		if (typeof code !== "number") return { ok: false, retryable: true, reason: "kafka record error" };
+		// Kafka REST error codes start with the HTTP status they map to: 42201 is 422, 50002 is 500.
+		const verdict = classifyStatus(Math.floor(code / 100));
+		return { ok: false, retryable: verdict.ok === false && verdict.retryable, reason: `kafka record error ${code}` };
+	}
+	return { ok: true };
 }
 
 export function createHttpTransport(opts: HttpTransportOptions): SinkTransport {
@@ -148,6 +181,7 @@ export function createKafkaRestTransport(opts: KafkaRestTransportOptions): SinkT
 				body,
 				fetchImpl,
 				signal,
+				readBody: classifyKafkaProduce,
 			});
 		},
 	};

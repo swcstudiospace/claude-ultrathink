@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterEach, describe, expect, test } from "bun:test";
+import net from "node:net";
 import { createSyslogTransport, encodeSyslogFrame } from "./syslog.ts";
 import type { SinkEnvelope } from "./types.ts";
 
@@ -71,6 +72,49 @@ function freePort(): number {
 	const port = probe.port;
 	probe.stop(true);
 	return port;
+}
+
+interface PausedReceiver {
+	readonly port: number;
+	resume(): void;
+	waitForBytes(count: number): Promise<void>;
+	received(): Uint8Array;
+}
+
+/** A TCP receiver that reads nothing until resume(), so the sender's socket buffers fill and its writes come back partial. */
+async function startPausedReceiver(): Promise<PausedReceiver> {
+	const chunks: Buffer[] = [];
+	let total = 0;
+	let onData: (() => void) | undefined;
+	let reader: net.Socket | undefined;
+	const server = net.createServer((sock) => {
+		reader = sock;
+		sock.on("error", () => {});
+		sock.on("data", (chunk: Buffer) => {
+			chunks.push(chunk);
+			total += chunk.byteLength;
+			onData?.();
+		});
+		sock.pause();
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+	stops.push(() => {
+		reader?.destroy();
+		server.close();
+	});
+	const { port } = server.address() as net.AddressInfo;
+	return {
+		port,
+		resume: () => reader?.resume(),
+		async waitForBytes(count) {
+			while (total < count) {
+				await new Promise<void>((resolve) => {
+					onData = resolve;
+				});
+			}
+		},
+		received: () => Buffer.concat(chunks),
+	};
 }
 
 interface ParsedFrame {
@@ -218,6 +262,21 @@ describe("createSyslogTransport", () => {
 			reason: "aborted",
 		});
 		expect(listener.opens).toBe(0);
+	});
+
+	test("a partial write waits for the socket to drain, so every byte of a batch larger than the socket buffers arrives", async () => {
+		const receiver = await startPausedReceiver();
+		const transport = createSyslogTransport({ host: "127.0.0.1", port: receiver.port, hostname: "host.test", appName: "ultrathink" });
+		// 32 envelopes of 1 MiB: the first write accepts only a few MiB, so the rest of the batch must wait for drain.
+		const batch = Array.from({ length: 32 }, (_, seq) => envelope(seq, "audit", { pad: "x".repeat(1024 * 1024) }));
+		const sending = transport.send(batch, new AbortController().signal);
+		// Kernel socket buffers cannot be observed from here, so the receiver stays paused briefly to let the
+		// sender's first write come back partial. No event marks that point.
+		await Bun.sleep(100);
+		receiver.resume();
+		expect(await sending).toEqual({ ok: true });
+		await receiver.waitForBytes(batch.reduce((sum, env) => sum + frameLength(env), 0));
+		expect(parseFrames(receiver.received()).map(parseMessage).map((msg) => msg.body)).toEqual(batch);
 	});
 
 	test("an empty batch is ok and sends nothing", async () => {

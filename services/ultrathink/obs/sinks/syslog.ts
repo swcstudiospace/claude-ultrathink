@@ -2,8 +2,9 @@
 // Copyright (C) 2026 SWC Studio
 
 // RFC 5424 syslog over TCP with RFC 6587 octet-counting framing (AUDIT-02). One connection is kept
-// and reopened on demand. A send is ok once its frames are handed to the socket; the transport does
-// not wait for a server acknowledgement, because syslog over TCP has none.
+// and reopened on demand. A send is ok once every byte of its frames is accepted by the socket. A partial
+// write waits for the socket to drain. The transport does not wait for a server acknowledgement, because
+// syslog over TCP has none.
 
 import type { Socket } from "bun";
 import { networkFailure } from "./http.ts";
@@ -18,6 +19,8 @@ export interface SyslogTransportOptions {
 
 interface Link {
 	alive: boolean;
+	/** Set while a send waits for a partial write to drain. Called with false when the link dies first. */
+	onDrain?: (drained: boolean) => void;
 }
 
 // local0 facility. audit is info (134), security is warning (132), alert is critical (130).
@@ -60,6 +63,32 @@ export function encodeSyslogFrame(env: SinkEnvelope, hostname: string, appName: 
 	return concatBytes([prefix, message]);
 }
 
+/** Marks a link dead and wakes a send waiting on it, so that send fails instead of waiting for a drain that never comes. */
+function markDead(socket: Socket<Link>): void {
+	socket.data.alive = false;
+	const resume = socket.data.onDrain;
+	socket.data.onDrain = undefined;
+	resume?.(false);
+}
+
+/** Waits for the socket to drain. Resolves false when the socket closes or the signal aborts first. */
+function awaitDrain(socket: Socket<Link>, signal: AbortSignal): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		if (signal.aborted || !socket.data.alive) {
+			resolve(false);
+			return;
+		}
+		const finish = (drained: boolean): void => {
+			signal.removeEventListener("abort", onAbort);
+			socket.data.onDrain = undefined;
+			resolve(drained);
+		};
+		const onAbort = (): void => finish(false);
+		socket.data.onDrain = finish;
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 /** Opens a TCP connection. An abort rejects at once; a connection that completes after the abort is closed. */
 function connectLink(host: string, port: number, signal: AbortSignal): Promise<Socket<Link>> {
 	return new Promise<Socket<Link>>((resolve, reject) => {
@@ -77,12 +106,14 @@ function connectLink(host: string, port: number, signal: AbortSignal): Promise<S
 			socket: {
 				// Syslog receivers do not reply, so inbound bytes are ignored. Bun requires a data callback.
 				data() {},
-				close(socket) {
-					socket.data.alive = false;
+				// The socket accepts more bytes: resume a send that is waiting on a partial write.
+				drain(socket) {
+					const resume = socket.data.onDrain;
+					socket.data.onDrain = undefined;
+					resume?.(true);
 				},
-				error(socket) {
-					socket.data.alive = false;
-				},
+				close: markDead,
+				error: markDead,
 			},
 		}).then(
 			(socket) => {
@@ -150,10 +181,24 @@ export function createSyslogTransport(opts: SyslogTransportOptions): SinkTranspo
 				return networkFailure(err, signal);
 			}
 			try {
-				const written = socket.write(payload);
-				if (written < 0 || !socket.data.alive) {
-					dropLink();
-					return { ok: false, retryable: true, reason: "network error: write" };
+				let offset = 0;
+				while (offset < payload.byteLength) {
+					// socket.write can accept fewer bytes than offered; the rest of the frame waits for drain.
+					const written = socket.write(payload, offset, payload.byteLength - offset);
+					if (written < 0 || !socket.data.alive) {
+						dropLink();
+						return { ok: false, retryable: true, reason: "network error: write" };
+					}
+					offset += written;
+					if (offset < payload.byteLength && !(await awaitDrain(socket, signal))) {
+						// A cut-off frame cannot be finished on this connection, so the connection goes. The retry
+						// resends the whole batch, so records already partly written may repeat; that beats losing them.
+						// The send's signal bounds the wait.
+						dropLink();
+						return signal.aborted
+							? { ok: false, retryable: true, reason: "aborted" }
+							: { ok: false, retryable: true, reason: "network error: write" };
+					}
 				}
 			} catch (err) {
 				dropLink();

@@ -198,7 +198,11 @@ describe("createHttpTransport", () => {
 
 describe("createKafkaRestTransport", () => {
 	test("the topic is percent-encoded in the path, the content type is v2 JSON, and the value is the envelope", async () => {
-		const { server, calls } = serve(() => new Response("{}", { status: 200 }));
+		const offsets = [
+			{ partition: 0, offset: 7, error_code: null, error: null },
+			{ partition: 0, offset: 8, error_code: null, error: null },
+		];
+		const { server, calls } = serve(() => new Response(JSON.stringify({ offsets }), { status: 200 }));
 		const transport = createKafkaRestTransport({ baseUrl: baseUrl(server), topic: "a/b", token: TOKEN });
 		const batch = [envelope(7), envelope(8, "security")];
 
@@ -232,6 +236,37 @@ describe("createKafkaRestTransport", () => {
 
 		expect(await retryTransport.send([envelope(1)], signal)).toEqual({ ok: false, retryable: true, reason: "http 503" });
 		expect(await fatalTransport.send([envelope(1)], signal)).toEqual({ ok: false, retryable: false, reason: "http 422" });
+	});
+
+	test("a 200 whose body reports a record error fails the batch, classified by the Kafka error code", async () => {
+		const signal = new AbortController().signal;
+		const okRecord = { partition: 0, offset: 1, error_code: null, error: null };
+		const rejected = serve(() => new Response(JSON.stringify({ offsets: [okRecord, { error_code: 42201, error: "invalid record" }] }), { status: 200 }));
+		const unavailable = serve(() => new Response(JSON.stringify({ offsets: [{ error_code: 50002, error: "leader unavailable" }] }), { status: 200 }));
+		const rejectedTransport = createKafkaRestTransport({ baseUrl: baseUrl(rejected.server), topic: "audit" });
+		const unavailableTransport = createKafkaRestTransport({ baseUrl: baseUrl(unavailable.server), topic: "audit" });
+
+		expect(await rejectedTransport.send([envelope(1), envelope(2)], signal)).toEqual({
+			ok: false,
+			retryable: false,
+			reason: "kafka record error 42201",
+		});
+		expect(await unavailableTransport.send([envelope(1)], signal)).toEqual({
+			ok: false,
+			retryable: true,
+			reason: "kafka record error 50002",
+		});
+	});
+
+	test("a 200 body that is not a produce response is a retryable failure, not a delivery", async () => {
+		const { server } = serve(() => new Response("accepted", { status: 200 }));
+		const transport = createKafkaRestTransport({ baseUrl: baseUrl(server), topic: "audit" });
+
+		expect(await transport.send([envelope(1)], new AbortController().signal)).toEqual({
+			ok: false,
+			retryable: true,
+			reason: "kafka response unreadable",
+		});
 	});
 
 	test("an empty topic, a plaintext remote URL, and URL credentials are rejected", () => {
