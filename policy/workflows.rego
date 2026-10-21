@@ -31,8 +31,8 @@ grants_write(perms) if perms == "write-all"
 
 grants_write(perms) if {
 	is_object(perms)
-	some level in object.values(perms)
-	level == "write"
+	some scope
+	perms[scope] == "write"
 }
 
 top_level_read_only(perms) if {

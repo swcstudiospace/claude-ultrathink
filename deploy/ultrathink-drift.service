@@ -23,9 +23,8 @@ Group=ultrathink
 WorkingDirectory=/opt/ultrathink/current
 # Bun and some libraries read $HOME. ProtectHome hides /home and /root, so point it inside the state dir.
 Environment=HOME=/var/lib/ultrathink-policy
-# check.sh runs bun (/opt/ultrathink/bin/bun) to collect the policy input. OPA is named explicitly.
+# check.sh runs bun (/opt/ultrathink/bin/bun) to collect the policy input. OPA is the binary pinned in opa-pin.json.
 Environment=PATH=/opt/ultrathink/bin:/usr/local/bin:/usr/bin:/bin
-Environment=OPA_BIN=/opt/ultrathink/bin/opa
 ExecStart=-/usr/bin/bash /opt/ultrathink/current/deploy/drift-check.sh --unit-dir /opt/ultrathink/current/deploy --install-dir /etc/systemd/system --report /var/lib/ultrathink-policy/drift-report.json
 ExecStart=/usr/bin/bash /opt/ultrathink/current/policy/check.sh --live http://127.0.0.1:8795/
 

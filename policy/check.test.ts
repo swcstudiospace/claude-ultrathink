@@ -6,6 +6,7 @@
 // they run without the real binary. Tests that need the real OPA on PATH are skipped when it is absent. Scratch
 // directories live under the OS temp dir and are removed in afterAll.
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	copyFileSync,
@@ -16,6 +17,7 @@ import {
 	readFileSync,
 	readdirSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -57,10 +59,6 @@ async function run(cmd: string[], env: Record<string, string>, cwd: string): Pro
 	return { exitCode, stdout, stderr };
 }
 
-function runCheck(args: string[], extraEnv: Record<string, string> = {}): Promise<RunResult> {
-	return run(["bash", SCRIPT, ...args], scrubbedEnv(extraEnv), REPO);
-}
-
 // A stub OPA: `check` and `test` succeed, and `eval` prints the given JSON, as the real CLI would on stdout.
 function writeStubOpa(evalOutput: string): string {
 	const dir = mkdtempSync(join(scratch, "stub-"));
@@ -77,6 +75,29 @@ function writeStubOpa(evalOutput: string): string {
 
 function evalResult(value: unknown[]): string {
 	return JSON.stringify({ result: [{ expressions: [{ value, text: "data.ultrathink.policy.violations" }] }] });
+}
+
+// A policy tree of its own: a copy of policy/ whose pin names `binary` by its real sha256 and a file:// url. check.sh
+// verifies it exactly as it verifies the pinned download. services/ and node_modules/ are linked in so the copied
+// collect.ts resolves its imports.
+function pinnedTree(binary: string): string {
+	const dir = mkdtempSync(join(scratch, "tree-"));
+	cpSync(join(REPO, "policy"), join(dir, "policy"), { recursive: true });
+	symlinkSync(join(REPO, "services"), join(dir, "services"));
+	symlinkSync(join(REPO, "node_modules"), join(dir, "node_modules"));
+	const pin = {
+		version: "test",
+		asset: "opa_stub",
+		sha256: createHash("sha256").update(readFileSync(binary)).digest("hex"),
+		url: pathToFileURL(binary).href,
+	};
+	writeFileSync(join(dir, "policy", "opa-pin.json"), JSON.stringify(pin));
+	return join(dir, "policy", "check.sh");
+}
+
+// Runs check.sh from a pinned tree with --root set to this repository, unless `args` names another root.
+function runVerified(binary: string, args: string[] = [], extraEnv: Record<string, string> = {}): Promise<RunResult> {
+	return run(["bash", pinnedTree(binary), "--root", REPO, ...args], scrubbedEnv(extraEnv), REPO);
 }
 
 test("a checksum mismatch aborts before any OPA step and leaves no binary behind", async () => {
@@ -147,18 +168,44 @@ test("a null pin field aborts before any download, even when a download url is s
 	expect(readdirSync(tmp)).toEqual([]);
 });
 
-test("an OPA_BIN that is not an executable file fails before collection runs", async () => {
-	const result = await runCheck([], { OPA_BIN: join(scratch, "no-such-opa") });
+test("an unverified OPA_BIN never runs: with no verified pin the run stops before any binary executes", async () => {
+	const marker = join(scratch, "bypass-ran");
+	const fixture = join(scratch, "bypass-opa");
+	writeFileSync(fixture, `#!/bin/sh\ntouch '${marker}'\nexit 0\n`);
+	chmodSync(fixture, 0o755);
 
-	expect(result.exitCode).toBe(2);
-	expect(result.stderr).toContain("OPA_BIN");
+	// The repository pin is set now, so this test writes a null pin into its own copy of policy/ instead of reading it.
+	const unpinned = join(scratch, "unpinned-tree");
+	cpSync(join(REPO, "policy"), join(unpinned, "policy"), { recursive: true });
+	symlinkSync(join(REPO, "services"), join(unpinned, "services"));
+	symlinkSync(join(REPO, "node_modules"), join(unpinned, "node_modules"));
+	writeFileSync(join(unpinned, "policy", "opa-pin.json"), JSON.stringify({ version: null, asset: "opa_linux_amd64_static", sha256: null, url: null }));
+	const result = await run(["bash", join(unpinned, "policy", "check.sh"), "--root", REPO], scrubbedEnv({ OPA_BIN: fixture }), REPO);
+
+	expect(result.exitCode).toBe(1);
+	expect(result.stderr).toContain("no verified OPA pin");
 	expect(result.stdout).not.toContain("==> collect");
+	expect(existsSync(marker)).toBe(false);
+});
+
+test("OPA_BIN has no effect: the pinned binary that passed verification decides the run", async () => {
+	const violation = {
+		rule: "W-R1",
+		file: ".github/workflows/ci.yml",
+		detail: "uses ref actions/checkout@v4 is not pinned to a 40-hex SHA",
+	};
+	const pinned = writeStubOpa(evalResult([violation]));
+	const bypass = writeStubOpa(evalResult([]));
+	const result = await runVerified(pinned, [], { OPA_BIN: bypass });
+
+	expect(result.exitCode).toBe(1);
+	expect(result.stdout).toContain("W-R1 .github/workflows/ci.yml");
+	expect(result.stdout).not.toContain("no violations");
+	expect(result.stderr).toContain("OPA_BIN is ignored");
 });
 
 test("an unknown --root writes nothing to stdout and exits non-zero", async () => {
-	const result = await runCheck(["--root", join(scratch, "does-not-exist")], {
-		OPA_BIN: writeStubOpa(evalResult([])),
-	});
+	const result = await runVerified(writeStubOpa(evalResult([])), ["--root", join(scratch, "does-not-exist")]);
 
 	expect(result.exitCode).toBe(2);
 	expect(result.stdout).toBe("");
@@ -170,7 +217,7 @@ test("a non-empty violations set fails the run and names each violation", async 
 		file: ".github/workflows/ci.yml",
 		detail: "uses ref actions/checkout@v4 is not pinned to a 40-hex SHA",
 	};
-	const result = await runCheck([], { OPA_BIN: writeStubOpa(evalResult([violation])) });
+	const result = await runVerified(writeStubOpa(evalResult([violation])));
 
 	expect(result.exitCode).toBe(1);
 	expect(result.stdout).toContain("W-R1 .github/workflows/ci.yml");
@@ -178,21 +225,21 @@ test("a non-empty violations set fails the run and names each violation", async 
 });
 
 test("an empty violations set passes the run", async () => {
-	const result = await runCheck([], { OPA_BIN: writeStubOpa(evalResult([])) });
+	const result = await runVerified(writeStubOpa(evalResult([])));
 
 	expect(result.exitCode).toBe(0);
 	expect(result.stdout).toContain("no violations");
 });
 
 test("an undefined violations set fails closed rather than reading as no violations", async () => {
-	const result = await runCheck([], { OPA_BIN: writeStubOpa(JSON.stringify({ result: [] })) });
+	const result = await runVerified(writeStubOpa(JSON.stringify({ result: [] })));
 
 	expect(result.exitCode).toBe(1);
 	expect(result.stderr).toContain("no violations set");
 });
 
 test.skipIf(!REAL_OPA)("the baseline repository passes with the real OPA binary", async () => {
-	const result = await runCheck([], { OPA_BIN: REAL_OPA ?? "" });
+	const result = await runVerified(REAL_OPA ?? "");
 
 	expect(result.exitCode).toBe(0);
 });
@@ -206,7 +253,7 @@ test.skipIf(!REAL_OPA)("a seeded unpinned uses ref in a copied workflow tree fai
 	expect(seeded).not.toBe(original);
 	writeFileSync(ci, seeded);
 
-	const result = await runCheck(["--root", dir], { OPA_BIN: REAL_OPA ?? "" });
+	const result = await runVerified(REAL_OPA ?? "", ["--root", dir]);
 
 	expect(result.exitCode).toBe(1);
 	expect(result.stdout).toContain("W-R1");

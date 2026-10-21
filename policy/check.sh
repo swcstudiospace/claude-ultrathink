@@ -11,11 +11,10 @@
 #   --root <dir>   tree to inspect; .github/workflows and deploy/ are read from here (default: this repository)
 #   --live <url>   also collect the live response headers from <url> (collect.ts --live)
 #
-# OPA binary, first match wins:
-#   OPA_BIN            an executable OPA binary, used as given; no download and no digest check
-#   (otherwise)        download the asset named in policy/opa-pin.json, verify its sha256, and run it only on a match.
-#                      A mismatch aborts the run. There is no fallback to an unverified binary.
-#   OPA_DOWNLOAD_URL   replaces the url in opa-pin.json (tests use a file:// URL)
+# OPA binary: always the one named in policy/opa-pin.json. It is downloaded, its sha256 is checked, and it runs only on a
+# match. A mismatch aborts the run. No environment variable selects another binary or skips the check.
+#   OPA_DOWNLOAD_URL   replaces the url in opa-pin.json; the sha256 check still applies (tests use a file:// URL)
+#   OPA_BIN            ignored; a warning is printed when it is set
 #
 # Steps, stopping at the first failure:
 #   1. opa check --strict on every .rego file
@@ -89,27 +88,26 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 if [ -n "${OPA_BIN:-}" ]; then
-	[ -x "$OPA_BIN" ] || usage "OPA_BIN is not an executable file: $OPA_BIN"
-	OPA="$OPA_BIN"
-else
-	PIN="$SCRIPT_DIR/opa-pin.json"
-	[ -f "$PIN" ] || die "missing $PIN"
-	VERSION="$(pin_field version)"
-	ASSET="$(pin_field asset)"
-	EXPECTED_SHA="$(pin_field sha256)"
-	PINNED_URL="$(pin_field url)"
-	[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || die "opa-pin.json sha256 is not 64 lowercase hex characters"
-	URL="${OPA_DOWNLOAD_URL:-$PINNED_URL}"
-
-	OPA="$WORK/opa"
-	say "download $ASSET $VERSION"
-	curl --fail --silent --show-error --location --output "$OPA" "$URL" || die "download failed: $URL"
-	ACTUAL_SHA="$(sha256_of "$OPA")"
-	if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-		die "OPA checksum mismatch for $ASSET: pinned $EXPECTED_SHA, downloaded $ACTUAL_SHA; refusing to run it"
-	fi
-	chmod 0755 "$OPA"
+	printf 'check.sh: OPA_BIN is ignored: only the binary pinned in opa-pin.json, verified by sha256, runs\n' >&2
 fi
+
+PIN="$SCRIPT_DIR/opa-pin.json"
+[ -f "$PIN" ] || die "missing $PIN"
+VERSION="$(pin_field version)"
+ASSET="$(pin_field asset)"
+EXPECTED_SHA="$(pin_field sha256)"
+PINNED_URL="$(pin_field url)"
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || die "opa-pin.json sha256 is not 64 lowercase hex characters"
+URL="${OPA_DOWNLOAD_URL:-$PINNED_URL}"
+
+OPA="$WORK/opa"
+say "download $ASSET $VERSION"
+curl --fail --silent --show-error --location --output "$OPA" "$URL" || die "download failed: $URL"
+ACTUAL_SHA="$(sha256_of "$OPA")"
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+	die "OPA checksum mismatch for $ASSET: pinned $EXPECTED_SHA, downloaded $ACTUAL_SHA; refusing to run it"
+fi
+chmod 0755 "$OPA"
 
 ALL_REGO=("$SCRIPT_DIR"/*.rego)
 [ -e "${ALL_REGO[0]}" ] || die "no .rego files in $SCRIPT_DIR"
@@ -125,7 +123,8 @@ say "opa check --strict"
 "$OPA" check --strict "${ALL_REGO[@]}" || die "opa check --strict failed"
 
 say "opa test"
-"$OPA" test "$SCRIPT_DIR" -v || die "opa test failed"
+# controls.json is the compliance catalog read by compliance-report.ts. It is not Rego data and is a JSON array, so opa test must skip it.
+"$OPA" test --ignore controls.json "$SCRIPT_DIR" -v || die "opa test failed"
 
 say "collect $ROOT${LIVE:+ (live: $LIVE)}"
 COLLECT_ARGS=(--root "$ROOT")
@@ -135,7 +134,9 @@ fi
 bun "$SCRIPT_DIR/collect.ts" "${COLLECT_ARGS[@]}" > "$WORK/input.json" || die "collect.ts failed"
 
 say "opa eval data.ultrathink.policy.violations"
-"$OPA" eval --format json -d "${RULES[@]}" -i "$WORK/input.json" data.ultrathink.policy.violations > "$WORK/eval.json" ||
+DATA_ARGS=()
+for rule in "${RULES[@]}"; do DATA_ARGS+=(-d "$rule"); done
+"$OPA" eval --format json "${DATA_ARGS[@]}" -i "$WORK/input.json" data.ultrathink.policy.violations > "$WORK/eval.json" ||
 	die "opa eval failed"
 
 # An undefined set is a failure, not a pass: a misspelled package or rule name must not read as "no violations".

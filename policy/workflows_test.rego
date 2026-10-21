@@ -28,7 +28,7 @@ wf_ci(on, perms, jobs) := {
 wf_release(perms, jobs) := {
 	"file": release_file,
 	"on": ["push"],
-	"permissions": read_perms,
+	"permissions": perms,
 	"jobs": jobs,
 }
 
