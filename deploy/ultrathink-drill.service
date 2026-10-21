@@ -1,0 +1,58 @@
+# Installed as /etc/systemd/system/ultrathink-drill.service and started by ultrathink-drill.timer.
+# Monthly unattended restore drill: restores the newest ring snapshot into a private scratch state and checks it. The
+# off-host leg reports SKIPPED unless ULTRATHINK_AGE_IDENTITY is supplied at run time. Never touches the live state
+# directory or the web service, so the unit has no StateDirectory.
+# Run by hand: systemctl start ultrathink-drill.service ; journalctl -u ultrathink-drill -n 50 --no-pager
+
+[Unit]
+Description=Ultrathink monthly restore drill
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Same user as the other ultrathink units: it reads the ring under /var/backups/ultrathink.
+User=ultrathink
+Group=ultrathink
+WorkingDirectory=/opt/ultrathink/current
+EnvironmentFile=/etc/ultrathink/ultrathink.env
+# Invoked through bash so the unit does not depend on the executable bit surviving a release checkout.
+ExecStart=/usr/bin/bash /opt/ultrathink/current/deploy/ultrathink-restore.sh drill
+TimeoutStartSec=30min
+Nice=10
+
+# Same sandbox as ultrathink-maintenance.service, minus the state directory: the drill writes only to its private tmp
+# and reads the backup directory.
+UMask=0077
+MemoryMax=512M
+TasksMax=64
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/ultrathink
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectHostname=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+# @resources is not excluded: Bun may call setrlimit at startup (a blocked syscall kills the process with SIGSYS).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-drill

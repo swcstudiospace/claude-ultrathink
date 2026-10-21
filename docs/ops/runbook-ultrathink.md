@@ -12,7 +12,7 @@ Operations guide for the ultrathink MCP service on the VPS. Commands run as root
 6. Server-side planning calls OpenRouter (`OPENROUTER_API_KEY`, model `ULTRATHINK_PLANNING_MODEL`); the client-driven loop (Grok Bot) makes no model call.
 7. State lives in `/var/lib/ultrathink` (mode 0700): `ultrathink.sqlite` (runs, token ledger), `oauth.json` (OAuth clients and tokens), `journal/`, `sessions/`, `jobs/`.
 8. Configuration and secrets live in `/etc/ultrathink/ultrathink.env` (mode 0600, root), read by systemd.
-9. `deploy/ultrathink-release.sh` builds, tests, smoke-tests and switches releases; `deploy/ultrathink-maintenance.timer` runs the daily backup and retention job.
+9. `deploy/ultrathink-release.sh` builds, tests, smoke-tests and switches releases. Scheduled jobs: `deploy/ultrathink-maintenance.timer` runs the daily backup and retention job; `deploy/ultrathink-snapshot.timer` takes a point-in-time snapshot every 30 seconds and stays disabled until the staging measurement is recorded (section 5); `deploy/ultrathink-drill.timer` runs the monthly restore drill.
 10. Logs go to journald as JSON lines; Prometheus-format metrics are on `https://127.0.0.1:8795/metrics`, which accepts the probe identity only (section 17).
 
 ## 2. First install
@@ -52,7 +52,7 @@ Prerequisites: a git checkout of this repository on the VPS (any path; the relea
 5. Install the units and the nginx vhost:
 
    ```bash
-   install -m 0644 deploy/ultrathink-web.service deploy/ultrathink-maintenance.service deploy/ultrathink-maintenance.timer /etc/systemd/system/
+   install -m 0644 deploy/ultrathink-web.service deploy/ultrathink-maintenance.service deploy/ultrathink-maintenance.timer deploy/ultrathink-snapshot.service deploy/ultrathink-snapshot.timer deploy/ultrathink-drill.service deploy/ultrathink-drill.timer /etc/systemd/system/
    systemctl daemon-reload
    install -m 0644 deploy/nginx-ultrathink.swcstudio.space.conf /etc/nginx/sites-available/ultrathink.swcstudio.space
    nginx -t && systemctl reload nginx
@@ -67,6 +67,8 @@ Prerequisites: a git checkout of this repository on the VPS (any path; the relea
    systemctl enable ultrathink-web
    systemctl enable --now ultrathink-maintenance.timer
    ```
+
+   The snapshot and drill timers stay disabled here. Section 5 gives the conditions for enabling each one.
 
 7. Verify from outside: `curl -s https://ultrathink.swcstudio.space/healthz` returns 200. Verify the origin is closed to direct clients: `curl -s --resolve ultrathink.swcstudio.space:443:187.77.130.10 https://ultrathink.swcstudio.space/healthz` returns `{"error":"forbidden"}` with status 403.
 8. Run the sandbox audit and read the exposure score: `systemd-analyze security ultrathink-web`.
@@ -167,42 +169,231 @@ deploy/ultrathink-release.sh rollback
 
 nginx rollback: `rm /etc/nginx/sites-enabled/ultrathink.swcstudio.space && nginx -t && systemctl reload nginx` takes the vhost offline; to revert a change instead, reinstall the previous conf from git.
 
-## 5. Backup and restore drill
+## 5. Backup and disaster recovery
+
+The state directory `/var/lib/ultrathink` has three independent layers:
+
+- **Snapshot ring** (`ultrathink-snapshot.timer`, every 30 seconds): point-in-time copies on the same host. A local restore goes to the newest snapshot at or before the target time.
+- **Daily archive** (`ultrathink-maintenance.timer`, 03:17 UTC): one verified whole-state archive a day, 14 kept.
+- **Off-host copy** (written by the snapshot tick every `ULTRATHINK_OFFHOST_INTERVAL_SECONDS`, default 300): the newest snapshot, encrypted with age and pushed to an rsync target. The daily archive goes to the same target when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set.
+
+### Targets
+
+These are design targets. None of them has been measured on a live host.
+
+| Target | Design value | Basis | Status |
+|---|---|---|---|
+| Local RPO | under 1 minute | 30 s tick interval plus tick duration | Pending: staging tick on a copy of real state |
+| Local restore RTO | under 5 minutes | Scripted restore with per-step timings | Pending: staging restore on a copy |
+| Off-host RPO (region loss) | 300 s plus transfer time | Off-host push interval | Pending: off-host target and operator identity |
+
+Not provided: per-transaction point-in-time recovery (restores go to tick granularity), automated failover (promotion is manual, see Promote below), and key custody (the operator holds the age identity, see Encryption). The open items are listed at the end of this section.
+
+### Units
+
+| Unit | Schedule | Runs | After install |
+|---|---|---|---|
+| `ultrathink-snapshot.timer` | every 30 s (`OnUnitActiveSec=30s`) | `ultrathink-snapshot.sh tick` | Disabled. Keep it disabled and stopped until the staging tick is recorded under "Open items". |
+| `ultrathink-maintenance.timer` | daily, 03:17 UTC | `ultrathink-backup.sh run` | Enabled (section 2, step 6). |
+| `ultrathink-drill.timer` | 1st of each month, 04:17 UTC, random delay up to 30 minutes | `ultrathink-restore.sh drill` | Not enabled by the release. Enable it after the staging drill passes. |
+
+Ticks never overlap: systemd does not start an active oneshot, and the script also holds a lock.
+
+### Snapshot ring and point-in-time recovery
+
+Each tick (`deploy/ultrathink-snapshot.sh tick`, run by `ultrathink-snapshot.service` as user `ultrathink`):
+
+1. Disk guard. The tick needs free space of at least the larger of `ULTRATHINK_SNAPSHOT_MIN_FREE_BYTES` (default 1 GiB) and twice the size of the database and its WAL. Below that it writes nothing and fails.
+2. `VACUUM INTO` a temporary file in the ring. The copy runs in one read transaction, so it is one consistent point in time. `integrity_check` runs on the copy, and the copy is renamed to `ultrathink-<stamp>.sqlite`.
+3. File layer (`ULTRATHINK_SNAPSHOT_TREE=1`, the default). `rsync --link-dest` copies `jobs/`, `sessions/`, `journal/`, `oauth.json` and `audit.jsonl` into `tree/ultrathink-<stamp>/`. Unchanged files are hard links to the previous tree. The database is copied before the files: a file written in between is an orphan, which is harmless. The reverse order could leave a row pointing at a file that was never copied.
+4. Off-host push, when it is due (see Encryption).
+5. Prune by policy (`services/ultrathink/store/snapshots.ts`): every snapshot for one hour, then the newest per five minutes up to `ULTRATHINK_SNAPSHOT_KEEP_HOURS` (default 24). The newest snapshot is never deleted. Entries dated in the future are kept and do not count as newest.
+
+Stamps are UTC with milliseconds, for example `ultrathink-20261021T043224933Z.sqlite`. A new stamp is never older than the newest existing one plus 1 ms, so a backward clock step cannot reuse or reorder a name.
+
+The ring holds plaintext prompts and `oauth.json` for its whole window, in the same trust boundary as the state directory. Erasure timeline: live rows follow `ULTRATHINK_RETENTION_DAYS` (30), the ring keeps 24 hours, daily archives keep 14 days, and off-host copies stay until the target's own cleanup removes them.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ULTRATHINK_SNAPSHOT_DIR` | `$ULTRATHINK_BACKUP_DIR/ring` (`/var/backups/ultrathink/ring`) | Ring location, outside the state directory |
+| `ULTRATHINK_SNAPSHOT_TREE` | `1` | `0` skips the file layer |
+| `ULTRATHINK_SNAPSHOT_KEEP_HOURS` | `24` | Ring window in whole hours, at least 1 |
+| `ULTRATHINK_SNAPSHOT_MIN_FREE_BYTES` | `1073741824` | Disk guard floor |
+| `ULTRATHINK_OFFHOST_INTERVAL_SECONDS` | `300` | Minimum seconds between off-host pushes |
+
+Set these in `/etc/ultrathink/ultrathink.env` (mode 0600) only when a default is wrong. None of them is a secret.
+
+Status and logs:
+
+```bash
+/opt/ultrathink/current/deploy/ultrathink-snapshot.sh status
+journalctl -u ultrathink-snapshot -n 50 --no-pager
+systemctl list-timers ultrathink-snapshot
+```
+
+`status` prints `newest`, `age_seconds`, `snapshots`, `free_bytes` and `offhost_last_epoch` (`never` before the first push). It exits 1 when the ring is empty. Run it as root, so the env file can be read. Start a tick only through the unit (`systemctl start ultrathink-snapshot.service`). A tick run by hand as root can leave root-owned files in the ring, and those block later ticks. Each tick prints timing lines (`step copy`, `step check`, `step tree`, `step offhost`, `step prune`).
+
+#### Measured cost of VACUUM INTO
+
+Measured 2026-10-21 UTC on a synthetic store with the ultrathink schema: bun 1.4.0, bun:sqlite SQLite 3.53.2, median of 5 runs per size, one VPS (8 vCPU, AMD EPYC 9354P, QEMU virtual disk).
+
+| Source size | Source bytes | Rows runs / phases / token_ledger | VACUUM INTO ms (median, min to max) | Output bytes | Peak RSS MiB (VmHWM) | Plain cp ms (checkpointed DB) | integrity_check ms (of the copy) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 MiB | 1,069,056 | 104 / 348 / 348 | 23.3 (14.6 to 36.7) | 1,069,056 | 33.4 (29.8 before) | 3.9 | 2.2 |
+| 10 MiB | 10,522,624 | 1086 / 3664 / 3664 | 71.1 (50.6 to 137.1) | 10,469,376 | 35.4 (29.8 before) | 14.7 | 24.2 |
+| 100 MiB | 104,865,792 | 11012 / 36398 / 36398 | 398.9 (370.2 to 722.5) | 104,329,216 | 35.4 (29.8 before) | 113.5 | 222.4 |
+
+Derived from the medians (arithmetic, not measured):
+
+- Copy step without bun startup (VACUUM plus integrity_check): about 25 ms at 1 MiB, 95 ms at 10 MiB, 621 ms at 100 MiB.
+- Sustained write at one tick per 30 seconds: about 0.03, 0.33 and 3.3 MiB/s.
+- Ring footprint if a 100 MiB store stays that size: at most 396 snapshots (120 in the first hour, 276 five-minute buckets for hours 1 to 24), about 38.5 GiB of plaintext.
+
+Caveats:
+
+- The store is synthetic. Real data, page cache and disk differ, so the staging tick on real state is still required.
+- The harness never forces writeback, and each output is deleted within seconds. Whether SQLite fsyncs the `VACUUM INTO` output was not verified, so device latency may or may not be inside these numbers.
+- The first two runs at 10 and 100 MiB were slower (137.1 and 117.9 ms; 684.1 and 722.5 ms) than runs 3 to 5. The cause was not isolated, and the medians include those runs.
+- `integrity_check` runs twice per tick: once in the copy action (`deploy/ultrathink-dr-lib.sh`, `check(dst)`) and once in the snapshot script's own `dr_bun check` step.
+- The measurement host had 9.4 GB free on a 400 GB disk at 98 percent use. The 38.5 GiB ring at 100 MiB does not fit there. Size the backup filesystem before enabling the timer.
+
+#### Keep the snapshot timer disabled
+
+`ultrathink-snapshot.timer` stays disabled until a staging tick on a copy of real state has been recorded in this section: the duration of `step copy` and the whole tick over 10 minutes, the IO cost, and the ring size that results. Only then run `systemctl enable --now ultrathink-snapshot.timer`.
+
+### Daily archive
 
 The daily timer runs `deploy/ultrathink-backup.sh run` as user `ultrathink`:
 
-- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, and the `jobs/`, `sessions/` and `journal/` directories (saved plans and client-driven sessions live in the last two), with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file.
-- Archive `/var/backups/ultrathink/ultrathink-<utc>.tar.gz` (mode 0600 in a 0700 directory), 14 kept.
-- Optional rsync when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set in the env file. For ssh targets put the private key `id_ed25519` and a `known_hosts` file in `/var/lib/ultrathink/home/.ssh` (directory mode 0700, owner `ultrathink`); the script passes both paths to ssh explicitly because OpenSSH ignores `$HOME`. The archive contains prompts and OAuth secrets: use an encrypted or trusted target.
+- `ultrathink.sqlite` copied with `VACUUM INTO` (consistent while the service runs; the `sqlite3` CLI is not needed), `oauth.json`, `audit.jsonl` when present, and the `jobs/`, `sessions/` and `journal/` directories (saved plans and client-driven sessions live in the last two), with `PRAGMA integrity_check` on the copy and a `SHA256SUMS` file. The plaintext archive is verified in a 0700 staging directory before it is encrypted or moved into place.
+- Archive `/var/backups/ultrathink/ultrathink-<utc>.tar.gz` (mode 0600 in a 0700 directory), 14 kept. With `ULTRATHINK_BACKUP_RECIPIENT` set, the archive is `ultrathink-<utc>.tar.gz.age` instead.
+- Optional rsync when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set in the env file. For ssh targets put the private key `id_ed25519` and a `known_hosts` file in `/var/lib/ultrathink/home/.ssh` (directory mode 0700, owner `ultrathink`); the script passes both paths to ssh explicitly because OpenSSH ignores `$HOME`. Set a recipient before the first push (see Encryption); without one nothing is pushed.
 - Retention: `journal/`, `sessions/` and `jobs/` entries, and the root-level `last.json` and `last-plan.json` plan copies, untouched for `ULTRATHINK_RETENTION_DAYS` (default 30) are deleted; newer entries are not touched. SQLite runs not updated within the same window are deleted with their phases and ledger rows in one transaction; the job prints `database retention: removed N runs, M ledger rows`. `deploy/ultrathink-backup.sh prune` runs only the retention part. In `run` the three steps (backup, file retention, database retention) are independent: a failed backup marks the unit failed but retention still runs. A backup killed before it could clean up leaves a `.work.*` staging directory in the backup directory; the next backup removes those older than a day.
 
-Manual run and status:
+Manual run, status and verification:
 
 ```bash
 systemctl start ultrathink-maintenance.service
 journalctl -u ultrathink-maintenance -n 40 --no-pager
 systemctl list-timers ultrathink-maintenance
+deploy/ultrathink-backup.sh verify /var/backups/ultrathink/<archive>
 ```
 
-Restore drill (do it after the first install and then quarterly):
+`verify` of a `.tar.gz.age` archive needs `ULTRATHINK_AGE_IDENTITY` (see Encryption).
 
-1. Verify the newest archive: `deploy/ultrathink-backup.sh verify /var/backups/ultrathink/<archive>`.
-2. Rehearse on a scratch instance without touching production:
+### Encryption and recipients
+
+- Archives and off-host copies are encrypted with `age` to `ULTRATHINK_BACKUP_RECIPIENT`, which is an `age1...` public key or a path to a recipients file. The private identity never lives on the host. The local ring stays plaintext.
+- Create the key pair on a workstation, not on the VPS:
+
+  ```bash
+  age-keygen -o ultrathink-backup-identity.txt
+  ```
+
+  The command prints the public key. Keep the identity file in your key store, and put only the public key (`age1...`) in `/etc/ultrathink/ultrathink.env`.
+- `ULTRATHINK_AGE_IDENTITY` is a path read at run time for decryption: `restore --identity <file>`, `restore --archive <file>.tar.gz.age`, `backup verify` of an encrypted archive, and the drill's off-host leg. Never put it in the env file. For a decryption on the host, copy the identity to a mode 0600 file under `/run`, use it, and delete it.
+- Fail closed. With an rsync target and no recipient, nothing is pushed. The daily job writes its local archive and fails. The tick writes its local snapshot, reports the off-host failure and exits 1.
+
+#### Migrating an rsync target without a recipient
+
+A host that already sets `ULTRATHINK_BACKUP_RSYNC_TARGET` pushes nothing until a recipient is set. Each daily run fails until then.
+
+1. Create the key pair (above) and set `ULTRATHINK_BACKUP_RECIPIENT=age1...` in `/etc/ultrathink/ultrathink.env`.
+2. Run `systemctl start ultrathink-maintenance.service` and read `journalctl -u ultrathink-maintenance -n 40 --no-pager`. Expect the lines `encrypting the archive to ULTRATHINK_BACKUP_RECIPIENT` and `rsync to the configured target`.
+3. On the target host, confirm that a new `ultrathink-<utc>.tar.gz.age` arrived.
+4. Remove the older plaintext `ultrathink-*.tar.gz` copies from the target under its own retention. The scripts never delete remote files.
+
+Once the snapshot timer is enabled, its tick also pushes encrypted snapshots to `ring/` on the same target.
+
+### Restore
+
+Run restore as root. It stops and starts units. It refuses while `ultrathink-web` is active, and in that case it changes nothing. There is no dry run: a restore places files.
+
+Choose one source. With none, the newest ring snapshot is used.
+
+- `--at 2026-10-20T12:00:00Z`: the newest ring snapshot at or before this UTC time. A time earlier than the first snapshot exits 1.
+- `--snapshot ultrathink-<stamp>.sqlite`: a named ring snapshot.
+- `--archive <path>`: a daily archive, `ultrathink-<utc>.tar.gz`, or `ultrathink-<utc>.tar.gz.age` with `--identity <file>`.
+
+Procedure:
+
+1. Stop the web service: `systemctl stop ultrathink-web`. It drains on SIGTERM (`TimeoutStopSec=30`).
+2. Restore. `--no-start` leaves `ultrathink-web` stopped so you can inspect the state first:
 
    ```bash
-   scratch=$(mktemp -d /var/tmp/ut-restore.XXXXXX)
-   tar -xzf /var/backups/ultrathink/<archive> -C "$scratch" --no-same-owner
-   mkdir -p "$scratch/state" && cp -a "$scratch"/ultrathink-*/ultrathink.sqlite "$scratch"/ultrathink-*/oauth.json "$scratch/state/"
-   for d in jobs sessions journal; do [ -d "$scratch"/ultrathink-*/"$d" ] && cp -a "$scratch"/ultrathink-*/"$d" "$scratch/state/"; done
-   chown -R ultrathink:ultrathink "$scratch" && chmod 0700 "$scratch"
-   # Start with the production env file and the scratch state on port 8797; see the env parsing in deploy/ultrathink-release.sh.
+   /opt/ultrathink/current/deploy/ultrathink-restore.sh restore --at 2026-10-20T12:00:00Z --no-start
    ```
 
-   Probe `https://127.0.0.1:8797/readyz` with the ops identity (`--cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem`) and stop the instance.
-3. Real restore: `systemctl stop ultrathink-web`; move the damaged `ultrathink.sqlite*` aside; copy `ultrathink.sqlite`, `oauth.json` and the `jobs/`, `sessions/` and `journal/` directories from the extracted archive into `/var/lib/ultrathink` with `cp -a` (the saved plans and client-driven sessions live in `sessions/` and `journal/`; `jobs/` alone restores status only; `BACKUP_INFO` in the archive lists which directories it holds); `chown -R ultrathink:ultrathink /var/lib/ultrathink`; `find /var/lib/ultrathink -type f -exec chmod 0600 {} +`; `systemctl start ultrathink-web`; probe `/readyz`. Removing stale `ultrathink.sqlite-wal` and `-shm` files before the copy is required.
-4. Record the date, archive name and outcome of the drill in your change log.
+3. Read the output. It prints `source <label>`, one line per step (`step source`, `step guard`, `step verify`, `step compat`, `step place`, `step start`, `step probe`, each with milliseconds), `step total`, and `restore ok: <source>; pre-restore state at <dir>`. A restore from a ring snapshot whose tree directory is missing fails unless you add `--db-only`.
+4. If you used `--no-start`, run `systemctl start ultrathink-web` and check readiness (see Known limits for the probe).
 
-Losing `oauth.json` signs every connector out; clients re-register and the owner approves again. It does not lose plans.
+What restore does, in order (D12): refuse while the web unit runs; stop the snapshot and maintenance timers and services; verify the source (checksums, `quick_check`, `oauth.json` as JSON, and the audit chain of `audit.jsonl`); prove schema compatibility on a scratch copy, opened as the service user with the release's own store code; move the current state into `.pre-restore-<stamp>/`; place the source files with their modes; restart the timers; start the web unit unless `--no-start`.
+
+- Failure before placement (verify or compatibility check): exit 1, state unchanged.
+- Failure during placement: rolls back from `.pre-restore-<stamp>/`.
+- Failure in start or probe after placement: exit 1. The restored state stays in place, and the previous state is in `.pre-restore-<stamp>/`.
+- `--db-only` replaces `ultrathink.sqlite` with its `-wal` and `-shm` files, and leaves `oauth.json`, `audit.jsonl`, `jobs/`, `sessions/` and `journal/` alone.
+- Restore is roll-forward only (D11). There is no schema version table, so the compatibility check is the only proof that the current release opens the restored database. Archives record the release revision in `BACKUP_INFO`; a mismatch prints a warning.
+
+### Pre-restore state: cleanup rule
+
+Each restore moves the replaced state into `/var/lib/ultrathink/.pre-restore-<stamp>/` (mode 0700). It holds plaintext prompts, OAuth secrets and the previous database. No script removes it, and retention does not look at it. Delete it by hand once the restored service has passed readiness and you no longer need it for a rollback:
+
+```bash
+rm -rf /var/lib/ultrathink/.pre-restore-<stamp>
+```
+
+Record the directory name and the removal date in your change log. Do not leave these directories on the host past the rollback decision.
+
+### Promote (off-host, manual)
+
+Promotion is the manual step for criterion 2. It is never automatic:
+
+```bash
+/opt/ultrathink/current/deploy/ultrathink-restore.sh promote --origin-fenced --archive <path> --identity <file>
+```
+
+Promote takes the same source options as restore. `--origin-fenced` is your attestation that the origin is stopped. The script cannot prove that across regions. Without the flag, promote exits 2 and changes nothing. With it, promote restores the source, starts `ultrathink-web`, probes it, and writes `.promoted-<stamp>` in the state directory. `--no-start` and `--scratch` are refused. Confirm the origin is stopped before you attest.
+
+### Monthly drill
+
+`ultrathink-drill.timer` runs `ultrathink-restore.sh drill` on the 1st of each month at 04:17 UTC, with up to 30 minutes of random delay. It replaces the earlier quarterly manual rehearsal.
+
+- Local leg (always runs): restores the newest ring snapshot at or before now into a private scratch state, with the same checks as restore and `--scratch`. No unit is stopped or started, and the live state is not touched. If the snapshot has no tree directory, the leg restores the database alone.
+- Off-host leg: runs only when `ULTRATHINK_AGE_IDENTITY` is set. It decrypts the newest off-host copy (`ring/.offhost` or a `.tar.gz.age` daily archive) and checks it. Otherwise it reports `offhost SKIPPED`.
+- Output: `drill: local PASS, offhost SKIPPED` (each leg reports `PASS`, `FAIL` or `SKIPPED`). Exit 0 when no leg failed, and 1 when a leg that ran failed. A leg that did not run is never reported as PASS.
+- The scratch directory is removed on exit.
+
+The unit carries no identity. To run the off-host leg, copy the identity to a mode 0600 file under `/run`, run the drill as root with the variable set for that command only, then delete the file:
+
+```bash
+ULTRATHINK_AGE_IDENTITY=/run/ultrathink-drill/identity.txt /usr/bin/bash /opt/ultrathink/current/deploy/ultrathink-restore.sh drill
+rm -f /run/ultrathink-drill/identity.txt
+```
+
+After a staging drill passes, enable the timer with `systemctl enable --now ultrathink-drill.timer`. Record the date, the `drill:` line and the step timings in your change log.
+
+### Known limits of the current scripts
+
+- The readiness probe in `restore` and `promote` (`probe_web`) runs `curl -fs` against `ULTRATHINK_PROBE_URL` (default `http://127.0.0.1:8795/readyz`) with no client certificate. The production listener accepts TLS only and requires a client certificate (section 1, item 4). As written, the probe cannot pass on the production host. The restore then exits 1 after it has placed files, and `ultrathink-web` keeps running. Check readiness by hand with the ops identity: `curl -s --cacert /etc/ultrathink/tls/ca.pem --cert /etc/ultrathink/tls/ops/cert.pem --key /etc/ultrathink/tls/ops/key.pem https://127.0.0.1:8795/readyz`.
+- `restore` starts `ultrathink-snapshot.timer` and `ultrathink-maintenance.timer` at the end, whether or not they were enabled before. On a host that keeps the snapshot timer disabled, run `systemctl stop ultrathink-snapshot.timer` after the restore.
+
+### Open items (BLOCKED)
+
+Each item below cannot be closed from this repository. The prerequisite is what the operator must supply.
+
+| Item | Needed to close | Prerequisite |
+|---|---|---|
+| Staging tick on real state | Ten minutes of ticks on a copy of production state; record `step copy`, the tick duration and the IO cost; then enable the timer. This is the input to the RPO claim. | A staging host with a copy of production state and this release installed |
+| Staging restore timings | `restore --snapshot <name> --no-start` on that copy, with the step lines recorded. This is the input to the RTO claim. | The same staging host |
+| Staging drill, both legs | `drill` with `ULTRATHINK_AGE_IDENTITY` on that host, the `drill:` line recorded; then enable the drill timer. | The operator's age identity, supplied at run time |
+| Encrypted off-host round trip on the VPS | Encrypt, push and decrypt one real snapshot on the VPS. | `age` installed on the VPS (ops) and a customer recipient |
+| Off-host target and its retention | An rsync target with a cleanup job for its own copies (for example cron `find -mtime`). | An operator-owned target host |
+| DR drill on a second host | Restore an off-host copy on a second host and check it. | A second host |
+| Customer-managed key custody (criterion 5) | Key creation, custody, a named key owner and a rotation procedure. | A customer KMS, HSM or hardware token |
+| Per-transaction PITR and measured live RPO (criterion 1) | A WAL-class shipper with a reset barrier and an off-host sink. | Neither exists in this repository |
+| Automated failover (criterion 2) | Automatic promotion with fencing. | A second-region host, a DNS or load-balancer control, and a fencing service |
+| Measured RTO on a production-like host, and region-loss RTO (criterion 3) | A measured restore on a production-like host. Region loss also depends on the failover item. | A production-like host |
 
 ## 6. Secret rotation
 
@@ -299,11 +490,15 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 | Auth abuse | `ultrathink_auth_failures_total` or `ultrathink_rate_limited_total` more than 10 times their usual rate for 10 minutes; any burst of login failures. | Ticket |
 | Planner saturation | Busy refusals from the planner, or jobs at `ULTRATHINK_MAX_CONCURRENT_PLANS` for more than 15 minutes. | Ticket |
 | Dropped series | `increase(ultrathink_metrics_dropped_total[1h]) > 0` (label cardinality abuse). | Ticket |
-| Backups | Newest file in `/var/backups/ultrathink` older than 36 hours; `ultrathink-maintenance.service` in `failed`. | Ticket |
+| Backups | Newest `ultrathink-*.tar.gz` or `ultrathink-*.tar.gz.age` at the top level of `/var/backups/ultrathink` older than 36 hours (the `ring/` subdirectory is excluded, because it fills every 30 seconds); `ultrathink-maintenance.service` in `failed`. | Ticket |
+| Snapshot unit failed | `systemctl is-failed ultrathink-snapshot.service` reports `failed`. The journal names the cause: `disk guard:`, `off-host push failed`, `tree copy failed` or an integrity failure. Applies only while the snapshot timer is enabled. | Ticket |
+| Snapshot ring stale | `/opt/ultrathink/current/deploy/ultrathink-snapshot.sh status` shows `age_seconds` above 300, so no snapshot in five minutes. Applies only while the snapshot timer is enabled. | Page |
+| Off-host push stale | `offhost_last_epoch` in the status output is older than 15 minutes, or `never` after the first push was due. Applies only when `ULTRATHINK_BACKUP_RSYNC_TARGET` is set and the snapshot timer is enabled. | Ticket |
+| Drill unit failed | `ultrathink-drill.service` in `failed`; the journal shows `drill: local FAIL` or `offhost FAIL`. Applies only once the drill timer is enabled. | Ticket |
 | Disk | `/var/lib/ultrathink` or `/var/backups/ultrathink` filesystem above 80 percent. | Ticket |
 | Certificate | Edge or origin certificate expires in under 14 days (`certbot renew --dry-run` monthly). | Ticket |
 
-The metric rows of this table are encoded as alert rules in `deploy/observability/rules.yml`; the backup, disk, certificate, restart and external-probe rows are not (section 16).
+The metric rows of this table are encoded as alert rules in `deploy/observability/rules.yml`; the backup, snapshot, drill, disk, certificate, restart and external-probe rows are not (section 16).
 
 ## 9. Cloudflare settings to check
 
@@ -326,7 +521,12 @@ The metric rows of this table are encoded as alert rules in `deploy/observabilit
 | Sessions | `/var/lib/ultrathink/sessions/` | Session records (request, specification) | Same 30 days; included in backups. The root `last.json` and `last-plan.json` copies of the latest plan follow the same window. |
 | Server planning jobs | `/var/lib/ultrathink/jobs/` | Job records and plan output | Same 30 days; included in backups. |
 | Scratch | `/var/lib/ultrathink/cwd/`, `home/` | Empty working directory and `$HOME` | Not pruned; hold no user data. |
-| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, `jobs/`, `sessions/`, `journal/` | 14 daily archives locally; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
+| Backups | `/var/backups/ultrathink/` | Database, `oauth.json`, `audit.jsonl`, `jobs/`, `sessions/`, `journal/` | 14 daily archives locally, as `.tar.gz` or, with `ULTRATHINK_BACKUP_RECIPIENT` set, `.tar.gz.age`; the rsync target sets its own retention. Archives contain prompts and OAuth secrets. |
+| Snapshot ring | `/var/backups/ultrathink/ring/` (`ULTRATHINK_SNAPSHOT_DIR`): `ultrathink-<stamp>.sqlite` and `tree/ultrathink-<stamp>/` | Plaintext prompts, OAuth state and audit lines | Every snapshot for one hour, then the newest per five minutes up to `ULTRATHINK_SNAPSHOT_KEEP_HOURS` (default 24). The newest is never deleted. |
+| Off-host staging copies | `/var/backups/ultrathink/ring/.offhost/` | Encrypted snapshot waiting to be pushed | Removed by the tick once older than 60 minutes. |
+| Pre-restore state | `/var/lib/ultrathink/.pre-restore-<stamp>/` | Plaintext copy of the state a restore replaced | Never pruned. Delete by hand after the restore is confirmed (section 5, "Pre-restore state"). |
+| Off-host copies | The rsync target (`ULTRATHINK_BACKUP_RSYNC_TARGET`): archives at its root, snapshots under `ring/` | Encrypted archives and snapshots, once a recipient is set | The operator's cleanup on the target host. The scripts never delete remote files. |
+| Drill scratch | `$TMPDIR/ultrathink-restore.*` | Restored copy used by the drill | Removed when the drill exits. |
 | Logs and metrics | journald, `/metrics` | Structured access and error logs without prompt text, secrets or tokens; counters | Per journald configuration (`journalctl --disk-usage`; set `SystemMaxUse` if needed). |
 | Provider side | OpenRouter and the model provider | Prompts and outputs of server-side plans | Governed by the provider's policy and your OpenRouter privacy settings. |
 

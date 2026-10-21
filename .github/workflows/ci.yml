@@ -59,6 +59,17 @@ jobs:
           git config --global user.email ci@example.com
           git config --global user.name ci
 
+      # Phase 74: the off-host round-trip and rsync tests skip silently when age or rsync is missing.
+      - name: Install age and rsync (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age rsync
+
+      - name: Install age and rsync (macOS)
+        if: runner.os == 'macOS'
+        run: brew install age rsync
+
       - name: Test
         run: bun test
 
