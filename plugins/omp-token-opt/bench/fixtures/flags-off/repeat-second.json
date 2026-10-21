@@ -1,0 +1,100 @@
+{
+  "events": [
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 15717,
+        "cacheHitPct": 0,
+        "currentTokens": 3413,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 7307,
+            "current": 384,
+            "saved": 6923,
+            "source": "compress"
+          },
+          {
+            "baseline": 94,
+            "current": 15,
+            "saved": 79,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 15721,
+        "providerOutput": 0,
+        "savedTokens": 12304,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    },
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 15717,
+        "cacheHitPct": 0,
+        "currentTokens": 3413,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 7307,
+            "current": 384,
+            "saved": 6923,
+            "source": "compress"
+          },
+          {
+            "baseline": 94,
+            "current": 15,
+            "saved": 79,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 15815,
+        "providerOutput": 0,
+        "savedTokens": 12304,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    }
+  ],
+  "fixture": "repeat-second.json",
+  "tokens": {
+    "baseline": 94,
+    "current": 15
+  },
+  "toolCall": null,
+  "toolResult": {
+    "content": [
+      {
+        "text": "token-opt: repeated grep result omitted (376 chars) for src",
+        "type": "text"
+      }
+    ]
+  }
+}

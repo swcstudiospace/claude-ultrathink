@@ -1,0 +1,46 @@
+{
+  "events": [
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 15623,
+        "cacheHitPct": 0,
+        "currentTokens": 3398,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 7307,
+            "current": 384,
+            "saved": 6923,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 15721,
+        "providerOutput": 0,
+        "savedTokens": 12225,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    }
+  ],
+  "fixture": "repeat-first.json",
+  "tokens": {
+    "baseline": 94,
+    "current": 94
+  },
+  "toolCall": null,
+  "toolResult": null
+}
