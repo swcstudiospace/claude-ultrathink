@@ -44,6 +44,13 @@ jobs:
         if: matrix.bun == 'latest'
         run: bun install --frozen-lockfile
 
+      # The policy and drift tests import the yaml package from node_modules. The minimum-Bun leg installs nothing (above),
+      # so it gets only that package, at the version package.json pins, without writing package.json or any lockfile.
+      - name: Install the policy test dependency (minimum-Bun leg)
+        if: matrix.bun != 'latest'
+        run: |
+          npm install --no-save --no-package-lock "yaml@$(node -p "require('./package.json').devDependencies.yaml")"
+
       - name: Type check
         if: matrix.bun == 'latest'
         run: bun run check
