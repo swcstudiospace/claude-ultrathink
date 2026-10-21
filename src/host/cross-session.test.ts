@@ -343,6 +343,23 @@ describe("per-session /ultrathink-skip", () => {
 		expect(readSkipOnce(stateDir, "desk-20261022-0941-next")).toBe(true);
 	});
 
+	test("two conversations reserving in the same minute get their own ids, and each request with its own prompt is skipped", async () => {
+		const root = tempRoot();
+		const stateDir = join(root, "state");
+		const env = (): NodeJS.ProcessEnv => ({ HOME: root, XDG_CONFIG_HOME: join(root, "xdg"), ULTRATHINK_DECISIONS: "0", ULTRATHINK_STATE_DIR: stateDir, PATH: process.env.PATH });
+		const ids = ["desk-20261022-0940-next-1a2b3c4d", "desk-20261022-0940-next-9f8e7d6c"];
+		const prompts = ["Add a CSV export button to the reports page.", "Rename the billing module to invoicing."];
+		for (const id of ids) await grokbotMain(["ctl", "skip", "--session", id], env());
+		for (const [i, id] of ids.entries()) {
+			const file = join(root, `ORIGINAL-${i}.txt`);
+			writeFileSync(file, prompts[i] as string);
+			const planned = await grokbotMain(["plan", "--session", id, "--prompt-file", file, "--cwd", root], env());
+			expect(planned.code).toBe(0);
+			expect(JSON.parse(planned.text)).toMatchObject({ status: "skipped", sessionId: id });
+			expect(readSkipOnce(stateDir, id)).toBe(false);
+		}
+	});
+
 	test("the Markdown and Grok Bot skip/status fallbacks forward the current session id", () => {
 		const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 		const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -355,7 +372,11 @@ describe("per-session /ultrathink-skip", () => {
 		}
 		// Grok Bot's skills pass the planner session, so `G ctl skip` is not refused and `G ctl status` sees its flag.
 		// Each request plans under a fresh id, so the skip reserves the next request's id `N` and the protocol plans under it.
-		expect(read("hosts/grok-bot/skills/ultrathink-skip/SKILL.md")).toContain("`G ctl skip --session N`");
+		const skipSkill = read("hosts/grok-bot/skills/ultrathink-skip/SKILL.md");
+		expect(skipSkill).toContain("`G ctl skip --session N`");
+		// A new reservation carries a random suffix, so two conversations reserving in the same minute get different ids.
+		expect(skipSkill).toContain("`desk-YYYYMMDD-HHMM-next-<8 random hex>`");
+		expect(skipSkill).not.toContain("`desk-YYYYMMDD-HHMM-next`");
 		expect(read("hosts/grok-bot/skills/ultrathink-status/SKILL.md")).toContain("`G ctl status --session N`");
 		expect(read("hosts/grok-bot/skills/ultrathink-protocol/SKILL.md")).toContain("`G plan --session N`");
 	});
