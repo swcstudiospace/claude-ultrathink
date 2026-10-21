@@ -51,10 +51,12 @@ import { resolveRepoSlug } from "../track/git.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
 import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
-import { PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { ACTIVITY_TYPE, activityFallbackLine, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
 import type { ProgressEvent } from "./progress.ts";
+import { toActivityNotice } from "./activity-notice.ts";
+import { readActivity } from "../teach/activity.ts";
 import { confirmInsightLesson, installInsightSkill, previewInsightSkill, type InsightActionRuntime } from "./omp-insight-actions.ts";
 import { createInsightDashboard, type InsightDashboardCallbacks, type InsightPanel } from "./omp-dashboard.ts";
 import type { InsightActionResult, InsightScope, InsightSnapshot, LessonSelection, SkillPreview } from "./omp-insights.ts";
@@ -266,7 +268,7 @@ export interface NativeEngineDeps {
 type McpState = NonNullable<BarState["mcp"]>;
 
 export const PENDING =
-	"Ultrathink is still planning this prompt. The plan arrives as a separate message at the next step boundary. Until then, read and investigate only: no edits and no mutating commands. If a note says planning produced nothing, proceed with the user's request as written.";
+	"Ultrathink is still planning this prompt. If planning finishes while this request is still current, its result arrives as a separate message at a subsequent step boundary. Until then, read and investigate only: no edits and no mutating commands. If a note says planning produced nothing, proceed with the user's request as written.";
 
 export const NO_PLAN =
 	"Ultrathink planning produced no plan. Continue with the user's request as written.";
@@ -807,7 +809,7 @@ export function createOmpExtension(
 ): (pi: ExtensionAPI) => void {
 	const plan = options.plan ?? nativeEnginePlanner;
 	const raceMs = options.raceMs ?? 25_000;
-	const maxRunMs = options.maxRunMs ?? 600_000;
+	const maxRunMs = options.maxRunMs ?? 0;
 	const now = options.now ?? Date.now;
 	const uiEnabled = options.ui ?? true;
 	const readMcp = options.mcp ?? readMcpState;
@@ -835,6 +837,10 @@ export function createOmpExtension(
 			/** The flight's own lifetime: superseded, switched, invalidated, ended or out of time aborts it. */
 			controller: AbortController;
 			result: Promise<OmpPlan>;
+			/** Settles the existing outcome and clears the optional outer handle; cancellation releases through this. */
+			finishFlight: (result: OmpPlan) => void;
+			/** The outer deadline handle, present only for a strictly positive maxRunMs. */
+			deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 			/** Pending was returned; the aside is the only delivery. */
 			deferred: boolean;
 			/** Start order; only the latest flight writes to the bar store. */
@@ -893,6 +899,8 @@ export function createOmpExtension(
 		// Set on session_shutdown and cleared on session_start/session_switch: a reply computed across an
 		// await must not be delivered into a host that no longer has a live session to receive it.
 		let shutDown = false;
+		let activityTimer: NodeJS.Timeout | undefined;
+		const activitySeen = new Set<string>();
 
 		const guard = (fn: () => void): void => {
 			try {
@@ -942,6 +950,9 @@ export function createOmpExtension(
 			if (flight.cancelled) return;
 			flight.cancelled = true;
 			if (flights.get(flight.sessionId) === flight) flights.delete(flight.sessionId);
+			// Release the waiting consumer through the existing outcome even when the provider ignores abort;
+			// suppression flags are already set, so the settlement publishes nothing.
+			guard(() => flight.finishFlight({ context: "" }));
 			guard(() => flight.controller.abort());
 			if (!flight.settled) barWrite(flight.generation, () => store.skipped(note, now()));
 		};
@@ -1302,9 +1313,55 @@ export function createOmpExtension(
 					});
 				}, 80);
 			});
+		const stopActivityPoll = (): void => {
+			if (activityTimer) {
+				clearInterval(activityTimer);
+				activityTimer = undefined;
+			}
+		};
+		const startActivityPoll = (ctx: ExtensionContext | undefined): void => {
+			stopActivityPoll();
+			if (!uiEnabled || shutDown || !ctx?.hasUI || ctx.mode !== "tui") return;
+			if (isSubagentSession(ctx, exists)) return;
+			const dir = stateDir(ctx.cwd || process.cwd());
+			// Receipts name the session whose observe run wrote them: this window publishes only its own session's.
+			const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+			if (sessionId === "") return;
+			try {
+				for (const row of readActivity(dir)) activitySeen.add(row.id);
+			} catch {
+				// fail-open: a missing or unreadable receipt log must not block the poller
+			}
+			const timer = setInterval(() => {
+				if (shutDown) return;
+				try {
+					for (const row of readActivity(dir)) {
+						if (row.sessionId !== sessionId || activitySeen.has(row.id)) continue;
+						activitySeen.add(row.id);
+						if (activitySeen.size > 200) {
+							const oldest = activitySeen.values().next().value;
+							if (oldest !== undefined) activitySeen.delete(oldest);
+						}
+						if (shutDown) return;
+						const { id: _id, sessionId: _owner, ...notice } = row;
+						guard(() =>
+							pi.sendMessage(
+								{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
+								{ triggerTurn: false },
+							),
+						);
+					}
+				} catch {
+					// fail-open: a receipt is display only
+				}
+			}, 2_000);
+			timer.unref?.();
+			activityTimer = timer;
+		};
 		pi.on("session_start", (_event, ctx) => {
 			shutDown = false;
 			attach(ctx);
+			startActivityPoll(ctx);
 			scheduleMount();
 			// The host already named this session. An invalid id is ignored; a throw must not block startup.
 			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
@@ -1316,11 +1373,13 @@ export function createOmpExtension(
 			guard(() => closeInsightForSwitch(ctx));
 			shutDown = false;
 			attach(ctx);
+			startActivityPoll(ctx);
 			scheduleMount();
 			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_shutdown", () => {
 			shutDown = true;
+			stopActivityPoll();
 			guard(endFlights);
 			guard(() => {
 				if (activeInsight) teardownInsight(activeInsight);
@@ -1586,38 +1645,66 @@ export function createOmpExtension(
 				generation,
 				settled: false,
 				cancelled: false,
+				finishFlight: (result) => {
+					const timer = flight.deadlineTimer;
+					if (timer !== undefined) {
+						clearTimeout(timer);
+						flight.deadlineTimer = undefined;
+					}
+					outcome.resolve(result);
+				},
+				deadlineTimer: undefined,
 				timedOut: false,
 				content: "",
 			};
+			// Subscribed before the callback boundary below: cancelling the previous flight runs its abort
+			// listeners synchronously, and a reentrant cancellation of this flight still settles through the
+			// existing outcome with no second subscription.
+			void flight.result.then((result) => settle(flight, result));
 			// Registered before the planner runs, so a progress callback that fires at once already finds its flight.
 			flights.set(request.sessionId, flight);
 			if (previous) cancel(previous, SUPERSEDED);
+			// A reentrant session/model cancellation of this flight during the previous abort runs synchronously
+			// above: a flight that lost ownership there admits no planner and schedules no outer timer.
+			if (flight.cancelled) return flight;
 			guard(() => store.setLiveSession(request.sessionId));
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
 				guard(() => {
 					if (flight.timedOut || flight.settled || !owns(flight)) return;
 					if ((event.type === "begin" || event.type === "end") && event.modelResolution) observe(flight.sessionId, event.modelResolution);
+					if (event.type === "activity") {
+						barWrite(generation, () => {
+							if (shutDown) return;
+							const notice = toActivityNotice(event.notice);
+							if (!notice) return;
+							guard(() =>
+								pi.sendMessage(
+									{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
+									{ triggerTurn: false },
+								),
+							);
+						});
+					}
 					barWrite(generation, () => store.apply(event));
 					if (event.type === "end" && event.detail) flight.endDetail = event.detail;
 				});
-			// The deadline settles independently of provider cooperation; only the inline race keeps the flight running.
-			const timer = setTimeout(() => {
-				flight.timedOut = true;
-				finish({ context: "" });
-				guard(() => flight.controller.abort());
-			}, maxRunMs);
-			// Like the AbortSignal.timeout it replaces, the limit alone never keeps a process alive.
-			timer.unref?.();
-			const finish = (result: OmpPlan): void => {
-				clearTimeout(timer);
-				outcome.resolve(result);
-			};
-			void flight.result.then((result) => settle(flight, result));
+			// The outer deadline exists only for an explicit positive maxRunMs; omitted and zero leave planning unbounded.
+			// A positive deadline still settles independently of provider cooperation; only the inline race keeps the flight running.
+			if (maxRunMs > 0) {
+				const timer = setTimeout(() => {
+					flight.timedOut = true;
+					flight.finishFlight({ context: "" });
+					guard(() => flight.controller.abort());
+				}, maxRunMs);
+				// Like the AbortSignal.timeout it replaces, the limit alone never keeps a process alive.
+				timer.unref?.();
+				flight.deadlineTimer = timer;
+			}
 			try {
-				plan({ ...request, isCurrent: () => !flight.timedOut && !flight.settled && current(flight) }, flight.controller.signal, onEvent).then(finish, () => finish({ context: "" }));
+				plan({ ...request, isCurrent: () => !flight.timedOut && !flight.settled && current(flight) }, flight.controller.signal, onEvent).then(flight.finishFlight, () => flight.finishFlight({ context: "" }));
 			} catch {
-				finish({ context: "" });
+				flight.finishFlight({ context: "" });
 			}
 			return flight;
 		};

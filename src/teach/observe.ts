@@ -12,10 +12,11 @@ import { buildTeachableState } from "../decisions/questions.ts";
 import { DEFAULT_DECISIONS_CONFIG } from "../decisions/types.ts";
 import { selectEngine } from "../host/engine.ts";
 import { HOSTS, type HostId } from "../host/types.ts";
+import { appendActivity } from "./activity.ts";
 import { captureMoment } from "./capture.ts";
 import { askLesson, type DecisionSummary, lessonDecisions, summarizeDecision, teachEnabled } from "./context.ts";
 import { promoteDue } from "./promote.ts";
-import { redactText } from "./redact.ts";
+import { redactLine, redactText } from "./redact.ts";
 import {
 	type CaptureFn,
 	type CaptureInput,
@@ -259,7 +260,20 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 				}
 			}
 			try {
-				captured.push(await capture({ ...input, status: confirm ? "confirmed" : "candidate" }, ctx));
+				const outcome = await capture({ ...input, status: confirm ? "confirmed" : "candidate" }, ctx);
+				captured.push(outcome);
+				// `retain: "off"` means no lesson was stored (store unavailable or a failed write): no success receipt.
+				if (outcome.retain === "off") continue;
+				const reason = outcome.reason ? redactLine(outcome.reason, 80) : "";
+				appendActivity(ctx.stateDir, {
+					v: 1,
+					kind: "teachable-created",
+					title: "Teachable moment",
+					outcome: outcome.created ? "created" : "merged",
+					names: [outcome.moment.name],
+					detail: `${outcome.moment.kind} · ${outcome.moment.status} · retain ${outcome.retain}${reason ? ` · ${reason}` : ""}`,
+					...(outcome.retain === "retained" ? { source: "hindsight" as const } : {}),
+				}, digest.sessionId);
 			} catch {
 				ctx.log?.("teach observe: a lesson could not be captured");
 			}
