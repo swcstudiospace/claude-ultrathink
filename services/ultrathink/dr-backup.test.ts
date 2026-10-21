@@ -72,7 +72,8 @@ function regenerateSums(top: string): void {
 	writeFileSync(join(top, "SHA256SUMS"), lines.join(""));
 }
 
-describe("ultrathink-backup.sh", () => {
+// The script calls sha256sum, which the stock macOS runner does not have (it has only shasum), so these cases run on Linux.
+describe.skipIf(process.platform !== "linux")("ultrathink-backup.sh", () => {
 	let base = "";
 
 	beforeAll(() => {

@@ -135,6 +135,13 @@ function seedSnapshot(ring: string, ms: number, source: string): string {
 	return name;
 }
 
+/** Creates tree/<stamp> for a ring file, with one file in it, as a tick stages the file layer. */
+function seedTree(ring: string, ringName: string): void {
+	const dir = join(ring, "tree", ringName.replace(/\.sqlite$/, ""));
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "oauth.json"), "{}\n");
+}
+
 async function waitForLine(stream: ReadableStream<Uint8Array>, text: string): Promise<void> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
@@ -170,7 +177,8 @@ function startWriter(dbPath: string, stopPath: string) {
 	return Bun.spawn({ cmd: [process.execPath, "-e", code], stdout: "ignore", stderr: "pipe" });
 }
 
-describe("tick", () => {
+// GNU date, stat and flock: the script needs them, and the stock macOS runner does not have them.
+describe.skipIf(process.platform !== "linux")("tick", () => {
 	test("one tick adds one ring file that passes quick_check and holds the runs committed before it", () => {
 		const f = fixture(3);
 		const r = tick(f);
@@ -255,6 +263,22 @@ describe("tick", () => {
 		expect(files).toContain(`ultrathink-${formatStamp(NOW_MS)}.sqlite`);
 	});
 
+	test("retention keeps or deletes a snapshot's ring file and tree directory together", () => {
+		const f = fixture(1);
+		const source = join(f.state, "ultrathink.sqlite");
+		const recent = seedSnapshot(f.ring, NOW_MS - 90 * 60_000, source);
+		const old = seedSnapshot(f.ring, NOW_MS - 3 * DAY, source);
+		seedTree(f.ring, recent);
+		seedTree(f.ring, old);
+		const r = tick(f, { ULTRATHINK_DR_NOW_MS: String(NOW_MS) });
+		expect(r.code).toBe(0);
+		// Both parts of one snapshot share a retention decision: the thinned band keeps the pair, the window drops it.
+		expect(snapshotFiles(f.ring)).toContain(recent);
+		expect(treeDirs(f.ring)).toContain(recent.replace(/\.sqlite$/, ""));
+		expect(snapshotFiles(f.ring)).not.toContain(old);
+		expect(treeDirs(f.ring)).not.toContain(old.replace(/\.sqlite$/, ""));
+	});
+
 	test("a tick never sorts before an existing name, and a future-dated entry is kept", () => {
 		const f = fixture(1);
 		const source = join(f.state, "ultrathink.sqlite");
@@ -325,6 +349,25 @@ describe("tick", () => {
 		expect(second.ino).toBe(first.ino);
 	});
 
+	test.skipIf(!HAS_RSYNC)("nested files under sessions/ are staged with their contents", () => {
+		const f = fixture(1, 1);
+		mkdirSync(join(f.state, "sessions", "run-1", "plan"), { recursive: true });
+		writeFileSync(join(f.state, "sessions", "run-1", "plan", "step.json"), '{"step":1}\n');
+		expect(tick(f).code).toBe(0);
+		const [tree] = treeDirs(f.ring);
+		expect(readFileSync(join(f.ring, "tree", tree!, "sessions", "run-1", "plan", "step.json"), "utf8")).toBe(
+			'{"step":1}\n',
+		);
+	});
+
+	test.skipIf(!HAS_RSYNC)("sealed audit segments are staged next to audit.jsonl", () => {
+		const f = fixture(1, 3);
+		writeFileSync(join(f.state, "audit-1-2.jsonl"), "sealed segment\n");
+		expect(tick(f).code).toBe(0);
+		const [tree] = treeDirs(f.ring);
+		expect(readFileSync(join(f.ring, "tree", tree!, "audit-1-2.jsonl"), "utf8")).toBe("sealed segment\n");
+	});
+
 	test.skipIf(!HAS_FLOCK)("a busy tick lock makes the tick exit 0 and write nothing", async () => {
 		const f = fixture(1);
 		mkdirSync(f.ring, { recursive: true });
@@ -347,7 +390,8 @@ describe("tick", () => {
 	});
 });
 
-describe("status", () => {
+// GNU date, stat and flock: the script needs them, and the stock macOS runner does not have them.
+describe.skipIf(process.platform !== "linux")("status", () => {
 	test("an empty ring exits 1", () => {
 		const f = fixture(1);
 		const r = runDr(SCRIPT, ["status"], envFor(f));

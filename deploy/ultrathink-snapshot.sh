@@ -9,9 +9,10 @@
 #
 # A tick copies the live database with VACUUM INTO to ring/.tmp-<stamp>.sqlite, checks it with integrity_check and
 # renames it to ring/ultrathink-<stamp>.sqlite. With ULTRATHINK_SNAPSHOT_TREE=1 it then stages the file layer
-# (jobs/ sessions/ journal/ oauth.json audit.jsonl) in tree/ultrathink-<stamp>/, hard-linking unchanged files to the
-# newest earlier tree. When ULTRATHINK_BACKUP_RSYNC_TARGET is set and the off-host interval has elapsed, the newest
-# snapshot is age-encrypted to ULTRATHINK_BACKUP_RECIPIENT and pushed. The ring is then pruned by the policy in
+# (jobs/ sessions/ journal/ oauth.json audit.jsonl and the sealed audit-*.jsonl segments) in tree/ultrathink-<stamp>/,
+# hard-linking unchanged files to the newest earlier tree. When ULTRATHINK_BACKUP_RSYNC_TARGET is set and the off-host
+# interval has elapsed, the newest snapshot is age-encrypted to ULTRATHINK_BACKUP_RECIPIENT and pushed. The ring is then
+# pruned by the policy in
 # store/snapshots.ts (snapshots-cli.ts plan). A failed off-host push is reported after pruning and exits 1; the local
 # snapshot is kept.
 #
@@ -98,14 +99,16 @@ TMP_DB=""
 TMP_TREE=""
 OFFHOST_FAILED=0
 
-# Snapshot candidates for the policy: ring files and tree directories, named ultrathink-<stamp>.
+# Snapshot candidates for the policy, one per snapshot. The ring file ultrathink-<stamp>.sqlite and the tree directory
+# ultrathink-<stamp> are the same snapshot, so both are listed under the bare name; the policy keeps or deletes them together.
 list_names() {
-	local path
+	local path name
 	for path in "$SNAPSHOT_DIR"/ultrathink-* "$TREE_DIR"/ultrathink-*; do
 		if [ -e "$path" ] || [ -L "$path" ]; then
-			basename -- "$path"
+			name="$(basename -- "$path")"
+			printf '%s\n' "${name%.sqlite}"
 		fi
-	done
+	done | sort -u
 }
 
 # Ring snapshot files only (ultrathink-<stamp>.sqlite).
@@ -181,8 +184,21 @@ cleanup() {
 	fi
 }
 
+# Sealed audit segments in the state directory, by bare name (audit-<first>-<last>.jsonl). The audit chain verifies only
+# with them, so the file layer copies them next to audit.jsonl.
+sealed_audit_names() {
+	local path name
+	for path in "$STATE_DIR"/audit-*.jsonl; do
+		name="${path##*/}"
+		if [ -f "$path" ] && [[ "$name" =~ ^audit-[1-9][0-9]*-[1-9][0-9]*\.jsonl$ ]]; then
+			printf '%s\n' "$name"
+		fi
+	done
+}
+
 # Stages the file layer in tree/.tmp-<stamp>, hard-linking unchanged files to the newest earlier tree, then renames it.
 # Uses rsync directly because dr_rsync passes everything after "--", so it cannot carry --files-from or --link-dest.
+# rsync needs -r with --files-from: -a alone copies a listed directory as an empty entry.
 snapshot_tree() {
 	local item newest=""
 	local -a tree_items=() link_args=()
@@ -195,6 +211,9 @@ snapshot_tree() {
 			tree_items+=("$item")
 		fi
 	done
+	while IFS= read -r item; do
+		tree_items+=("$item")
+	done < <(sealed_audit_names)
 	TMP_TREE="$TREE_DIR/.tmp-$STAMP"
 	rm -rf -- "$TMP_TREE"
 	mkdir -- "$TMP_TREE"
@@ -204,7 +223,7 @@ snapshot_tree() {
 			link_args=("--link-dest=$TREE_DIR/$newest")
 		fi
 		printf '%s\n' "${tree_items[@]}" |
-			rsync -a --chmod=F600 ${link_args[@]+"${link_args[@]}"} --files-from=- -- "$STATE_DIR/" "$TMP_TREE/" ||
+			rsync -a -r --chmod=F600 ${link_args[@]+"${link_args[@]}"} --files-from=- -- "$STATE_DIR/" "$TMP_TREE/" ||
 			die "tree copy failed; the database snapshot is kept"
 	fi
 	mv -- "$TMP_TREE" "$TREE_DIR/$NAME"
@@ -245,7 +264,7 @@ prune_ring() {
 		"delete ultrathink-"*) name="${line#delete }" ;;
 		*) continue ;;
 		esac
-		rm -f -- "$SNAPSHOT_DIR/$name"
+		rm -f -- "$SNAPSHOT_DIR/$name.sqlite"
 		rm -rf -- "$TREE_DIR/${name:?}"
 	done <<<"$plan"
 	# Leftovers of crashed ticks and off-host copies older than an hour (a SIGKILL skips the EXIT trap).

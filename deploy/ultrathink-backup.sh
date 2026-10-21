@@ -78,8 +78,24 @@ case "$RETENTION_DAYS" in '' | *[!0-9]*) die "ULTRATHINK_RETENTION_DAYS must be 
 STATE_DATA_DIRS="jobs sessions journal"
 # The planner also writes full plan copies (request text included) next to the state directories.
 STATE_ROOT_COPIES="last.json last-plan.json"
-# Single files a backup copies when present. BACKUP_INFO files= lists the ones that were actually copied.
+# Single files a backup copies when present. BACKUP_INFO files= lists the ones that were actually copied. The sealed
+# audit segments (is_sealed_audit) are copied too; the chain does not verify without them.
 STATE_FILES="audit.jsonl"
+
+# Sealed audit segments are named audit-<first>-<last>.jsonl and hold the chain records before audit.jsonl.
+is_sealed_audit() {
+	[[ "$1" =~ ^audit-[1-9][0-9]*-[1-9][0-9]*\.jsonl$ ]]
+}
+
+# Bare names of the sealed audit segments in the state directory.
+sealed_audit_names() {
+	local path
+	for path in "$STATE_DIR"/audit-*.jsonl; do
+		if [ -f "$path" ] && is_sealed_audit "${path##*/}"; then
+			printf '%s\n' "${path##*/}"
+		fi
+	done
+}
 
 work_dir=""
 verify_dir=""
@@ -132,10 +148,11 @@ do_verify() {
 	done
 	files="$(sed -n 's/^files=//p' "$top/BACKUP_INFO" 2>/dev/null || true)"
 	for file in $files; do
-		case " $STATE_FILES " in *" $file "*) ;; *) die "archive lists an unexpected file: $file" ;; esac
+		case " $STATE_FILES " in *" $file "*) ;; *) is_sealed_audit "$file" || die "archive lists an unexpected file: $file" ;; esac
 		[ -f "$top/$file" ] || die "archive is missing $file"
 	done
-	if [ -f "$top/audit.jsonl" ]; then
+	# The chain is checked whenever the archive holds an audit file; sealed segments alone still verify against the chain.
+	if [ -f "$top/audit.jsonl" ] || [ -n "$files" ]; then
 		say "checking the audit chain"
 		"$BUN" "$(dr_repo_root)/services/ultrathink/obs/audit-cli.ts" verify "$top/audit.jsonl" ||
 			die "audit chain is broken in archive: audit.jsonl"
@@ -156,7 +173,7 @@ prune_archives() {
 }
 
 do_backup() {
-	local stamp name stage archive tmp_archive enc_tmp rsync_failed=0 dir copied_dirs="" copied_files="" revision
+	local stamp name stage archive tmp_archive enc_tmp rsync_failed=0 dir file copied_dirs="" copied_files="" revision
 	[ -d "$STATE_DIR" ] || die "state directory not found: $STATE_DIR"
 	[ -f "$STATE_DIR/ultrathink.sqlite" ] || die "database not found: $STATE_DIR/ultrathink.sqlite"
 	install -d -m 0700 "$BACKUP_DIR" || die "cannot create $BACKUP_DIR"
@@ -180,10 +197,18 @@ do_backup() {
 	else
 		warn "no oauth.json in $STATE_DIR (skipped)"
 	fi
+	# Sealed segments are copied before audit.jsonl. A prune only deletes segments and records itself in the active file, so
+	# a segment copied before the prune stays in the archive. Copied the other way round, an active file taken before a
+	# prune would need a segment that the later segment copy no longer finds, and verification would reject the archive.
+	while IFS= read -r file; do
+		say "copying $file"
+		cp -- "$STATE_DIR/$file" "$stage/$file" || die "cannot copy $file"
+		copied_files="${copied_files:+$copied_files }$file"
+	done < <(sealed_audit_names)
 	if [ -f "$STATE_DIR/audit.jsonl" ]; then
 		say "copying audit.jsonl"
 		cp -- "$STATE_DIR/audit.jsonl" "$stage/audit.jsonl" || die "cannot copy audit.jsonl"
-		copied_files="audit.jsonl"
+		copied_files="${copied_files:+$copied_files }audit.jsonl"
 	fi
 	# jobs/ holds status and usage only; the plans themselves live in sessions/ and journal/, so a restore needs all three.
 	for dir in $STATE_DATA_DIRS; do
