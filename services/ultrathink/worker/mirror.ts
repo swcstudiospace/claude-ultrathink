@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PhaseRecord, Run, Store } from "../store/store.ts";
+import { fsyncDirectory } from "./durable.ts";
 
 const STATE_FILE = "STATE.md";
 const MIRROR_RUN_LIMIT = 100;
@@ -106,7 +107,7 @@ function renderState(run: Run, phases: PhaseRecord[], decision: PendingDecision 
 	return lines.join("\n");
 }
 
-/** Writes via a temp file in the same directory, fsyncs, then renames into place. */
+/** Writes via a temp file in the same directory, fsyncs, renames into place, then fsyncs the directory. */
 function writeStateFile(runDir: string, content: string): void {
 	mkdirSync(runDir, { recursive: true, mode: 0o700 });
 	const finalPath = join(runDir, STATE_FILE);
@@ -124,6 +125,9 @@ function writeStateFile(runDir: string, content: string): void {
 		rmSync(tempPath, { force: true });
 		throw error;
 	}
+	// Defect BUG-14: the rename was never followed by a directory fsync, so the STATE.md entry
+	// could be lost on power loss.
+	fsyncDirectory(runDir);
 }
 
 /** Mirrors one run's status (never its request text or phase output) to `${artifactDir}/${runId}/STATE.md`. */

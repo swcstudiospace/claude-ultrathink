@@ -11,6 +11,23 @@
 export const GRAPH_APP_URI = "ui://ultrathink/graph";
 export const GRAPH_APP_MIME = "text/html;profile=mcp-app";
 
+/**
+ * The default CSP of the MCP Apps spec, plus the directives its construction example adds. A conforming host injects
+ * it; the document also carries it as a meta tag so a host that renders the text as-is (or a srcdoc frame) gets it too.
+ */
+export const APP_CSP = [
+	"default-src 'none'",
+	"script-src 'self' 'unsafe-inline'",
+	"style-src 'self' 'unsafe-inline'",
+	"img-src 'self' data:",
+	"media-src 'self' data:",
+	"connect-src 'none'",
+	"object-src 'none'",
+	"base-uri 'self'",
+	"frame-src 'none'",
+	"font-src 'self'",
+].join("; ");
+
 /** The `_meta.ui` object of the resource: nothing external is loaded, so the CSP lists no origins and there is no `domain`. */
 export function graphAppResourceMeta(): { csp: Record<string, never>; prefersBorder: false } {
 	return { csp: {}, prefersBorder: false };
@@ -281,7 +298,7 @@ const SCRIPT = String.raw`
 			S.failures = 0;
 			S.gaveUp = false;
 			S.note = "";
-			try { ingest(p, false); } catch (e) { fatal("Could not display this result."); }
+			try { ingest(p); } catch (e) { fatal("Could not display this result."); }
 		} else if (method === "ui/notifications/tool-input") {
 			var a = p.arguments;
 			if (a && typeof a === "object" && typeof a.sessionId === "string" && !S.sessionId) S.sessionId = a.sessionId.slice(0, 200);
@@ -484,7 +501,7 @@ const SCRIPT = String.raw`
 		};
 	}
 
-	function ingest(result, fromPoll) {
+	function ingest(result) {
 		if (!result || typeof result !== "object") return;
 		var sc = result.structuredContent && typeof result.structuredContent === "object" ? result.structuredContent : null;
 		var text = firstText(result);
@@ -507,7 +524,10 @@ const SCRIPT = String.raw`
 		}
 		if (S.status === "running") {
 			if (!S.startedAt) S.startedAt = Date.now();
-			ensurePolling(fromPoll ? 300 : Math.min(Math.max(S.pollAfter || 2, 1), 10) * 1000);
+			// A client-mode plan is run by the chat model: ultrathink_result never progresses on its own, so polling it is wasted calls.
+			if (sc && sc.mode === "client") giveUp("The assistant is working through this plan; the view updates when it reports the result.");
+			else if (!S.sessionId || !S.canTools) giveUp();
+			else ensurePolling(pollDelay());
 		} else {
 			S.startedAt = 0;
 			stopPolling();
@@ -539,7 +559,7 @@ const SCRIPT = String.raw`
 			if (S.torn || S.sessionId !== sid || S.status !== "planned" || S.graph) return;
 			if (!res || typeof res !== "object" || res.isError === true) { failed(); return; }
 			S.note = "";
-			try { ingest(res, true); } catch (e) { fatal("Could not display this result."); }
+			try { ingest(res); } catch (e) { fatal("Could not display this result."); }
 		}, failed);
 	}
 	function fatal(message) {
@@ -556,6 +576,8 @@ const SCRIPT = String.raw`
 	var polling = false;
 	var pollGen = 0;
 	function canPoll() { return !!S.sessionId && S.status === "running" && !S.torn && !S.gaveUp; }
+	// The server's hint, clamped to 1..10 s; never a fixed sub-second re-poll, since the server only long-polls while a live job exists.
+	function pollDelay() { return Math.min(Math.max(S.pollAfter || 2, 1), 10) * 1000; }
 	function ensurePolling(delayMs) {
 		if (polling || pollTimer || !canPoll()) return;
 		if (!S.canTools) { giveUp(); return; }
@@ -566,10 +588,10 @@ const SCRIPT = String.raw`
 		pollTimer = 0;
 		pollGen++;
 	}
-	function giveUp() {
+	function giveUp(note) {
 		stopPolling();
 		S.gaveUp = true;
-		S.note = "Stopped checking. Ask the assistant for the result.";
+		S.note = note || "Stopped checking. Ask the assistant for the result.";
 		syncTimers();
 		renderHead();
 		announce(S.note);
@@ -582,13 +604,13 @@ const SCRIPT = String.raw`
 		var gen = ++pollGen;
 		request("tools/call", { name: RESULT_TOOL, arguments: { sessionId: S.sessionId, waitSeconds: 25 } }, 60000).then(function (res) {
 			polling = false;
-			if (gen !== pollGen || S.torn) { ensurePolling(300); return; }
+			if (gen !== pollGen || S.torn) { ensurePolling(pollDelay()); return; }
 			S.failures = 0;
 			S.note = "";
-			try { ingest(res, true); } catch (e) { fatal("Could not display this result."); }
+			try { ingest(res); } catch (e) { fatal("Could not display this result."); }
 		}, function () {
 			polling = false;
-			if (gen !== pollGen || S.torn) { ensurePolling(300); return; }
+			if (gen !== pollGen || S.torn) { ensurePolling(pollDelay()); return; }
 			S.failures += 1;
 			if (S.failures >= MAX_POLL_FAILURES) { giveUp(); return; }
 			S.note = "Could not reach the planner. Retrying.";
@@ -1073,6 +1095,7 @@ function buildDocument(): string {
 		'<meta charset="utf-8">',
 		'<meta name="viewport" content="width=device-width, initial-scale=1">',
 		'<meta name="color-scheme" content="light dark">',
+		`<meta http-equiv="Content-Security-Policy" content="${APP_CSP}">`,
 		"<title>UltraThink graph</title>",
 		`<style>${CSS}</style>`,
 		"</head>",

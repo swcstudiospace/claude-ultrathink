@@ -1,0 +1,17 @@
+# Prometheus scrape configuration for the ultrathink service.
+# Prometheus must run on the same host as ultrathink: /metrics is served on loopback only
+# (router.ts LOOPBACK_PEERS), so a remote Prometheus cannot scrape it.
+# Validate with: promtool check config deploy/observability/prometheus.yml
+# No alerting block: the Alertmanager destination and on-call routing are not chosen in this repo.
+
+global:
+  scrape_interval: 30s
+
+rule_files:
+  - rules.yml
+
+scrape_configs:
+  - job_name: ultrathink
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8795"]

@@ -9,6 +9,7 @@
 
 // Type-only import: mcp.ts and the entry points import this module, a runtime import would be a cycle.
 import type { ToolDefinition } from "./mcp.ts";
+import { compileSchema, SchemaCompileError } from "./validate.ts";
 
 export interface ToolDefinitionViolation {
 	tool: string;
@@ -214,6 +215,20 @@ function checkInputSchema(schema: unknown, add: Report): void {
 	}
 	if (schema.type !== "object") add("schema-type", 'inputSchema.type must be "object"');
 	checkNode(schema, "inputSchema", true, add);
+	checkCompiles(schema, add);
+}
+
+/**
+ * The schema must compile for the runtime validator mcp.ts runs on every tools/call: a schema it cannot enforce
+ * would list a contract the server does not keep. Reported on top of the rule-level findings, with the keyword path.
+ */
+function checkCompiles(schema: Record<string, unknown>, add: Report): void {
+	try {
+		compileSchema(schema);
+	} catch (error) {
+		if (!(error instanceof SchemaCompileError)) throw error;
+		add("schema-compile", `the runtime validator cannot enforce it: ${error.message}`);
+	}
 }
 
 /** The ways the list could be refused by a strict client; empty when it is fine. Order: list order, then rule order. */

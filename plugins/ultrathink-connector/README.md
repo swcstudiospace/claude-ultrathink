@@ -46,6 +46,12 @@ The connector has not been connected to Claude chat or Claude Code from this plu
 
 Hosted Claude chat does not deliver the server's `instructions`, which is why the playbook is in the skill and the commands.
 
+## Development notes
+
+Claude loads every file in `commands/` verbatim as that command's prompt, so maintainer notes stay out of those files. A command file carries only the client prompt.
+
+If reading a file back shows a note that the same output was received several times, that note is not part of the file. Re-reading returns the same bytes, so edit by a narrower line range instead.
+
 ## License
 
 AGPL-3.0-or-later, as the rest of the repository.

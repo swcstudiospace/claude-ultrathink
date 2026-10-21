@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpToolHost } from "../mcp/mcp.ts";
@@ -174,7 +174,8 @@ describe("failures", () => {
 		const lines: string[] = [];
 		await serveStdio({
 			host,
-			input: chunked([`${request(7, "tools/call", { name: "ultrathink_status", arguments: {} })}\n`, `${request(8, "ping")}\n`]),
+			// Arguments must pass the tool's schema (sessionId is required) so the call reaches the throwing host.
+			input: chunked([`${request(7, "tools/call", { name: "ultrathink_status", arguments: { sessionId: "11111111-1111-4111-8111-111111111111" } })}\n`, `${request(8, "ping")}\n`]),
 			write: (line) => {
 				lines.push(line);
 			},
@@ -276,5 +277,26 @@ describe("environment", () => {
 		expect(logLevelFrom({ ULTRATHINK_LOG_LEVEL: "INFO" })).toBe("info");
 		expect(logLevelFrom({ ULTRATHINK_LOG_LEVEL: "error" })).toBe("error");
 		expect(logLevelFrom({ ULTRATHINK_LOG_LEVEL: "verbose" })).toBe("warn");
+	});
+});
+
+describe("crash handler", () => {
+	test("an uncaught non-Error value is reported as UnknownError on stderr and exits 1", async () => {
+		// main() installs the handler synchronously before it awaits stdin, so the emit right after reaches it.
+		const dir = tmp();
+		const script = join(dir, "crash.ts");
+		writeFileSync(
+			script,
+			`import { main } from ${JSON.stringify(join(import.meta.dir, "main.ts"))};\nvoid main(process.env);\nprocess.emit("uncaughtException", null);\n`,
+		);
+		const proc = Bun.spawn([process.execPath, script], {
+			env: { ...process.env, ULTRATHINK_STATE_DIR: join(dir, "state") },
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+		expect(code).toBe(1);
+		expect(stderr).toContain("ultrathink-connector: uncaught exception: UnknownError\n");
 	});
 });

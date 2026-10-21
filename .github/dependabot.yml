@@ -25,3 +25,16 @@ updates:
     groups:
       bun:
         patterns: ["*"]
+
+  # Keeps the runtime dependencies of plugins/omp-token-opt and its bun.lock current, one grouped pull request a week.
+  - package-ecosystem: bun
+    directory: "/plugins/omp-token-opt"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      bun-plugin-omp-token-opt:
+        patterns: ["*"]

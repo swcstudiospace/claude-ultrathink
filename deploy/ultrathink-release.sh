@@ -4,7 +4,7 @@
 #
 # Release management for ultrathink-web.
 #
-#   ultrathink-release.sh release <git-ref>   build, test, smoke-test, switch, verify; roll back on any failure
+#   ultrathink-release.sh release <git-ref>   refuse a ref not on origin/main; build, test, security audit, smoke-test, switch, verify; roll back on any failure
 #   ultrathink-release.sh rollback            switch to the previous release and restart
 #   ultrathink-release.sh status              show the current and previous release
 #
@@ -16,7 +16,7 @@
 #
 # Environment overrides: ULTRATHINK_REPO (git checkout to archive from, default: the checkout holding this script),
 # ULTRATHINK_ROOT, ULTRATHINK_ENV_FILE, ULTRATHINK_UNIT, ULTRATHINK_SERVICE_USER, ULTRATHINK_SMOKE_PORT,
-# ULTRATHINK_KEEP_RELEASES.
+# ULTRATHINK_KEEP_RELEASES, ULTRATHINK_TLS_DIR (CA bundle and app/ops leaves, default /etc/ultrathink/tls).
 set -euo pipefail
 
 ROOT="${ULTRATHINK_ROOT:-/opt/ultrathink}"
@@ -25,6 +25,7 @@ UNIT="${ULTRATHINK_UNIT:-ultrathink-web}"
 SERVICE_USER="${ULTRATHINK_SERVICE_USER:-ultrathink}"
 SMOKE_PORT="${ULTRATHINK_SMOKE_PORT:-8796}"
 KEEP="${ULTRATHINK_KEEP_RELEASES:-5}"
+TLS_DIR="${ULTRATHINK_TLS_DIR:-/etc/ultrathink/tls}"
 BUN="$ROOT/bin/bun"
 RELEASES="$ROOT/releases"
 CURRENT="$ROOT/current"
@@ -37,6 +38,8 @@ REPO=""
 SMOKE_PID=""
 SMOKE_STATE=""
 SMOKE_LOG=""
+TEST_STATE=""
+SEC_STATE=""
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -44,6 +47,11 @@ die() {
 	printf 'ERROR: %s\n' "$*" >&2
 	exit 1
 }
+
+# Validated before anything else runs: a non-integer KEEP makes `[ "$count" -le "$KEEP" ]` false for every release,
+# and prune_releases would then delete everything except current/previous. Same check as ultrathink-backup.sh.
+case "$KEEP" in '' | *[!0-9]*) die "ULTRATHINK_KEEP_RELEASES must be a positive integer" ;; esac
+[ "$KEEP" -ge 1 ] || die "ULTRATHINK_KEEP_RELEASES must be at least 1"
 
 usage() {
 	cat >&2 <<'EOF'
@@ -65,7 +73,27 @@ cleanup_smoke() {
 	fi
 	SMOKE_STATE=""
 }
-trap cleanup_smoke EXIT
+
+cleanup_test() {
+	if [ -n "$TEST_STATE" ] && [ -d "$TEST_STATE" ]; then
+		rm -rf -- "$TEST_STATE"
+	fi
+	TEST_STATE=""
+}
+
+cleanup_security() {
+	if [ -n "$SEC_STATE" ] && [ -d "$SEC_STATE" ]; then
+		rm -rf -- "$SEC_STATE"
+	fi
+	SEC_STATE=""
+}
+
+cleanup_all() {
+	cleanup_smoke
+	cleanup_test
+	cleanup_security
+}
+trap cleanup_all EXIT
 
 require_root() {
 	[ "$(id -u)" -eq 0 ] || die "must run as root (it writes under $ROOT and restarts $UNIT)"
@@ -121,21 +149,41 @@ env_value() {
 	printf '%s' "$default"
 }
 
+probe_status() {
+	# probe_status <port> <path>: prints the HTTP status, or 000 when the handshake or the request fails.
+	curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+		--cacert "$TLS_DIR/ca.pem" --cert "$TLS_DIR/ops/cert.pem" --key "$TLS_DIR/ops/key.pem" \
+		"https://127.0.0.1:$1$2" || true
+}
+
 probe() {
-	# probe <port> <label>: /healthz and /readyz must both answer 200 within about 30 s.
+	# probe <port> <label>: /healthz and /readyz must both answer 200 within about 30 s over mTLS as the ops identity.
+	# The app CA is pinned with --cacert and -k is never passed, so a server that cannot prove its chain or refuses the
+	# ops leaf fails here, and no probe request goes out unauthenticated.
 	local port="$1" label="$2" path attempt
 	for path in /healthz /readyz; do
 		attempt=0
-		until [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port$path" || true)" = "200" ]; do
+		until [ "$(probe_status "$port" "$path")" = "200" ]; do
 			attempt=$((attempt + 1))
 			if [ "$attempt" -ge 30 ]; then
-				warn "$label: $path did not return 200 on port $port"
+				warn "$label: $path did not return 200 on port $port over mTLS"
 				return 1
 			fi
 			sleep 1
 		done
 		say "$label: $path is 200"
 	done
+}
+
+# The app key is 0440 root:ultrathink, so the service user must be able to read it. Runs before any release file is
+# written: a missing file or an unreadable key stops the release before the symlink switch.
+check_tls_material() {
+	local path
+	for path in "$TLS_DIR/ca.pem" "$TLS_DIR/app/cert.pem" "$TLS_DIR/app/key.pem" "$TLS_DIR/ops/cert.pem" "$TLS_DIR/ops/key.pem"; do
+		[ -f "$path" ] || die "TLS file missing: $path"
+	done
+	setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- test -r "$TLS_DIR/app/key.pem" ||
+		die "service user $SERVICE_USER cannot read $TLS_DIR/app/key.pem"
 }
 
 current_target() {
@@ -184,6 +232,56 @@ prune_releases() {
 	)
 }
 
+# The test suite of the archived commit is untrusted code (whatever the operator's ref contains), so it must never run
+# as root: drop to the service user exactly like smoke_test, with HOME and TMPDIR in a throwaway directory outside the
+# release tree so no root-owned artefacts (bun cache, test state) ship inside what becomes $CURRENT. The release tree is
+# already root-owned and world-readable (see do_release), so the service user can read it but not modify it.
+run_tests() {
+	local release="$1" test_home
+	TEST_STATE="$(mktemp -d /var/tmp/ultrathink-test.XXXXXX)"
+	chown "$SERVICE_USER": "$TEST_STATE"
+	chmod 0700 "$TEST_STATE"
+	test_home="$TEST_STATE/home"
+	mkdir "$test_home"
+	chown "$SERVICE_USER": "$test_home"
+	say "running tests in $release as $SERVICE_USER"
+	if ! (
+		cd "$release"
+		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
+			env -i PATH=/usr/bin:/bin HOME="$test_home" TMPDIR="$TEST_STATE" \
+			GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.com GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.com \
+			"$BUN" test services/ultrathink
+	); then
+		cleanup_test
+		return 1
+	fi
+	cleanup_test
+}
+
+# The dependency audit gate: `security-gate.ts audit` runs in the release tree before the switch. Same isolation as
+# run_tests: it runs as the service user, with HOME and the state directory in a throwaway directory outside the release
+# tree, so nothing it writes ships inside $CURRENT. Rollback never runs it.
+security_gate() {
+	local release="$1" sec_home
+	SEC_STATE="$(mktemp -d /var/tmp/ultrathink-security.XXXXXX)"
+	chown "$SERVICE_USER": "$SEC_STATE"
+	chmod 0700 "$SEC_STATE"
+	sec_home="$SEC_STATE/home"
+	mkdir "$sec_home"
+	chown "$SERVICE_USER": "$sec_home"
+	say "running security audit in $release as $SERVICE_USER"
+	if ! (
+		cd "$release"
+		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
+			env -i PATH=/usr/bin:/bin HOME="$sec_home" \
+			"$BUN" run scripts/security-gate.ts audit --root . --out "$SEC_STATE"
+	); then
+		cleanup_security
+		return 1
+	fi
+	cleanup_security
+}
+
 smoke_test() {
 	local release="$1" smoke_home
 	SMOKE_STATE="$(mktemp -d /var/tmp/ultrathink-smoke.XXXXXX)"
@@ -197,6 +295,7 @@ smoke_test() {
 	: >"$SMOKE_LOG"
 	chown "$SERVICE_USER": "$SMOKE_LOG"
 	say "smoke start on port $SMOKE_PORT with a throwaway state directory"
+	# ENV_ARGS carries ULTRATHINK_TLS_*, so the smoke process serves the leaf production serves, and probe checks it over mTLS.
 	(
 		cd "$release"
 		exec setpriv --reuid="$SERVICE_USER" --regid="$SERVICE_USER" --init-groups -- \
@@ -214,6 +313,17 @@ smoke_test() {
 	cleanup_smoke
 }
 
+# The ancestry gate: the release commit must already be on origin/main. Runs the release workflow's check
+# (scripts/security-gate.ts ancestry) from the checkout with the pinned Bun and refuses on any failure. The gate exits 1
+# when the commit is not an ancestor and 2 when git cannot answer; both refuse, because the gate fails closed.
+ancestry_gate() {
+	local ref="$1" sha="$2"
+	if ! (cd "$REPO" && "$BUN" run scripts/security-gate.ts ancestry --sha "$sha"); then
+		die "ref $ref ($sha) is not on origin/main; release refused, nothing was archived"
+	fi
+	say "ancestry: $sha is on origin/main"
+}
+
 do_release() {
 	local ref="${1:-}" sha short stamp release old_current old_previous port
 	[ -n "$ref" ] || usage
@@ -222,9 +332,14 @@ do_release() {
 	take_lock
 	REPO="${ULTRATHINK_REPO:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}" || die "cannot locate the git checkout; set ULTRATHINK_REPO"
 	load_env_file
+	check_tls_material
 	port="$(env_value ULTRATHINK_PORT 8795)"
 
+	say "fetching origin/main"
+	git -C "$REPO" fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' ||
+		die "cannot fetch origin/main; release refused, nothing was archived"
 	sha="$(git -C "$REPO" rev-parse --verify "$ref^{commit}")" || die "cannot resolve git ref: $ref"
+	ancestry_gate "$ref" "$sha"
 	short="${sha:0:12}"
 	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 	release="$RELEASES/$short-$stamp"
@@ -244,12 +359,14 @@ do_release() {
 	chown -R root:root "$release"
 	chmod -R go+rX,go-w "$release"
 
-	say "running tests in $release"
-	if ! (cd "$release" && env -i PATH=/usr/bin:/bin HOME="$release/.test-home" \
-		GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.com GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.com \
-		"$BUN" test services/ultrathink); then
+	if ! run_tests "$release"; then
 		rm -rf -- "$release"
 		die "tests failed; release discarded, nothing was switched"
+	fi
+
+	if ! security_gate "$release"; then
+		rm -rf -- "$release"
+		die "security gate failed; release discarded, nothing was switched"
 	fi
 
 	if ! smoke_test "$release"; then
@@ -314,13 +431,16 @@ do_status() {
 	printf 'previous: %s\n' "$(previous_target || true)"
 	if [ -d "$RELEASES" ]; then
 		printf 'releases:\n'
-		find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '  %f\n' | sort -r
+		find "$RELEASES" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do printf '  %s\n' "${dir##*/}"; done | LC_ALL=C sort -r
 	fi
 }
 
-case "${1:-}" in
-release) do_release "${2:-}" ;;
-rollback) do_rollback ;;
-status) do_status ;;
-*) usage ;;
-esac
+# Sourcing the file defines its functions without running a subcommand; the release test sources it that way.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	case "${1:-}" in
+	release) do_release "${2:-}" ;;
+	rollback) do_rollback ;;
+	status) do_status ;;
+	*) usage ;;
+	esac
+fi

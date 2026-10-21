@@ -33,7 +33,7 @@ The plugin carries one command file for each supported command. Where Claude nam
 
 - `/ultrathink <request>` and `/ultrathink-plan <request>`: plan the request as above.
 - `/ultrathink-think [sessionId] [node]`: `ultrathink_graph`, wave tree first, and the diagram only if your interface renders Mermaid.
-- `/ultrathink-last`: `ultrathink_sessions` with `limit` 5, then `ultrathink_graph` and `ultrathink_result` with the `sessionId` of the newest session whose status is planned.
+- `/ultrathink-last`: `ultrathink_graph` with no arguments (newest planned session), then `ultrathink_result` with that `sessionId`.
 - `/ultrathink-status`: `ultrathink_sessions`.
 - `/ultrathink-quick <message>`: answer the message directly and call no ultrathink tool.
 

@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -198,6 +198,13 @@ function ownerIsDead(token: string): boolean {
  * Removes the lock only if it is still the one that was judged stale. The rename is atomic, so two
  * waiters cannot both remove the same file; the claimed file is then checked against what was observed
  * and put back if a live owner replaced it in between.
+ *
+ * Known limitation (TOCTOU): the staleness judgment in acquireLock and the rename here are separate
+ * syscalls. A live owner can create a fresh lock in that gap, and the rename then displaces it. Until
+ * restoreClaim puts it back, another process can enter the critical section alongside the displaced
+ * owner. If restoreClaim finds lockPath already recreated, the displaced owner's lock is dropped and the
+ * two holders overlap. The no-clobber link prevents overwriting a lock but not this overlap. Closing the
+ * window needs a protocol that never renames a lock whose owner may still be alive.
  */
 function breakStale(lockPath: string, seen: LockObservation): void {
 	const claim = `${lockPath}.stale.${process.pid}.${lockSeq++}`;
@@ -208,11 +215,22 @@ function breakStale(lockPath: string, seen: LockObservation): void {
 	}
 	const claimed = observeLock(claim);
 	if (claimed === null || claimed.ino !== seen.ino || claimed.token !== seen.token) {
-		try {
-			linkSync(claim, lockPath);
-		} catch {
-			// someone else already created a new lock; the owner's token check keeps its release safe
-		}
+		restoreClaim(claim, lockPath);
+		return;
+	}
+	rmSync(claim, { recursive: true, force: true });
+}
+
+/**
+ * Puts a claimed lock back without replacing whatever now sits at lockPath. linkSync fails with EEXIST when
+ * another process created the lock after the stale one was removed; that process holds the lock, so the
+ * claim is dropped and the caller's next acquire attempt waits on it like any live owner.
+ */
+function restoreClaim(claim: string, lockPath: string): void {
+	try {
+		linkSync(claim, lockPath);
+	} catch {
+		// EEXIST: another holder. Any other failure also leaves lockPath to the next acquire attempt.
 	}
 	rmSync(claim, { recursive: true, force: true });
 }
@@ -222,14 +240,21 @@ function acquireLock(lockPath: string): string {
 	const token = `${process.pid}:${lockSeq++}:${Date.now().toString(36)}`;
 	const started = Date.now();
 	for (;;) {
+		let created = false;
 		try {
-			writeFileSync(lockPath, token, { flag: "wx" });
+			const fd = openSync(lockPath, "wx");
+			created = true;
+			try {
+				writeFileSync(fd, token);
+			} finally {
+				closeSync(fd);
+			}
 			return token;
 		} catch (err) {
 			const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
 			if (code !== "EEXIST") {
-				// a failed write may have left an empty lock file behind
-				rmSync(lockPath, { force: true });
+				// remove only a lock this call created; any other failure leaves lockPath alone
+				if (created) rmSync(lockPath, { force: true });
 				throw new LedgerReject("ledger lock failed");
 			}
 		}

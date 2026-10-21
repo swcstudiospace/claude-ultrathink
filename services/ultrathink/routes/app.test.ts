@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../../package.json";
@@ -16,7 +16,10 @@ import { type Auth, createAuth } from "../auth/auth.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import type { HeadlessPlanner, ResultView } from "../engine/headless.ts";
 import type { OpenRouterFetch } from "../engine/openrouter.ts";
+import { auditPath, verifyAuditFile } from "../obs/audit.ts";
+import { type RequestContext, currentRequestContext } from "../obs/context.ts";
 import { createLogger } from "../obs/log.ts";
+import type { SinkEnvelope, SinkTransport } from "../obs/sinks/types.ts";
 import { type Store, openStore } from "../store/store.ts";
 import { type App, type RouterDeps, createApp } from "./router.ts";
 
@@ -79,7 +82,32 @@ function baseConfig(dir: string, overrides: Partial<UltrathinkConfig> = {}): Ult
 		modelTimeoutMs: 5000,
 		planTimeoutMs: 60_000,
 		modelMaxOutputTokens: 1000,
-		serverDecisions: false,
+		sessionSecretPrevious: [],
+		breakerFailures: 5,
+		breakerWindowMs: 60000,
+		breakerOpenMs: 30000,
+		maxInflight: 256,
+		drainMs: 5000,
+		retentionDays: 30,
+		auditLog: true,
+		auditAnchorEvery: 1000,
+		auditSegmentBytes: 67108864,
+		auditRetentionDays: 365,
+		auditWatchMs: 1000,
+		auditSinkQueue: 10000,
+		priorityReservePct: 25,
+		fairQueueDepth: 16,
+		fairQueueWaitMs: 1500,
+		adaptiveQuotaMinPct: 50,
+		lagTargetMs: 100,
+		replicaCapacityRps: 20,
+		abuseFailuresPerMinute: 20,
+		penaltyBaseSec: 60,
+		penaltyMaxSec: 3600,
+		tls: undefined,
+		spiffeTrustDomain: "ultrathink.internal",
+		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 }
@@ -265,6 +293,7 @@ function stubPlanner(enabled: boolean, impl: Partial<Pick<HeadlessPlanner, "star
 		results: [],
 		shutdowns: 0,
 		serverIds: new Set(),
+		upstream: () => undefined,
 		async start(input) {
 			stub.starts.push(input);
 			if (impl.start) return impl.start(input);
@@ -480,7 +509,7 @@ describe("tool surface", () => {
 		expect(sample(h, "ultrathink_mcp_tool_calls_total", { tool: "ultrathink_uplift", outcome: "error" })).toBe(1);
 	});
 
-	test("a planner that throws is an engine_error tool result and is logged without a stack", async () => {
+	test("a planner that throws is an engine_error tool result and is logged by error class only, without message or stack", async () => {
 		const planner = stubPlanner(true, {
 			start: async () => {
 				throw new Error("planner exploded");
@@ -492,7 +521,9 @@ describe("tool surface", () => {
 		expect(started.structuredContent.error).toBe("engine_error");
 		const [logged] = logsOf(h, "tool_error");
 		expect(logged?.tool).toBe("ultrathink_uplift");
-		expect(logged?.error).toEqual({ name: "Error", message: "planner exploded" });
+		expect(logged?.error).toBe("Error");
+		expect(logged?.stack).toBeUndefined();
+		expect(JSON.stringify(h.logs)).not.toContain("planner exploded");
 	});
 
 	test("ultrathink_status asks the planner first and falls back to the journal", async () => {
@@ -683,7 +714,7 @@ describe("end to end with the real planner", () => {
 			expect(line).toMatchObject({ level: "info", sessionId, model: "x-ai/grok-test", attempts: 1, usage: { input: 100, output: 50 } });
 			expect(typeof line.ms).toBe("number");
 			expect(typeof line.outcome).toBe("string");
-			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "sessionId", "ts", "usage"]);
+			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "reqId", "sessionId", "spanId", "traceId", "ts", "usage"]);
 		}
 		const outcome = String(callLogs[0]?.outcome);
 		expect(sample(h, "ultrathink_planner_calls_total", { outcome })).toBe(calls);
@@ -882,7 +913,8 @@ describe("command surface", () => {
 		expect((await callTool(h, "ultrathink_command", { command: "nope" })).structuredContent.support).toBe("unknown");
 		const refused = await callTool(h, "ultrathink_command", { command: 5 });
 		expect(refused.isError).toBe(true);
-		expect(refused.structuredContent.error).toBe("invalid_input");
+		expect(refused.structuredContent.error).toBe("invalid_arguments");
+		expect(refused.structuredContent.errors).toEqual([expect.stringContaining("arguments.command")]);
 	});
 });
 
@@ -1004,6 +1036,24 @@ describe("observability", () => {
 		expect(body.error).toBe("persistence_unavailable");
 		expect(logsOf(h, "persistence_unavailable")[0]?.correlationId).toBe(body.correlationId);
 	});
+
+	test("a tool that throws is answered with engine_error and logged as tool_error with the error class and a correlationId, never the message", async () => {
+		const planner = stubPlanner(true, {
+			start: async (input) => {
+				throw new Error(String(input.prompt));
+			},
+		});
+		const h = harness({ deps: { planner } });
+		const result = await callTool(h, "ultrathink_uplift", { prompt: "SECRET-PROMPT" });
+		expect(result.isError).toBe(true);
+		expect(result.structuredContent.error).toBe("engine_error");
+		const [line] = logsOf(h, "tool_error");
+		expect(line).toMatchObject({ level: "error", tool: "ultrathink_uplift", error: "Error" });
+		expect(line?.correlationId).toMatch(UUID_PATTERN);
+		expect(line?.stack).toBeUndefined();
+		expect(JSON.stringify(h.logs)).not.toContain("SECRET-PROMPT");
+		expect(sample(h, "ultrathink_mcp_tool_calls_total", { tool: "ultrathink_uplift", outcome: "error" })).toBe(1);
+	});
 });
 
 describe("readiness and metrics endpoints", () => {
@@ -1012,7 +1062,11 @@ describe("readiness and metrics endpoints", () => {
 		const response = await h.app.handle(new Request(`${ORIGIN}/readyz`), PEER);
 		expect(response.status).toBe(200);
 		const text = await response.text();
-		expect(JSON.parse(text)).toEqual({ status: "ready", checks: { store: true, stateDir: true, oauth: true, planner: true } });
+		expect(JSON.parse(text)).toEqual({
+			status: "ready",
+			checks: { store: true, stateDir: true, oauth: true, planner: true, integrity: true, draining: true },
+			upstream: { state: "closed" },
+		});
 		expect(text).not.toContain(h.dir);
 	});
 
@@ -1069,6 +1123,39 @@ describe("readiness and metrics endpoints", () => {
 	});
 });
 
+describe("HEAD requests", () => {
+	test("HEAD answers with the GET status and headers and no body on every GET endpoint, and 405 elsewhere", async () => {
+		const h = harness();
+		const paths = [
+			"/healthz",
+			"/readyz",
+			"/metrics",
+			"/ultrathink",
+			"/ultrathink/runs/no-such-run",
+			"/.well-known/oauth-protected-resource",
+			"/.well-known/oauth-authorization-server",
+			"/oauth/authorize",
+		];
+		for (const path of paths) {
+			const get = await h.app.handle(new Request(`${ORIGIN}${path}`), PEER);
+			const head = await h.app.handle(new Request(`${ORIGIN}${path}`, { method: "HEAD" }), PEER);
+			expect({ path, status: head.status }).toEqual({ path, status: get.status });
+			expect({ path, type: head.headers.get("content-type") }).toEqual({ path, type: get.headers.get("content-type") });
+			expect({ path, body: await head.text() }).toEqual({ path, body: "" });
+		}
+		expect(logsOf(h, "request").filter((line) => line.method === "HEAD")).toHaveLength(paths.length);
+
+		for (const path of ["/login", "/mcp", "/oauth/token", "/oauth/register", "/oauth/revoke"]) {
+			const refused = await h.app.handle(new Request(`${ORIGIN}${path}`, { method: "HEAD" }), PEER);
+			expect({ path, status: refused.status }).toEqual({ path, status: 405 });
+			expect(refused.headers.get("allow")).toBe("POST");
+		}
+		const post = await h.app.handle(new Request(`${ORIGIN}/readyz`, { method: "POST" }), PEER);
+		expect(post.status).toBe(405);
+		expect(post.headers.get("allow")).toBe("GET, HEAD");
+	});
+});
+
 describe("app lifecycle", () => {
 	test("shutdown stops the planner, and createHandler-style use needs no planner of its own", async () => {
 		const planner = stubPlanner(true);
@@ -1079,5 +1166,290 @@ describe("app lifecycle", () => {
 
 		const own = harness();
 		await own.app.shutdown();
+	});
+});
+
+describe("hardening wiring", () => {
+	const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+	const PARENT_SPAN = "00f067aa0ba902b7";
+	const TRACEPARENT = /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/;
+
+	function loginRequest(password: string): Request {
+		return new Request(`${ORIGIN}/login`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Origin: ORIGIN },
+			body: JSON.stringify({ password }),
+		});
+	}
+
+	function auditRecords(dir: string): Array<{ event: string; fields: Record<string, unknown> }> {
+		return readFileSync(auditPath(dir), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+	}
+
+	test("POST /ultrathink/logout needs the publicOrigin, clears the cookie with or without a session, and records a presented session", async () => {
+		const h = harness();
+		const login = await h.app.handle(loginRequest(OWNER_PASSWORD), PEER);
+		expect(login.status).toBe(200);
+		const session = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+
+		const foreign = await h.app.handle(
+			new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: "https://evil.test", Cookie: session } }),
+			PEER,
+		);
+		expect(foreign.status).toBe(403);
+		expect(await json<Json>(foreign)).toEqual({ error: "forbidden" });
+
+		const out = await h.app.handle(new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: ORIGIN, Cookie: session } }), PEER);
+		expect(out.status).toBe(200);
+		expect(await json<Json>(out)).toEqual({ ok: true });
+		const cleared = out.headers.get("set-cookie") ?? "";
+		expect(cleared.startsWith("__Host-ut_session=;")).toBe(true);
+		expect(cleared).toContain("Max-Age=0");
+
+		const bare = await h.app.handle(new Request(`${ORIGIN}/ultrathink/logout`, { method: "POST", headers: { Origin: ORIGIN } }), PEER);
+		expect(bare.status).toBe(200);
+		expect(bare.headers.get("set-cookie") ?? "").toContain("Max-Age=0");
+		// The old path is not routed; nginx only forwards /ultrathink, so /logout is an unknown path.
+		expect((await h.app.handle(new Request(`${ORIGIN}/logout`, { method: "POST", headers: { Origin: ORIGIN } }), PEER)).status).toBe(404);
+		expect(auditRecords(h.dir).map((record) => record.event)).toEqual(["login_ok", "logout"]);
+	});
+
+	test("every dropped audit record is counted, and the failure is logged once per distinct message", async () => {
+		const h = harness();
+		// Closing the audit log makes every later record a drop.
+		await h.app.shutdown();
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		}
+		expect(sample(h, "ultrathink_audit_write_failures_total")).toBe(3);
+		expect(logsOf(h, "audit_write_failed")).toHaveLength(1);
+	});
+
+	test("an unsampled inbound traceparent stays unsampled: echoed as -00 and seen by the request context", async () => {
+		const seen: Array<RequestContext | undefined> = [];
+		const planner = stubPlanner(true, {
+			result: async (input) => {
+				seen.push(currentRequestContext());
+				return { ok: true, data: viewOf(String(input.sessionId)) };
+			},
+		});
+		const h = harness({ deps: { planner } });
+		const resultCall = {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: { name: "ultrathink_result", arguments: { sessionId: randomSessionId(), waitSeconds: 0, detail: "full" } },
+		};
+
+		const unsampled = await rpc(h, resultCall, { traceparent: `00-${TRACE_ID}-${PARENT_SPAN}-00` });
+		expect(unsampled.status).toBe(200);
+		expect(unsampled.headers.get("traceparent")).toMatch(new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-00$`));
+		expect(seen[0]).toMatchObject({ traceId: TRACE_ID, sampled: false });
+
+		const fresh = await rpc(h, resultCall);
+		expect(fresh.headers.get("traceparent")).toMatch(/-01$/);
+		expect(seen[1]).toMatchObject({ sampled: true });
+	});
+
+	test("a failed login is written to the audit log, which verifies, and auditLog off writes no file", async () => {
+		const h = harness();
+		const res = await h.app.handle(loginRequest("wrong-password"), PEER);
+		expect(res.status).toBe(401);
+		expect(verifyAuditFile(auditPath(h.dir))).toMatchObject({ ok: true, records: 1 });
+		expect(auditRecords(h.dir)).toEqual([expect.objectContaining({ event: "login_failed", fields: { ip: PEER } })]);
+		expect(readFileSync(auditPath(h.dir), "utf8")).not.toContain("wrong-password");
+
+		const quiet = harness({ config: { auditLog: false } });
+		expect((await quiet.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		expect(existsSync(auditPath(quiet.dir))).toBe(false);
+	});
+
+	/**
+	 * A sink that keeps every envelope it is handed. With `hold`, each send waits until `release()`, so a test can keep
+	 * the tail queued while shutdown starts.
+	 */
+	function loopback(hold = false): { transport: SinkTransport; envelopes: SinkEnvelope[]; release: () => void } {
+		const envelopes: SinkEnvelope[] = [];
+		const gate = Promise.withResolvers<void>();
+		if (!hold) gate.resolve();
+		return {
+			envelopes,
+			release: () => gate.resolve(),
+			transport: {
+				name: "loopback",
+				async send(batch) {
+					await gate.promise;
+					envelopes.push(...batch);
+					return { ok: true };
+				},
+			},
+		};
+	}
+
+	/** Timers the test fires by hand. The watch and the sweep register here instead of on the real clock. */
+	function manualTimers(): { timers: NonNullable<RouterDeps["timers"]>; ticks: Array<{ ms: number; run: () => void }> } {
+		const ticks: Array<{ ms: number; run: () => void }> = [];
+		return {
+			ticks,
+			timers: {
+				setInterval: (run, ms) => {
+					ticks.push({ ms, run });
+					return {};
+				},
+				clearInterval: () => undefined,
+			},
+		};
+	}
+
+	test("a burst of failed logins raises one anomaly record and one alert envelope, in that order", async () => {
+		const sink = loopback();
+		const h = harness({
+			config: { auditRules: [{ name: "burst", event: "login_failed", count: 3, windowSec: 300, groupBy: "ip" }] },
+			deps: { auditTransports: [sink.transport] },
+		});
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		}
+		await h.app.shutdown();
+
+		expect(auditRecords(h.dir).map((record) => record.event)).toEqual(["login_failed", "login_failed", "login_failed", "anomaly_detected"]);
+		expect(auditRecords(h.dir)[3]).toMatchObject({ fields: { rule: "burst", key: PEER, count: 3, windowSec: 300 } });
+		const audited = sink.envelopes.filter((envelope) => envelope.kind === "audit").map((envelope) => envelope.body.event);
+		expect(audited).toEqual(["login_failed", "login_failed", "login_failed", "anomaly_detected"]);
+		const alerts = sink.envelopes.filter((envelope) => envelope.kind === "alert");
+		expect(alerts).toEqual([expect.objectContaining({ body: expect.objectContaining({ event: "anomaly_detected", rule: "burst", key: PEER }) })]);
+	});
+
+	test("truncating the audit file raises a tamper alert on the next watch tick", async () => {
+		const sink = loopback();
+		const clock = manualTimers();
+		const h = harness({ deps: { auditTransports: [sink.transport], timers: clock.timers } });
+		h.app.start();
+		await h.app.handle(loginRequest("wrong-password"), PEER);
+		await h.app.handle(loginRequest("wrong-password"), PEER);
+		const [first] = readFileSync(auditPath(h.dir), "utf8").split("\n");
+		writeFileSync(auditPath(h.dir), `${first}\n`);
+
+		const watch = clock.ticks.find((tick) => tick.ms === h.config.auditWatchMs);
+		expect(watch).toBeDefined();
+		watch?.run();
+		await h.app.shutdown();
+
+		const alerts = sink.envelopes.filter((envelope) => envelope.kind === "alert");
+		expect(alerts).toEqual([expect.objectContaining({ body: expect.objectContaining({ event: "audit_tamper_detected" }) })]);
+	});
+
+	test("a login failure reaches the security stream, and the envelope carries no details", async () => {
+		const sink = loopback();
+		const h = harness({ deps: { auditTransports: [sink.transport] } });
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		await h.app.shutdown();
+
+		const security = sink.envelopes.filter((envelope) => envelope.kind === "security");
+		expect(security).toEqual([expect.objectContaining({ body: expect.objectContaining({ type: "auth_failure", name: "auth.login_failed", ip: PEER }) })]);
+		expect(security[0]?.body).not.toHaveProperty("details");
+	});
+
+	test("records still queued when shutdown starts are delivered before shutdown returns", async () => {
+		const sink = loopback(true);
+		const h = harness({ deps: { auditTransports: [sink.transport] } });
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		const closing = h.app.shutdown();
+		sink.release();
+		await closing;
+
+		expect(sink.envelopes.filter((envelope) => envelope.kind === "audit")).toHaveLength(2);
+		expect(sink.envelopes.filter((envelope) => envelope.kind === "security")).toHaveLength(2);
+	});
+
+	test("with auditLog off no audit file is written, and the security stream still runs", async () => {
+		const sink = loopback();
+		const h = harness({ config: { auditLog: false }, deps: { auditTransports: [sink.transport] } });
+		h.app.start();
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		await h.app.shutdown();
+
+		expect(existsSync(auditPath(h.dir))).toBe(false);
+		expect(sink.envelopes.map((envelope) => envelope.kind)).toEqual(["security"]);
+	});
+
+	test("past maxInflight a request is refused with 503 and Retry-After, while /healthz still answers", async () => {
+		const reached = Promise.withResolvers<void>();
+		const planner = stubPlanner(true, {
+			result: () => {
+				reached.resolve();
+				return new Promise<never>(() => undefined);
+			},
+		});
+		const h = harness({ config: { maxInflight: 1 }, deps: { planner } });
+		// Never settles, so it holds the only slot.
+		void rpc(h, {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: { name: "ultrathink_result", arguments: { sessionId: randomSessionId(), waitSeconds: 0, detail: "full" } },
+		});
+		// The held request reads its body under the slot, then reaches the planner. Wait for that, so the refusal below
+		// happens while the slot is still held.
+		await reached.promise;
+
+		const refused = await h.app.handle(mcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }), PEER);
+		expect(refused.status).toBe(503);
+		expect(refused.headers.get("retry-after")).toBe("1");
+		expect(await json<Json>(refused)).toEqual({ error: "overloaded" });
+		expect(planner.results).toHaveLength(1);
+
+		expect((await h.app.handle(new Request(`${ORIGIN}/healthz`), PEER)).status).toBe(200);
+		expect(sample(h, "ultrathink_overload_total")).toBe(1);
+		expect(sample(h, "ultrathink_http_inflight")).toBe(1);
+	});
+
+	test("beginDrain fails /readyz with draining while /healthz keeps answering", async () => {
+		const h = harness();
+		expect((await h.app.handle(new Request(`${ORIGIN}/readyz`), PEER)).status).toBe(200);
+		h.app.beginDrain();
+		h.app.beginDrain();
+		const readyz = await h.app.handle(new Request(`${ORIGIN}/readyz`), PEER);
+		expect(readyz.status).toBe(503);
+		expect((await json<{ failed: string[] }>(readyz)).failed).toEqual(["draining"]);
+		expect((await h.app.handle(new Request(`${ORIGIN}/healthz`), PEER)).status).toBe(200);
+	});
+
+	test("the breaker state is published as a gauge and reported by /readyz, and breakerFailures 0 omits it", async () => {
+		const h = harness();
+		expect(sample(h, "ultrathink_upstream_breaker_state", { state: "closed" })).toBe(1);
+		expect(sample(h, "ultrathink_upstream_breaker_state", { state: "open" })).toBe(0);
+
+		const off = harness({ config: { breakerFailures: 0 } });
+		const body = await json<Json>(await off.app.handle(new Request(`${ORIGIN}/readyz`), PEER));
+		expect(body).not.toHaveProperty("upstream");
+	});
+
+	test("an inbound traceparent is continued under a new span, and an invalid one starts a fresh trace", async () => {
+		const h = harness();
+		const inbound = `00-${TRACE_ID}-${PARENT_SPAN}-01`;
+		const continued = await h.app.handle(new Request(`${ORIGIN}/healthz`, { headers: { traceparent: inbound } }), PEER);
+		const echoed = continued.headers.get("traceparent") ?? "";
+		expect(echoed).toMatch(TRACEPARENT);
+		expect(echoed.split("-")[1]).toBe(TRACE_ID);
+		expect(echoed.split("-")[2]).not.toBe(PARENT_SPAN);
+		expect(logsOf(h, "request").at(-1)).toMatchObject({ traceId: TRACE_ID });
+
+		const fresh = await h.app.handle(new Request(`${ORIGIN}/healthz`, { headers: { traceparent: "not-a-traceparent" } }), PEER);
+		const started = fresh.headers.get("traceparent") ?? "";
+		expect(started).toMatch(TRACEPARENT);
+		expect(started.split("-")[1]).not.toBe(TRACE_ID);
+	});
+
+	test("start is idempotent and shutdown stops the probe and sweeper, so the process exits cleanly", async () => {
+		const h = harness({ config: { retentionDays: 1 } });
+		h.app.start();
+		h.app.start();
+		await h.app.shutdown();
+		await h.app.shutdown();
 	});
 });

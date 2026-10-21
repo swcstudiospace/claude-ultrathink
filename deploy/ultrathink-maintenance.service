@@ -9,7 +9,10 @@
 [Unit]
 Description=Ultrathink backup and state retention
 Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
-After=local-fs.target
+After=local-fs.target network-online.target
+# The optional rsync step goes off-host; with Persistent=true on the timer a missed run fires right after boot and
+# would otherwise fail on ordering alone.
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -52,6 +55,9 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# The script needs neither the hostname nor SysV IPC; both are flagged by systemd-analyze security.
+ProtectHostname=true
+RemoveIPC=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

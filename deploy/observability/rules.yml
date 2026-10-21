@@ -1,0 +1,158 @@
+# Prometheus alerting and recording rules for the ultrathink service.
+# Encodes runbook docs/ops/runbook-ultrathink.md section 8. Validate with
+#   promtool check rules deploy/observability/rules.yml
+# Not encoded here (no metric in the closed list, or a value this repo does not own):
+#   restart count (systemd NRestarts), external health probes, planner saturation,
+#   USD budget threshold, backups, disk, certificate expiry. Receivers are not configured.
+# Ratios and increases use `or vector(0)` so an absent counter reads as zero.
+
+groups:
+  - name: ultrathink-alerts
+    rules:
+      - alert: UltrathinkServiceDown
+        expr: 'absent(ultrathink_build_info)'
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "ultrathink metrics are absent from the scrape"
+          description: "ultrathink_build_info has not been scraped for 2 minutes. The service or its scrape target is down."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkVersionChanged
+        expr: 'count(max_over_time(ultrathink_build_info[1h])) > 1'
+        labels:
+          severity: page
+        annotations:
+          summary: "ultrathink_build_info shows more than one version in the last hour"
+          description: "A version change means a deploy or a restart onto a new build. Silence it for the deploy window. A same-version restart is not visible here."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkServerErrors
+        expr: '(sum(rate(ultrathink_http_requests_total{status_class="5xx"}[10m])) or vector(0)) / sum(rate(ultrathink_http_requests_total[10m])) > 0.02'
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 2% of HTTP requests returned 5xx for 10 minutes"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkSlowRequests
+        expr: 'histogram_quantile(0.95, sum by (le, endpoint) (rate(ultrathink_http_request_duration_seconds_bucket{endpoint!="mcp"}[10m]))) > 5'
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p95 latency above 5 s on {{ $labels.endpoint }}"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkSlowMcpRequests
+        expr: '1 - (sum(rate(ultrathink_http_request_duration_seconds_bucket{endpoint="mcp",le="60"}[10m])) / sum(rate(ultrathink_http_request_duration_seconds_count{endpoint="mcp"}[10m]))) > 0.05'
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "More than 5% of /mcp requests take longer than 60 s (p95 above 60 s)"
+          description: "Written as the share over the 60 s bucket because histogram_quantile cannot report a value above the last finite bucket."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkToolFailures
+        expr: '(sum(increase(ultrathink_mcp_tool_calls_total{outcome="error"}[30m])) or vector(0)) / sum(increase(ultrathink_mcp_tool_calls_total[30m])) > 0.2'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "More than 20% of MCP tool calls failed over 30 minutes"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkPlannerTimeouts
+        expr: '(sum(increase(ultrathink_planner_calls_total{outcome="timeout"}[15m])) or vector(0)) > 0'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Planner model calls are timing out"
+          description: "A timeout is not retried and fails the whole plan. Compare with ULTRATHINK_MODEL_TIMEOUT_MS."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkPlannerFailures
+        expr: '(sum(increase(ultrathink_plan_jobs_total{status="failed"}[30m])) or vector(0)) / sum(increase(ultrathink_plan_jobs_total[30m])) > 0.2'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "More than 20% of finished plan jobs failed over 30 minutes"
+          description: "Usually a key, credit, provider outage or model timeout."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkPlannerDisabled
+        expr: 'ultrathink_planner_enabled == 0'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Server-side planning is disabled"
+          description: "Fires only when planning is expected. A deployment that deliberately runs without a planner will keep this firing; silence it there."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkTokenBudget
+        expr: '(sum(increase(ultrathink_plan_tokens_total[24h])) or vector(0)) > 800000'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Planner tokens over 24 hours above 80% of the daily token ceiling"
+          description: "800000 is 80% of the default ULTRATHINK_DAILY_TOKEN_CEILING (1000000). Edit this value if the environment sets a different ceiling. The window is rolling 24 hours, not the UTC day, and counters reset on restart."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkAuthAbuse
+        expr: '((sum(rate(ultrathink_auth_failures_total[10m])) or vector(0)) > 10 * (sum(rate(ultrathink_auth_failures_total[1d])) or vector(0))) or ((sum(rate(ultrathink_rate_limited_total[10m])) or vector(0)) > 10 * (sum(rate(ultrathink_rate_limited_total[1d])) or vector(0)))'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Auth failures or rate-limited requests are more than 10 times their daily rate"
+          description: "With a zero daily baseline, any failure in the last 10 minutes fires this alert."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkDroppedSeries
+        expr: '(sum(increase(ultrathink_metrics_dropped_total[1h])) or vector(0)) > 0'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Metric series were dropped by the cardinality cap"
+          description: "Label cardinality abuse or a new unbounded label."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkBreakerOpen
+        expr: 'ultrathink_upstream_breaker_state{state="open"} == 1'
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Upstream circuit breaker is open for 5 minutes"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkAnomalyActive
+        expr: 'ultrathink_anomaly_active == 1'
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Anomaly detector active for signal {{ $labels.signal }}"
+          description: "In-process statistical detector on event-loop lag, RSS or heap used. A breach is raised after 3 samples at 5 s and cleared after 5 calm samples. A sustained jump is adopted as the new baseline after 120 breaching samples (about 10 minutes), which clears it, so this rule waits 5 minutes to fire before that."
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+  - name: ultrathink-slo
+    rules:
+      - record: ultrathink:http_bad_ratio:30d
+        expr: '(sum(increase(ultrathink_http_requests_total{status_class="5xx"}[30d])) or vector(0)) / sum(increase(ultrathink_http_requests_total[30d]))'
+
+      - alert: UltrathinkSLOBurnRatePage
+        expr: 'ultrathink_slo_burn_rate{slo="http_availability",window="1h"} > 14.4 and on(slo) ultrathink_slo_burn_rate{slo="http_availability",window="5m"} > 14.4'
+        labels:
+          severity: page
+        annotations:
+          summary: "http_availability error budget burning above 14.4x over 1h and 5m"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"
+
+      - alert: UltrathinkSLOBurnRateTicket
+        expr: 'ultrathink_slo_burn_rate{slo="http_availability",window="6h"} > 6 and on(slo) ultrathink_slo_burn_rate{slo="http_availability",window="30m"} > 6'
+        labels:
+          severity: ticket
+        annotations:
+          summary: "http_availability error budget burning above 6x over 6h and 30m"
+          runbook: "docs/ops/runbook-ultrathink.md#8-suggested-alerts"

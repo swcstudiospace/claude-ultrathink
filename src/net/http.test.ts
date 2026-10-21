@@ -55,7 +55,7 @@ describe("requestJson", () => {
 	});
 
 	test("times out while the body is still streaming", async () => {
-		const stall = (async () => ({ status: 200, text: () => new Promise<string>(() => {}) })) as unknown as typeof fetch;
+		const stall = (async () => new Response(new ReadableStream<Uint8Array>({ pull: () => new Promise<void>(() => {}) }))) as unknown as typeof fetch;
 		const out = await requestJson("https://svc.test/slow-body", { timeoutMs: 30, fetch: stall });
 		expect(out.kind).toBe("timeout");
 	});
@@ -84,5 +84,28 @@ describe("requestJson", () => {
 	test("refuses an oversized response", async () => {
 		const out = await requestJson("https://svc.test/big", { timeoutMs: 1000, fetch: respond("x".repeat(MAX_RESPONSE_CHARS + 1)) });
 		expect(out).toMatchObject({ kind: "network", message: "response too large" });
+	});
+
+	test("stops reading an endless body at the limit and cancels the stream", async () => {
+		let pulled = 0;
+		let cancelled = false;
+		const endless = (async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						pulled++;
+						controller.enqueue(new Uint8Array(1024 * 1024).fill(120));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				}),
+			)) as unknown as typeof fetch;
+		const started = Date.now();
+		const out = await requestJson("https://svc.test/endless", { timeoutMs: 10_000, fetch: endless });
+		expect(out).toMatchObject({ kind: "network", message: "response too large" });
+		expect(Date.now() - started).toBeLessThan(5000);
+		expect(cancelled).toBe(true);
+		expect(pulled).toBeLessThan(MAX_RESPONSE_CHARS / (1024 * 1024) + 3);
 	});
 });

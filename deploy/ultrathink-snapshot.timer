@@ -1,0 +1,18 @@
+# Installed as /etc/systemd/system/ultrathink-snapshot.timer, installed DISABLED by the runbook. It stays disabled
+# until both the VACUUM INTO cost measurement and a staging tick on real state are recorded in
+# docs/ops/runbook-ultrathink.md (a tick must stay well under 30 s on real data, see PLAN.md risks).
+# Once both are recorded: systemctl enable --now ultrathink-snapshot.timer
+# Each tick runs ultrathink-snapshot.service. Ticks never overlap: a oneshot unit is not restarted while active.
+
+[Unit]
+Description=Ultrathink point-in-time snapshot every 30 seconds
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=ultrathink-snapshot.service
+
+[Install]
+WantedBy=timers.target

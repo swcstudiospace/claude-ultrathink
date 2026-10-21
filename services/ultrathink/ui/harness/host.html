@@ -119,7 +119,8 @@
 	function send(msg) {
 		msg.jsonrpc = "2.0";
 		record("out", msg);
-		frame.contentWindow.postMessage(msg, location.origin);
+		// The app runs at an opaque origin (srcdoc + sandbox without allow-same-origin), so only "*" reaches it.
+		frame.contentWindow.postMessage(msg, "*");
 	}
 	function reply(id, result) { send({ id: id, result: result }); }
 	function replyError(id, code, message) { send({ id: id, error: { code: code, message: message } }); }
@@ -310,14 +311,16 @@
 		setValue("f-safe", cfg.safe);
 		document.getElementById("desc").textContent = fx.name + ": " + fx.description;
 		applyStage();
-		frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
-		frame.src = "/app.html";
+		// Scripts only, no allow-same-origin: the view runs at an opaque origin as under a real host, so it cannot reach
+		// this page or lift its own sandbox. Loaded as srcdoc because a same-origin src plus allow-scripts would be escapable.
+		frame.setAttribute("sandbox", "allow-scripts");
+		window.fetch("/app.html").then(function (r) { return r.text(); }).then(function (text) { frame.srcdoc = text; }, failLoad("/app.html"));
 	}
-	function failBoot(error) {
-		logEl.textContent = "Could not load /fixtures.json: " + error;
+	function failLoad(path) {
+		return function (error) { logEl.textContent = "Could not load " + path + ": " + error; };
 	}
-	// Same-origin request to the harness itself; the host page is the only thing that may talk to the server.
-	window.fetch("/fixtures.json").then(function (r) { return r.json(); }).then(boot, failBoot);
+	// Same-origin requests to the harness itself; the host page is the only thing that may talk to the server.
+	window.fetch("/fixtures.json").then(function (r) { return r.json(); }).then(boot, failLoad("/fixtures.json"));
 })();
 </script>
 </body>

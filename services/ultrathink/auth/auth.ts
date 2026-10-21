@@ -1,12 +1,56 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+/**
+ * Owner session, approval-proof and request-limiting primitives.
+ *
+ * Session-secret key ring. Session cookies and approval proofs are signed with
+ * the current `sessionSecret`; verification also accepts any secret listed in
+ * `previousSessionSecrets`. Every value carries the 8-hex key id (`keyIdOf`) of
+ * the secret that signed it, so rotation needs no downtime:
+ *
+ *   1. Set `ULTRATHINK_SESSION_SECRET` to the new value and move the old value
+ *      into `ULTRATHINK_SESSION_SECRET_PREVIOUS` (comma-separated, newest first
+ *      if several). Restart the service. Existing sessions and pending consents
+ *      keep verifying; new ones are signed with the new secret.
+ *   2. After the longest-lived value signed by the old secret has expired, i.e.
+ *      12 h for sessions (SESSION_LIFETIME_MS) and 10 min for pending consents,
+ *      remove the old entry from `ULTRATHINK_SESSION_SECRET_PREVIOUS` and
+ *      restart. Cookies naming an unknown key id are rejected from then on.
+ *
+ * Sessions are bound to the owner password hash: the session MAC covers
+ * `sha256(ownerPasswordHash)`, so changing the owner password invalidates every
+ * session without rotating the secret. Cookie values from before the key ring
+ * (`<expiresAt>.<mac>`) are rejected outright; such sessions end at deploy.
+ *
+ * Session cookie: `__Host-ut_session` when the cookie is Secure, otherwise
+ * `ut_session` (the `__Host-` prefix requires Secure). Value layout is
+ * `<kid>.<expiresAt>.<mac>` with `mac = HMAC-SHA256(secret,
+ * "ut-session|<expiresAt>|<sha256hex(ownerPasswordHash)>")` in base64url.
+ *
+ * Approval proofs are `<kid>.<mac>` and verify with the ring key named by the
+ * key id, so consents issued before a rotation survive it.
+ *
+ * Request limits (fixed one-minute windows sharing one bounded table, checked
+ * in this order): 120 per client IP, 60 per principal (an opaque id the router
+ * derives, e.g. `bearer:<sha256 prefix>` or `key:connector`), and 60 per owner
+ * unless the caller passes `ownerLimit`.
+ */
+
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
+import { getSecurityLogger } from "../security/events.ts";
+import { StringValidator } from "../security/validation.ts";
 
 export interface AuthOptions {
 	ownerPasswordHash: string;
+	/** Signs new sessions and approval proofs; also verifies. */
 	sessionSecret: string;
+	/**
+	 * Verification-only secrets kept during a rotation, newest first. Each must
+	 * be at least 32 characters; entries equal to `sessionSecret` are ignored.
+	 */
+	previousSessionSecrets?: string[];
 	cookieSecure: boolean;
 	now?: () => number;
 }
@@ -19,6 +63,9 @@ export interface ApprovalProof {
 	refreshedAt: number;
 }
 
+/** Which window refused a request. */
+export type RequestLimitScope = "ip" | "principal" | "owner";
+
 export interface Auth {
 	login(input: { password: string; clientIp: string }): Promise<
 		| { ok: true; setCookie: string }
@@ -26,14 +73,28 @@ export interface Auth {
 	>;
 	sessionFor(req: Request): { ownerId: "owner" } | null;
 	logoutCookie(): string;
-	allowRequest(input: { clientIp: string; ownerId: string }): { ok: true } | { ok: false; retryAfterSec: number };
+	/**
+	 * Counts one request against the IP, principal (when given) and owner
+	 * windows, in that order, and reports the first one that is exhausted.
+	 * `principal` is an opaque id of at most 128 characters; longer ids are
+	 * hashed. `ownerLimit` overrides the 60-per-minute owner window.
+	 * `scale` (optional, default 1) multiplies the IP, principal and owner limits. Finite values are clamped to [0.1, 1]; NaN, Infinity or a non-number fails closed to 0.1. Each scaled limit is at least one request.
+	 */
+	allowRequest(input: {
+		clientIp: string;
+		ownerId: string;
+		principal?: string;
+		ownerLimit?: number;
+		scale?: number;
+	}): { ok: true } | { ok: false; retryAfterSec: number; scope: RequestLimitScope };
 	newApprovalNonce(): string;
+	/** Returns `<kid>.<mac>`, signed with the current secret. */
 	signApproval(proof: ApprovalProof): string;
+	/** Verifies a `<kid>.<mac>` proof with the ring key named by `kid`. */
 	verifyApproval(proof: ApprovalProof, signature: string): boolean;
 	allowApprovalAttempt(clientIp: string): { ok: true } | { ok: false; retryAfterSec: number };
 }
 
-const COOKIE_NAME = "ut_session";
 const OWNER_ID = "owner" as const;
 const SESSION_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -41,16 +102,65 @@ const LOGIN_ATTEMPTS_PER_IP = 5;
 const OWNER_FAILURES_PER_WINDOW = 10;
 const REQUEST_WINDOW_MS = 60 * 1000;
 const OWNER_REQUESTS_PER_WINDOW = 60;
+const PRINCIPAL_REQUESTS_PER_WINDOW = 60;
 const IP_REQUESTS_PER_WINDOW = 120;
+const MAX_PRINCIPAL_LENGTH = 128;
 const APPROVAL_WINDOW_MS = 60 * 1000;
 const APPROVAL_ATTEMPTS_PER_WINDOW = 2;
 const APPROVAL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const MIN_SECRET_LENGTH = 32;
+const KEY_ID = /^[0-9a-f]{8}$/;
 const MAX_TRACKED_KEYS = 10_000;
 const PRUNE_INTERVAL_MS = 60 * 1000;
 const OWNER_KEY = "owner";
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 const HASH_FORMAT = /^\$(?:argon2(?:id|i|d)|2[abxy]?)\$/;
 const FORWARDED_IP = /^[0-9A-Fa-f:.]{1,45}$/;
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+/** Longest password login accepts. A longer one is refused before any hashing. */
+export const MAX_PASSWORD_CHARS = 1024;
+const MAX_IDENTITY_CHARS = 64;
+const MAX_PRINCIPAL_INPUT_CHARS = 4096;
+const MAX_COOKIE_HEADER_CHARS = 8192;
+const MAX_SESSION_VALUE_CHARS = 256;
+const MAX_SIGNATURE_CHARS = 128;
+const PASSWORD_INPUT = new StringValidator({ allowEmpty: true, maxLength: MAX_PASSWORD_CHARS });
+const IDENTITY_INPUT = new StringValidator({ maxLength: MAX_IDENTITY_CHARS, pattern: NO_CONTROL });
+const SESSION_VALUE = new StringValidator({ maxLength: MAX_SESSION_VALUE_CHARS, pattern: /^[0-9a-f]{8}\.\d{1,16}\.[A-Za-z0-9_-]+$/ });
+
+/**
+ * Key id of a session secret: the first 8 hex characters of
+ * HMAC-SHA256(secret, "ut-kid"). Safe to print; it does not reveal the secret.
+ */
+export function keyIdOf(secret: string): string {
+	return createHmac("sha256", secret).update("ut-kid").digest("hex").slice(0, 8);
+}
+
+/** Session cookie name: `__Host-ut_session` for Secure cookies, else `ut_session`. */
+export function sessionCookieName(cookieSecure: boolean): string {
+	return cookieSecure ? "__Host-ut_session" : "ut_session";
+}
+
+/**
+ * Verification secrets by key id: the current secret plus every previous one.
+ * Throws on a previous secret shorter than MIN_SECRET_LENGTH or a key-id
+ * collision between distinct secrets, both of which are configuration errors.
+ * Lookups must validate the kid against KEY_ID first; the table is a plain
+ * object and 8-hex ids can never name a prototype property.
+ */
+function buildKeyRing(current: string, previous: string[]): Record<string, string> {
+	const secrets: Record<string, string> = { [keyIdOf(current)]: current };
+	for (const secret of previous) {
+		if (typeof secret !== "string" || secret.length < MIN_SECRET_LENGTH) {
+			throw new Error(`previous session secrets must be at least ${MIN_SECRET_LENGTH} characters`);
+		}
+		const kid = keyIdOf(secret);
+		const existing = secrets[kid];
+		if (existing === undefined) secrets[kid] = secret;
+		else if (existing !== secret) throw new Error(`session secret key id collision on ${kid}`);
+	}
+	return secrets;
+}
 
 interface Window {
 	count: number;
@@ -121,9 +231,37 @@ function retryAfterOf(hit: Hit | null, windowMs: number): number {
 	return hit ? hit.retryAfterSec : Math.ceil(windowMs / 1000);
 }
 
+/** Records a refused input on the security feed. Only the field and the validator code are recorded, never the value. */
+function refused(resource: string, field: string, code: string): void {
+	getSecurityLogger().logValidationFailure({ source: "auth", resource, details: { field, code } });
+}
+
+/** Lowest effective per-call scale; smaller finite values clamp up to it. */
+const MIN_REQUEST_SCALE = 0.1;
+
+/**
+ * Effective per-call scale. Omitted means 1. A finite value is clamped to
+ * [0.1, 1]. Anything else (NaN, Infinity, a non-number) fails closed to 0.1.
+ */
+function effectiveScale(scale: number | undefined): number {
+	if (scale === undefined) return 1;
+	if (typeof scale !== "number" || !Number.isFinite(scale)) return MIN_REQUEST_SCALE;
+	return Math.min(1, Math.max(MIN_REQUEST_SCALE, scale));
+}
+
+/** A request window limit multiplied by the scale factor, never below one request. */
+function scaledLimit(base: number, factor: number): number {
+	return Math.max(1, Math.floor(base * factor));
+}
+
 export function createAuth(options: AuthOptions): Auth {
 	const { ownerPasswordHash, sessionSecret, cookieSecure } = options;
 	const now = options.now ?? (() => Date.now());
+	const secretsByKid = buildKeyRing(sessionSecret, options.previousSessionSecrets ?? []);
+	const signingKid = keyIdOf(sessionSecret);
+	// Covered by every session MAC so an owner password change ends all sessions.
+	const passwordBinding = createHash("sha256").update(ownerPasswordHash).digest("hex");
+	const cookieName = sessionCookieName(cookieSecure);
 	const dummyHash = Bun.password.hashSync(randomBytes(32).toString("base64url"));
 	const loginsByIp = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
 	const ownerFailures = new FixedWindowLimiter(now, MAX_TRACKED_KEYS);
@@ -145,22 +283,28 @@ export function createAuth(options: AuthOptions): Auth {
 		}
 	}
 
-	function sign(expiresAtMs: number): string {
-		return createHmac("sha256", sessionSecret).update(`ut-session|${expiresAtMs}`).digest("base64url");
+	function sessionMac(secret: string, expiresAtMs: number): string {
+		return createHmac("sha256", secret).update(`ut-session|${expiresAtMs}|${passwordBinding}`).digest("base64url");
 	}
 
-	function approvalMac(proof: ApprovalProof): string | null {
+	function approvalMac(secret: string, proof: ApprovalProof): string | null {
 		const times = [proof.issuedAt, proof.expiresAt, proof.refreshedAt];
 		const timesOk = times.every((value) => Number.isSafeInteger(value) && value >= 0 && value <= 9_999_999_999_999_999);
 		if (!APPROVAL_TOKEN.test(proof.subject) || !APPROVAL_TOKEN.test(proof.nonce) || !timesOk) return null;
 		if (proof.expiresAt < proof.issuedAt || proof.refreshedAt < proof.issuedAt) return null;
-		return createHmac("sha256", sessionSecret)
+		return createHmac("sha256", secret)
 			.update(`ut-approval|${proof.subject}|${proof.nonce}|${proof.issuedAt}|${proof.expiresAt}|${proof.refreshedAt}`)
 			.digest("base64url");
 	}
 
+	/** Secret for a value's key id, or null when the kid is malformed or unknown. */
+	function ringSecret(kid: string): string | null {
+		if (!KEY_ID.test(kid)) return null;
+		return secretsByKid[kid] ?? null;
+	}
+
 	function cookieHeader(value: string, maxAgeSec: number): string {
-		const attributes = [`${COOKIE_NAME}=${value}`, "Path=/", "HttpOnly", "SameSite=Strict", `Max-Age=${maxAgeSec}`];
+		const attributes = [`${cookieName}=${value}`, "Path=/", "HttpOnly", "SameSite=Strict", `Max-Age=${maxAgeSec}`];
 		if (cookieSecure) attributes.push("Secure");
 		return attributes.join("; ");
 	}
@@ -168,23 +312,38 @@ export function createAuth(options: AuthOptions): Auth {
 	function readCookie(req: Request): string | null {
 		const header = req.headers.get("cookie");
 		if (!header) return null;
+		if (header.length > MAX_COOKIE_HEADER_CHARS) {
+			refused("session", "cookie", "TOO_LONG");
+			return null;
+		}
 		for (const part of header.split(";")) {
 			const eq = part.indexOf("=");
 			if (eq < 0) continue;
-			if (part.slice(0, eq).trim() === COOKIE_NAME) return part.slice(eq + 1).trim();
+			if (part.slice(0, eq).trim() === cookieName) return part.slice(eq + 1).trim();
 		}
 		return null;
 	}
 
 	return {
 		async login({ password, clientIp }) {
+			const passwordVerdict = PASSWORD_INPUT.validate(password);
+			if (!passwordVerdict.valid) {
+				refused("login", "password", passwordVerdict.errors[0]?.code ?? "INVALID");
+				return { ok: false, reason: "invalid" };
+			}
+			const addressVerdict = IDENTITY_INPUT.validate(clientIp);
+			if (!addressVerdict.valid) {
+				refused("login", "clientIp", addressVerdict.errors[0]?.code ?? "INVALID");
+				return { ok: false, reason: "invalid" };
+			}
 			const perIp = loginsByIp.hit(clientIp, LOGIN_WINDOW_MS);
 			if (!perIp || perIp.count > LOGIN_ATTEMPTS_PER_IP) {
 				return { ok: false, reason: "rate_limited", retryAfterSec: retryAfterOf(perIp, LOGIN_WINDOW_MS) };
 			}
 
 			// Reserve an owner-level slot before verifying so concurrent attempts
-			// cannot all pass the check at once. Released on success.
+			// cannot all pass the check at once. Both reservations are released on
+			// success, so only failures count against either window.
 			const perOwner = ownerFailures.hit(OWNER_KEY, LOGIN_WINDOW_MS);
 			if (!perOwner || perOwner.count > OWNER_FAILURES_PER_WINDOW) {
 				return { ok: false, reason: "rate_limited", retryAfterSec: retryAfterOf(perOwner, LOGIN_WINDOW_MS) };
@@ -195,25 +354,28 @@ export function createAuth(options: AuthOptions): Auth {
 			}
 
 			ownerFailures.release(OWNER_KEY);
+			loginsByIp.release(clientIp);
 			const expiresAt = now() + SESSION_LIFETIME_MS;
-			return {
-				ok: true,
-				setCookie: cookieHeader(`${expiresAt}.${sign(expiresAt)}`, SESSION_LIFETIME_MS / 1000),
-			};
+			const value = `${signingKid}.${expiresAt}.${sessionMac(sessionSecret, expiresAt)}`;
+			return { ok: true, setCookie: cookieHeader(value, SESSION_LIFETIME_MS / 1000) };
 		},
 
 		sessionFor(req) {
 			const value = readCookie(req);
 			if (!value) return null;
-			const dot = value.indexOf(".");
-			if (dot < 0) return null;
-			const expiresRaw = value.slice(0, dot);
-			const mac = value.slice(dot + 1);
-			if (!/^\d{1,16}$/.test(expiresRaw)) return null;
+			// Exactly `<kid>.<expiresAt>.<mac>`; the pre-ring two-part layout is refused.
+			const shape = SESSION_VALUE.validate(value);
+			if (!shape.valid) {
+				refused("session", "cookie", shape.errors[0]?.code ?? "INVALID");
+				return null;
+			}
+			const [kid = "", expiresRaw = "", mac = ""] = value.split(".");
+			const secret = ringSecret(kid);
+			if (secret === null) return null;
 			const expiresAt = Number(expiresRaw);
 			if (!Number.isSafeInteger(expiresAt) || expiresAt <= now()) return null;
 
-			const expected = Buffer.from(sign(expiresAt));
+			const expected = Buffer.from(sessionMac(secret, expiresAt));
 			const actual = Buffer.from(mac);
 			if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
 			return { ownerId: OWNER_ID };
@@ -223,14 +385,37 @@ export function createAuth(options: AuthOptions): Auth {
 			return cookieHeader("", 0);
 		},
 
-		allowRequest({ clientIp, ownerId }) {
+		allowRequest({ clientIp, ownerId, principal, ownerLimit, scale }) {
+			// These arguments come from the router, never from a request: a bad one is a programming error, so it throws.
+			if (!IDENTITY_INPUT.validate(clientIp).valid || !IDENTITY_INPUT.validate(ownerId).valid) {
+				refused("limits", "identity", "INVALID");
+				throw new TypeError("request limit needs a client address and an owner id");
+			}
+			if (principal !== undefined && (typeof principal !== "string" || principal.length > MAX_PRINCIPAL_INPUT_CHARS)) {
+				refused("limits", "principal", "INVALID");
+				throw new TypeError("request limit principal must be a string of at most 4096 characters");
+			}
+			if (ownerLimit !== undefined && (!Number.isFinite(ownerLimit) || ownerLimit < 0)) {
+				refused("limits", "ownerLimit", "INVALID");
+				throw new TypeError("request limit owner limit must be a finite, non-negative number");
+			}
+			const factor = effectiveScale(scale);
 			const ip = requests.hit(`ip:${clientIp}`, REQUEST_WINDOW_MS);
-			if (!ip || ip.count > IP_REQUESTS_PER_WINDOW) {
-				return { ok: false, retryAfterSec: retryAfterOf(ip, REQUEST_WINDOW_MS) };
+			if (!ip || ip.count > scaledLimit(IP_REQUESTS_PER_WINDOW, factor)) {
+				return { ok: false, retryAfterSec: retryAfterOf(ip, REQUEST_WINDOW_MS), scope: "ip" };
+			}
+			if (principal !== undefined) {
+				const key = principal.length <= MAX_PRINCIPAL_LENGTH
+					? principal
+					: `sha256:${createHash("sha256").update(principal).digest("hex")}`;
+				const hit = requests.hit(`principal:${key}`, REQUEST_WINDOW_MS);
+				if (!hit || hit.count > scaledLimit(PRINCIPAL_REQUESTS_PER_WINDOW, factor)) {
+					return { ok: false, retryAfterSec: retryAfterOf(hit, REQUEST_WINDOW_MS), scope: "principal" };
+				}
 			}
 			const owner = requests.hit(`owner:${ownerId}`, REQUEST_WINDOW_MS);
-			if (!owner || owner.count > OWNER_REQUESTS_PER_WINDOW) {
-				return { ok: false, retryAfterSec: retryAfterOf(owner, REQUEST_WINDOW_MS) };
+			if (!owner || owner.count > scaledLimit(ownerLimit ?? OWNER_REQUESTS_PER_WINDOW, factor)) {
+				return { ok: false, retryAfterSec: retryAfterOf(owner, REQUEST_WINDOW_MS), scope: "owner" };
 			}
 			return { ok: true };
 		},
@@ -240,21 +425,42 @@ export function createAuth(options: AuthOptions): Auth {
 		},
 
 		signApproval(proof) {
-			const mac = approvalMac(proof);
-			if (mac === null) throw new Error("invalid approval proof");
-			return mac;
+			const mac = approvalMac(sessionSecret, proof);
+			if (mac === null) {
+				refused("approval", "proof", "INVALID");
+				throw new Error("invalid approval proof");
+			}
+			return `${signingKid}.${mac}`;
 		},
 
 		verifyApproval(proof, signature) {
-			if (typeof signature !== "string" || signature.length === 0 || signature.length > 128) return false;
-			const expected = approvalMac(proof);
-			if (expected === null) return false;
+			if (typeof signature !== "string" || signature.length === 0 || signature.length > MAX_SIGNATURE_CHARS) {
+				refused("approval", "signature", "INVALID");
+				return false;
+			}
+			const dot = signature.indexOf(".");
+			const kid = dot < 0 ? "" : signature.slice(0, dot);
+			if (!KEY_ID.test(kid)) {
+				refused("approval", "signature", "PATTERN_MISMATCH");
+				return false;
+			}
+			const secret = ringSecret(kid);
+			if (secret === null) return false;
+			const expected = approvalMac(secret, proof);
+			if (expected === null) {
+				refused("approval", "proof", "INVALID");
+				return false;
+			}
 			const expectedBuf = Buffer.from(expected);
-			const actualBuf = Buffer.from(signature);
+			const actualBuf = Buffer.from(signature.slice(dot + 1));
 			return actualBuf.length === expectedBuf.length && timingSafeEqual(actualBuf, expectedBuf);
 		},
 
 		allowApprovalAttempt(clientIp) {
+			if (!IDENTITY_INPUT.validate(clientIp).valid) {
+				refused("approval", "clientIp", "INVALID");
+				throw new TypeError("approval attempt needs a client address");
+			}
 			const hit = approvalAttempts.hit(clientIp, APPROVAL_WINDOW_MS);
 			if (!hit || hit.count > APPROVAL_ATTEMPTS_PER_WINDOW) {
 				return { ok: false, retryAfterSec: retryAfterOf(hit, APPROVAL_WINDOW_MS) };
@@ -285,9 +491,14 @@ function limiterKey(address: string): string {
 		.join(":")}::/64`;
 }
 
-export function clientIpFrom(req: Request, peerIp: string): string {
-	if (LOOPBACK_PEERS[peerIp] !== true) return limiterKey(peerIp);
+/**
+ * Address the limiters and logs use. X-Real-IP is read only when `trustForwarded` is true. The default is the
+ * plaintext-mode rule (a loopback peer); with mTLS the router passes true only for the verified edge identity.
+ */
+export function clientIpFrom(req: Request, peerIp: string, trustForwarded = LOOPBACK_PEERS[peerIp] === true): string {
+	if (!trustForwarded) return limiterKey(peerIp);
 	const forwarded = req.headers.get("x-real-ip")?.trim();
 	if (forwarded && FORWARDED_IP.test(forwarded) && isIP(forwarded) !== 0) return limiterKey(forwarded);
+	if (forwarded) refused("client-ip", "x-real-ip", "PATTERN_MISMATCH");
 	return limiterKey(peerIp);
 }

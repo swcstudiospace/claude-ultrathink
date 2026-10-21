@@ -11,6 +11,10 @@ export interface ShutdownDeps {
 	logger: Logger;
 	/** Longest a graceful shutdown may take before the process exits anyway. */
 	timeoutMs: number;
+	/** Called first, so the app refuses new work while in-flight requests finish. */
+	beginDrain?: () => void;
+	/** Time after `beginDrain`, before the server stops. Defaults to 0: no wait. */
+	drainMs?: number;
 	/** Runs `run` after `ms` and returns a canceller. Defaults to an unref'd timer; a test supplies its own. */
 	schedule?: (run: () => void, ms: number) => () => void;
 	exit: (code: number) => void;
@@ -33,6 +37,7 @@ function defaultSchedule(run: () => void, ms: number): () => void {
  * One shutdown for the whole process; later calls return the first one's promise.
  * `server.stop()` is started first and awaited last: ending the planner's jobs is what releases
  * long-polling requests, which the graceful stop is waiting for. The store closes only after both.
+ * `beginDrain` runs first and `drainMs` elapses before the server stops, so in-flight work can finish.
  */
 export function createShutdown(deps: ShutdownDeps): Shutdown {
 	const { server, app, store, logger } = deps;
@@ -53,6 +58,7 @@ export function createShutdown(deps: ShutdownDeps): Shutdown {
 
 		logger.info("shutdown", { reason });
 		const schedule = deps.schedule ?? defaultSchedule;
+		const drainMs = deps.drainMs ?? 0;
 		const cancel = schedule(() => {
 			logger.error("shutdown_timeout", { reason, timeoutMs: deps.timeoutMs });
 			finish(code === 0 ? 1 : code);
@@ -60,6 +66,20 @@ export function createShutdown(deps: ShutdownDeps): Shutdown {
 
 		return (async () => {
 			try {
+				try {
+					deps.beginDrain?.();
+				} catch (error) {
+					failedStep("drain", error);
+				}
+				if (drainMs > 0) {
+					const drained = Promise.withResolvers<void>();
+					const cancelDrain = schedule(() => drained.resolve(), drainMs);
+					try {
+						await drained.promise;
+					} finally {
+						cancelDrain();
+					}
+				}
 				let stopped: Promise<void> = Promise.resolve();
 				try {
 					stopped = Promise.resolve(server.stop());

@@ -27,7 +27,11 @@
 		"uplift": "bun hooks/uplift.ts --ctl",
 		"setup": "bun scripts/setup.ts",
 		"mcp": "bun src/mcp/cli.ts",
-		"ship": "bun src/ship/cli.ts"
+		"chaos": "bun services/ultrathink/chaos/cli.ts",
+		"ship": "bun src/ship/cli.ts",
+		"policy:check": "bash policy/check.sh",
+		"policy:collect": "bun policy/collect.ts",
+		"compliance": "bun policy/compliance-report.ts --root ."
 	},
 	"omp": {
 		"extensions": ["./src/host/omp.ts"]
@@ -36,8 +40,9 @@
 		"extensions": ["./src/host/omp.ts"]
 	},
 	"devDependencies": {
-		"@oh-my-pi/pi-ai": "^18.8.0",
-		"@oh-my-pi/pi-catalog": "^18.8.0",
-		"@types/bun": "^1.4.0"
+		"@oh-my-pi/pi-ai": "^18.12.0",
+		"@oh-my-pi/pi-catalog": "^18.12.0",
+		"@types/bun": "^1.4.3",
+		"yaml": "2.9.1"
 	}
 }

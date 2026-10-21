@@ -291,8 +291,12 @@ describe("runControl", () => {
 		expect(unset).toContain("shunt gateway not configured (set grok.shuntBaseUrl)");
 		expect(unset).toContain("wire model grok-test");
 		expect(unset).not.toContain("/v1/messages");
+		// A project file cannot set the gateway: the same key there leaves the status line unchanged.
+		projectConfig({ grok: { ...grok, shuntBaseUrl: "https://gateway.example" } });
+		expect(await statusLine("Grok:")).toBe(unset);
 
-		projectConfig({ grok: { ...grok, shuntBaseUrl: "https://gateway.example", shuntModel: "wire-x" } });
+		userServices({ grok: { shuntBaseUrl: "https://gateway.example" } });
+		projectConfig({ grok: { ...grok, shuntModel: "wire-x" } });
 		const set = await statusLine("Grok:");
 		expect(set).toContain("https://gateway.example/v1/messages");
 		expect(set).toContain("wire model wire-x");
