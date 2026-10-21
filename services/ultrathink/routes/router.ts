@@ -750,9 +750,7 @@ export function createApp(deps: RouterDeps): App {
 			signal,
 			onWait: () => {
 				waited = true;
-				ctx.outer.release?.();
-				ctx.outer.release = undefined;
-				metrics.gauge("ultrathink_http_inflight", inflight.count);
+				releaseOuter(ctx);
 			},
 		});
 		if (!slot.ok) {
@@ -762,6 +760,8 @@ export function createApp(deps: RouterDeps): App {
 		if (waited) {
 			const outer = inflight.enter();
 			if (outer === null) {
+				// Same order as every finishing call: outer first, then the share slot a waiter may be woken by.
+				releaseOuter(ctx);
 				slot.release();
 				metrics.inc("ultrathink_overload_total");
 				return fail(503, "overloaded", { "Retry-After": "1" });
@@ -775,8 +775,18 @@ export function createApp(deps: RouterDeps): App {
 			return await work();
 		} finally {
 			if (context) context.admission = undefined;
+			// Outer first: a waiter woken by the share release must see the outer slot already free, or its re-entry fails.
+			releaseOuter(ctx);
 			slot.release();
 		}
+	}
+
+	/** Gives back the request's outer inflight slot if it holds one. Idempotent; the only place the outer slot is released. */
+	function releaseOuter(ctx: RequestCtx): void {
+		const release = ctx.outer.release;
+		ctx.outer.release = undefined;
+		release?.();
+		metrics.gauge("ultrathink_http_inflight", inflight.count);
 	}
 
 	function authFailed(kind: string): void {
@@ -1231,8 +1241,7 @@ export function createApp(deps: RouterDeps): App {
 				logger.error("request_error", { reqId: ctx.reqId, correlationId, error, stack: true });
 				response = respond(500, { error: "internal_error", correlationId });
 			} finally {
-				ctx.outer.release?.();
-				metrics.gauge("ultrathink_http_inflight", inflight.count);
+				releaseOuter(ctx);
 			}
 			response = withHeaders(response, { "X-Request-Id": ctx.reqId, traceparent: formatTraceparent(server) });
 

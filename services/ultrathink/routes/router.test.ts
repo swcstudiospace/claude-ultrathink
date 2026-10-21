@@ -600,10 +600,10 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 	/** A fresh app over its own state directory: its own penalty table, pools, load history and auth windows. */
 	function build(
 		overrides: Partial<UltrathinkConfig> = {},
-		extras: { stateDir?: string; planner?: HeadlessPlanner; onPoolEntry?: () => void } = {},
+		extras: { stateDir?: string; planner?: HeadlessPlanner; onPoolEntry?: () => void; auth?: Auth } = {},
 	): { app: App; metrics: Metrics } {
 		const metrics = createMetrics();
-		const auth = createAuth({ ownerPasswordHash: config.ownerPasswordHash, sessionSecret: config.sessionSecret, cookieSecure: true });
+		const auth = extras.auth ?? createAuth({ ownerPasswordHash: config.ownerPasswordHash, sessionSecret: config.sessionSecret, cookieSecure: true });
 		const app = createApp({
 			config: { ...config, stateDir: extras.stateDir ?? mkdtempSync(join(root, "app-")), ...overrides },
 			store,
@@ -851,6 +851,82 @@ describe("penalties, pool shares, pressure scaling and load history", () => {
 		expect((await holdB).status).toBe(200);
 		expect((await queuedC).status).toBe(200);
 		expect((await queuedD).status).toBe(200);
+	});
+
+	test("a finishing call releases its outer slot before its share slot: a queued call is admitted, not 503", async () => {
+		const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()] as const;
+		const reached = Promise.withResolvers<void>();
+		const waiterQueued = Promise.withResolvers<void>();
+		const loginsHeld = Promise.withResolvers<void>();
+		const releaseLogins = Promise.withResolvers<void>();
+		const heldLoginIps = new Set(["203.0.113.1", "203.0.113.2"]);
+		let entered = 0;
+		let pooled = 0;
+		let loginsEntered = 0;
+		const planner: HeadlessPlanner = {
+			enabled: true,
+			async start(input) {
+				entered += 1;
+				if (entered === 2) reached.resolve();
+				// The third connector, admitted from the queue, is not gated.
+				const gate = gates[entered - 1];
+				if (gate !== undefined) await gate.promise;
+				return { ok: true, data: { sessionId: String(input.sessionId ?? "held"), status: "running", pollAfterSec: 5 } };
+			},
+			async result() {
+				throw new Error("the stub planner is not asked for results in this test");
+			},
+			status: () => null,
+			async shutdown() {},
+			upstream: () => undefined,
+		};
+		// /login calls from the held IPs block inside auth, holding an outer slot each; every other caller is unaffected.
+		const realAuth = createAuth({ ownerPasswordHash: config.ownerPasswordHash, sessionSecret: config.sessionSecret, cookieSecure: true });
+		const gatedAuth: Auth = {
+			...realAuth,
+			async login(input) {
+				if (!heldLoginIps.has(input.clientIp)) return realAuth.login(input);
+				loginsEntered += 1;
+				if (loginsEntered === 2) loginsHeld.resolve();
+				await releaseLogins.promise;
+				return realAuth.login(input);
+			},
+		};
+		// maxInflight 4, reserve 50 %: two connectors hold the non-owner share, the third waits in the queue (depth 16).
+		const { app, metrics } = build(
+			{ connectorKey: CONNECTOR_KEY, maxInflight: 4, priorityReservePct: 50 },
+			{
+				planner,
+				auth: gatedAuth,
+				onPoolEntry: () => {
+					pooled += 1;
+					// Entry 3 is the waiter; its outer slot is released in the same synchronous step, so this resolves after that.
+					if (pooled === 3) waiterQueued.resolve();
+				},
+			},
+		);
+		const loginFrom = (ip: string): Promise<Response> =>
+			app.handle(new Request(`${PUBLIC_ORIGIN}/login`, { method: "POST", headers: jsonHeaders(), body: JSON.stringify({ password: "not-the-owner-password" }) }), ip);
+
+		const holdA = app.handle(connectorUplift(1), "198.51.100.1");
+		const holdB = app.handle(connectorUplift(2), "198.51.100.2");
+		await reached.promise;
+		const waiter = app.handle(connectorUplift(3), "198.51.100.3");
+		await waiterQueued.promise;
+		// Outer slots: two running connectors plus the two logins make four, the limit.
+		const logins = [loginFrom("203.0.113.1"), loginFrom("203.0.113.2")];
+		await loginsHeld.promise;
+		expect(metrics.sum("ultrathink_http_inflight")).toBe(4);
+
+		// holdA finishes. Its outer slot must be released before its share slot wakes the waiter.
+		gates[0].resolve();
+		expect((await holdA).status).toBe(200);
+		expect((await waiter).status).toBe(200);
+
+		gates[1].resolve();
+		releaseLogins.resolve();
+		expect((await holdB).status).toBe(200);
+		for (const login of logins) expect((await login).status).toBe(401);
 	});
 
 	test("a corrupt load-history.json starts the app empty and is logged; readiness and metrics still answer", async () => {
