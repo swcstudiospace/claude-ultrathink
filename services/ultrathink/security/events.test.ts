@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { createLogger } from "../obs/log.ts";
 import { ConsoleSecurityEventLogger, SecurityEventType, createSecurityEvent } from "./events.ts";
 
@@ -34,4 +35,22 @@ describe("Security events", () => {
 
 		expect(lines).toHaveLength(0);
 	});
+
+	test("the default writer sends each line to stderr and nothing to stdout", async () => {
+		// A process that installs no writer gets the default one. Stdout carries protocol traffic in the stdio modes.
+		const eventsPath = fileURLToPath(new URL("./events.ts", import.meta.url));
+		// The child process loads events.ts by absolute path at run time, which a static import cannot express. That is the module-loading boundary under test.
+		const probe = `(async () => {
+  const { ConsoleSecurityEventLogger } = await import(${JSON.stringify(eventsPath)});
+  new ConsoleSecurityEventLogger().logValidationFailure({ source: "probe", resource: "/probe", details: { field: "field", code: "PROBE" } });
+})();`;
+		const child = Bun.spawn([process.execPath, "-e", probe], { stdout: "pipe", stderr: "pipe" });
+		const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+
+		expect(exitCode).toBe(0);
+		expect(stdout).toBe("");
+		const lines = stderr.split("\n").filter((line) => line.startsWith("{"));
+		expect(lines).toHaveLength(1);
+		expect(JSON.parse(lines[0] ?? "")).toMatchObject({ level: "info", event: "security.validation_failure", source: "probe", details: { field: "field", code: "PROBE" } });
+	}, 15_000);
 });

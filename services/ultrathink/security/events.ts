@@ -56,13 +56,21 @@ function getCurrentTimestamp(): number {
 
 const LOG_LEVEL = { low: "info", medium: "warn", high: "warn", critical: "error" } as const;
 
+/** stderr, never stdout: the stdio MCP relay sends its protocol messages on stdout. */
+function writeLineToStderr(line: string): void {
+	process.stderr.write(`${line}\n`);
+}
+
 export class ConsoleSecurityEventLogger implements SecurityEventLogger {
 	private severityOrder = { low: 0, medium: 1, high: 2, critical: 3 };
 	private minSeverity: 'low' | 'medium' | 'high' | 'critical' = 'low';
 	private readonly logger: Logger;
 
-	/** Writes through the app's structured logger, which stamps each line and drops secret-named fields. */
-	constructor(logger: Logger = createLogger()) {
+	/**
+	 * Writes through the structured logger, which stamps each line and drops secret-named fields. The default writer is
+	 * stderr: stdout carries protocol traffic in the stdio modes, so a security line must never land there.
+	 */
+	constructor(logger: Logger = createLogger({ write: writeLineToStderr })) {
 		this.logger = logger;
 	}
 
