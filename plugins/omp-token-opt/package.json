@@ -17,6 +17,6 @@
     "extensions": ["./src/index.ts"]
   },
   "dependencies": {
-    "gpt-tokenizer": "4.0.3"
+    "gpt-tokenizer": "4.1.0"
   }
 }
