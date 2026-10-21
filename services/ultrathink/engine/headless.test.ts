@@ -18,6 +18,7 @@ import type { UltrathinkConfig } from "../config/config.ts";
 import { createLedger } from "../cost/ledger.ts";
 import { type RequestContext, runWithRequestContext } from "../obs/context.ts";
 import type { Admission } from "../obs/fair-share.ts";
+import type { FinishedSpan, SpanSink } from "../obs/otel.ts";
 import { openStore, type Store } from "../store/store.ts";
 import { createCircuitBreaker } from "./breaker.ts";
 import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner, type PlannerCall, UNPERSISTED_JOBS_MAX } from "./headless.ts";
@@ -1107,5 +1108,31 @@ describe("headless planner: plan-slot fairness", () => {
 		expect(await startAs(h, connector("key-b"), sessionId)).toMatchObject({ ok: true, data: { sessionId, status: "running" } });
 		gate.resolve();
 		await h.planner.result({ sessionId, waitSeconds: 30 });
+	});
+});
+
+describe("headless planner: client span threading", () => {
+	test("a planner call started inside a request context records its hop span parented by that context", async () => {
+		const CTX: RequestContext = { reqId: "req-plan-span", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+		const spans: FinishedSpan[] = [];
+		const sink: SpanSink = {
+			record: (span) => {
+				spans.push(span);
+			},
+		};
+		const sentParents: string[] = [];
+		const rejected: OpenRouterFetch = async (_url, init) => {
+			sentParents.push((init.headers as Record<string, string>).traceparent?.split("-")[2] ?? "");
+			return new Response("nope", { status: 401 });
+		};
+		const h = setup({}, { completer: undefined, fetch: rejected, spans: sink });
+		const sessionId = randomUUID();
+		const started = await runWithRequestContext(CTX, () => h.planner.start({ prompt: PROMPT, sessionId }));
+		expect(started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "auth" } });
+		expect(spans.length).toBeGreaterThanOrEqual(1);
+		expect(spans.map((span) => span.spanId)).toEqual(sentParents);
+		for (const span of spans) {
+			expect(span).toMatchObject({ traceId: CTX.traceId, parentSpanId: CTX.spanId, kind: 3, error: false });
+		}
 	});
 });

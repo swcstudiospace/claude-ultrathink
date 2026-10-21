@@ -283,6 +283,8 @@ A counter appears only after its first increment, so a fresh process, a quiet ho
 | Disk | `/var/lib/ultrathink` or `/var/backups/ultrathink` filesystem above 80 percent. | Ticket |
 | Certificate | Edge or origin certificate expires in under 14 days (`certbot renew --dry-run` monthly). | Ticket |
 
+The metric rows of this table are encoded as alert rules in `deploy/observability/rules.yml`; the backup, disk, certificate, restart and external-probe rows are not (section 16).
+
 ## 9. Cloudflare settings to check
 
 - SSL/TLS mode **Full (strict)**; minimum TLS version 1.2; Always Use HTTPS on.
@@ -643,3 +645,69 @@ Each item below is not built. Its prerequisite is named; until that exists, only
 - **Shared rate-limit state (RATE-04, Redis Cluster).** Prerequisite: a reachable Redis Cluster endpoint, approval of a Redis client dependency (`package.json` has none), and a multi-replica deployment to test against. Until then the limits in this section apply per process.
 - **SIEM delivery of abuse events.** Prerequisite: the Phase 68 SIEM sink and its collector. Until both exist, `abuse_penalty` stays in the local audit log and in any sink from section 14, and no collector alerts on it.
 - **Calibration of `ULTRATHINK_REPLICA_CAPACITY_RPS`.** Prerequisite: a load test on the VPS with the production build. See the warning above.
+
+## 16. Observability
+
+This section covers the phase 71 signals. Metrics live in memory and reset on restart. Scrape them on loopback with `curl -s 127.0.0.1:8795/metrics`. Every family named here is in the closed list in `services/ultrathink/obs/metric-families.ts`, and the deploy files may use only those names.
+
+### Traces
+
+- `ULTRATHINK_OTLP_ENDPOINT` is optional. Unset or empty disables export. Otherwise it must be `https://`, or `http://` for `127.0.0.1`, `localhost` or `[::1]`, with no userinfo, query or fragment. A trailing slash is removed, and spans go to `<endpoint>/v1/traces` as OTLP/JSON. A bad value stops startup with an error that names the variable and never the value.
+- Spans are recorded only for sampled requests. Sampling is head-based: the inbound `traceparent` flag decides, and a request with no inbound trace is sampled. Each request gets a SERVER span, and each OpenRouter attempt gets a CLIENT span named `POST chat/completions` with `server.address` set to the host only. No span carries a URL path, query, header, API key, bearer token or peer address.
+- Export is bounded: a queue of 2048 spans, batches of 512, a 5 s timeout, and a flush on each 5 s runtime sample and at shutdown. A failed batch is dropped and never retried, and export never delays a response.
+- `ultrathink_otel_spans_dropped_total{reason="queue_full"}` counts spans refused by a full queue, and `ultrathink_otel_export_failures_total` counts failed batches. If failures rise, test the collector from the host with `curl -s -o /dev/null -w '%{http_code}\n' -X POST '<endpoint>/v1/traces' -H 'content-type: application/json' -d '{}'`. Any HTTP status means the collector answers; `000` or a timeout means it does not.
+
+### Log correlation
+
+Lines written inside a request carry `reqId`, `traceId` and `spanId`. The `request` line (info, or warn for 5xx) has the `reqId` that the response returns in `X-Request-Id`, and its `spanId` equals the parent-id of the response `traceparent`. To follow one request, grep its `traceId` or `reqId` in `journalctl -u ultrathink-web -o cat`. A `planner_call` line carries the `reqId` of the request that started the plan.
+
+`tracestate` is not parsed, forwarded or echoed (D3). This deviates from the W3C trace-context SHOULD on purpose: the service must not pass opaque third-party state to upstreams it calls for a client (`services/ultrathink/obs/trace.ts`). The owner may reverse it; see the blocked items.
+
+### New metric families
+
+| Family | Labels | Meaning |
+|---|---|---|
+| `ultrathink_upstream_breaker_transitions_total` | `from`, `to` | Breaker state changes on the OpenRouter hop |
+| `ultrathink_audit_chain_notices_total` | none | Audit chain notices (section 14) |
+| `ultrathink_retention_sweep_duration_seconds` | histogram | Duration of one retention sweep |
+| `ultrathink_retention_errors_total` | none | Errors reported by retention sweeps |
+| `ultrathink_otel_spans_dropped_total` | `reason` (`queue_full`) | Spans not exported |
+| `ultrathink_otel_export_failures_total` | none | Export batches that failed and were dropped |
+| `ultrathink_anomaly_active` | `signal` | 1 while that signal's detector is raised |
+| `ultrathink_anomaly_transitions_total` | `signal`, `to` (`raised` or `cleared`) | Detector transitions |
+| `ultrathink_slo_error_budget_remaining_ratio` | `slo` | Budget left over the 6 h in-process window; negative when overspent |
+| `ultrathink_slo_burn_rate` | `slo`, `window` (`5m`, `30m`, `1h`, `6h`) | Burn rate per window; 1 spends the budget exactly at the objective's pace |
+| `ultrathink_slo_observed_seconds` | `slo` | Span of history the SLO figures cover |
+
+### Anomaly detection
+
+The detector watches three runtime values sampled every 5 s: `event_loop_lag`, `rss` and `heap_used`. HTTP rates are not watched, because they are sparse at current traffic. Each signal keeps an EWMA baseline (alpha 0.1). After 30 warm-up samples, a sample breaches when its z-score reaches 4 in either direction; sigma is floored at 5 percent of the mean. A signal raises after 3 breaching samples in a row and clears after 5 calm samples in a row. The baseline freezes during a breach, so a sustained step does not become the new normal. After 120 breaching samples while raised, the detector adopts the new level and clears. Each raise or clear logs an `anomaly` line at warn with `signal` and `to`.
+
+State is in memory, so after a restart a signal needs about 150 s of warm-up before it can raise. `UltrathinkAnomalyActive` is a ticket after 10 minutes. A raised signal marks a change in the process; it does not name a cause.
+
+### SLO
+
+- The SLI is the share of `ultrathink_http_requests_total` that is not `status_class="5xx"`. Only 5xx count as bad. The objective is 0.99 for `http_availability`, a chosen default that the owner may change in one place.
+- In process, the budget and burn-rate gauges cover the last 6 h at 5 s sampling. Counters reset at restart, so `ultrathink_slo_observed_seconds` stays under 6 h for a while after one. A short value means partial coverage, not a healthy service.
+- For 30 days, Prometheus records `ultrathink:http_bad_ratio:30d`. The 30-day budget is `1 - ratio / 0.01`.
+- Burn-rate alerts: page when the 1 h and 5 m burn rates both exceed 14.4; ticket when the 6 h and 30 m burn rates both exceed 6.
+
+### Deploy files
+
+- `deploy/observability/rules.yml`: group `ultrathink-alerts` encodes the metric rows of section 8, plus breaker open (page, 5 m) and anomaly active (ticket, 10 m). Group `ultrathink-slo` holds the 30-day recording rule and the burn-rate alerts. Ratios and increases use `or vector(0)`. Check with `promtool check rules deploy/observability/rules.yml`. Not encoded: restart count, external probes, planner saturation, the USD budget threshold, backups, disk and certificates.
+- `deploy/observability/prometheus.yml`: scrapes `127.0.0.1:8795/metrics` every 30 s and loads `rules.yml`. It has no `alerting:` block. Prometheus must run on the same host, because `/metrics` answers only on loopback. Check with `promtool check config deploy/observability/prometheus.yml`.
+- `deploy/observability/dashboards/ultrathink.json`: one Grafana dashboard with a `DS_PROMETHEUS` input and three rows: Service health, Business flows, and SLO and anomaly.
+- `services/ultrathink/obs/observability-contract.test.ts` fails when a deploy file names a family outside `METRIC_FAMILIES`, so a rename cannot silently blank a rule or panel.
+
+### Not provided by this repo
+
+Each item is open and names its prerequisite. Until the prerequisite exists, the behaviour above is unverified end to end.
+
+- **Collector export check.** Prerequisite: an OTLP/HTTP collector reachable at `ULTRATHINK_OTLP_ENDPOINT`. Until then, export is covered by unit tests only.
+- **End-to-end trace view.** Prerequisite: the same collector, and the owner's ruling on `tracestate` (D3).
+- **Scope of "all services" (D12).** Only `services/ultrathink` is covered. `hosts/*` and `src/*` are host and CLI packages; they count as services only if the owner rules so.
+- **Prometheus host and tooling.** Prerequisite: Prometheus on the same host, `promtool`, and 30-day retention for the budget. Rule and config validity are unchecked until then.
+- **Alert routing.** Prerequisite: an Alertmanager URL, or a PagerDuty or Opsgenie routing key, an on-call schedule, and a named escalation owner. `prometheus.yml` has no receiver, so alerts fire into nothing.
+- **Log shipping.** Prerequisite: a log backend such as journald forwarded to an aggregator. The service writes to stdout only.
+- **Grafana and staging.** Prerequisite: a Grafana instance with a Prometheus datasource to render the dashboard, and a staging host to run the scrape and rules before production.
+- **ML anomaly models.** Prerequisite: persisted time-series history and an approved ML dependency. The detector is an in-process EWMA, and the repo has no runtime dependencies (D1).

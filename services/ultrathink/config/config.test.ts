@@ -894,3 +894,36 @@ describe("rate limiting settings", () => {
 		expect(config.penaltyMaxSec).toBe(300);
 	});
 });
+
+describe("ULTRATHINK_OTLP_ENDPOINT", () => {
+	test("unset and empty both give undefined", () => {
+		expect(loadConfig(baseEnv()).otlpEndpoint).toBeUndefined();
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_OTLP_ENDPOINT: "" }).otlpEndpoint).toBeUndefined();
+	});
+
+	test("a trailing slash is removed from the stored endpoint", () => {
+		expect(loadConfig({ ...baseEnv(), ULTRATHINK_OTLP_ENDPOINT: "https://collector.example/otel/" }).otlpEndpoint).toBe(
+			"https://collector.example/otel",
+		);
+	});
+
+	test("plaintext http is refused for a non-loopback host", () => {
+		const message = messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_OTLP_ENDPOINT: "http://collector.example:4318" }));
+		expect(message).toContain("ULTRATHINK_OTLP_ENDPOINT");
+	});
+
+	test("http is accepted for 127.0.0.1, localhost and [::1]", () => {
+		for (const value of ["http://127.0.0.1:4318", "http://localhost:4318", "http://[::1]:4318"]) {
+			expect(loadConfig({ ...baseEnv(), ULTRATHINK_OTLP_ENDPOINT: value }).otlpEndpoint).toBe(value);
+		}
+	});
+
+	test("credentials, a query or a fragment are refused, and the message echoes neither the secret nor the query", () => {
+		for (const value of ["https://user:secret@collector.example", "https://collector.example/?key=1", "https://collector.example/#key=1"]) {
+			const message = messageOf(() => loadConfig({ ...baseEnv(), ULTRATHINK_OTLP_ENDPOINT: value }));
+			expect(message).toContain("ULTRATHINK_OTLP_ENDPOINT");
+			expect(message).not.toContain("secret");
+			expect(message).not.toContain("key=1");
+		}
+	});
+});

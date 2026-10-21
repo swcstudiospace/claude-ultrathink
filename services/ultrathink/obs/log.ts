@@ -124,6 +124,7 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
 			if (ctx !== undefined) {
 				body.reqId ??= ctx.reqId;
 				body.traceId ??= ctx.traceId;
+				body.spanId ??= ctx.spanId;
 			}
 			// Reserved keys come last so a field can never overwrite them.
 			const line = JSON.stringify({ ...body, ts: stamp(now), level, event: clip(String(event)) });

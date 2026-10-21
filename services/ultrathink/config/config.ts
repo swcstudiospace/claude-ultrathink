@@ -96,6 +96,8 @@ export interface UltrathinkConfig {
 	auditKafkaRestUrl?: string;
 	/** Kafka topic; set together with auditKafkaRestUrl. */
 	auditKafkaTopic?: string;
+	/** OTLP/JSON trace collector base URL: https, or http to 127.0.0.1, localhost or [::1]. Absent disables span export. */
+	otlpEndpoint?: string;
 }
 
 const DEFAULT_STATE_DIR = "/var/lib/ultrathink";
@@ -130,6 +132,7 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = "low";
 const OWNER_HASH_FORMAT =
 	/^(?:\$argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+|\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53})$/;
 const LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true };
+const OTLP_LOOPBACK_HOSTS: Record<string, true> = { localhost: true, "127.0.0.1": true, "[::1]": true };
 const DEFAULT_AUDIT_ANCHOR_EVERY = 1000;
 const DEFAULT_AUDIT_SEGMENT_BYTES = 67108864;
 const DEFAULT_AUDIT_RETENTION_DAYS = 365;
@@ -425,6 +428,31 @@ function readSinkUrl(env: Record<string, string | undefined>, name: string): str
 	throw new ConfigError(`${name} must use https://, or http:// to 127.0.0.1 or localhost`);
 }
 
+/**
+ * The span collector base URL, stored without trailing slashes ("/v1/traces" is appended by the exporter). Plaintext
+ * http is accepted only for loopback. The value is never echoed: a userinfo password must not reach a log.
+ */
+function readOtlpEndpoint(env: Record<string, string | undefined>): string | undefined {
+	const name = "ULTRATHINK_OTLP_ENDPOINT";
+	const raw = readOptional(env, name);
+	if (raw === undefined) {
+		return undefined;
+	}
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		throw new ConfigError(`${name} must be an absolute URL`);
+	}
+	if (url.protocol !== "https:" && !(url.protocol === "http:" && OTLP_LOOPBACK_HOSTS[url.hostname] === true)) {
+		throw new ConfigError(`${name} must use https://, or http:// to 127.0.0.1, localhost or [::1]`);
+	}
+	if (url.username !== "" || url.password !== "" || raw.includes("?") || raw.includes("#")) {
+		throw new ConfigError(`${name} must be a URL without credentials, query or fragment`);
+	}
+	return raw.replace(/\/+$/, "");
+}
+
 function readAuditHttpToken(env: Record<string, string | undefined>): string | undefined {
 	const name = "ULTRATHINK_AUDIT_HTTP_TOKEN";
 	const token = readOptional(env, name);
@@ -622,6 +650,7 @@ export function loadConfig(
 		auditHttpUrl: readSinkUrl(env, "ULTRATHINK_AUDIT_HTTP_URL"),
 		auditHttpToken: readAuditHttpToken(env),
 		auditSyslog: readAuditSyslog(env),
+		otlpEndpoint: readOtlpEndpoint(env),
 		...readKafkaSink(env),
 	};
 }

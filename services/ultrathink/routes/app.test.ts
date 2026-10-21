@@ -708,7 +708,7 @@ describe("end to end with the real planner", () => {
 			expect(line).toMatchObject({ level: "info", sessionId, model: "x-ai/grok-test", attempts: 1, usage: { input: 100, output: 50 } });
 			expect(typeof line.ms).toBe("number");
 			expect(typeof line.outcome).toBe("string");
-			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "reqId", "sessionId", "traceId", "ts", "usage"]);
+			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "reqId", "sessionId", "spanId", "traceId", "ts", "usage"]);
 		}
 		const outcome = String(callLogs[0]?.outcome);
 		expect(sample(h, "ultrathink_planner_calls_total", { outcome })).toBe(calls);

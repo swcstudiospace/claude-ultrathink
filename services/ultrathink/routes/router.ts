@@ -14,7 +14,7 @@ import { type BreakerState, createCircuitBreaker } from "../engine/breaker.ts";
 import { type HeadlessPlanner, type ResultView, createHeadlessPlanner } from "../engine/headless.ts";
 import type { JournalOptions } from "../engine/journal.ts";
 import type { OpenRouterFetch } from "../engine/openrouter.ts";
-import { createSweeper, sweepStateDir } from "../engine/retention.ts";
+import { type SweepResult, createSweeper, sweepStateDir } from "../engine/retention.ts";
 import { defaultGraphResources, loadCatalogWithFallback } from "../mcp/connector-host.ts";
 import { type McpToolHost, type ToolOutcome, handleMcpPayload } from "../mcp/mcp.ts";
 import { createToolHost } from "../mcp/tool-host.ts";
@@ -28,13 +28,16 @@ import { type Admission, createFairShare } from "../obs/fair-share.ts";
 import { type LoadHistory, createLoadHistory, loadLoadHistory, recommendedReplicas } from "../obs/forecast.ts";
 import { type Logger, createLogger, newRequestId, sanitizeRequestId } from "../obs/log.ts";
 import { type Metrics, createMetrics } from "../obs/metrics.ts";
+import { type SpanSink, createSpanExporter } from "../obs/otel.ts";
 import { createAdaptiveQuota } from "../obs/quota.ts";
 import { type RuntimeSample, createDrainState, createInflight, createRuntimeProbe } from "../obs/runtime.ts";
+import { createAnomalyDetector as createSignalDetector } from "../obs/signal-anomaly.ts";
 import { createAuditStreams } from "../obs/sinks/fanout.ts";
 import { createHttpTransport, createKafkaRestTransport } from "../obs/sinks/http.ts";
 import type { SinkEvent } from "../obs/sinks/queue.ts";
 import { createSyslogTransport } from "../obs/sinks/syslog.ts";
 import type { SinkTransport } from "../obs/sinks/types.ts";
+import { createSloTracker } from "../obs/slo.ts";
 import { childSpan, formatTraceparent, traceContextFor } from "../obs/trace.ts";
 import { DEFAULT_REDIRECT_ORIGINS, createOAuth } from "../oauth/oauth.ts";
 import {
@@ -77,6 +80,8 @@ export interface RouterDeps {
 	};
 	/** Test seam. Replaces the sink transports that config builds (HTTP, Kafka REST and syslog). */
 	auditTransports?: SinkTransport[];
+	/** Test seam. Receives the SERVER and client spans; absent means the OTLP exporter when ULTRATHINK_OTLP_ENDPOINT is set. */
+	spans?: SpanSink;
 }
 
 export interface App {
@@ -89,6 +94,8 @@ export interface App {
 	shutdown(): Promise<void>;
 	/** Feeds one runtime sample to the adaptive quota and refreshes the load gauges. The runtime probe calls it on every sample. */
 	observeRuntime(sample: RuntimeSample): void;
+	/** Runs one retention sweep now, timed and handled as the sweeper handles its runs. A test hook. */
+	runSweepNow(): void;
 	planner: HeadlessPlanner;
 	metrics: Metrics;
 	logger: Logger;
@@ -167,6 +174,19 @@ const PENALTY_DECAY_MS = 15 * 60 * 1000;
 const PENALTY_KEYS = 10_000;
 /** The load history is saved this often, and once more on shutdown. */
 const HISTORY_SAVE_MS = 5 * 60 * 1000;
+/** The one SLO: the share of requests that are not 5xx, over a 6 h in-process window (phase 71, CONTEXT D7). */
+const SLO_NAME = "http_availability";
+const SLO_OBJECTIVE = 0.99;
+const SLO_WINDOW_MS = 6 * 60 * 60 * 1000;
+const SLO_BURN_WINDOWS: ReadonlyArray<{ label: string; ms: number }> = [
+	{ label: "5m", ms: 5 * 60 * 1000 },
+	{ label: "30m", ms: 30 * 60 * 1000 },
+	{ label: "1h", ms: 60 * 60 * 1000 },
+	{ label: "6h", ms: SLO_WINDOW_MS },
+];
+/** Samples the ring needs to cover the SLO window at the runtime sample interval, plus two spare. */
+const SLO_MAX_SAMPLES = Math.ceil(SLO_WINDOW_MS / RUNTIME_SAMPLE_MS) + 2;
+const NS_PER_MS = 1_000_000n;
 
 const LOOPBACK_PEERS: Record<string, true> = { "127.0.0.1": true, "::1": true, "::ffff:127.0.0.1": true };
 
@@ -475,6 +495,7 @@ export function createApp(deps: RouterDeps): App {
 					},
 					onNotice: (notice) => {
 						logger.info("audit_chain_notice", { kind: notice.kind, message: notice.message });
+						metrics.inc("ultrathink_audit_chain_notices_total");
 						switch (notice.kind) {
 							case "changed_outside":
 							case "moved_to":
@@ -556,6 +577,7 @@ export function createApp(deps: RouterDeps): App {
 					now: deps.now,
 					onTransition: (from, to) => {
 						publishBreakerState(to);
+						metrics.inc("ultrathink_upstream_breaker_transitions_total", { from, to });
 						logger.warn("upstream_breaker", { from, to });
 					},
 				})
@@ -583,6 +605,25 @@ export function createApp(deps: RouterDeps): App {
 	const drain = createDrainState(deps.now);
 	// Refreshed by start() and after each retention sweep; openStore already ran quick_check at startup.
 	let integrityOk = true;
+	// One detector per runtime signal, and the in-process SLO tracker; both live as long as this app.
+	const signalDetectors = {
+		event_loop_lag: createSignalDetector(),
+		rss: createSignalDetector(),
+		heap_used: createSignalDetector(),
+	};
+	const sloTracker = createSloTracker({ name: SLO_NAME, objective: SLO_OBJECTIVE, windowMs: SLO_WINDOW_MS }, { maxSamples: SLO_MAX_SAMPLES });
+	// Spans are exported only when a collector is configured; a caller may inject a sink instead.
+	const spans: SpanSink | undefined =
+		deps.spans ??
+		(config.otlpEndpoint === undefined
+			? undefined
+			: createSpanExporter({
+					endpoint: config.otlpEndpoint,
+					serviceName: "ultrathink",
+					serviceVersion: pkg.version,
+					onDrop: () => metrics.inc("ultrathink_otel_spans_dropped_total", { reason: "queue_full" }),
+					onFailure: () => metrics.inc("ultrathink_otel_export_failures_total"),
+				}));
 	const planner =
 		deps.planner ??
 		createHeadlessPlanner({
@@ -594,6 +635,7 @@ export function createApp(deps: RouterDeps): App {
 			...(breaker ? { breaker } : {}),
 			...(deps.fetch ? { fetch: deps.fetch } : {}),
 			...(deps.sleep ? { sleep: deps.sleep } : {}),
+			...(spans === undefined ? {} : { spans }),
 			onCall: (call) => {
 				metrics.inc("ultrathink_planner_calls_total", { outcome: call.outcome });
 				metrics.observe("ultrathink_planner_call_duration_seconds", call.ms / 1000, { outcome: call.outcome });
@@ -1068,6 +1110,7 @@ export function createApp(deps: RouterDeps): App {
 
 	async function handle(req: Request, peerIp: string): Promise<Response> {
 		const started = performance.now();
+		const startedWall = Date.now();
 		// A valid inbound traceparent is continued under a new span; anything else starts a fresh trace.
 		const inbound = traceContextFor(req.headers.get("traceparent"));
 		const server = inbound.inherited ? childSpan(inbound.ctx) : inbound.ctx;
@@ -1112,6 +1155,26 @@ export function createApp(deps: RouterDeps): App {
 			response = withHeaders(response, { "X-Request-Id": ctx.reqId, traceparent: formatTraceparent(server) });
 
 			const elapsedMs = performance.now() - started;
+			if (server.sampled && spans !== undefined) {
+				// Method, status and endpoint only: never the path, query, headers, peer IP or any credential.
+				const startUnixNano = BigInt(startedWall) * NS_PER_MS;
+				spans.record({
+					traceId: server.traceId,
+					spanId: server.spanId,
+					...(inbound.inherited ? { parentSpanId: inbound.ctx.spanId } : {}),
+					name: `${req.method} ${ctx.endpoint}`,
+					kind: 2,
+					startUnixNano,
+					endUnixNano: startUnixNano + BigInt(Math.round(elapsedMs * 1_000_000)),
+					attributes: {
+						"http.request.method": req.method,
+						"http.response.status_code": response.status,
+						"ultrathink.endpoint": ctx.endpoint,
+						"ultrathink.req_id": ctx.reqId,
+					},
+					error: response.status >= 500,
+				});
+			}
 			metrics.inc("ultrathink_http_requests_total", { endpoint: ctx.endpoint, status_class: `${Math.floor(response.status / 100)}xx` });
 			metrics.observe("ultrathink_http_request_duration_seconds", elapsedMs / 1000, { endpoint: ctx.endpoint });
 			const fields = {
@@ -1144,6 +1207,78 @@ export function createApp(deps: RouterDeps): App {
 		metrics.gauge("ultrathink_adaptive_quota_factor", quota.factor());
 		metrics.gauge("ultrathink_load_forecast_rps", rps);
 		metrics.gauge("ultrathink_recommended_replicas", recommendedReplicas(rps, config.replicaCapacityRps));
+		observeSignals(sample);
+		observeSlo(clock());
+		// Flush is single-flight and the sink never rejects, so the runtime sample does not wait for the export.
+		spans?.flush?.()?.catch(() => undefined);
+	}
+
+	/** Feeds the three runtime signals to their detectors and publishes activity; each transition is counted and logged once. */
+	function observeSignals(sample: RuntimeSample): void {
+		const readings: Array<[keyof typeof signalDetectors, number]> = [
+			["event_loop_lag", sample.eventLoopLagMs / 1000],
+			["rss", sample.rssBytes],
+			["heap_used", sample.heapUsedBytes],
+		];
+		for (const [signal, value] of readings) {
+			const state = signalDetectors[signal].observe(value);
+			metrics.gauge("ultrathink_anomaly_active", state.active ? 1 : 0, { signal });
+			if (state.transition !== undefined) {
+				metrics.inc("ultrathink_anomaly_transitions_total", { signal, to: state.transition });
+				logger.warn("anomaly", { signal, to: state.transition });
+			}
+		}
+	}
+
+	/** Feeds one cumulative sample of the request counters to the SLO tracker, then publishes its budget and burn-rate gauges. */
+	function observeSlo(now: number): void {
+		const total = metrics.sum("ultrathink_http_requests_total");
+		const bad = metrics.sum("ultrathink_http_requests_total", { status_class: "5xx" });
+		sloTracker.observe({ at: now, good: total - bad, total });
+		const budget = sloTracker.budget(now);
+		if (budget.errorBudgetRemaining !== undefined) {
+			metrics.gauge("ultrathink_slo_error_budget_remaining_ratio", budget.errorBudgetRemaining, { slo: SLO_NAME });
+		}
+		metrics.gauge("ultrathink_slo_observed_seconds", budget.observedMs / 1000, { slo: SLO_NAME });
+		for (const burnWindow of SLO_BURN_WINDOWS) {
+			const burnRate = sloTracker.budget(now, burnWindow.ms).burnRate;
+			if (burnRate !== undefined) metrics.gauge("ultrathink_slo_burn_rate", burnRate, { slo: SLO_NAME, window: burnWindow.label });
+		}
+	}
+
+	/** One retention sweep, timed. The sweeper and runSweepNow both run it. */
+	function sweepTimed(): SweepResult {
+		const began = performance.now();
+		try {
+			return sweepStateDir({ stateDir: config.stateDir, retentionDays: config.retentionDays, now: deps.now });
+		} finally {
+			metrics.observe("ultrathink_retention_sweep_duration_seconds", (performance.now() - began) / 1000);
+		}
+	}
+
+	function onSweepResult(result: SweepResult): void {
+		for (const kind of ["jobs", "sessions", "journals"] as const) {
+			metrics.inc("ultrathink_retention_removed_total", { kind }, result.removed[kind]);
+		}
+		if (result.errors > 0) {
+			metrics.inc("ultrathink_retention_errors_total", undefined, result.errors);
+			logger.warn("retention_errors", { errors: result.errors });
+		}
+		refreshIntegrity();
+	}
+
+	function onSweepError(error: Error): void {
+		metrics.inc("ultrathink_retention_errors_total");
+		logger.error("retention_failed", { error: error.message });
+	}
+
+	/** Runs one retention sweep now, timed and handled as the sweeper handles its runs. A test hook. */
+	function runSweepNow(): void {
+		try {
+			onSweepResult(sweepTimed());
+		} catch (error) {
+			onSweepError(error instanceof Error ? error : new Error(String(error)));
+		}
 	}
 
 	let stopProbe: (() => void) | undefined;
@@ -1172,16 +1307,10 @@ export function createApp(deps: RouterDeps): App {
 		}).start();
 		if (config.retentionDays > 0) {
 			stopSweeper = createSweeper({
-				sweep: () => sweepStateDir({ stateDir: config.stateDir, retentionDays: config.retentionDays, now: deps.now }),
+				sweep: sweepTimed,
 				intervalMs: RETENTION_SWEEP_MS,
-				onResult: (result) => {
-					for (const kind of ["jobs", "sessions", "journals"] as const) {
-						metrics.inc("ultrathink_retention_removed_total", { kind }, result.removed[kind]);
-					}
-					if (result.errors > 0) logger.warn("retention_errors", { errors: result.errors });
-					refreshIntegrity();
-				},
-				onError: (error) => logger.error("retention_failed", { error: error.message }),
+				onResult: onSweepResult,
+				onError: onSweepError,
 			}).start();
 		}
 		stopCheckpoint = createWalCheckpointer({
@@ -1228,6 +1357,7 @@ export function createApp(deps: RouterDeps): App {
 		handle,
 		start,
 		observeRuntime,
+		runSweepNow,
 		beginDrain() {
 			drain.begin();
 		},
@@ -1244,6 +1374,9 @@ export function createApp(deps: RouterDeps): App {
 			if (!(await streams.flush(AUDIT_FLUSH_MS))) logger.warn("audit_sink_flush_incomplete", {});
 			streams.close();
 			await planner.shutdown();
+			// Spans are flushed, then the exporter is closed; a sink without either method is simply skipped.
+			await spans?.flush?.();
+			await spans?.shutdown?.();
 		},
 		planner,
 		metrics,

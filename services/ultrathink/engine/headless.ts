@@ -22,6 +22,7 @@ import { CeilingError, type Ledger } from "../cost/ledger.ts";
 import { currentRequestContext } from "../obs/context.ts";
 import { createFairShare } from "../obs/fair-share.ts";
 import type { Logger } from "../obs/log.ts";
+import type { SpanSink } from "../obs/otel.ts";
 import type { Store } from "../store/store.ts";
 import type { BreakerState, CircuitBreaker } from "./breaker.ts";
 import type { GraphView } from "./graph-view.ts";
@@ -106,6 +107,8 @@ export interface HeadlessOptions {
 	logger?: Logger;
 	/** Upstream circuit breaker handed to every OpenRouter completer; a refused call fails the job with `upstream_unavailable`. */
 	breaker?: CircuitBreaker;
+	/** Receives one CLIENT span per model HTTP attempt made under a sampled request context; never sees URLs, keys or headers. */
+	spans?: SpanSink;
 }
 
 interface JobFile {
@@ -368,6 +371,7 @@ export function createHeadlessPlanner(opts: HeadlessOptions): HeadlessPlanner {
 						sleep,
 						...(opts.fetch ? { fetch: opts.fetch } : {}),
 						...(opts.breaker ? { breaker: opts.breaker } : {}),
+						...(opts.spans ? { spans: opts.spans } : {}),
 						onUsage: (usage) => {
 							reported.usage = usage;
 						},
