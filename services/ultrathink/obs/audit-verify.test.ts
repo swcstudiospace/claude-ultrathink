@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { auditPath, createAuditLog, verifyAuditFile } from "./audit.ts";
-import { createAuditVerifier, verifyObserved } from "./audit-verify.ts";
+import { chainIdentity, createAuditVerifier, verifyObserved } from "./audit-verify.ts";
 import { type ScanReply, type WatchAlert, createAuditWatch } from "./audit-watch.ts";
 
 const START = 1_700_000_000_000;
@@ -39,11 +39,12 @@ describe("observed scans", () => {
 		log.record("login_ok", { n: 1 });
 		log.record("login_ok", { n: 2 });
 		const observed = statSync(path);
+		const identity = chainIdentity(path);
 		const head = log.head();
 		log.record("login_ok", { n: 3 });
 		log.record("login_ok", { n: 4 });
 
-		expect(verifyObserved({ path, activeBytes: observed.size, activeIno: observed.ino })).toEqual({ ok: true, records: 2, lastHash: head.hash });
+		expect(verifyObserved({ path, activeBytes: observed.size, activeIno: observed.ino, identity })).toEqual({ ok: true, records: 2, lastHash: head.hash });
 		expect(verifyAuditFile(path).ok).toBe(true);
 	});
 
@@ -52,8 +53,9 @@ describe("observed scans", () => {
 		const log = createAuditLog({ path, now: clock() });
 		log.record("login_ok", { n: 1 });
 		const observed = statSync(path);
+		const identity = chainIdentity(path);
 
-		expect(verifyObserved({ path, activeBytes: observed.size, activeIno: observed.ino + 1 })).toBe("raced");
+		expect(verifyObserved({ path, activeBytes: observed.size, activeIno: observed.ino + 1, identity })).toBe("raced");
 	});
 
 	test("the worker verifier judges a tampered chain as broken, and answers raced once closed", async () => {
@@ -62,7 +64,7 @@ describe("observed scans", () => {
 		log.record("login_ok", { n: 1 });
 		log.record("login_ok", { n: 2 });
 		const observed = statSync(path);
-		const request = { path, activeBytes: observed.size, activeIno: observed.ino };
+		const request = { path, activeBytes: observed.size, activeIno: observed.ino, identity: chainIdentity(path) };
 		const verifier = createAuditVerifier();
 
 		expect(await verifier.verify(request)).toMatchObject({ ok: true, records: 2 });
@@ -76,6 +78,37 @@ describe("observed scans", () => {
 		expect(await verifier.verify(request)).toBe("raced");
 	});
 });
+
+describe("a prune between the observation and the worker", () => {
+	const MIB = 1024 * 1024;
+
+	function bulk(i: number): Record<string, string | number> {
+		const fields: Record<string, string | number> = { n: i };
+		for (let k = 0; k < 31; k += 1) fields[`k${k}`] = "x".repeat(250);
+		return fields;
+	}
+
+	test("is raced, not reported as a broken chain, when the sealed list changed before the worker read the chain", async () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const log = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		for (let i = 1; i <= 300; i += 1) log.record("login_ok", bulk(i));
+		// The watch observes the active bytes and the chain together, then asks for a scan.
+		const observed = statSync(path);
+		const request = { path, activeBytes: observed.size, activeIno: observed.ino, identity: chainIdentity(path) };
+		const verifier = createAuditVerifier();
+		const pending = verifier.verify(request);
+		// The prune lands before the worker runs. It deletes the sealed segments and writes its boundary past the observed bytes.
+		expect(log.prune(Number.MAX_SAFE_INTEGER).segments).toBeGreaterThan(0);
+
+		// Read with the observed byte limit, the pruned chain would look broken: the boundary is past that limit.
+		expect(verifyAuditFile(path, { activeBytes: observed.size }).ok).toBe(false);
+		expect(await pending).toBe("raced");
+		verifier.close();
+		log.close();
+	}, 60_000);
+});
+
 
 describe("a worker that does not answer", () => {
 	test("fails the scan at the deadline, and the next tick scans again on a fresh worker", async () => {
@@ -110,7 +143,7 @@ self.onmessage = (event) => {
 				return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
 			},
 			acknowledged: () => ({ fingerprint: undefined, seq: head.seq, hash: head.hash }),
-			scan: (observed) => verifier.verify({ path, activeBytes: observed.size, activeIno: observed.ino }),
+			scan: (observed) => verifier.verify({ path, activeBytes: observed.size, activeIno: observed.ino, identity: chainIdentity(path) }),
 			onAlert: (alert) => alerts.push(alert),
 			onRecover: () => {
 				recovers += 1;
@@ -172,7 +205,7 @@ describe("a dispatch that fails", () => {
 				(handle as FakeTimer).cleared = true;
 			},
 		});
-		const request = { path: "unused", activeBytes: 0, activeIno: 0 };
+		const request = { path: "unused", activeBytes: 0, activeIno: 0, identity: "" };
 		await expect(verifier.verify(request)).rejects.toThrow("cannot start worker");
 
 		const verdict: ScanReply = { ok: true, records: 2, lastHash: "a".repeat(64) };

@@ -16,15 +16,19 @@ import { verifyAuditFile } from "./audit.ts";
 import { listSegments } from "./audit-segments.ts";
 import type { ScanReply } from "./audit-watch.ts";
 
-/** One observed state of the audit file: the active file's size and inode as the watch saw them. */
+/**
+ * One observed state of the audit file. `activeBytes` and `activeIno` are the active file as the watch stat'd it; `identity`
+ * is {@link chainIdentity} captured in the same synchronous step, so the sealed segments and the active bytes describe one moment.
+ */
 export interface VerifyRequest {
 	readonly path: string;
 	readonly activeBytes: number;
 	readonly activeIno: number;
+	readonly identity: string;
 }
 
 /** The identity of the chain on disk: the active file's inode, then the names of its sealed segments, in order. */
-function identityOf(path: string): string {
+export function chainIdentity(path: string): string {
 	let ino = "missing";
 	try {
 		ino = String(nodeFs.statSync(path).ino);
@@ -35,14 +39,15 @@ function identityOf(path: string): string {
 }
 
 /**
- * Verifies the chain as the watch observed it. The verdict covers exactly the active bytes the watch saw, and it stands
- * only if the chain's identity was the same before and after the scan.
+ * Verifies the chain as the watch observed it. The chain must still have the identity captured with the observed bytes: a
+ * prune or a new sealed segment in between changes the records the observed bytes stand for, so the scan is raced, not judged.
+ * The verdict stands only if the identity is also unchanged after the scan.
  */
 export function verifyObserved(request: VerifyRequest): ScanReply {
-	const before = identityOf(request.path);
-	if (!before.startsWith(`${request.activeIno}\n`)) return "raced";
+	if (chainIdentity(request.path) !== request.identity) return "raced";
+	if (!request.identity.startsWith(`${request.activeIno}\n`)) return "raced";
 	const outcome = verifyAuditFile(request.path, { activeBytes: request.activeBytes });
-	return identityOf(request.path) === before ? outcome : "raced";
+	return chainIdentity(request.path) === request.identity ? outcome : "raced";
 }
 
 /** How long one scan may run before it is abandoned and its worker terminated. */

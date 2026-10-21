@@ -22,7 +22,7 @@ import type { PlanningInfo } from "../mcp/tools-connector.ts";
 import { DEFAULT_ALLOWED_ORIGINS, originAllowed, resolveProtocolVersion } from "../mcp/transport.ts";
 import { type AnomalyAlert, DEFAULT_ANOMALY_RULES, createAnomalyDetector } from "../obs/anomaly.ts";
 import { type Fingerprint, createAuditWatch } from "../obs/audit-watch.ts";
-import { createAuditVerifier } from "../obs/audit-verify.ts";
+import { chainIdentity, createAuditVerifier } from "../obs/audit-verify.ts";
 import { type AuditEvent, type AuditLog, auditPath, createAuditLog } from "../obs/audit.ts";
 import { currentRequestContext, runWithRequestContext } from "../obs/context.ts";
 import { type Admission, createFairShare } from "../obs/fair-share.ts";
@@ -1382,7 +1382,8 @@ export function createApp(deps: RouterDeps): App {
 					const head = log.head();
 					return { fingerprint: log.fingerprint(), seq: head.seq, hash: head.hash };
 				},
-				scan: (observed) => verifier.verify({ path: log.path, activeBytes: observed.size, activeIno: observed.ino }),
+				// Called from the watch's tick, in the same synchronous step as `stat`, so the identity and the bytes describe one moment.
+				scan: (observed) => verifier.verify({ path: log.path, activeBytes: observed.size, activeIno: observed.ino, identity: chainIdentity(log.path) }),
 				onAlert: (alert) => raiseTamper(alert.reason),
 				onRecover: () => logger.info("audit_tamper_cleared", {}),
 				onError: (error) => logger.error("audit_watch_failed", { error: errorMessage(error) }),

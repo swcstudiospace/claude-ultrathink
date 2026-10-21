@@ -134,7 +134,7 @@ export function createAuditWatch(options: AuditWatchOptions): AuditWatch {
 	const idle = (): Promise<void> => scanning ?? Promise.resolve();
 
 	// Starts one verification of the state `observed` and judges it against the head `ack` acknowledged on the same tick.
-	const startScan = (observed: Fingerprint, ack: Acknowledged): Promise<void> => {
+	const startScan = (observed: Fingerprint, ack: Acknowledged, full: boolean): Promise<void> => {
 		const started = epoch;
 		const pending = new Promise<ScanReply>((resolve) => resolve(scan(observed)));
 		const judged = pending
@@ -144,6 +144,8 @@ export function createAuditWatch(options: AuditWatchOptions): AuditWatch {
 					if (reply === "raced") {
 						// The chain moved under the scan, so nothing is decided; the next tick scans again.
 						decided = undefined;
+						// A full scan that was discarded is owed again, so the next tick that can start a scan runs it.
+						if (full) fullScanOwed = true;
 						return;
 					}
 					apply(judge(reply, ack));
@@ -151,6 +153,7 @@ export function createAuditWatch(options: AuditWatchOptions): AuditWatch {
 				(error: unknown) => {
 					if (started !== epoch) return;
 					// A scan that failed decided nothing, so the next tick scans again rather than waiting on the same state.
+					if (full) fullScanOwed = true;
 					decided = undefined;
 					apply({ kind: "chain_broken", reason: `verifier failed: ${error instanceof Error ? error.message : String(error)}` });
 				},
@@ -196,7 +199,7 @@ export function createAuditWatch(options: AuditWatchOptions): AuditWatch {
 
 		fullScanOwed = false;
 		decided = current;
-		return startScan(current, ack);
+		return startScan(current, ack, due);
 	};
 
 	return {

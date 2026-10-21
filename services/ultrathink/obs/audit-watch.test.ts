@@ -286,6 +286,24 @@ describe("off the request path", () => {
 		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
 	});
 
+	test("a full scan that comes back raced is run again on the next tick", async () => {
+		const h = harness();
+		// The file matches the acknowledged fingerprint, so only a full scan can look at it, and tick 60 is the first one.
+		h.world.outcome = "raced";
+		await h.tickMany(59);
+		expect(h.world.scans).toBe(0);
+
+		await h.watch.tick();
+		expect(h.world.scans).toBe(1);
+		expect(h.alerts).toEqual([]);
+
+		// Tick 61 is not a full-scan tick and the file is unchanged, but the discarded full scan is owed.
+		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
+		await h.watch.tick();
+		expect(h.world.scans).toBe(2);
+		expect(h.alerts).toEqual([]);
+	});
+
 	test("a verdict from a scan that began before the file went missing does not clear the newer alert", async () => {
 		const alerts: WatchAlert[] = [];
 		let disk: Fingerprint | undefined = fp(120, 2_000);
