@@ -1,0 +1,76 @@
+{
+  "events": [
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 8316,
+        "cacheHitPct": 0,
+        "currentTokens": 3014,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 4158,
+        "providerOutput": 0,
+        "savedTokens": 5302,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    },
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 8316,
+        "cacheHitPct": 0,
+        "currentTokens": 3014,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 8316,
+        "providerOutput": 0,
+        "savedTokens": 5302,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    }
+  ],
+  "fixture": "bash-long-log.json",
+  "tokens": {
+    "baseline": 4158,
+    "current": 1507
+  },
+  "toolCall": null,
+  "toolResult": {
+    "content": [
+      {
+        "text": "$ bun test src\nbun test v1.4.0\n\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11m\n… omitted 10631 chars …\nder usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)\nsrc/ledger.test.ts:\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > records provider usage once [0.31ms]\n(pass) compress > drops repeated lines [0.08ms]\n[graphify] query cache hit\n  12 assertions passed\n(pass) skim > keeps signatures [0.11ms]\n(pass) ledger > loads an empty session [0.42ms]\n\n[graphify] query cache hit\n(pass) compress > drops repeated lines [0.08ms]\n  warning: slow snapshot write (12.4ms)",
+        "type": "text"
+      }
+    ]
+  }
+}

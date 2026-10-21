@@ -1,0 +1,47 @@
+{
+  "events": [
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 8316,
+        "cacheHitPct": 0,
+        "currentTokens": 3014,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 8320,
+        "providerOutput": 0,
+        "savedTokens": 5302,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    }
+  ],
+  "fixture": "empty-grep.json",
+  "tokens": {
+    "baseline": 4,
+    "current": 6
+  },
+  "toolCall": null,
+  "toolResult": {
+    "content": [
+      {
+        "text": "token-opt: grep empty",
+        "type": "text"
+      }
+    ]
+  }
+}
