@@ -28,6 +28,7 @@
 
 import { readFileSync } from "node:fs";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket as NetSocket } from "node:net";
 import tls, { type TLSSocket } from "node:tls";
 import { identityFromUriSans, type IdentityResult } from "./identity.ts";
 
@@ -275,7 +276,8 @@ export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHa
 			socket.destroy();
 		});
 	});
-	const openSockets = new Set<TLSSocket>();
+	/** Every accepted TCP connection until it closes, including handshakes still in flight, so stop() reaches them all. */
+	const connections = new Set<NetSocket>();
 	const tlsServer = tls.createServer(
 		{
 			cert: readFileSync(options.certFile),
@@ -290,8 +292,6 @@ export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHa
 				socket.destroy();
 				return;
 			}
-			openSockets.add(socket);
-			socket.once("close", () => openSockets.delete(socket));
 			socket.setTimeout(idleMs);
 			socket.on("timeout", () => socket.destroy());
 			let deadline: NodeJS.Timeout | undefined;
@@ -312,6 +312,8 @@ export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHa
 	// Bun ignores the tls `handshakeTimeout` option, so a raw connection that never completes its handshake is
 	// bounded here. The inactivity timer stays on the raw socket, which also carries the TLS bytes afterwards.
 	tlsServer.on("connection", (raw) => {
+		connections.add(raw);
+		raw.once("close", () => connections.delete(raw));
 		raw.setTimeout(idleMs, () => raw.destroy());
 		// A refused handshake emits its error on this raw socket. Bun 1.2.23 does not route it to tlsClientError, so
 		// without a listener it escalates as an unhandled error. The failed handshake already closes the socket.
@@ -325,7 +327,8 @@ export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHa
 	const stop = (): Promise<void> => {
 		stopping ??= new Promise<void>((resolveStop, rejectStop) => {
 			tlsServer.close((error) => (error ? rejectStop(error) : resolveStop()));
-			for (const socket of openSockets) socket.destroy();
+			// Destroys raw connections, including handshakes not yet finished, so tlsServer.close() returns at once.
+			for (const socket of connections) socket.destroy();
 		});
 		return stopping;
 	};

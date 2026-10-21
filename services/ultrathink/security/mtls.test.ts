@@ -313,6 +313,19 @@ describe.skipIf(!ADAPTER_SUPPORTED)(ADAPTER_TITLE, () => {
 		expect(calls).toBe(1);
 	});
 
+	test("stop closes a connection that is still in its TLS handshake", async () => {
+		// Sends no ClientHello, so the handshake never finishes. The idle timeout is long, so only stop() can close it.
+		const pending = await startMtlsServer(serverOptions(30), async () => new Response("unused"));
+		const raw = net.connect(pending.port, "127.0.0.1");
+		raw.on("error", () => {});
+		const closed = new Promise<void>((resolve) => raw.on("close", () => resolve()));
+		await new Promise<void>((resolve) => raw.once("connect", () => resolve()));
+		// The TCP accept happens in the kernel and no event reaches this test, so a short pause lets it land before stop().
+		await Bun.sleep(50);
+		await pending.stop();
+		await closed;
+	});
+
 	test("reports a bind failure as a rejection", async () => {
 		const holder = net.createServer();
 		await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", () => resolve()));
