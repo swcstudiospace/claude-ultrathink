@@ -6,7 +6,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -320,6 +320,29 @@ describe("per-session /ultrathink-skip", () => {
 		expect(readSkipOnce(deps.stateDir, "desk-20261020-1200-slug")).toBe(true);
 	});
 
+	test("a grok-bot skip armed for the reserved next-request id makes that request's G plan return skipped, once", async () => {
+		const root = tempRoot();
+		const stateDir = join(root, "state");
+		const env = (): NodeJS.ProcessEnv => ({ HOME: root, XDG_CONFIG_HOME: join(root, "xdg"), ULTRATHINK_DECISIONS: "0", ULTRATHINK_STATE_DIR: stateDir, PATH: process.env.PATH });
+		const promptFile = join(root, "ORIGINAL.txt");
+		writeFileSync(promptFile, "Add a CSV export button to the reports page.");
+		// The skill reserves the next request's id N and arms the skip for it; the protocol then plans that request under N.
+		expect((await grokbotMain(["ctl", "skip", "--session", "desk-20261022-0940-next"], env())).text).toContain("will skip the next prompt in this session");
+		expect((await grokbotMain(["ctl", "status", "--session", "desk-20261022-0940-next"], env())).text).toContain("(skipping next prompt)");
+
+		const skipped = await grokbotMain(["plan", "--session", "desk-20261022-0940-next", "--prompt-file", promptFile, "--cwd", root], env());
+		expect(skipped.code).toBe(0);
+		expect(JSON.parse(skipped.text)).toMatchObject({ status: "skipped", sessionId: "desk-20261022-0940-next", skipped: expect.stringContaining("skip") });
+		expect(readSkipOnce(stateDir, "desk-20261022-0940-next")).toBe(false);
+		expect((await grokbotMain(["ctl", "status", "--session", "desk-20261022-0940-next"], env())).text).not.toContain("(skipping next prompt)");
+
+		// A request under any other fresh id is not skipped by it.
+		await grokbotMain(["ctl", "skip", "--session", "desk-20261022-0941-next"], env());
+		const other = await grokbotMain(["plan", "--session", "desk-20261022-0942-other", "--prompt-file", promptFile, "--cwd", root], env());
+		expect(JSON.parse(other.text).status).not.toBe("skipped");
+		expect(readSkipOnce(stateDir, "desk-20261022-0941-next")).toBe(true);
+	});
+
 	test("the Markdown and Grok Bot skip/status fallbacks forward the current session id", () => {
 		const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 		const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -331,8 +354,10 @@ describe("per-session /ultrathink-skip", () => {
 			for (const run of runs) expect(run).toContain(`${verb} --session "\${CLAUDE_SESSION_ID}"`);
 		}
 		// Grok Bot's skills pass the planner session, so `G ctl skip` is not refused and `G ctl status` sees its flag.
-		expect(read("hosts/grok-bot/skills/ultrathink-skip/SKILL.md")).toContain("`G ctl skip --session S`");
-		expect(read("hosts/grok-bot/skills/ultrathink-status/SKILL.md")).toContain("`G ctl status --session S`");
+		// Each request plans under a fresh id, so the skip reserves the next request's id `N` and the protocol plans under it.
+		expect(read("hosts/grok-bot/skills/ultrathink-skip/SKILL.md")).toContain("`G ctl skip --session N`");
+		expect(read("hosts/grok-bot/skills/ultrathink-status/SKILL.md")).toContain("`G ctl status --session N`");
+		expect(read("hosts/grok-bot/skills/ultrathink-protocol/SKILL.md")).toContain("`G plan --session N`");
 	});
 
 	test("a skip read before an engine wait is consumed by the prompt that read it, and cleared with it", async () => {

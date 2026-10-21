@@ -6,7 +6,7 @@ description: >-
 
 # Ultrathink skip
 
-Run `G ctl skip --session S` and relay its output in one or two lines. `S` is this conversation's planner session id (the `--session` its `G plan` takes); the skip covers that session only, and the CLI refuses a skip with no `--session`. The next `G plan --session S` consumes the skip and returns `skipped`.
+Every request plans under a fresh session id, so the skip is armed for the id the next request will use. Reserve that id now: if this conversation already holds a reserved id `N` from an earlier `/ultrathink-skip` that no message has used yet, keep it; otherwise mint a fresh `N` in the protocol's form (`desk-YYYYMMDD-HHMM-next`). Run `G ctl skip --session N` and relay its output in one or two lines, then remember `N` for this conversation. `ultrathink-protocol` plans the next substantive message under `N`, where `G plan --session N` consumes the skip and returns `skipped`. The CLI refuses a skip with no `--session`.
 
 ## Shared rules (every ultrathink skill on Grok Bot)
 - CLI: `/home/box/tools/claude-ultrathink/bin/ultrathink-grokbot` (abbreviated `G` below). It always runs with `ULTRATHINK_SHIP=0`; state lives in `~/.local/state/ultrathink-grokbot`.
