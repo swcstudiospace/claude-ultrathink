@@ -955,7 +955,7 @@ Each item is open and names its prerequisite. Until the prerequisite exists, the
 
 Phase 69 puts the one internal hop, nginx to the app, and every loopback probe under mutual TLS. The app listens on `127.0.0.1:8795` with TLS only. A client reaches it only with a leaf certificate that chains to the internal CA, and the SPIFFE ID in that certificate selects what it may reach. Headers never set an identity.
 
-**Status.** The code, the nginx vhost, the systemd units and the release script carry this change. The script `deploy/ultrathink-pki.sh` and its test `deploy/ultrathink-pki.test.ts` are in the repository, and the operator commands are in 17.8. Until the files exist, the TLS-only service refuses to start, and the release script stops before it switches `current`. Do not work around that with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`.
+**Status.** The code, the nginx vhost, the systemd units and the release script carry this change. The script `deploy/ultrathink-pki.sh` and its test `deploy/ultrathink-pki.test.ts` are in the repository, and the operator commands are in 17.8. Until the files exist, the TLS-only service refuses to start, and the release script stops before it switches `current`. Do not work around that with `ULTRATHINK_PLAINTEXT_LOOPBACK=1`. The TLS-only listener needs Bun 1.4.0 or newer. On Bun 1.2.23, requests through the listener hang, and the service refuses to start below 1.4.0. The product's Bun floor stays at 1.2 for every other feature.
 
 ### 17.1 Identities and route policy
 
