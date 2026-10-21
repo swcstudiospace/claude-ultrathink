@@ -8,7 +8,7 @@ description: >-
 
 # Ultrathink status
 
-Run `G ctl status` and relay its output in one or two lines. Redact any email or account name before relaying. Ship must read off.
+Run `G ctl status --session S` (`S` is this conversation's planner session id, as for `G plan`, so the output shows whether that session's next prompt is skipped) and relay its output in one or two lines. Redact any email or account name before relaying. Ship must read off.
 
 ## Shared rules (every ultrathink skill on Grok Bot)
 - CLI: `/home/box/tools/claude-ultrathink/bin/ultrathink-grokbot` (abbreviated `G` below). It always runs with `ULTRATHINK_SHIP=0`; state lives in `~/.local/state/ultrathink-grokbot`.

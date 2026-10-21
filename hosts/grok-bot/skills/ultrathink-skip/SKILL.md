@@ -6,7 +6,7 @@ description: >-
 
 # Ultrathink skip
 
-Run `G ctl skip` and relay its output in one or two lines. The next `G plan` consumes the skip and returns `skipped`.
+Run `G ctl skip --session S` and relay its output in one or two lines. `S` is this conversation's planner session id (the `--session` its `G plan` takes); the skip covers that session only, and the CLI refuses a skip with no `--session`. The next `G plan --session S` consumes the skip and returns `skipped`.
 
 ## Shared rules (every ultrathink skill on Grok Bot)
 - CLI: `/home/box/tools/claude-ultrathink/bin/ultrathink-grokbot` (abbreviated `G` below). It always runs with `ULTRATHINK_SHIP=0`; state lives in `~/.local/state/ultrathink-grokbot`.

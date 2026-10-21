@@ -208,8 +208,8 @@ function engineRequestLine(config: UltrathinkConfig, state: ControlState, host: 
  * resolution`, never as current detection (§9 path 6); together they replace the universal `Model: <claude.model>` line.
  */
 async function statusText(config: UltrathinkConfig, state: ControlState, stateDir: string, host: HostId, live?: ModelResolution, skipArmed = false): Promise<string> {
- 	const last = readLast(stateDir);
- 	const lines = [
+	const last = readLast(stateDir);
+	const lines = [
 		`Prompt Uplift ${flag(state.enabled, config.uplift.enabled)}${skipArmed ? " (skipping next prompt)" : ""}`,
 		`Engine: ${engineLabel(config, state, host, live)}`,
 		grokTransportLine(config),

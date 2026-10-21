@@ -6,9 +6,10 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defaultConfig } from "../config.ts";
 import { type HookDeps, runPromptSubmit } from "../claude/hook.ts";
 import {
@@ -293,6 +294,45 @@ describe("per-session /ultrathink-skip", () => {
 		expect(bare.text).toContain("--session <id>");
 		expect(readSkipOnce(deps.stateDir, "desk-other")).toBe(false);
 		expect(readSkipOnce(deps.stateDir, "desk-20261020-1200-slug")).toBe(true);
+	});
+
+	test("status shows the armed skip for the session it names, and only for that session", async () => {
+		const deps = baseDeps();
+		expect(await runControl(["skip"], { stateDir: deps.stateDir, cwd: "/repo", sessionId: "Claude-A" })).toContain("will skip");
+
+		// The status fallback passes `--session "${CLAUDE_SESSION_ID}"` like the skip does; the id keeps its case.
+		const { sessionId, args } = takeSessionFlag(["status", "--session", "Claude-A"]);
+		expect(await runControl(args, { stateDir: deps.stateDir, cwd: "/repo", sessionId })).toContain("(skipping next prompt)");
+		expect(await runControl(["status"], { stateDir: deps.stateDir, cwd: "/repo", sessionId: "other" })).not.toContain("(skipping next prompt)");
+		expect(await runControl(["status"], { stateDir: deps.stateDir, cwd: "/repo" })).not.toContain("(skipping next prompt)");
+		// Showing the flag never consumes it.
+		expect(readSkipOnce(deps.stateDir, "Claude-A")).toBe(true);
+	});
+
+	test("a grok-bot-style ctl status shows the skip armed for the session named by --session", async () => {
+		const deps = baseDeps();
+		await grokbotMain(["ctl", "skip", "--session", "desk-20261020-1200-slug"], { ULTRATHINK_STATE_DIR: deps.stateDir });
+
+		const named = await grokbotMain(["ctl", "status", "--session", "desk-20261020-1200-slug"], { ULTRATHINK_STATE_DIR: deps.stateDir });
+		expect(named.text).toContain("(skipping next prompt)");
+		const other = await grokbotMain(["ctl", "status", "--session", "desk-other"], { ULTRATHINK_STATE_DIR: deps.stateDir });
+		expect(other.text).not.toContain("(skipping next prompt)");
+		expect(readSkipOnce(deps.stateDir, "desk-20261020-1200-slug")).toBe(true);
+	});
+
+	test("the Markdown and Grok Bot skip/status fallbacks forward the current session id", () => {
+		const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+		const read = (path: string) => readFileSync(join(root, path), "utf8");
+		// Claude Code and Muse run commands/*.md when the prompt hook did not answer: both commands name this session.
+		for (const verb of ["skip", "status"]) {
+			const command = read(`commands/ultrathink-${verb}.md`);
+			const runs = command.match(/bin\/ultrathink" [^`\n]*/g) ?? [];
+			expect(runs.length).toBe(2);
+			for (const run of runs) expect(run).toContain(`${verb} --session "\${CLAUDE_SESSION_ID}"`);
+		}
+		// Grok Bot's skills pass the planner session, so `G ctl skip` is not refused and `G ctl status` sees its flag.
+		expect(read("hosts/grok-bot/skills/ultrathink-skip/SKILL.md")).toContain("`G ctl skip --session S`");
+		expect(read("hosts/grok-bot/skills/ultrathink-status/SKILL.md")).toContain("`G ctl status --session S`");
 	});
 
 	test("a skip read before an engine wait is consumed by the prompt that read it, and cleared with it", async () => {
