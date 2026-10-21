@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as cliMain } from "./audit-cli.ts";
@@ -196,6 +196,22 @@ describe("tamper detection", () => {
 		expect(v.brokenAt).toBe(0);
 		expect(v.records).toBe(0);
 		expect(v.reason).toMatch(/^cannot (open|read): /);
+	});
+
+	test("a line with an extra key breaks at that line", () => {
+		const { path } = filled(2);
+		const out = lines(path);
+		out[1] = JSON.stringify({ ...(JSON.parse(out[1] as string) as Record<string, unknown>), note: "smuggled" });
+		rewrite(path, out);
+		expectBroken(verifyAuditFile(path), 2, /exactly the keys/);
+	});
+
+	test("a line with a duplicate key breaks at that line", () => {
+		const { path } = filled(2);
+		const out = lines(path);
+		out[1] = (out[1] as string).replace('"n":2', '"n":2,"n":9');
+		rewrite(path, out);
+		expectBroken(verifyAuditFile(path), 2, /canonical serialization/);
 	});
 });
 
@@ -600,6 +616,18 @@ describe("anchors", () => {
 		expect(records(path)).toEqual([]);
 		expect(errors.map((e) => e.message)).toEqual(["audit log: audit_anchor is written by the log only; record dropped"]);
 	});
+
+	test("the log rejects a caller-supplied audit_retention_pruned record and the chain is unchanged", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		log.record("login_ok", { n: 1 });
+		const before = readFileSync(path, "utf8");
+		log.record("audit_retention_pruned", { segments: 1, fromSeq: 1, throughSeq: 1, throughHash: "f".repeat(64), frontier: "{}" });
+		expect(readFileSync(path, "utf8")).toBe(before);
+		expect(errors.map((e) => e.message)).toEqual(["audit log: audit_retention_pruned is written by the log only; record dropped"]);
+		expect(log.verify().ok).toBe(true);
+	});
 });
 
 describe("streaming hook", () => {
@@ -616,17 +644,22 @@ describe("streaming hook", () => {
 		const path = auditPath(tempDir());
 		const errors: Error[] = [];
 		const seen: AuditRecord[] = [];
-		let fsyncs = 0;
+		let failNextSync = false;
 		const fs: AuditFs = {
 			...nodeFs,
 			fsyncSync: (fd: number) => {
-				fsyncs += 1;
-				if (fsyncs === 2) throw new Error("EIO: fsync");
+				if (failNextSync) {
+					failNextSync = false;
+					throw new Error("EIO: fsync");
+				}
 				nodeFs.fsyncSync(fd);
 			},
 		};
 		const log = createAuditLog({ path, now: clock(), fs, onError: (e) => errors.push(e), onAppend: (r) => seen.push(r) });
-		for (let i = 1; i <= 3; i += 1) log.record("login_ok", { n: i });
+		log.record("login_ok", { n: 1 });
+		failNextSync = true;
+		log.record("login_ok", { n: 2 });
+		log.record("login_ok", { n: 3 });
 		expect(errors.length).toBe(1);
 		expect(errors[0]?.message).toMatch(/record dropped: EIO: fsync/);
 		expect(seen.map((r) => r.hash)).toEqual(records(path).map((r) => r.hash));
@@ -711,6 +744,57 @@ describe("head and fingerprint", () => {
 		expect(recs.map((r) => r.seq)).toEqual([1]);
 		expect(log.head()).toEqual({ seq: 1, hash: recs[0]?.hash as string });
 		expect(log.fingerprint()).toEqual(diskIdentity(path));
+		expect(log.verify().ok).toBe(true);
+	});
+});
+
+describe("active file checks", () => {
+	test("a same-length edit to the active file is found by the next append, which starts a new chain", () => {
+		const path = auditPath(tempDir());
+		const notices: AuditNotice[] = [];
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onNotice: (n) => notices.push(n), onError: (e) => errors.push(e) });
+		for (let i = 1; i <= 3; i += 1) log.record("login_ok", { n: i, who: `user${i}` });
+		const out = lines(path);
+		out[1] = (out[1] as string).replace('"user2"', '"user9"');
+		rewrite(path, out);
+		const later = new Date(Date.now() + 60_000);
+		utimesSync(path, later, later);
+		log.record("logout", { n: 4 });
+		expect(notices.map((n) => n.kind)).toEqual(["moved_to"]);
+		expect(records(path).map((r) => r.seq)).toEqual([1]);
+		expect(log.verify().ok).toBe(true);
+		expect(errors).toEqual([]);
+	});
+
+	test("a new active file is synced in its directory before its first record is acknowledged", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const openPaths = new Map<number, string>();
+		let dirSyncs = 0;
+		const fs: AuditFs = {
+			...nodeFs,
+			openSync: ((target: nodeFs.PathLike, flags: nodeFs.OpenMode, mode?: nodeFs.Mode | null) => {
+				const fd = nodeFs.openSync(target, flags, mode);
+				openPaths.set(fd, String(target));
+				return fd;
+			}) as typeof nodeFs.openSync,
+			closeSync: ((fd: number) => {
+				openPaths.delete(fd);
+				nodeFs.closeSync(fd);
+			}) as typeof nodeFs.closeSync,
+			fsyncSync: ((fd: number) => {
+				if (openPaths.get(fd) === dir) dirSyncs += 1;
+				nodeFs.fsyncSync(fd);
+			}) as typeof nodeFs.fsyncSync,
+		};
+		const log = createAuditLog({ path, now: clock(), fs });
+		rmSync(path);
+		const before = dirSyncs;
+		log.record("login_ok", { n: 1 });
+		expect(dirSyncs - before).toBe(1);
+		log.record("login_ok", { n: 2 });
+		expect(dirSyncs - before).toBe(1);
 		expect(log.verify().ok).toBe(true);
 	});
 });

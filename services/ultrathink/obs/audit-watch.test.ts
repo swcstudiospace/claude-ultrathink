@@ -3,6 +3,10 @@
 
 import { describe, expect, test } from "bun:test";
 import { type Acknowledged, type AuditWatch, createAuditWatch, type Fingerprint, type ScanOutcome, type WatchAlert } from "./audit-watch.ts";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { auditPath, createAuditLog } from "./audit.ts";
 
 const GENESIS = "0".repeat(64);
 const HEAD_HASH = "a".repeat(64);
@@ -99,7 +103,7 @@ describe("external edits", () => {
 
 		expect(h.alerts).toHaveLength(1);
 		expect(h.alerts[0]?.kind).toBe("head_mismatch");
-		expect(h.alerts[0]?.reason).toContain("3 records");
+		expect(h.alerts[0]?.reason).toContain("record 5");
 	});
 
 	test("a clean chain whose last hash differs from the acknowledged hash alerts head_mismatch", () => {
@@ -167,9 +171,14 @@ describe("alert lifecycle", () => {
 		expect(h.world.scans).toBe(1);
 		expect(h.recovers()).toBe(0);
 
-		// The file is restored to the log's own fingerprint and head.
+		// The file is restored to the log's own fingerprint and head. Ticks that are not full scans do not clear the alert.
 		h.world.disk = fp(100, 1_000);
 		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
+		h.tickMany(54);
+		expect(h.recovers()).toBe(0);
+		expect(h.alerts).toHaveLength(1);
+
+		// The next full scan (tick 60) finds the chain healthy and clears the alert.
 		h.watch.tick();
 
 		expect(h.recovers()).toBe(1);
@@ -197,6 +206,24 @@ describe("alert lifecycle", () => {
 
 		expect(h.alerts).toEqual([]);
 		expect(h.recovers()).toBe(0);
+	});
+
+	test("a broken scan under an unchanged fingerprint keeps the alert across non-full ticks", () => {
+		const h = harness();
+		h.world.outcome = { ok: false, records: 2, brokenAt: 3, reason: "hash mismatch" };
+		h.tickMany(60);
+		expect(h.alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
+
+		// The file still matches the acknowledged fingerprint. Ticks that are not full scans must not retract the alert.
+		h.tickMany(59);
+		expect(h.world.scans).toBe(1);
+		expect(h.recovers()).toBe(0);
+		expect(h.alerts).toHaveLength(1);
+
+		// Only a full scan that comes back healthy clears it.
+		h.world.outcome = { ok: true, records: 5, lastHash: HEAD_HASH };
+		h.tickMany(60);
+		expect(h.recovers()).toBe(1);
 	});
 });
 
@@ -251,5 +278,59 @@ describe("timer and interval", () => {
 
 	test("fullScanEveryTicks below 1 is rejected", () => {
 		expect(() => harness({ fullScanEveryTicks: 0 })).toThrow(RangeError);
+	});
+});
+
+describe("pruned chain", () => {
+	const MIB = 1024 * 1024;
+
+	function bulk(i: number): Record<string, string | number> {
+		const fields: Record<string, string | number> = { n: i };
+		for (let k = 0; k < 31; k += 1) fields[`k${k}`] = "x".repeat(250);
+		return fields;
+	}
+
+	function diskOf(path: string): Fingerprint | undefined {
+		try {
+			const stat = statSync(path);
+			return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+		} catch {
+			return undefined;
+		}
+	}
+
+	test("a full scan of a pruned chain raises no tamper alert, and dropping its boundary record alerts", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ultrathink-watch-"));
+		try {
+			const path = auditPath(dir);
+			let t = 1_700_000_000_000;
+			const log = createAuditLog({ path, now: () => (t += 1000), segmentBytes: MIB });
+			for (let i = 1; i <= 140; i += 1) log.record("login_ok", bulk(i));
+			expect(log.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: 1 });
+
+			const alerts: WatchAlert[] = [];
+			const watch = createAuditWatch({
+				intervalMs: 1000,
+				fullScanEveryTicks: 1,
+				stat: () => diskOf(path),
+				acknowledged: () => {
+					const head = log.head();
+					return { fingerprint: log.fingerprint(), seq: head.seq, hash: head.hash };
+				},
+				scan: () => log.verify(),
+				onAlert: (alert) => alerts.push(alert),
+			});
+			watch.tick();
+			expect(alerts).toEqual([]);
+
+			// Drop the boundary record at the end of the file: the pruned chain no longer verifies, so the full scan alerts.
+			const kept = readFileSync(path, "utf8").split("\n").filter((l) => l.length > 0).slice(0, -1);
+			writeFileSync(path, kept.map((l) => `${l}\n`).join(""));
+			watch.tick();
+			expect(alerts.map((alert) => alert.kind)).toEqual(["chain_broken"]);
+			log.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

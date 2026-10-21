@@ -292,6 +292,41 @@ The operator sets these in `/etc/ultrathink/ultrathink.env` and restarts the ser
 | `ULTRATHINK_CONNECTOR_KEY` | unset | Key for the `x-connector-key` header (Grok Bot), at least 32 characters. |
 | `ULTRATHINK_ALLOWED_ORIGINS` | none | Comma list of extra browser origins (http or https) that `/mcp` accepts. |
 | `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | none | Comma list of extra https origins allowed in client redirect URIs. |
+| `ULTRATHINK_SESSION_SECRET_PREVIOUS` | unset | Comma list of up to 4 earlier session secrets, each at least 32 characters, for sessions signed before `ULTRATHINK_SESSION_SECRET` was rotated. |
+| `ULTRATHINK_PLAINTEXT_LOOPBACK` | `0` | `1` lets the server run without mTLS, for development and local smoke tests only. With `0` or unset, the three `ULTRATHINK_TLS_*` files are required. |
+| `ULTRATHINK_TLS_CERT` | unset | Absolute path to the server certificate of the mTLS listener. Set it together with `ULTRATHINK_TLS_KEY` and `ULTRATHINK_TLS_CLIENT_CA`, or not at all. |
+| `ULTRATHINK_TLS_KEY` | unset | Absolute path to the private key of the server certificate. Same set rule as `ULTRATHINK_TLS_CERT`. |
+| `ULTRATHINK_TLS_CLIENT_CA` | unset | Absolute path to the CA that signs client certificates. Same set rule as `ULTRATHINK_TLS_CERT`. |
+| `ULTRATHINK_SPIFFE_TRUST_DOMAIN` | `ultrathink.internal` | SPIFFE trust domain that client certificate identities are checked against when mTLS is on. 1 to 255 characters from a-z, 0-9, `.`, `_` and `-`. |
+| `ULTRATHINK_CHAOS` | `0` | `1` arms fault injection at the upstream seam. It also needs `ULTRATHINK_CHAOS_ENV=staging` and `ULTRATHINK_CHAOS_PLAN`. Off otherwise. |
+| `ULTRATHINK_CHAOS_ENV` | unset | Must be `staging` whenever `ULTRATHINK_CHAOS=1`. Any other value stops the server from starting. |
+| `ULTRATHINK_CHAOS_PLAN` | unset | Absolute path to the fault plan. Required with `ULTRATHINK_CHAOS=1`; refused without it. |
+| `ULTRATHINK_BREAKER_FAILURES` | `5` | Failures inside the window that open the upstream circuit breaker, 0 to 100. `0` turns the breaker off. |
+| `ULTRATHINK_BREAKER_WINDOW_MS` | `60000` | Window in milliseconds in which breaker failures are counted, 1000 to 3600000. |
+| `ULTRATHINK_BREAKER_OPEN_MS` | `30000` | How long an open breaker stays open before its next attempt, in milliseconds, 1000 to 600000. |
+| `ULTRATHINK_MAX_INFLIGHT` | `256` | Requests the server handles at once, 1 to 10000. |
+| `ULTRATHINK_PRIORITY_RESERVE_PCT` | `25` | Percent of `ULTRATHINK_MAX_INFLIGHT` slots held back as a reserve, 0 to 90. |
+| `ULTRATHINK_ADAPTIVE_QUOTA_MIN_PCT` | `50` | Lowest percent of the normal quota that the adaptive quota may reduce to under load, 10 to 100. |
+| `ULTRATHINK_LAG_TARGET_MS` | `100` | Lag target in milliseconds that the adaptive quota reacts to, 10 to 5000. |
+| `ULTRATHINK_REPLICA_CAPACITY_RPS` | `20` | Requests per second one replica can take. The recommended replica count metric is computed from it, 1 to 100000. |
+| `ULTRATHINK_ABUSE_FAILURES_PER_MINUTE` | `20` | Failures per minute that start the abuse penalty ladder, 1 to 10000. |
+| `ULTRATHINK_PENALTY_BASE_SEC` | `60` | Length in seconds of the first penalty block, 1 to 86400. |
+| `ULTRATHINK_PENALTY_MAX_SEC` | `3600` | Longest penalty block in seconds, 1 to 86400. Must be greater than or equal to `ULTRATHINK_PENALTY_BASE_SEC`. |
+| `ULTRATHINK_DRAIN_MS` | `5000` | Wait in milliseconds after shutdown begins and before the server stops, so in-flight work can finish. 0 to 60000. |
+| `ULTRATHINK_RETENTION_DAYS` | `30` | Days before the state directory sweep removes old data. `0` turns the sweep off. 0 to 3650. |
+| `ULTRATHINK_AUDIT_LOG` | `1` | `1` writes the audit log; `0` turns it off. |
+| `ULTRATHINK_AUDIT_ANCHOR_EVERY` | `1000` | Audit records between anchors, 1 to 1000000. |
+| `ULTRATHINK_AUDIT_SEGMENT_BYTES` | `67108864` | Audit segment size in bytes, 1048576 (1 MiB) to 4294967296 (4 GiB). |
+| `ULTRATHINK_AUDIT_RETENTION_DAYS` | `365` | Days kept for audit segments before they are pruned. `0` turns pruning off. 0 to 36500. |
+| `ULTRATHINK_AUDIT_WATCH_MS` | `1000` | Interval in milliseconds for the check that watches the audit file, 100 to 1000. |
+| `ULTRATHINK_AUDIT_SINK_QUEUE` | `10000` | Capacity of the audit sink queue in events, 1 to 1000000. |
+| `ULTRATHINK_AUDIT_HTTP_URL` | unset | URL of an audit HTTP sink. https, or http to 127.0.0.1 or localhost. No credentials. |
+| `ULTRATHINK_AUDIT_HTTP_TOKEN` | unset | Token for the audit HTTP sink. At least 16 printable ASCII characters, no spaces. |
+| `ULTRATHINK_AUDIT_SYSLOG` | unset | `host:port` of a syslog audit sink. Host from letters, digits, `.`, `_` and `-`; port 1 to 65535. |
+| `ULTRATHINK_AUDIT_RULES` | unset (built-in rules) | JSON array of anomaly rules that replaces the built-in rules. Validated at startup. |
+| `ULTRATHINK_AUDIT_KAFKA_REST_URL` | unset | Kafka REST proxy URL of the audit sink. Same URL rules as `ULTRATHINK_AUDIT_HTTP_URL`. Set it together with `ULTRATHINK_AUDIT_KAFKA_TOPIC`. |
+| `ULTRATHINK_AUDIT_KAFKA_TOPIC` | unset | Kafka topic of the audit sink. Set it together with `ULTRATHINK_AUDIT_KAFKA_REST_URL`. |
+| `ULTRATHINK_OTLP_ENDPOINT` | unset | Base URL of the span collector for OpenTelemetry traces; `/v1/traces` is appended. https, or http to loopback. No credentials, query or fragment. |
 
 Origin lists take bare origins only (`https://host[:port]`, no path, query or fragment). The request body limit is 65,536 bytes and is not configurable. `ULTRATHINK_RETENTION_DAYS` and the backup variables belong to the maintenance job; see the runbook.
 

@@ -16,6 +16,10 @@
  * - Body cap: a 413 is returned for an over-cap Content-Length and for an over-cap chunked body.
  * - Idle timeout: http.Server.setTimeout does not close manually-emitted sockets; a per-socket
  *   setTimeout with a "timeout" handler that destroys the socket does, and the client sees close.
+ *
+ * Timeouts: `idleTimeoutSec` is used three ways. It bounds idle gaps on a socket, it bounds the TLS
+ * handshake, and it is the absolute per-request deadline, armed at the first byte of a request and
+ * disarmed when its response finishes. A request that trickles past that window is destroyed.
  */
 
 import { readFileSync } from "node:fs";
@@ -26,6 +30,8 @@ import { identityFromUriSans, type IdentityResult } from "./identity.ts";
 const LOOPBACK = "127.0.0.1";
 const URI_SAN_LABEL = "URI:";
 const SAN_SEPARATOR = ", ";
+/** Most TLS connections the listener holds at once. Connections beyond this are closed at accept. */
+export const MAX_CONNECTIONS = 256;
 /** Headers that describe the client's connection or body framing, not the request itself. */
 const DROPPED_REQUEST_HEADERS: Record<string, true> = {
 	connection: true,
@@ -43,7 +49,10 @@ export interface MtlsServerOptions {
 	certFile: string;
 	keyFile: string;
 	clientCaFile: string;
-	/** Seconds a connection may sit with no traffic before the server closes it. */
+	/**
+	 * Seconds of allowed silence on a connection, also the TLS handshake limit and the absolute
+	 * deadline for each request (from its first byte to its response finishing).
+	 */
 	idleTimeoutSec: number;
 	/** Largest request body handed to the handler; larger bodies get 413 and never reach it. */
 	maxBodyBytes: number;
@@ -100,6 +109,7 @@ function toRequest(req: IncomingMessage, body: Uint8Array): Request {
 /**
  * Reads the whole body up to `limit` bytes. Returns null as soon as the body is known to exceed it,
  * either from Content-Length or while streaming, so the handler is never given an oversized body.
+ * Rejects when the request closes or errors before its body has ended.
  */
 function readCappedBody(req: IncomingMessage, limit: number): Promise<Uint8Array | null> {
 	const declared = req.headers["content-length"];
@@ -112,10 +122,20 @@ function readCappedBody(req: IncomingMessage, limit: number): Promise<Uint8Array
 	const chunks: Buffer[] = [];
 	let total = 0;
 	let settled = false;
+	// Bun does not emit req "close" or "aborted" for a connection dropped mid-body, so the socket's close is watched.
+	const socket = req.socket;
+	const onSocketClose = () => fail(new Error("connection closed before the request body ended"));
 	const settle = (value: Uint8Array | null) => {
 		if (settled) return;
 		settled = true;
+		socket.removeListener("close", onSocketClose);
 		resolve(value);
+	};
+	const fail = (error: Error) => {
+		if (settled) return;
+		settled = true;
+		socket.removeListener("close", onSocketClose);
+		reject(error);
 	};
 	req.on("data", (chunk: Buffer) => {
 		total += chunk.byteLength;
@@ -128,11 +148,8 @@ function readCappedBody(req: IncomingMessage, limit: number): Promise<Uint8Array
 		if (!settled) chunks.push(chunk);
 	});
 	req.on("end", () => settle(total > limit ? null : Buffer.concat(chunks, total)));
-	req.on("error", (error) => {
-		if (settled) return;
-		settled = true;
-		reject(error);
-	});
+	req.on("error", fail);
+	socket.once("close", onSocketClose);
 	return promise;
 }
 
@@ -203,8 +220,9 @@ async function serveRequest(
 /**
  * Starts the mTLS listener on 127.0.0.1. The TLS layer refuses clients without a certificate from
  * `clientCaFile`, so `handle` runs only for verified peers. `port: 0` binds an ephemeral port.
+ * Resolves once the listener is bound; a bind failure rejects with the listener's error.
  */
-export function startMtlsServer(options: MtlsServerOptions, handle: MtlsHandler): MtlsServer {
+export async function startMtlsServer(options: MtlsServerOptions, handle: MtlsHandler): Promise<MtlsServer> {
 	const hostname = options.hostname ?? LOOPBACK;
 	if (hostname !== LOOPBACK) throw new RangeError("mTLS listener binds 127.0.0.1 only");
 	if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
@@ -219,8 +237,15 @@ export function startMtlsServer(options: MtlsServerOptions, handle: MtlsHandler)
 	const idleMs = options.idleTimeoutSec * 1000;
 	const maxBodyBytes = options.maxBodyBytes;
 
+	/** Clears the request deadline of a socket once its response has finished. */
+	const disarmDeadline = new WeakMap<TLSSocket, () => void>();
 	const httpServer = http.createServer((req, res) => {
-		void serveRequest(req, res, maxBodyBytes, handle);
+		const socket = req.socket as TLSSocket;
+		res.once("finish", () => disarmDeadline.get(socket)?.());
+		serveRequest(req, res, maxBodyBytes, handle).catch((error: unknown) => {
+			console.error("mtls request failed", error);
+			socket.destroy();
+		});
 	});
 	const openSockets = new Set<TLSSocket>();
 	const tlsServer = tls.createServer(
@@ -241,25 +266,58 @@ export function startMtlsServer(options: MtlsServerOptions, handle: MtlsHandler)
 			socket.once("close", () => openSockets.delete(socket));
 			socket.setTimeout(idleMs);
 			socket.on("timeout", () => socket.destroy());
+			let deadline: NodeJS.Timeout | undefined;
+			const disarm = () => {
+				clearTimeout(deadline);
+				deadline = undefined;
+			};
+			// The first byte of a request arms its deadline; the response finishing disarms it.
+			socket.on("data", () => {
+				deadline ??= setTimeout(() => socket.destroy(), idleMs);
+			});
+			socket.once("close", disarm);
+			disarmDeadline.set(socket, disarm);
 			httpServer.emit("connection", socket);
 		},
 	);
-	tlsServer.listen(options.port, LOOPBACK);
-	const address = tlsServer.address();
-	if (address === null || typeof address === "string") {
-		tlsServer.close();
-		throw new Error("mTLS listener did not bind a TCP address");
-	}
+	tlsServer.maxConnections = MAX_CONNECTIONS;
+	// Bun ignores the tls `handshakeTimeout` option, so a raw connection that never completes its handshake is
+	// bounded here. The inactivity timer stays on the raw socket, which also carries the TLS bytes afterwards.
+	tlsServer.on("connection", (raw) => {
+		raw.setTimeout(idleMs, () => raw.destroy());
+	});
 
+	const { promise, resolve, reject } = Promise.withResolvers<MtlsServer>();
+	let listening = false;
+	let errorLogged = false;
 	let stopping: Promise<void> | undefined;
-	return {
-		port: address.port,
-		stop(): Promise<void> {
-			stopping ??= new Promise<void>((resolve, reject) => {
-				tlsServer.close((error) => (error ? reject(error) : resolve()));
-				for (const socket of openSockets) socket.destroy();
-			});
-			return stopping;
-		},
+	const stop = (): Promise<void> => {
+		stopping ??= new Promise<void>((resolveStop, rejectStop) => {
+			tlsServer.close((error) => (error ? rejectStop(error) : resolveStop()));
+			for (const socket of openSockets) socket.destroy();
+		});
+		return stopping;
 	};
+	tlsServer.on("error", (error) => {
+		if (!listening) {
+			reject(error);
+			return;
+		}
+		if (!errorLogged) {
+			errorLogged = true;
+			console.error("mtls listener error", error);
+		}
+		stop().catch(() => {});
+	});
+	tlsServer.listen(options.port, LOOPBACK, () => {
+		listening = true;
+		const address = tlsServer.address();
+		if (address === null || typeof address === "string") {
+			tlsServer.close();
+			reject(new Error("mTLS listener did not bind a TCP address"));
+			return;
+		}
+		resolve({ port: address.port, stop });
+	});
+	return promise;
 }

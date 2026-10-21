@@ -2,12 +2,13 @@
 // Copyright (C) 2026 SWC Studio
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import net from "node:net";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
 import { identityFromUriSans, type IdentityResult } from "./identity.ts";
-import { type MtlsPeer, type MtlsServer, peerIdentity, startMtlsServer } from "./mtls.ts";
+import { MAX_CONNECTIONS, type MtlsPeer, type MtlsServer, peerIdentity, startMtlsServer } from "./mtls.ts";
 
 const TRUST_DOMAIN = "ultrathink.test";
 const EDGE_URI = "spiffe://ultrathink.test/edge/nginx";
@@ -98,7 +99,21 @@ function serverOptions(idleTimeoutSec: number) {
 	};
 }
 
-beforeAll(() => {
+/** The TCP port a listener bound to, failing the test if it is not a TCP listener. */
+function boundPort(listener: net.Server): number {
+	const address = listener.address();
+	if (address === null || typeof address === "string") throw new Error("not a TCP listener");
+	return address.port;
+}
+
+/** Opens a TLS client with the edge certificate, so the test controls the bytes written after the handshake. */
+function edgeClient(port: number): tls.TLSSocket {
+	const client = tls.connect({ port, host: "127.0.0.1", ca, cert: edgeCreds.cert, key: edgeCreds.key });
+	client.on("error", () => {});
+	return client;
+}
+
+beforeAll(async () => {
 	dir = mkdtempSync(join(tmpdir(), "mtls-test-"));
 	openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=ultrathink-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
 	openssl(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca2.key", "-out", "ca2.pem", "-days", "2", "-subj", "/CN=other-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
@@ -110,7 +125,7 @@ beforeAll(() => {
 	edgeNewCreds = issueLeaf("edge-new", `URI:${EDGE_URI}`, join(dir, "ca.pem"), join(dir, "ca.key"));
 	foreignCreds = issueLeaf("foreign", `URI:${EDGE_URI}`, join(dir, "ca2.pem"), join(dir, "ca2.key"));
 	expiredCreds = issueExpiredLeaf("expired", `URI:${EDGE_URI}`);
-	server = startMtlsServer(serverOptions(30), async (req, peer) => {
+	server = await startMtlsServer(serverOptions(30), async (req, peer) => {
 		calls++;
 		lastPeer = peer;
 		return new Response(await req.text());
@@ -196,10 +211,7 @@ describe("mTLS server adapter", () => {
 			});
 			probe.once("error", reject);
 			probe.listen(0, "127.0.0.1", () => {
-				const address = probe.address();
-				if (address === null || typeof address === "string") throw new Error("probe did not bind a TCP address");
-				const port = address.port;
-				const client = tls.connect({ port, host: "127.0.0.1", ca, cert: edgeCreds.cert, key: edgeCreds.key });
+				const client = tls.connect({ port: boundPort(probe), host: "127.0.0.1", ca, cert: edgeCreds.cert, key: edgeCreds.key });
 				client.on("error", reject);
 				client.on("close", () => probe.close());
 			});
@@ -207,13 +219,13 @@ describe("mTLS server adapter", () => {
 		expect(identity).toEqual({ ok: true, spiffeId: EDGE_URI, path: "/edge/nginx" });
 	});
 
+	// Timing tests: socket timeouts run on the platform clock inside the server, so they cannot be faked from the
+	// client. Each awaits the close event with a short configured window, never an elapsed-time assertion.
 	test("closes a connection that stays idle past idleTimeoutSec", async () => {
-		const idle = startMtlsServer(serverOptions(0.2), async () => new Response("unused"));
+		const idle = await startMtlsServer(serverOptions(0.2), async () => new Response("unused"));
 		try {
 			await new Promise<void>((resolve) => {
-				const client = tls.connect({ port: idle.port, host: "127.0.0.1", ca, cert: edgeCreds.cert, key: edgeCreds.key });
-				// A reset after the server destroys the idle socket is part of the same close; the close event is what is asserted.
-				client.on("error", () => {});
+				const client = edgeClient(idle.port);
 				client.on("close", () => resolve());
 			});
 		} finally {
@@ -221,7 +233,85 @@ describe("mTLS server adapter", () => {
 		}
 	});
 
-	test("refuses to bind any address other than 127.0.0.1", () => {
-		expect(() => startMtlsServer({ ...serverOptions(30), hostname: "0.0.0.0" }, async () => new Response())).toThrow(RangeError);
+	test("closes a request that trickles past the per-request deadline", async () => {
+		// Bytes keep arriving every 20 ms, well inside the 300 ms window, so only the absolute deadline can close it.
+		const slow = await startMtlsServer(serverOptions(0.3), async () => new Response("unused"));
+		try {
+			await new Promise<void>((resolve) => {
+				const client = edgeClient(slow.port);
+				let trickle: NodeJS.Timeout | undefined;
+				client.on("close", () => {
+					clearInterval(trickle);
+					resolve();
+				});
+				client.write("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: ");
+				trickle = setInterval(() => client.write("a"), 20);
+			});
+		} finally {
+			await slow.stop();
+		}
+	});
+
+	test("closes a connection that never completes the TLS handshake", async () => {
+		const stalled = await startMtlsServer(serverOptions(0.2), async () => new Response("unused"));
+		try {
+			await new Promise<void>((resolve) => {
+				const raw = net.connect(stalled.port, "127.0.0.1");
+				raw.on("error", () => {});
+				raw.on("close", () => resolve());
+			});
+		} finally {
+			await stalled.stop();
+		}
+	});
+
+	test("closes the connection beyond MAX_CONNECTIONS at accept", async () => {
+		const full = await startMtlsServer(serverOptions(30), async () => new Response("unused"));
+		const held: net.Socket[] = [];
+		try {
+			const firstClose = new Promise<void>((resolve) => {
+				for (let i = 0; i <= MAX_CONNECTIONS; i++) {
+					const raw = net.connect(full.port, "127.0.0.1");
+					raw.on("error", () => {});
+					raw.on("close", () => resolve());
+					held.push(raw);
+				}
+			});
+			await firstClose;
+		} finally {
+			for (const raw of held) raw.destroy();
+			await full.stop();
+		}
+	});
+
+	test("survives a client that aborts mid-body and still serves the next request", async () => {
+		calls = 0;
+		const aborted = new Promise<void>((resolve) => {
+			const client = edgeClient(server.port);
+			client.on("secureConnect", () => {
+				// Declares 100 body bytes, sends 3, and drops the connection once those bytes are flushed.
+				client.write("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\nabc", () => client.destroy());
+			});
+			client.on("close", () => resolve());
+		});
+		await aborted;
+		const response = await fetchWith(server.port, { body: "ok", tls: { ca, cert: edgeCreds.cert, key: edgeCreds.key } });
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok");
+		expect(calls).toBe(1);
+	});
+
+	test("reports a bind failure as a rejection", async () => {
+		const holder = net.createServer();
+		await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", () => resolve()));
+		try {
+			await expect(startMtlsServer({ ...serverOptions(30), port: boundPort(holder) }, async () => new Response())).rejects.toThrow();
+		} finally {
+			await new Promise<void>((resolve) => holder.close(() => resolve()));
+		}
+	});
+
+	test("refuses to bind any address other than 127.0.0.1", async () => {
+		await expect(startMtlsServer({ ...serverOptions(30), hostname: "0.0.0.0" }, async () => new Response())).rejects.toThrow(RangeError);
 	});
 });

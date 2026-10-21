@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AuditFs, type AuditNotice, type AuditRecord, auditPath, createAuditLog, verifyAuditFile } from "./audit.ts";
 import { listSegments, sealedName } from "./audit-segments.ts";
+import { createFrontier } from "./audit-merkle.ts";
 
 const START = 1_700_000_000_000;
 const MIB = 1024 * 1024;
@@ -382,5 +383,83 @@ describe("prune", () => {
 			expect(existsSync(path)).toBe(true);
 			expect(() => createAuditLog({ path, now: clock() })).toThrow(/cannot verify/);
 		}
+	});
+
+	test("a boundary record that cannot be written removes no segment, and the chain still verifies", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const errors: Error[] = [];
+		let failWrites = false;
+		const fs: AuditFs = {
+			...nodeFs,
+			writeSync: ((fd: number, data: Buffer, offset: number, length: number) => {
+				if (failWrites) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+				return nodeFs.writeSync(fd, data, offset, length);
+			}) as typeof nodeFs.writeSync,
+		};
+		const log = createAuditLog({ path, now: clock(), fs, segmentBytes: MIB, onError: (e) => errors.push(e) });
+		fill(log, 1, 200);
+		const sealedBefore = sealedIn(dir);
+		failWrites = true;
+		expect(log.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: 0 });
+		failWrites = false;
+		expect(sealedIn(dir)).toEqual(sealedBefore);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.message).toMatch(/retention record dropped: ENOSPC/);
+		expect(verifyAuditFile(path).ok).toBe(true);
+		expect(log.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: sealedBefore.length });
+		expect(sealedIn(dir)).toEqual([]);
+		expect(verifyAuditFile(path).ok).toBe(true);
+	});
+
+	test("a segment that cannot be deleted after the boundary is written leaves a chain that verifies", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const errors: Error[] = [];
+		let unlinks = 0;
+		const fs: AuditFs = {
+			...nodeFs,
+			unlinkSync: ((target: nodeFs.PathLike) => {
+				unlinks += 1;
+				if (unlinks === 2) throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+				nodeFs.unlinkSync(target);
+			}) as typeof nodeFs.unlinkSync,
+		};
+		const log = createAuditLog({ path, now: clock(), fs, segmentBytes: MIB, onError: (e) => errors.push(e) });
+		fill(log, 1, 400);
+		const sealed = sealedIn(dir);
+		expect(sealed.length).toBeGreaterThanOrEqual(2);
+		expect(log.prune(Number.MAX_SAFE_INTEGER)).toEqual({ segments: 1 });
+		expect(errors.map((e) => e.message)).toEqual([expect.stringMatching(/prune stopped at/)]);
+		expect(sealedIn(dir)).toEqual(sealed.slice(1));
+		expect(verifyAuditFile(path).ok).toBe(true);
+		expect(records(path).at(-1)?.event).toBe("audit_retention_pruned");
+		log.record("login_ok", { n: 999 });
+		expect(verifyAuditFile(path).ok).toBe(true);
+	});
+
+	test("a boundary frontier over a different number of records fails closed", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const log = createAuditLog({ path, now: clock(), segmentBytes: MIB });
+		fill(log, 1, 200);
+		const sealed = sealedIn(dir)[0] as string;
+		const lastSealed = Number(/-(\d+)\.jsonl$/.exec(sealed)?.[1]);
+		const cutoff = Date.parse(records(join(dir, sealed))[lastSealed - 1]?.ts as string) + 1;
+		expect(log.prune(cutoff)).toEqual({ segments: 1 });
+		log.close();
+		// A frontier that is valid on its own but covers one record, not the records before the boundary.
+		const wrong = createFrontier();
+		wrong.push("a".repeat(64));
+		const out = lines(path);
+		const retention = JSON.parse(out.at(-1) as string) as AuditRecord;
+		out[out.length - 1] = JSON.stringify(rehash({ ...retention, fields: { ...retention.fields, frontier: JSON.stringify(wrong.snapshot()) } }));
+		rewrite(path, out);
+		const v = verifyAuditFile(path);
+		expect(v.ok).toBe(false);
+		if (v.ok) return;
+		expect(v.brokenAt).toBe(0);
+		expect(v.reason).toMatch(/carries a frontier over 1 records/);
+		expect(() => createAuditLog({ path, now: clock() })).toThrow(/cannot verify/);
 	});
 });

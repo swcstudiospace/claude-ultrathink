@@ -8,6 +8,7 @@
  * itself match and cost nothing. A different fingerprint triggers one full chain scan, which alerts when the chain is
  * broken or when the disk head differs from the acknowledged head. Every `fullScanEveryTicks` ticks a full scan runs
  * even when the fingerprint matches, which catches an in-place edit that keeps size, mtime and inode.
+ * A tick whose fingerprint matches the acknowledged one never clears an alert; only a full scan that comes back healthy does.
  *
  * The watch never writes to the chain. Alerts go to `onAlert`; the caller decides where they land.
  * `stat`, `acknowledged` and `scan` are expected not to throw.
@@ -71,11 +72,14 @@ function sameFingerprint(a: Fingerprint | undefined, b: Fingerprint | undefined)
 	return a !== undefined && b !== undefined && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
 }
 
-/** Compares a full scan with the acknowledged head. Returns the condition, or undefined when the file is healthy. */
+/**
+ * Compares a full scan with the acknowledged head. Returns the condition, or undefined when the file is healthy. The head
+ * is compared by hash only: the hash commits to the record's seq, while the retained record count stops equalling the
+ * global seq once a prune has removed segments.
+ */
 function judge(outcome: ScanOutcome, ack: Acknowledged): WatchAlert | undefined {
 	if (!outcome.ok) return { kind: "chain_broken", reason: `chain broken at record ${outcome.brokenAt}: ${outcome.reason}` };
-	if (outcome.records !== ack.seq) return { kind: "head_mismatch", reason: `disk holds ${outcome.records} records, acknowledged head is record ${ack.seq}` };
-	if (outcome.lastHash !== ack.hash) return { kind: "head_mismatch", reason: `hash of record ${ack.seq} differs from the acknowledged head` };
+	if (outcome.lastHash !== ack.hash) return { kind: "head_mismatch", reason: `last record on disk is not the acknowledged head, record ${ack.seq}` };
 	return undefined;
 }
 
@@ -114,18 +118,19 @@ export function createAuditWatch(options: AuditWatchOptions): AuditWatch {
 		const current = stat();
 		const ack = acknowledged();
 
+		const fullScan = ticks % fullScanEvery === 0;
 		if (current === undefined) {
 			decided = undefined;
-			apply(ack.seq > 0 ? { kind: "head_mismatch", reason: `audit file is missing; acknowledged head is record ${ack.seq}` } : undefined);
+			// A missing file is a condition only when records were acknowledged. Clearing a standing alert is a full-scan decision.
+			if (ack.seq > 0) apply({ kind: "head_mismatch", reason: `audit file is missing; acknowledged head is record ${ack.seq}` });
+			else if (fullScan) apply(undefined);
 			return;
 		}
 
-		const fullScan = ticks % fullScanEvery === 0;
 		if (!fullScan) {
-			// The log's own last write: nothing changed since it acknowledged the head.
+			// The log's own last write: nothing changed since it acknowledged the head. It is not a full scan, so it never clears an alert.
 			if (sameFingerprint(current, ack.fingerprint)) {
 				decided = current;
-				apply(undefined);
 				return;
 			}
 			// Already decided for this exact state; a persisting condition does not re-alert.

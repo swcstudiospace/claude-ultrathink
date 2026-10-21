@@ -130,6 +130,24 @@ The release script's probes need `/readyz`, which the old code lacks, and its re
 
 4. Rollback of the cutover: `systemctl stop ultrathink-web`, restore the old unit with `cp -a "$bak"/ultrathink-web.service /etc/systemd/system/`, `systemctl daemon-reload`, `systemctl start ultrathink-web`. The old unit still points at the working tree under `/root`, which the cutover did not modify, and root can read the service-owned state. If the new code changed state the old code cannot read, also restore it: `rm -rf /var/lib/ultrathink && cp -a "$bak"/state /var/lib/ultrathink`. Restore the nginx conf from `$bak` if it was already replaced, then `nginx -t && systemctl reload nginx`.
 
+### Other environment keys
+
+These are read by `services/ultrathink/config/config.ts` and are not in the item 4 list. Set them in `/etc/ultrathink/ultrathink.env` only when a default is wrong.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ULTRATHINK_PORT` | `8795` | Listen port, 1024 to 65535. |
+| `ULTRATHINK_MAX_INPUT_CHARS` | `8000` | Longest request, 1 to 20000 characters. |
+| `ULTRATHINK_MAX_ANSWER_CHARS` | `20000` | Longest client-driven answer, 1 to 20000 characters. |
+| `ULTRATHINK_MODEL_MAX_OUTPUT_TOKENS` | `8000` | Output token limit for one model call, 256 to 32000. |
+| `ULTRATHINK_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base. https only, no credentials, query or fragment. |
+| `ULTRATHINK_SERVER_PLANNING` | unset | `0` turns server-side planning off. `1` requires `OPENROUTER_API_KEY` and `ULTRATHINK_PLANNING_MODEL`, or the service refuses to start. Unset means on when both are set. |
+| `ULTRATHINK_SESSION_SECRET_PREVIOUS` | unset | Comma list of up to 4 earlier session secrets, each at least 32 characters, for sessions signed before a rotation. |
+| `ULTRATHINK_OAUTH_REDIRECT_ORIGINS` | unset | Comma list of extra https origins allowed in client redirect URIs. |
+| `ULTRATHINK_BREAKER_FAILURES` | `5` | Failures inside the window that open the upstream circuit breaker, 0 to 100. `0` turns the breaker off. |
+| `ULTRATHINK_BREAKER_WINDOW_MS` | `60000` | Window in milliseconds for counting breaker failures, 1000 to 3600000. |
+| `ULTRATHINK_BREAKER_OPEN_MS` | `30000` | How long an open breaker stays open, in milliseconds, 1000 to 600000. |
+
 ## 3. Deploy
 
 Commit and push the change first. The release is built from a commit, never from the working tree.

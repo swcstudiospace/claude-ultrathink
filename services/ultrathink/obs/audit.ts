@@ -153,7 +153,7 @@ export interface AuditLog {
 	 * that caused the event continues) and `onError` is called for each dropped record. Unknown values in
 	 * `fields` are dropped (only finite numbers, booleans and strings are kept), keys that look like secrets are
 	 * dropped, strings are clipped to 256 characters with control characters removed, and at most 32 keys are kept.
-	 * The event `audit_anchor` is reserved for the log itself and is dropped when passed here.
+	 * The events `audit_anchor` and `audit_retention_pruned` are reserved for the log itself and are dropped when passed here.
 	 */
 	record(event: AuditEvent, fields?: Record<string, unknown>): void;
 	/** Full scan of the chain on disk (sealed segments and the active file), constant memory per line. Reads with the log's `fs` hooks. */
@@ -167,6 +167,7 @@ export interface AuditLog {
 	 * `audit_retention_pruned` event. The event carries the anchor frontier over every deleted record, so anchors written
 	 * later still cover the whole chain. The active file and `.corrupt-*` evidence are never removed. Returns how many
 	 * segments were deleted; with none eligible nothing is written. Skipped (and reported) when the chain does not verify.
+	 * The event is written and fsynced before any segment is deleted; when it cannot be written, nothing is deleted.
 	 */
 	prune(cutoffMs: number): { segments: number };
 	/** Further `record()` calls are dropped, and each one is reported through `onError`. Idempotent. */
@@ -191,6 +192,8 @@ const SECRET_KEY = /secret|password|token|authorization|api[-_]?key|cookie|conne
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point.
 const CONTROL = /[\u0000-\u001f\u007f]/g;
 const HEX64 = /^[0-9a-f]{64}$/;
+/** The exact key set of a record line, sorted. A line with any other key was not written by this log. */
+const RECORD_KEYS: readonly string[] = ["event", "fields", "hash", "prev", "seq", "ts"];
 
 type Primitive = string | number | boolean;
 
@@ -270,6 +273,10 @@ function checkLine(line: string, expectedSeq: number, expectedPrev: string): { h
 		return { reason: "not valid JSON" };
 	}
 	if (!isPlainObject(parsed)) return { reason: "record is not an object" };
+	const keys = Object.keys(parsed).sort();
+	if (keys.length !== RECORD_KEYS.length || keys.some((key, i) => key !== RECORD_KEYS[i])) return { reason: "record does not have exactly the keys seq, ts, event, prev, hash and fields" };
+	// Only the writer's serialization is accepted: a duplicate key or extra whitespace changes the bytes but not the parsed object.
+	if (JSON.stringify(parsed) !== line) return { reason: "line is not the canonical serialization of its record (duplicate keys or extra whitespace)" };
 	const { seq, ts, event, prev, hash, fields } = parsed;
 	if (typeof seq !== "number" || !Number.isInteger(seq)) return { reason: "seq is not an integer" };
 	if (seq !== expectedSeq) return { reason: `seq ${seq} where ${expectedSeq} was expected` };
@@ -325,7 +332,11 @@ interface ChainScan {
 	lastHash: string;
 	/** Frontier over every verified record hash, anchors included. */
 	frontier: MerkleFrontier;
-	/** Non-anchor records since the last anchor (or since the start of the retained chain). */
+	/**
+	 * Non-anchor records since the last anchor (or since the start of the retained chain). The writer paces its own anchors
+	 * with this count. Known limit: verification does not enforce the cadence, since `verifyAuditFile` takes no `anchorEvery`;
+	 * a chain written with another cadence still verifies.
+	 */
 	sinceAnchor: number;
 	/** Global seq of the first record in the active file, or `lastSeq + 1` when the active file holds none. */
 	activeFirst: number;
@@ -443,6 +454,9 @@ function resolvePrunedPrefix(head: { seq: number; prev: string }, files: readonl
 	const seeded = decodeFrontier(found.fields.frontier);
 	if (seeded === undefined) {
 		return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 0, reason: `the audit_retention_pruned record for seq ${head.seq - 1} has no valid frontier; the records before seq ${head.seq} cannot be verified` } };
+	}
+	if (seeded.frontier.size !== head.seq - 1) {
+		return { kind: "failed", verdict: { ok: false, records: 0, brokenAt: 0, reason: `the audit_retention_pruned record for seq ${head.seq - 1} carries a frontier over ${seeded.frontier.size} records; the records before seq ${head.seq} cannot be verified` } };
 	}
 	return { kind: "seeded", ...seeded };
 }
@@ -604,6 +618,22 @@ function fingerprintOf(path: string, fs: AuditFs): Fingerprint | undefined {
 	}
 }
 
+/** Fsyncs the directory that holds `path`, so a file created or renamed there survives a crash. Throws on failure. */
+function fsyncDirectory(fs: AuditFs, path: string): void {
+	const dirFd = fs.openSync(dirname(path), "r");
+	try {
+		fs.fsyncSync(dirFd);
+	} finally {
+		fs.closeSync(dirFd);
+	}
+}
+
+/** True when two file identities describe the same state; two absent files match. */
+function sameIdentity(a: Fingerprint | undefined, b: Fingerprint | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
+}
+
 /**
  * Opens (or creates, `0600`) the audit file and continues its chain. An existing chain is verified first; a broken
  * active file (truncated by a crash, edited, reordered) is moved to `${path}.corrupt-<now>` and reported through
@@ -659,12 +689,13 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	let sinceAnchor = 0;
 	let activeFirst = 1;
 	let fingerprint: Fingerprint | undefined;
-	// The size of the active file as this log last left it. Undefined means the disk must be read before the next append.
-	let expectedSize: number | undefined;
+	// The identity of the active file as this log last left it. Undefined means the disk must be read before the next append.
+	let expected: { fp: Fingerprint | undefined } | undefined;
 
 	// The single point where the file identity is refreshed; every path that changes the active file calls it.
 	const refreshFingerprint = (): void => {
 		fingerprint = fingerprintOf(path, fs);
+		expected = { fp: fingerprint };
 	};
 
 	const adopt = (scan: ChainScan): void => {
@@ -712,6 +743,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	}
 
 	// Open for append once: the directory is writable (or startup fails), the file exists and is private.
+	const existed = sizeOf(path, fs) !== undefined;
 	let probe: number;
 	try {
 		probe = fs.openSync(path, "a", 0o600);
@@ -725,8 +757,14 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 	} finally {
 		fs.closeSync(probe);
 	}
+	if (!existed) {
+		try {
+			fsyncDirectory(fs, path);
+		} catch (error) {
+			throw new Error(`audit log: cannot sync the directory of ${path}: ${errorOf(error).message}`);
+		}
+	}
 
-	expectedSize = sizeOf(path, fs) ?? 0;
 	refreshFingerprint();
 
 	/**
@@ -741,29 +779,27 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 				notify("changed_outside", `audit log: ${path} changed outside the service; continuing from the file on disk`);
 			}
 			adopt(check);
-			expectedSize = sizeOf(path, fs) ?? 0;
 			refreshFingerprint();
 			return true;
 		}
 		if (verdict.brokenAt === 0) {
 			report(new Error(`audit log: cannot verify ${path}: ${verdict.reason}; record dropped`));
-			expectedSize = undefined;
+			expected = undefined;
 			return false;
 		}
 		const reason = recoverFrom(check);
 		if (reason !== undefined) {
 			report(new Error(`audit log: ${reason}; record dropped`));
-			expectedSize = undefined;
+			expected = undefined;
 			return false;
 		}
-		expectedSize = sizeOf(path, fs) ?? 0;
 		refreshFingerprint();
 		return true;
 	}
 
 	/** Brings the in-memory state in line with the file before a write. False when the record must be dropped. */
 	function ensureDisk(): boolean {
-		if (expectedSize !== undefined && sizeOf(path, fs) === expectedSize) return true;
+		if (expected !== undefined && sameIdentity(fingerprintOf(path, fs), expected.fp)) return true;
 		return adoptDisk();
 	}
 
@@ -795,17 +831,12 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			report(new Error(`audit log: ${name} is sealed but not read-only: ${errorOf(error).message}`));
 		}
 		try {
-			const dirFd = fs.openSync(dirname(path), "r");
-			try {
-				fs.fsyncSync(dirFd);
-			} finally {
-				fs.closeSync(dirFd);
-			}
+			fsyncDirectory(fs, path);
 		} catch (error) {
 			report(new Error(`audit log: ${name} is sealed but the directory was not synced: ${errorOf(error).message}`));
 		}
 		activeFirst = seq + 1;
-		expectedSize = 0;
+		expected = undefined;
 		return true;
 	}
 
@@ -820,25 +851,33 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		const hash = hashRecord(nextSeq, ts, event, prev, fields);
 		const line: AuditRecord = { seq: nextSeq, ts, event, prev, hash, fields };
 		const data = Buffer.from(`${JSON.stringify(line)}\n`, "utf8");
-		let before = sizeOf(path, fs) ?? 0;
+		const sizeBefore = sizeOf(path, fs);
+		let before = sizeBefore ?? 0;
+		let created = sizeBefore === undefined;
 		// Only a non-empty active file is sealed, so a record larger than the limit never leaves an empty segment behind.
-		if (before > 0 && before + data.length > segmentBytes && seal()) before = 0;
+		if (before > 0 && before + data.length > segmentBytes && seal()) {
+			before = 0;
+			created = true;
+		}
 		// Reopened per append (O_APPEND): a rotated or removed file is recreated instead of written into an unlinked inode.
 		let fd: number | undefined;
 		try {
 			fd = fs.openSync(path, "a", 0o600);
 			writeAll(fs, fd, data);
 			fs.fsyncSync(fd);
+			// A file this append created is durable only once its directory entry is synced too.
+			if (created) fsyncDirectory(fs, path);
 		} catch (error) {
 			report(new Error(`audit log: ${label} dropped: ${errorOf(error).message}`));
 			// Roll back whatever part of the record reached the file, so the chain on disk still ends at the last acknowledged record.
+			let truncated = true;
 			try {
 				fs.truncateSync(path, before);
-				expectedSize = before;
 			} catch {
-				expectedSize = undefined;
+				truncated = false;
 			}
 			refreshFingerprint();
+			if (!truncated) expected = undefined;
 			return undefined;
 		} finally {
 			if (fd !== undefined) {
@@ -851,7 +890,6 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		}
 		seq = nextSeq;
 		prev = hash;
-		expectedSize = before + data.length;
 		frontier.push(hash);
 		refreshFingerprint();
 		return line;
@@ -885,6 +923,17 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 		notifyAppended(line);
 	}
 
+	/**
+	 * Writes one `audit_retention_pruned` record naming `files` as deleted: the first and last seq, the hash of the last one,
+	 * and the anchor frontier over every record through it. Undefined when the record was dropped (and reported).
+	 */
+	function retain(files: readonly ScannedFile[]): AuditRecord | undefined {
+		const last = files[files.length - 1] as ScannedFile;
+		const line = appendLine(RETENTION_EVENT, { segments: files.length, fromSeq: files[0]?.firstSeq ?? 0, throughSeq: last.lastSeq, throughHash: last.lastHash, frontier: JSON.stringify(last.frontier) }, "retention record");
+		if (line !== undefined) commit(line);
+		return line;
+	}
+
 	/** Deletes the eligible sealed segments and records the boundary; see `AuditLog.prune`. */
 	function prune(cutoffMs: number): { segments: number } {
 		if (closed) {
@@ -903,6 +952,9 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			if (file.path === path || !(Date.parse(file.lastTs) < cutoffMs)) break;
 			eligible.push(file);
 		}
+		if (eligible.length === 0) return { segments: 0 };
+		// The boundary is written and fsynced before the first delete. If it cannot be written, nothing is deleted.
+		if (retain(eligible) === undefined) return { segments: 0 };
 		const removed: ScannedFile[] = [];
 		for (const file of eligible) {
 			try {
@@ -913,13 +965,14 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 			}
 			removed.push(file);
 		}
-		const last = removed.at(-1);
-		if (last === undefined) return { segments: 0 };
-		// The retained chain now starts after these records. This event names the boundary and carries the frontier over
-		// every record through it, so anchors written from now on still cover the whole chain.
-		notify("pruned", `audit log: pruned ${removed.length} sealed segment(s) through record ${last.lastSeq}`);
-		const line = appendLine(RETENTION_EVENT, { segments: removed.length, fromSeq: removed[0]?.firstSeq ?? 0, throughSeq: last.lastSeq, throughHash: last.lastHash, frontier: JSON.stringify(last.frontier) }, "retention record");
-		if (line !== undefined) commit(line);
+		const through = removed.at(-1);
+		// Nothing was deleted: the record above names segments that are still present. Its frontier is still correct, so
+		// verification is unaffected, and the next prune writes its own record.
+		if (through === undefined) return { segments: 0 };
+		// A delete failed after the boundary was written, so the chain now starts after `through`, which that record does not
+		// name. A second record names it, so the chain on disk still verifies.
+		if (removed.length < eligible.length) retain(removed);
+		notify("pruned", `audit log: pruned ${removed.length} sealed segment(s) through record ${through.lastSeq}`);
 		return { segments: removed.length };
 	}
 
@@ -930,8 +983,8 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
 				report(new Error("audit log: record after close dropped"));
 				return;
 			}
-			if (event === ANCHOR_EVENT) {
-				report(new Error("audit log: audit_anchor is written by the log only; record dropped"));
+			if (event === ANCHOR_EVENT || event === RETENTION_EVENT) {
+				report(new Error(`audit log: ${event} is written by the log only; record dropped`));
 				return;
 			}
 			const line = appendLine(event, sanitizeFields(fields), "record");

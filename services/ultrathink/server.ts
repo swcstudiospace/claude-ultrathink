@@ -67,24 +67,31 @@ interface Listener {
 
 // With TLS configured the listener is mTLS only: the handshake refuses any client that does not chain to the CA, and
 // the verified SPIFFE identity (never a header) is the only identity the router sees.
-function startTlsListener(tls: TlsFiles, config: UltrathinkConfig, app: App): Listener {
+async function startTlsListener(tls: TlsFiles, config: UltrathinkConfig, app: App): Promise<Listener> {
 	requireReadableOrExit("ULTRATHINK_TLS_CERT", tls.certFile);
 	requireReadableOrExit("ULTRATHINK_TLS_KEY", tls.keyFile);
 	requireReadableOrExit("ULTRATHINK_TLS_CLIENT_CA", tls.clientCaFile);
-	return startMtlsServer(
-		{
-			port: config.port,
-			certFile: tls.certFile,
-			keyFile: tls.keyFile,
-			clientCaFile: tls.clientCaFile,
-			idleTimeoutSec: IDLE_TIMEOUT_SEC,
-			maxBodyBytes: config.maxBodyBytes,
-		},
-		async (req, peer) => {
-			const identity = identityFromUriSans(peer.uriSans, config.spiffeTrustDomain);
-			return app.handle(req, peer.ip, { spiffeId: identity.ok ? identity.spiffeId : null });
-		},
-	);
+	try {
+		return await startMtlsServer(
+			{
+				port: config.port,
+				certFile: tls.certFile,
+				keyFile: tls.keyFile,
+				clientCaFile: tls.clientCaFile,
+				idleTimeoutSec: IDLE_TIMEOUT_SEC,
+				maxBodyBytes: config.maxBodyBytes,
+			},
+			async (req, peer) => {
+				const identity = identityFromUriSans(peer.uriSans, config.spiffeTrustDomain);
+				return app.handle(req, peer.ip, { spiffeId: identity.ok ? identity.spiffeId : null });
+			},
+		);
+	} catch (error) {
+		// A bind failure names the port and the system error code only; the TLS file paths are never printed.
+		const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+		process.stderr.write(`mTLS listener could not bind 127.0.0.1:${config.port} (${code})\n`);
+		process.exit(1);
+	}
 }
 
 // Plaintext exists only behind the loopback opt-in, which config.ts requires whenever no TLS files are set.
@@ -114,7 +121,7 @@ const chaosFetch = loadChaosFetch(config);
 const app = createApp({ config, store, auth, logger, ...(chaosFetch ? { fetch: chaosFetch } : {}) });
 
 const listener: Listener =
-	config.tls === undefined ? startPlaintextListener(config, app) : startTlsListener(config.tls, config, app);
+	config.tls === undefined ? startPlaintextListener(config, app) : await startTlsListener(config.tls, config, app);
 app.start();
 
 const shutdown = createShutdown({
