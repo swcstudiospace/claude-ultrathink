@@ -6,6 +6,8 @@ export interface Metrics {
 	/** Histogram observation in the default buckets (seconds). */
 	observe(name: string, value: number, labels?: Record<string, string>): void;
 	gauge(name: string, value: number, labels?: Record<string, string>): void;
+	/** Sum of series values in family `name` whose labels contain every `match` pair; 0 for an unknown family. */
+	sum(name: string, match?: Record<string, string>): number;
 	/** Prometheus text exposition format 0.0.4. */
 	render(): string;
 }
@@ -136,6 +138,16 @@ export function createMetrics(opts: MetricsOptions = {}): Metrics {
 			const norm = normalizeLabels(labels);
 			const series = seriesFor(name, "gauge", norm, () => ({ labels: norm, value: 0 }));
 			if (series) series.value = value;
+		},
+		sum(name, match) {
+			const family = families.get(metricName(name));
+			if (!family) return 0;
+			const pairs = Object.entries(match ?? {}).map(([k, v]) => [labelName(k), String(v)] as const);
+			let total = 0;
+			for (const series of family.series.values()) {
+				if (pairs.every(([k, v]) => series.labels.some(([lk, lv]) => lk === k && lv === v))) total += series.value;
+			}
+			return total;
 		},
 		render() {
 			const lines: string[] = [];

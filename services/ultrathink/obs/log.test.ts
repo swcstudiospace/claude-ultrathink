@@ -233,4 +233,23 @@ describe("request context", () => {
 		expect(parsed()[0]).not.toHaveProperty("reqId");
 		expect(parsed()[0]).not.toHaveProperty("traceId");
 	});
+
+	test("a line emitted inside a request carries that context's spanId", () => {
+		const { logger, parsed } = capture();
+		runWithRequestContext(CTX, () => logger.info("planner.start"));
+		expect(parsed()[0]).toMatchObject({ spanId: CTX.spanId });
+	});
+
+	test("a spanId the caller supplies is not overwritten", () => {
+		const { logger, parsed } = capture();
+		runWithRequestContext(CTX, () => logger.info("upstream", { spanId: "caller-span" }));
+		expect(parsed()[0]).toMatchObject({ spanId: "caller-span", reqId: CTX.reqId });
+	});
+
+	test("a line outside a request has no spanId or reqId key", () => {
+		const { logger, parsed } = capture();
+		logger.info("boot");
+		expect(parsed()[0]).not.toHaveProperty("spanId");
+		expect(parsed()[0]).not.toHaveProperty("reqId");
+	});
 });

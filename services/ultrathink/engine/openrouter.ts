@@ -3,6 +3,7 @@
 
 import type { ReasoningEffort } from "../config/config.ts";
 import { currentRequestContext } from "../obs/context.ts";
+import type { SpanSink } from "../obs/otel.ts";
 import { childSpan, formatTraceparent } from "../obs/trace.ts";
 import type { CircuitBreaker, ReleaseOutcome } from "./breaker.ts";
 
@@ -82,6 +83,11 @@ export interface OpenRouterCompleterOptions {
 	 * Absent: no breaker, calls always go out.
 	 */
 	breaker?: CircuitBreaker;
+	/**
+	 * Receives one CLIENT span per HTTP attempt made under a sampled request context. It never sees a URL path, query,
+	 * key or header. A throwing sink is ignored.
+	 */
+	spans?: SpanSink;
 }
 
 /** Outcome of one `complete()` call, reported once after retries. Carries no key, header or body. */
@@ -237,11 +243,22 @@ function parseCompletion(raw: string): Attempt {
 	};
 }
 
+/** Host of the endpoint URL, the only part of it a span may carry; undefined when the URL does not parse. */
+function hostOf(baseUrl: string): string | undefined {
+	try {
+		return new URL(baseUrl).hostname;
+	} catch {
+		return undefined;
+	}
+}
+
 export function createOpenRouterCompleter(
 	opts: OpenRouterCompleterOptions,
 ): OpenRouterCompleter {
 	const fetchImpl: OpenRouterFetch = opts.fetch ?? ((input, init) => fetch(input, init));
 	const sleep = opts.sleep ?? defaultSleep;
+	const spans = opts.spans;
+	const serverAddress = hostOf(opts.baseUrl);
 	const url = `${opts.baseUrl.replace(/\/+$/, "")}/chat/completions`;
 	const headers = {
 		Authorization: `Bearer ${opts.apiKey}`,
@@ -250,7 +267,12 @@ export function createOpenRouterCompleter(
 		"X-Title": "ultrathink",
 	};
 
-	async function attempt(body: string, caller: AbortSignal | undefined): Promise<Attempt> {
+	async function exchange(
+		body: string,
+		caller: AbortSignal | undefined,
+		requestHeaders: Record<string, string>,
+		reply: { status?: number },
+	): Promise<Attempt> {
 		const controller = new AbortController();
 		let timedOut = false;
 		const onCallerAbort = (): void => controller.abort();
@@ -269,15 +291,6 @@ export function createOpenRouterCompleter(
 			return undefined;
 		};
 		const badResponse = (): Attempt => ({ ok: false, error: new OpenRouterError("bad_response"), retry: false });
-		const ctx = currentRequestContext();
-		// Each attempt is a fresh span of the caller's trace. Only the ids go upstream, never the key or the body.
-		const requestHeaders: Record<string, string> =
-			ctx === undefined
-				? headers
-				: {
-						...headers,
-						traceparent: formatTraceparent(childSpan({ traceId: ctx.traceId, spanId: ctx.spanId, sampled: ctx.sampled ?? true })),
-					};
 		try {
 			let response: Response;
 			try {
@@ -292,6 +305,7 @@ export function createOpenRouterCompleter(
 				// No reply was seen, so the request is retried as it would be by any client.
 				return interrupted() ?? { ok: false, error: new OpenRouterError("upstream"), retry: true };
 			}
+			reply.status = response.status;
 			if (response.ok) {
 				const declared = response.headers.get("content-length");
 				if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
@@ -333,6 +347,44 @@ export function createOpenRouterCompleter(
 		}
 	}
 
+	/** One HTTP attempt. Under a sampled request context it is recorded as a CLIENT span of that trace, parented by the context span. */
+	async function attempt(body: string, caller: AbortSignal | undefined, attemptNo: number): Promise<Attempt> {
+		const ctx = currentRequestContext();
+		// Each attempt is a fresh span of the caller's trace. Only the ids go upstream, never the key or the body.
+		const hop = ctx === undefined ? undefined : childSpan({ traceId: ctx.traceId, spanId: ctx.spanId, sampled: ctx.sampled ?? true });
+		const requestHeaders: Record<string, string> = hop === undefined ? headers : { ...headers, traceparent: formatTraceparent(hop) };
+		const reply: { status?: number } = {};
+		const startWall = Date.now();
+		const startMono = performance.now();
+		let result: Attempt | undefined;
+		try {
+			result = await exchange(body, caller, requestHeaders, reply);
+			return result;
+		} finally {
+			if (ctx !== undefined && hop !== undefined && ctx.sampled !== false && spans !== undefined) {
+				const startUnixNano = BigInt(startWall) * 1_000_000n;
+				const attributes: Record<string, string | number | boolean> = { "http.request.method": "POST", "ultrathink.attempt": attemptNo };
+				if (serverAddress !== undefined) attributes["server.address"] = serverAddress;
+				if (reply.status !== undefined) attributes["http.response.status_code"] = reply.status;
+				try {
+					spans.record({
+						traceId: ctx.traceId,
+						spanId: hop.spanId,
+						parentSpanId: ctx.spanId,
+						name: "POST chat/completions",
+						kind: 3,
+						startUnixNano,
+						endUnixNano: startUnixNano + BigInt(Math.round((performance.now() - startMono) * 1_000_000)),
+						attributes,
+						error: result !== undefined && releaseOutcome(result) === "failure",
+					});
+				} catch {
+					// A throwing sink must not change the attempt's result.
+				}
+			}
+		}
+	}
+
 	return async (system, user, signal) => {
 		const body = JSON.stringify({
 			model: opts.model,
@@ -371,7 +423,7 @@ export function createOpenRouterCompleter(
 			attempts += 1;
 			let result: Attempt;
 			try {
-				result = await attempt(body, signal);
+				result = await attempt(body, signal, attempts);
 			} catch (error) {
 				// An attempt that threw never classified the upstream, so it only frees the slot.
 				slot?.release("ignored");

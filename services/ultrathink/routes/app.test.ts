@@ -3,7 +3,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pkg from "../../../package.json";
@@ -19,6 +19,7 @@ import type { OpenRouterFetch } from "../engine/openrouter.ts";
 import { auditPath, verifyAuditFile } from "../obs/audit.ts";
 import { type RequestContext, currentRequestContext } from "../obs/context.ts";
 import { createLogger } from "../obs/log.ts";
+import type { SinkEnvelope, SinkTransport } from "../obs/sinks/types.ts";
 import { type Store, openStore } from "../store/store.ts";
 import { type App, type RouterDeps, createApp } from "./router.ts";
 
@@ -89,6 +90,22 @@ function baseConfig(dir: string, overrides: Partial<UltrathinkConfig> = {}): Ult
 		drainMs: 5000,
 		retentionDays: 30,
 		auditLog: true,
+		auditAnchorEvery: 1000,
+		auditSegmentBytes: 67108864,
+		auditRetentionDays: 365,
+		auditWatchMs: 1000,
+		auditSinkQueue: 10000,
+		priorityReservePct: 25,
+		adaptiveQuotaMinPct: 50,
+		lagTargetMs: 100,
+		replicaCapacityRps: 20,
+		abuseFailuresPerMinute: 20,
+		penaltyBaseSec: 60,
+		penaltyMaxSec: 3600,
+		tls: undefined,
+		spiffeTrustDomain: "ultrathink.internal",
+		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 }
@@ -695,7 +712,7 @@ describe("end to end with the real planner", () => {
 			expect(line).toMatchObject({ level: "info", sessionId, model: "x-ai/grok-test", attempts: 1, usage: { input: 100, output: 50 } });
 			expect(typeof line.ms).toBe("number");
 			expect(typeof line.outcome).toBe("string");
-			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "reqId", "sessionId", "traceId", "ts", "usage"]);
+			expect(Object.keys(line).sort()).toEqual(["attempts", "event", "level", "model", "ms", "outcome", "reqId", "sessionId", "spanId", "traceId", "ts", "usage"]);
 		}
 		const outcome = String(callLogs[0]?.outcome);
 		expect(sample(h, "ultrathink_planner_calls_total", { outcome })).toBe(calls);
@@ -1246,6 +1263,116 @@ describe("hardening wiring", () => {
 		const quiet = harness({ config: { auditLog: false } });
 		expect((await quiet.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
 		expect(existsSync(auditPath(quiet.dir))).toBe(false);
+	});
+
+	/**
+	 * A sink that keeps every envelope it is handed. With `hold`, each send waits until `release()`, so a test can keep
+	 * the tail queued while shutdown starts.
+	 */
+	function loopback(hold = false): { transport: SinkTransport; envelopes: SinkEnvelope[]; release: () => void } {
+		const envelopes: SinkEnvelope[] = [];
+		const gate = Promise.withResolvers<void>();
+		if (!hold) gate.resolve();
+		return {
+			envelopes,
+			release: () => gate.resolve(),
+			transport: {
+				name: "loopback",
+				async send(batch) {
+					await gate.promise;
+					envelopes.push(...batch);
+					return { ok: true };
+				},
+			},
+		};
+	}
+
+	/** Timers the test fires by hand. The watch and the sweep register here instead of on the real clock. */
+	function manualTimers(): { timers: NonNullable<RouterDeps["timers"]>; ticks: Array<{ ms: number; run: () => void }> } {
+		const ticks: Array<{ ms: number; run: () => void }> = [];
+		return {
+			ticks,
+			timers: {
+				setInterval: (run, ms) => {
+					ticks.push({ ms, run });
+					return {};
+				},
+				clearInterval: () => undefined,
+			},
+		};
+	}
+
+	test("a burst of failed logins raises one anomaly record and one alert envelope, in that order", async () => {
+		const sink = loopback();
+		const h = harness({
+			config: { auditRules: [{ name: "burst", event: "login_failed", count: 3, windowSec: 300, groupBy: "ip" }] },
+			deps: { auditTransports: [sink.transport] },
+		});
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		}
+		await h.app.shutdown();
+
+		expect(auditRecords(h.dir).map((record) => record.event)).toEqual(["login_failed", "login_failed", "login_failed", "anomaly_detected"]);
+		expect(auditRecords(h.dir)[3]).toMatchObject({ fields: { rule: "burst", key: PEER, count: 3, windowSec: 300 } });
+		const audited = sink.envelopes.filter((envelope) => envelope.kind === "audit").map((envelope) => envelope.body.event);
+		expect(audited).toEqual(["login_failed", "login_failed", "login_failed", "anomaly_detected"]);
+		const alerts = sink.envelopes.filter((envelope) => envelope.kind === "alert");
+		expect(alerts).toEqual([expect.objectContaining({ body: expect.objectContaining({ event: "anomaly_detected", rule: "burst", key: PEER }) })]);
+	});
+
+	test("truncating the audit file raises a tamper alert on the next watch tick", async () => {
+		const sink = loopback();
+		const clock = manualTimers();
+		const h = harness({ deps: { auditTransports: [sink.transport], timers: clock.timers } });
+		h.app.start();
+		await h.app.handle(loginRequest("wrong-password"), PEER);
+		await h.app.handle(loginRequest("wrong-password"), PEER);
+		const [first] = readFileSync(auditPath(h.dir), "utf8").split("\n");
+		writeFileSync(auditPath(h.dir), `${first}\n`);
+
+		const watch = clock.ticks.find((tick) => tick.ms === h.config.auditWatchMs);
+		expect(watch).toBeDefined();
+		watch?.run();
+		await h.app.shutdown();
+
+		const alerts = sink.envelopes.filter((envelope) => envelope.kind === "alert");
+		expect(alerts).toEqual([expect.objectContaining({ body: expect.objectContaining({ event: "audit_tamper_detected" }) })]);
+	});
+
+	test("a login failure reaches the security stream, and the envelope carries no details", async () => {
+		const sink = loopback();
+		const h = harness({ deps: { auditTransports: [sink.transport] } });
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		await h.app.shutdown();
+
+		const security = sink.envelopes.filter((envelope) => envelope.kind === "security");
+		expect(security).toEqual([expect.objectContaining({ body: expect.objectContaining({ type: "auth_failure", name: "auth.login_failed", ip: PEER }) })]);
+		expect(security[0]?.body).not.toHaveProperty("details");
+	});
+
+	test("records still queued when shutdown starts are delivered before shutdown returns", async () => {
+		const sink = loopback(true);
+		const h = harness({ deps: { auditTransports: [sink.transport] } });
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		const closing = h.app.shutdown();
+		sink.release();
+		await closing;
+
+		expect(sink.envelopes.filter((envelope) => envelope.kind === "audit")).toHaveLength(2);
+		expect(sink.envelopes.filter((envelope) => envelope.kind === "security")).toHaveLength(2);
+	});
+
+	test("with auditLog off no audit file is written, and the security stream still runs", async () => {
+		const sink = loopback();
+		const h = harness({ config: { auditLog: false }, deps: { auditTransports: [sink.transport] } });
+		h.app.start();
+		expect((await h.app.handle(loginRequest("wrong-password"), PEER)).status).toBe(401);
+		await h.app.shutdown();
+
+		expect(existsSync(auditPath(h.dir))).toBe(false);
+		expect(sink.envelopes.map((envelope) => envelope.kind)).toEqual(["security"]);
 	});
 
 	test("past maxInflight a request is refused with 503 and Retry-After, while /healthz still answers", async () => {

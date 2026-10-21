@@ -16,6 +16,9 @@ import { UPLIFT_SYSTEM_PROMPT } from "../../../src/uplift/prompt.ts";
 import { escapeXml } from "../../../src/uplift/xml.ts";
 import type { UltrathinkConfig } from "../config/config.ts";
 import { createLedger } from "../cost/ledger.ts";
+import { type RequestContext, runWithRequestContext } from "../obs/context.ts";
+import type { Admission } from "../obs/fair-share.ts";
+import type { FinishedSpan, SpanSink } from "../obs/otel.ts";
 import { openStore, type Store } from "../store/store.ts";
 import { createCircuitBreaker } from "./breaker.ts";
 import { createHeadlessPlanner, type HeadlessOptions, type HeadlessPlanner, type PlannerCall, UNPERSISTED_JOBS_MAX } from "./headless.ts";
@@ -179,6 +182,22 @@ function setup(overrides: Partial<UltrathinkConfig> = {}, options: Partial<Headl
 		drainMs: 5000,
 		retentionDays: 30,
 		auditLog: true,
+		auditAnchorEvery: 1000,
+		auditSegmentBytes: 67108864,
+		auditRetentionDays: 365,
+		auditWatchMs: 1000,
+		auditSinkQueue: 10000,
+		priorityReservePct: 25,
+		adaptiveQuotaMinPct: 50,
+		lagTargetMs: 100,
+		replicaCapacityRps: 20,
+		abuseFailuresPerMinute: 20,
+		penaltyBaseSec: 60,
+		penaltyMaxSec: 3600,
+		tls: undefined,
+		spiffeTrustDomain: "ultrathink.internal",
+		plaintextLoopback: true,
+		chaosEnabled: false,
 		...overrides,
 	};
 	const store = openStore(config.dbPath);
@@ -1008,5 +1027,116 @@ describe("headless planner: graph view", () => {
 			ok: true,
 			data: { sessionId: clientId, status: "running", mode: "client", text: expect.stringContaining("driven by the chat model"), pollAfterSec: 10 },
 		});
+	});
+});
+
+describe("headless planner: plan-slot fairness", () => {
+	const owner: Admission = { principal: "owner", class: "owner" };
+	const connector = (principal: string): Admission => ({ principal, class: "connector" });
+	const admittedAs = (admission: Admission): RequestContext => ({
+		reqId: randomUUID(),
+		traceId: "0".repeat(32),
+		spanId: "0".repeat(16),
+		admission,
+	});
+
+	/** Starts a plan inside an admitted request (or none); a started plan waits out the start window, so fire it. */
+	async function startAs(h: Harness, admission: Admission | undefined, sessionId: string) {
+		const call = () => h.planner.start({ prompt: PROMPT, sessionId });
+		const started = admission === undefined ? call() : runWithRequestContext(admittedAs(admission), call);
+		await flush();
+		h.clock.fire(15_000);
+		return started;
+	}
+
+	test("connectors leave the reserved slot to owners: a second connector start is busy, a second owner start is busy at the cap", async () => {
+		const gate = Promise.withResolvers<void>();
+		const h = setup({ maxConcurrentPlans: 2 }, { completer: fakeModel(gate.promise).complete });
+		const connectorPlan = randomUUID();
+		const ownerPlan = randomUUID();
+		expect(await startAs(h, connector("key-a"), connectorPlan)).toMatchObject({ ok: true, data: { sessionId: connectorPlan, status: "running" } });
+		expect(await startAs(h, connector("key-b"), randomUUID())).toEqual({ ok: false, code: "busy" });
+		expect(await startAs(h, owner, ownerPlan)).toMatchObject({ ok: true, data: { sessionId: ownerPlan, status: "running" } });
+		expect(await startAs(h, owner, randomUUID())).toEqual({ ok: false, code: "busy" });
+		gate.resolve();
+		for (const sessionId of [connectorPlan, ownerPlan]) await h.planner.result({ sessionId, waitSeconds: 30 });
+	});
+
+	test("one connector principal is capped at its share while another principal is still admitted", async () => {
+		const gate = Promise.withResolvers<void>();
+		const h = setup({ maxConcurrentPlans: 4 }, { completer: fakeModel(gate.promise).complete });
+		const started: string[] = [];
+		for (let i = 0; i < 2; i++) {
+			const sessionId = randomUUID();
+			started.push(sessionId);
+			expect(await startAs(h, connector("key-a"), sessionId)).toMatchObject({ ok: true, data: { status: "running" } });
+		}
+		expect(await startAs(h, connector("key-a"), randomUUID())).toEqual({ ok: false, code: "busy" });
+		const other = randomUUID();
+		started.push(other);
+		expect(await startAs(h, connector("key-b"), other)).toMatchObject({ ok: true, data: { status: "running" } });
+		gate.resolve();
+		for (const sessionId of started) await h.planner.result({ sessionId, waitSeconds: 30 });
+	});
+
+	test("a settled plan frees its slot for the next connector start", async () => {
+		const gate = Promise.withResolvers<void>();
+		const h = setup({ maxConcurrentPlans: 2 }, { completer: fakeModel(gate.promise).complete });
+		const first = randomUUID();
+		await startAs(h, connector("key-a"), first);
+		expect(await startAs(h, connector("key-b"), randomUUID())).toEqual({ ok: false, code: "busy" });
+		gate.resolve();
+		await h.planner.result({ sessionId: first, waitSeconds: 30 });
+		const next = randomUUID();
+		expect(await startAs(h, connector("key-b"), next)).toMatchObject({ ok: true });
+		await h.planner.result({ sessionId: next, waitSeconds: 30 });
+	});
+
+	test("starts without an admission keep the count-only check", async () => {
+		const gate = Promise.withResolvers<void>();
+		const h = setup({ maxConcurrentPlans: 2 }, { completer: fakeModel(gate.promise).complete });
+		const plans = [randomUUID(), randomUUID()] as const;
+		expect(await startAs(h, undefined, plans[0])).toMatchObject({ ok: true, data: { status: "running" } });
+		expect(await startAs(h, undefined, plans[1])).toMatchObject({ ok: true, data: { status: "running" } });
+		expect(await startAs(h, undefined, randomUUID())).toEqual({ ok: false, code: "busy" });
+		gate.resolve();
+		for (const sessionId of plans) await h.planner.result({ sessionId, waitSeconds: 30 });
+	});
+
+	test("re-starting a running session is never busy, whoever asks", async () => {
+		const gate = Promise.withResolvers<void>();
+		const h = setup({ maxConcurrentPlans: 1 }, { completer: fakeModel(gate.promise).complete });
+		const sessionId = randomUUID();
+		await startAs(h, connector("key-a"), sessionId);
+		expect(await startAs(h, connector("key-b"), randomUUID())).toEqual({ ok: false, code: "busy" });
+		expect(await startAs(h, connector("key-b"), sessionId)).toMatchObject({ ok: true, data: { sessionId, status: "running" } });
+		gate.resolve();
+		await h.planner.result({ sessionId, waitSeconds: 30 });
+	});
+});
+
+describe("headless planner: client span threading", () => {
+	test("a planner call started inside a request context records its hop span parented by that context", async () => {
+		const CTX: RequestContext = { reqId: "req-plan-span", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+		const spans: FinishedSpan[] = [];
+		const sink: SpanSink = {
+			record: (span) => {
+				spans.push(span);
+			},
+		};
+		const sentParents: string[] = [];
+		const rejected: OpenRouterFetch = async (_url, init) => {
+			sentParents.push((init.headers as Record<string, string>).traceparent?.split("-")[2] ?? "");
+			return new Response("nope", { status: 401 });
+		};
+		const h = setup({}, { completer: undefined, fetch: rejected, spans: sink });
+		const sessionId = randomUUID();
+		const started = await runWithRequestContext(CTX, () => h.planner.start({ prompt: PROMPT, sessionId }));
+		expect(started).toEqual({ ok: true, data: { sessionId, status: "failed", error: "auth" } });
+		expect(spans.length).toBeGreaterThanOrEqual(1);
+		expect(spans.map((span) => span.spanId)).toEqual(sentParents);
+		for (const span of spans) {
+			expect(span).toMatchObject({ traceId: CTX.traceId, parentSpanId: CTX.spanId, kind: 3, error: false });
+		}
 	});
 });

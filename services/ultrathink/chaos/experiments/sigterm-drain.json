@@ -1,0 +1,13 @@
+{
+	"id": "sigterm-drain",
+	"title": "SIGTERM drain keeps /readyz failing while in-flight work finishes",
+	"failureMode": "sigterm_drain",
+	"kind": "operator",
+	"operatorStep": "On the staging host, run `sudo systemctl kill --kill-who=main --signal=SIGTERM ultrathink-web.service` once, to signal the main process of the ultrathink-web unit. Do not run `systemctl stop` or `systemctl restart` on that unit during the run.",
+	"notes": "Precondition: on the staging host, set ULTRATHINK_DRAIN_MS to at least 30000 in /etc/ultrathink/ultrathink.env and restart ultrathink-web.service so it reads the value. config.ts accepts 0 to 60000 and defaults to 5000, which is too short to observe. The drain begins on SIGTERM (services/ultrathink/lifecycle.ts beginDrain) and /readyz answers 503 while it lasts (obs/runtime.ts). Restart=always in deploy/ultrathink-web.service starts the unit again after the drain ends; that restart is expected and falls outside the observation window.",
+	"load": { "method": "GET", "path": "/healthz", "requests": 1, "concurrency": 1 },
+	"hypotheses": [
+		{ "id": "readyz-503-during-drain", "name": "/readyz returns 503 while the SIGTERM drain is running", "check": "status", "path": "/readyz", "equals": 503 }
+	],
+	"rollbackOnFail": true
+}

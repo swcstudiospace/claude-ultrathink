@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { runWithRequestContext } from "../obs/context.ts";
+import type { FinishedSpan, SpanSink } from "../obs/otel.ts";
 import { createCircuitBreaker } from "./breaker.ts";
 import {
 	createOpenRouterCompleter,
@@ -837,5 +838,75 @@ describe("trace propagation", () => {
 		await runWithRequestContext(CTX, () => complete("s", "u"));
 		expect(traceparentOf(calls[0] as Call)).toMatch(TRACEPARENT);
 		expect(traceparentOf(calls[1] as Call)).toMatch(TRACEPARENT);
+	});
+});
+
+describe("client span", () => {
+	const CTX = { reqId: "req-span-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+
+	/** A sink that keeps every span it is handed; with `throws`, it also throws after keeping it. */
+	function recorder(throws = false): { sink: SpanSink; spans: FinishedSpan[] } {
+		const spans: FinishedSpan[] = [];
+		const sink: SpanSink = {
+			record: (span) => {
+				spans.push(span);
+				if (throws) throw new Error("sink failure");
+			},
+		};
+		return { sink, spans };
+	}
+
+	test("records a CLIENT span whose id is the parent-id the upstream received", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sent = (calls[0] as Call).init.headers as Record<string, string>;
+		const span = spans[0] as FinishedSpan;
+		expect(spans).toHaveLength(1);
+		expect(span.spanId).toBe(sent.traceparent?.split("-")[2] ?? "");
+		expect(span.traceId).toBe(CTX.traceId);
+		expect(span.parentSpanId).toBe(CTX.spanId);
+		expect(span.kind).toBe(3);
+		expect(span.name).toBe("POST chat/completions");
+		expect(span.error).toBe(false);
+	});
+
+	test("a 500 then a 200 gives two spans: the first is an error, the second is not", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([status(500), completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sentIds = calls.map((call) => (call.init.headers as Record<string, string>).traceparent?.split("-")[2] ?? "");
+		expect(spans.map((span) => span.error)).toEqual([true, false]);
+		expect(spans.map((span) => span.spanId)).toEqual(sentIds);
+		expect(spans.map((span) => span.attributes["ultrathink.attempt"])).toEqual([1, 2]);
+	});
+
+	test("no request context and an unsampled context each record no span", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok"), completion("ok")], { spans: sink });
+		await complete("s", "u");
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(spans).toHaveLength(0);
+	});
+
+	test("attributes name the method and the host only, never the key, path, query or headers", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok")], { spans: sink, baseUrl: "https://openrouter.test/api/v1?x=1" });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const span = spans[0] as FinishedSpan;
+		expect(span.attributes).toEqual({
+			"http.request.method": "POST",
+			"server.address": "openrouter.test",
+			"http.response.status_code": 200,
+			"ultrathink.attempt": 1,
+		});
+		expect(JSON.stringify(span.attributes)).not.toContain(KEY);
+	});
+
+	test("a sink whose record throws still yields the successful completion", async () => {
+		const { sink, spans } = recorder(true);
+		const { complete } = setup([completion("ok")], { spans: sink });
+		expect(await runWithRequestContext(CTX, () => complete("s", "u"))).toBe("ok");
+		expect(spans).toHaveLength(1);
 	});
 });

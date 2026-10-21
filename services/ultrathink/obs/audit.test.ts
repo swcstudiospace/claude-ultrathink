@@ -4,11 +4,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as cliMain } from "./audit-cli.ts";
-import { AUDIT_EVENTS, type AuditFs, type AuditLog, type AuditRecord, type AuditVerification, auditPath, createAuditLog, GENESIS_HASH, verifyAuditFile } from "./audit.ts";
+import { createFrontier } from "./audit-merkle.ts";
+import { AUDIT_EVENTS, type AuditFs, type AuditLog, type AuditNotice, type AuditRecord, type AuditVerification, auditPath, createAuditLog, GENESIS_HASH, verifyAuditFile } from "./audit.ts";
 
 const START = 1_700_000_000_000;
 const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
@@ -196,6 +197,22 @@ describe("tamper detection", () => {
 		expect(v.records).toBe(0);
 		expect(v.reason).toMatch(/^cannot (open|read): /);
 	});
+
+	test("a line with an extra key breaks at that line", () => {
+		const { path } = filled(2);
+		const out = lines(path);
+		out[1] = JSON.stringify({ ...(JSON.parse(out[1] as string) as Record<string, unknown>), note: "smuggled" });
+		rewrite(path, out);
+		expectBroken(verifyAuditFile(path), 2, /exactly the keys/);
+	});
+
+	test("a line with a duplicate key breaks at that line", () => {
+		const { path } = filled(2);
+		const out = lines(path);
+		out[1] = (out[1] as string).replace('"n":2', '"n":2,"n":9');
+		rewrite(path, out);
+		expectBroken(verifyAuditFile(path), 2, /canonical serialization/);
+	});
 });
 
 describe("fields", () => {
@@ -327,14 +344,16 @@ describe("failure handling", () => {
 	test("a file removed between appends is started again from genesis", () => {
 		const path = auditPath(tempDir());
 		const errors: Error[] = [];
-		const notices: string[] = [];
-		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		const notices: AuditNotice[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (n) => notices.push(n) });
 		log.record("login_ok", { n: 1 });
 		rmSync(path);
 		log.record("login_ok", { n: 2 });
 		expect(records(path).map((r) => [r.seq, r.fields.n])).toEqual([[1, 2]]);
 		expect(log.verify().ok).toBe(true);
-		expect(notices.some((m) => /changed outside the service/.test(m))).toBe(true);
+		expect(notices.length).toBeGreaterThan(0);
+		expect(notices.every((n) => n.kind === "changed_outside")).toBe(true);
+		expect(notices.some((n) => /changed outside the service/.test(n.message))).toBe(true);
 		expect(errors).toEqual([]);
 	});
 
@@ -342,15 +361,17 @@ describe("failure handling", () => {
 		const dir = tempDir();
 		const path = auditPath(dir);
 		const errors: Error[] = [];
-		const notices: string[] = [];
-		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		const notices: AuditNotice[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e), onNotice: (n) => notices.push(n) });
 		log.record("login_ok", { n: 1 });
 		rmSync(path);
 		chmodSync(dir, 0o500);
 		log.record("login_ok", { n: 2 });
 		log.record("login_ok", { n: 3 });
 		expect(errors.map((e) => e.message.includes("record dropped"))).toEqual([true, true]);
-		expect(notices.some((m) => /changed outside the service/.test(m))).toBe(true);
+		expect(notices.length).toBeGreaterThan(0);
+		expect(notices.every((n) => n.kind === "changed_outside")).toBe(true);
+		expect(notices.some((n) => /changed outside the service/.test(n.message))).toBe(true);
 		chmodSync(dir, 0o700);
 		log.record("login_ok", { n: 4 });
 		expect(errors.length).toBe(2);
@@ -404,11 +425,12 @@ describe("quarantine on open", () => {
 		const out = lines(path);
 		out.splice(1, 1);
 		rewrite(path, out);
-		const notices: string[] = [];
-		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		const notices: AuditNotice[] = [];
+		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (n) => notices.push(n) });
 		expect(errors).toEqual([]);
 		expect(notices.length).toBe(1);
-		expect(notices[0]).toMatch(/broken at record 2 \(seq 3 where 2 was expected\); moved to .*audit\.jsonl\.corrupt-/);
+		expect(notices[0]?.kind).toBe("moved_to");
+		expect(notices[0]?.message).toMatch(/broken at record 2 \(seq 3 where 2 was expected\); moved to .*audit\.jsonl\.corrupt-/);
 		const names = readdirSync(join(path, "..")).sort();
 		expect(names.length).toBe(2);
 		expect(names.some((n) => n.startsWith("audit.jsonl.corrupt-"))).toBe(true);
@@ -426,10 +448,11 @@ describe("quarantine on open", () => {
 		log.close();
 		const text = readFileSync(path, "utf8");
 		writeFileSync(path, text.slice(0, text.length - 3));
-		const notices: string[] = [];
-		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (m) => notices.push(m) });
+		const notices: AuditNotice[] = [];
+		const reopened = createAuditLog({ path, now, onError: (e) => errors.push(e), onNotice: (n) => notices.push(n) });
 		expect(errors).toEqual([]);
-		expect(notices[0]).toMatch(/broken at record 2 \(truncated last record/);
+		expect(notices[0]?.kind).toBe("moved_to");
+		expect(notices[0]?.message).toMatch(/broken at record 2 \(truncated last record/);
 		reopened.record("logout");
 		expect(records(path).map((r) => r.seq)).toEqual([1]);
 		expect(reopened.verify().ok).toBe(true);
@@ -513,5 +536,316 @@ describe("audit-cli", () => {
 		expect(run(["verify", "a", "b"]).code).toBe(2);
 		expect(run(["verify", "--bogus"]).code).toBe(2);
 		expect(run(["frobnicate"]).err[0]).toMatch(/^usage:/);
+	});
+});
+
+describe("anchors", () => {
+	/** Recomputes a record's hash after an edit, so the chain link is valid and only the edited content is wrong. */
+	function rehash(r: AuditRecord): AuditRecord {
+		const fields = Object.fromEntries(Object.entries(r.fields).sort(([a], [b]) => (a < b ? -1 : 1)));
+		const canonical = JSON.stringify({ event: r.event, fields, prev: r.prev, seq: r.seq, ts: r.ts });
+		return { ...r, hash: createHash("sha256").update(`${r.prev}\n${canonical}`).digest("hex") };
+	}
+
+	test("an anchor follows every anchorEvery records and its root covers the records before it", () => {
+		const path = auditPath(tempDir());
+		const log = createAuditLog({ path, now: clock(), anchorEvery: 3 });
+		for (let i = 1; i <= 7; i += 1) log.record("login_ok", { n: i });
+		const recs = records(path);
+		expect(recs.map((r) => r.event)).toEqual(["login_ok", "login_ok", "login_ok", "audit_anchor", "login_ok", "login_ok", "login_ok", "audit_anchor", "login_ok"]);
+		for (const at of [3, 7]) {
+			const frontier = createFrontier();
+			for (const r of recs.slice(0, at)) frontier.push(r.hash);
+			expect(recs[at]?.fields).toEqual({ through: at, root: frontier.root() });
+		}
+		expect(log.verify()).toEqual({ ok: true, records: 9, lastHash: recs[8]?.hash as string });
+	});
+
+	test("a changed anchor root breaks at the anchor line even when its hash is recomputed", () => {
+		const path = auditPath(tempDir());
+		const log = createAuditLog({ path, now: clock(), anchorEvery: 2 });
+		log.record("login_ok", { n: 1 });
+		log.record("login_ok", { n: 2 });
+		const out = lines(path);
+		out[2] = JSON.stringify(rehash({ ...(JSON.parse(out[2] as string) as AuditRecord), fields: { through: 2, root: "f".repeat(64) } }));
+		rewrite(path, out);
+		expectBroken(verifyAuditFile(path), 3, /anchor root does not match records through 2/);
+	});
+
+	test("a rewrite of an earlier record that recomputes every later hash is caught by the anchor root", () => {
+		const path = auditPath(tempDir());
+		const log = createAuditLog({ path, now: clock(), anchorEvery: 2 });
+		log.record("login_ok", { n: 1 });
+		log.record("login_ok", { n: 2 });
+		const [first, second, anchor] = records(path) as [AuditRecord, AuditRecord, AuditRecord];
+		const rewritten = rehash({ ...first, fields: { ...first.fields, who: "mallory" } });
+		const relinked = rehash({ ...second, prev: rewritten.hash });
+		const relinkedAnchor = rehash({ ...anchor, prev: relinked.hash });
+		rewrite(path, [rewritten, relinked, relinkedAnchor].map((r) => JSON.stringify(r)));
+		expectBroken(verifyAuditFile(path), 3, /anchor root does not match records through 2/);
+	});
+
+	test("a reopened log places anchors where an uninterrupted run does, byte for byte", () => {
+		const fixed = () => START;
+		const whole = auditPath(tempDir());
+		const uninterrupted = createAuditLog({ path: whole, now: fixed, anchorEvery: 3 });
+		for (let i = 1; i <= 8; i += 1) uninterrupted.record("login_ok", { n: i });
+		const split = auditPath(tempDir());
+		const first = createAuditLog({ path: split, now: fixed, anchorEvery: 3 });
+		for (let i = 1; i <= 5; i += 1) first.record("login_ok", { n: i });
+		first.close();
+		const second = createAuditLog({ path: split, now: fixed, anchorEvery: 3 });
+		for (let i = 6; i <= 8; i += 1) second.record("login_ok", { n: i });
+		expect(readFileSync(split, "utf8")).toBe(readFileSync(whole, "utf8"));
+		expect(records(split).filter((r) => r.event === "audit_anchor").map((r) => r.seq)).toEqual([4, 8]);
+	});
+
+	test("anchorEvery must be an integer from 1 to 1000000", () => {
+		const path = auditPath(tempDir());
+		for (const bad of [0, 1.5, 1_000_001, Number.NaN]) {
+			expect(() => createAuditLog({ path, anchorEvery: bad })).toThrow(/anchorEvery/);
+		}
+		expect(() => createAuditLog({ path, anchorEvery: 1_000_000 })).not.toThrow();
+	});
+
+	test("the log rejects a caller-supplied audit_anchor record", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		log.record("audit_anchor", { through: 0, root: "0".repeat(64) });
+		expect(records(path)).toEqual([]);
+		expect(errors.map((e) => e.message)).toEqual(["audit log: audit_anchor is written by the log only; record dropped"]);
+	});
+
+	test("the log rejects a caller-supplied audit_retention_pruned record and the chain is unchanged", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onError: (e) => errors.push(e) });
+		log.record("login_ok", { n: 1 });
+		const before = readFileSync(path, "utf8");
+		log.record("audit_retention_pruned", { segments: 1, fromSeq: 1, throughSeq: 1, throughHash: "f".repeat(64), frontier: "{}" });
+		expect(readFileSync(path, "utf8")).toBe(before);
+		expect(errors.map((e) => e.message)).toEqual(["audit log: audit_retention_pruned is written by the log only; record dropped"]);
+		expect(log.verify().ok).toBe(true);
+	});
+});
+
+describe("streaming hook", () => {
+	test("onAppend sees each acknowledged record once, in seq order, including anchors", () => {
+		const path = auditPath(tempDir());
+		const seen: AuditRecord[] = [];
+		const log = createAuditLog({ path, now: clock(), anchorEvery: 2, onAppend: (r) => seen.push(r) });
+		for (let i = 1; i <= 5; i += 1) log.record("login_ok", { n: i });
+		expect(seen).toEqual(records(path));
+		expect(seen.filter((r) => r.event === "audit_anchor").length).toBe(2);
+	});
+
+	test("a dropped record is never streamed", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const seen: AuditRecord[] = [];
+		let failNextSync = false;
+		const fs: AuditFs = {
+			...nodeFs,
+			fsyncSync: (fd: number) => {
+				if (failNextSync) {
+					failNextSync = false;
+					throw new Error("EIO: fsync");
+				}
+				nodeFs.fsyncSync(fd);
+			},
+		};
+		const log = createAuditLog({ path, now: clock(), fs, onError: (e) => errors.push(e), onAppend: (r) => seen.push(r) });
+		log.record("login_ok", { n: 1 });
+		failNextSync = true;
+		log.record("login_ok", { n: 2 });
+		log.record("login_ok", { n: 3 });
+		expect(errors.length).toBe(1);
+		expect(errors[0]?.message).toMatch(/record dropped: EIO: fsync/);
+		expect(seen.map((r) => r.hash)).toEqual(records(path).map((r) => r.hash));
+		expect(seen.length).toBe(2);
+		expect(log.verify().ok).toBe(true);
+	});
+
+	test("an onAppend that throws leaves the record in the chain and is reported", () => {
+		const path = auditPath(tempDir());
+		const errors: Error[] = [];
+		const log = createAuditLog({
+			path,
+			now: clock(),
+			onError: (e) => errors.push(e),
+			onAppend: () => {
+				throw new Error("sink down");
+			},
+		});
+		log.record("login_ok", { n: 1 });
+		log.record("logout", { n: 2 });
+		expect(records(path).map((r) => r.seq)).toEqual([1, 2]);
+		expect(errors.map((e) => e.message)).toEqual(["audit log: onAppend failed for record 1: sink down", "audit log: onAppend failed for record 2: sink down"]);
+		expect(log.verify().ok).toBe(true);
+	});
+
+	test("a record written from inside onAppend is chained after the one that caused it", () => {
+		const path = auditPath(tempDir());
+		const seen: string[] = [];
+		const log: AuditLog = createAuditLog({
+			path,
+			now: clock(),
+			onAppend: (r) => {
+				seen.push(r.event);
+				if (r.event === "login_failed") log.record("rate_limited", { ip: "1.2.3.4" });
+			},
+		});
+		log.record("login_failed", { ip: "1.2.3.4" });
+		expect(records(path).map((r) => [r.seq, r.event])).toEqual([
+			[1, "login_failed"],
+			[2, "rate_limited"],
+		]);
+		expect(seen).toEqual(["login_failed", "rate_limited"]);
+		expect(log.verify().ok).toBe(true);
+	});
+});
+
+describe("head and fingerprint", () => {
+	function diskIdentity(path: string): { size: number; mtimeMs: number; ino: number } {
+		const stat = statSync(path);
+		return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+	}
+
+	test("match the disk after an append", () => {
+		const { log, path } = filled(2);
+		expect(log.head()).toEqual({ seq: 2, hash: records(path)[1]?.hash as string });
+		expect(log.fingerprint()).toEqual(diskIdentity(path));
+	});
+
+	test("an empty log has the genesis head and the identity of the empty file", () => {
+		const path = auditPath(tempDir());
+		const log = createAuditLog({ path });
+		expect(log.head()).toEqual({ seq: 0, hash: GENESIS_HASH });
+		expect(log.fingerprint()).toEqual(diskIdentity(path));
+	});
+
+	test("match the disk after quarantine on open", () => {
+		const { log, path, now } = filled(3);
+		log.close();
+		const out = lines(path);
+		out.splice(1, 1);
+		rewrite(path, out);
+		const reopened = createAuditLog({ path, now });
+		expect(reopened.head()).toEqual({ seq: 0, hash: GENESIS_HASH });
+		expect(reopened.fingerprint()).toEqual(diskIdentity(path));
+	});
+
+	test("match the disk after the file is removed and re-created", () => {
+		const { log, path } = filled(2);
+		rmSync(path);
+		log.record("logout", { n: 3 });
+		const recs = records(path);
+		expect(recs.map((r) => r.seq)).toEqual([1]);
+		expect(log.head()).toEqual({ seq: 1, hash: recs[0]?.hash as string });
+		expect(log.fingerprint()).toEqual(diskIdentity(path));
+		expect(log.verify().ok).toBe(true);
+	});
+});
+
+describe("active file checks", () => {
+	test("a same-length edit to the active file is found by the next append, which starts a new chain", () => {
+		const path = auditPath(tempDir());
+		const notices: AuditNotice[] = [];
+		const errors: Error[] = [];
+		const log = createAuditLog({ path, now: clock(), onNotice: (n) => notices.push(n), onError: (e) => errors.push(e) });
+		for (let i = 1; i <= 3; i += 1) log.record("login_ok", { n: i, who: `user${i}` });
+		const out = lines(path);
+		out[1] = (out[1] as string).replace('"user2"', '"user9"');
+		rewrite(path, out);
+		const later = new Date(Date.now() + 60_000);
+		utimesSync(path, later, later);
+		log.record("logout", { n: 4 });
+		expect(notices.map((n) => n.kind)).toEqual(["moved_to"]);
+		expect(records(path).map((r) => r.seq)).toEqual([1]);
+		expect(log.verify().ok).toBe(true);
+		expect(errors).toEqual([]);
+	});
+
+	test("a new active file is synced in its directory before its first record is acknowledged", () => {
+		const dir = tempDir();
+		const path = auditPath(dir);
+		const openPaths = new Map<number, string>();
+		let dirSyncs = 0;
+		const fs: AuditFs = {
+			...nodeFs,
+			openSync: ((target: nodeFs.PathLike, flags: nodeFs.OpenMode, mode?: nodeFs.Mode | null) => {
+				const fd = nodeFs.openSync(target, flags, mode);
+				openPaths.set(fd, String(target));
+				return fd;
+			}) as typeof nodeFs.openSync,
+			closeSync: ((fd: number) => {
+				openPaths.delete(fd);
+				nodeFs.closeSync(fd);
+			}) as typeof nodeFs.closeSync,
+			fsyncSync: ((fd: number) => {
+				if (openPaths.get(fd) === dir) dirSyncs += 1;
+				nodeFs.fsyncSync(fd);
+			}) as typeof nodeFs.fsyncSync,
+		};
+		const log = createAuditLog({ path, now: clock(), fs });
+		rmSync(path);
+		const before = dirSyncs;
+		log.record("login_ok", { n: 1 });
+		expect(dirSyncs - before).toBe(1);
+		log.record("login_ok", { n: 2 });
+		expect(dirSyncs - before).toBe(1);
+		expect(log.verify().ok).toBe(true);
+	});
+});
+
+describe("expectations", () => {
+	function runCli(argv: string[]): { code: number; out: string[]; err: string[] } {
+		const out: string[] = [];
+		const err: string[] = [];
+		const code = cliMain(argv, {}, { out: (l) => out.push(l), err: (l) => err.push(l) });
+		return { code, out, err };
+	}
+
+	test("a correct hash exits 0 and keeps the ok line", () => {
+		const { path } = filled(3);
+		const h3 = records(path)[2]?.hash as string;
+		const r = runCli(["verify", path, "--expect", `3:${h3}`]);
+		expect(r.code).toBe(0);
+		expect(r.out).toEqual([`audit ok: 3 records, last ${h3}`]);
+	});
+
+	test("a wrong hash exits 1 and names the expected and the found hash", () => {
+		const { path } = filled(3);
+		const h3 = records(path)[2]?.hash as string;
+		const wrong = "f".repeat(64);
+		const r = runCli(["verify", path, "--expect", `3:${wrong}`]);
+		expect(r.code).toBe(1);
+		expect(r.out).toEqual([`audit BROKEN: expected record 3 hash ${wrong}, found ${h3}`]);
+	});
+
+	test("a truncated copy reports the expected record as none", () => {
+		const { path } = filled(3);
+		const h3 = records(path)[2]?.hash as string;
+		rewrite(path, lines(path).slice(0, 2));
+		const r = runCli(["verify", path, "--expect", `3:${h3}`]);
+		expect(r.code).toBe(1);
+		expect(r.out).toEqual([`audit BROKEN: expected record 3 hash ${h3}, found none`]);
+	});
+
+	test("every expectation must match", () => {
+		const { path } = filled(3);
+		const [r1, , r3] = records(path);
+		expect(runCli(["verify", path, "--expect", `1:${r1?.hash}`, "--expect", `3:${r3?.hash}`]).code).toBe(0);
+		expect(runCli(["verify", path, "--expect", `1:${r1?.hash}`, "--expect", `2:${"f".repeat(64)}`]).code).toBe(1);
+	});
+
+	test("a malformed expectation exits 2", () => {
+		const { path } = filled(1);
+		const h1 = records(path)[0]?.hash as string;
+		for (const bad of ["1", `0:${h1}`, `x:${h1}`, `01:${h1}`, `1:${h1.toUpperCase()}`, `1:${h1.slice(0, 63)}`]) {
+			expect(runCli(["verify", path, "--expect", bad]).code).toBe(2);
+		}
+		expect(runCli(["verify", path, "--expect"]).code).toBe(2);
 	});
 });
