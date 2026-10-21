@@ -1,0 +1,41 @@
+{
+	"id": "upstream-5xx-breaker",
+	"title": "Upstream 5xx storm opens the upstream breaker while /healthz keeps answering",
+	"failureMode": "upstream_5xx",
+	"kind": "inprocess",
+	"plan": { "steps": [{ "count": "forever", "fault": { "kind": "status", "status": 503, "retryAfterSec": 0 } }] },
+	"config": { "breakerFailures": 3, "breakerOpenMs": 60000 },
+	"notes": "Load is POST /mcp, a JSON-RPC tools/call of ultrathink_uplift (mcp/mcp.ts UPLIFT_TOOL, routes/router.ts mcpRoute). It is the only HTTP route that starts a headless planner job: POST /ultrathink only queues a run and never reaches the upstream. The completer makes at most three attempts per call (MAX_RETRIES 2, engine/openrouter.ts). The third 503 opens the breaker on the last attempt, so call 1 reports outcome upstream, and calls 2 to 6 are refused by the open breaker and report upstream_unavailable; settle therefore counts requests minus one. Load runs one request at a time so that call 1 is unambiguous. The harness must enable server planning and present the connector key; this template holds no credential.",
+	"load": {
+		"method": "POST",
+		"path": "/mcp",
+		"body": {
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": { "name": "ultrathink_uplift", "arguments": { "prompt": "chaos probe: outline a rollout plan" } }
+		},
+		"requests": 6,
+		"concurrency": 1
+	},
+	"settle": { "metric": "ultrathink_planner_calls_total", "labels": { "outcome": "upstream_unavailable" }, "atLeast": 5 },
+	"hypotheses": [
+		{
+			"id": "breaker-open",
+			"name": "The upstream breaker is open after the 503 storm",
+			"check": "metric",
+			"metric": "ultrathink_upstream_breaker_state",
+			"labels": { "state": "open" },
+			"op": "eq",
+			"value": 1
+		},
+		{
+			"id": "healthz-200",
+			"name": "/healthz keeps answering 200 (the breaker fails open for non-planning routes)",
+			"check": "status",
+			"path": "/healthz",
+			"equals": 200
+		}
+	],
+	"rollbackOnFail": false
+}

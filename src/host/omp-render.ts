@@ -910,7 +910,9 @@ function activityRows(details: unknown, p: Paint): string[] {
 	if (notice.count !== undefined) rows.push(p.fg("muted", String(notice.count)));
 	const names = notice.names ?? [];
 	for (const name of names.slice(0, 3)) rows.push(p.fg("muted", name));
-	if (names.length > 3) rows.push(p.fg("dim", `${names.length - 3} more`));
+	// Validation caps `names`, so the hidden total comes from `count` when that is larger than the stored names.
+	const hidden = names.length > 0 ? Math.max(names.length, notice.count ?? 0) - Math.min(names.length, 3) : 0;
+	if (hidden > 0) rows.push(p.fg("dim", `${hidden} more`));
 	if (notice.detail) rows.push(p.fg("dim", notice.detail));
 	return rows;
 }

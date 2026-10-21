@@ -1,0 +1,17 @@
+# Installed as /etc/systemd/system/ultrathink-drift.timer.
+# Enable: systemctl enable --now ultrathink-drift.timer ; list: systemctl list-timers ultrathink-drift
+# Rollback: systemctl disable --now ultrathink-drift.timer
+
+[Unit]
+Description=Daily ultrathink drift detection and live header probe
+
+[Timer]
+OnCalendar=*-*-* 04:43:00 UTC
+# Spread the start so the job does not line up with other daily jobs on the host.
+RandomizedDelaySec=15min
+# A run missed while the host was off happens at the next boot.
+Persistent=true
+Unit=ultrathink-drift.service
+
+[Install]
+WantedBy=timers.target

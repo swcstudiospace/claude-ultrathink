@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 import { writeSync } from "node:fs";
+import type { ModelResolution } from "./engine.ts";
 import type { ActivityNotice } from "./activity-notice.ts";
 
 export type StageName = "brief" | "uplift" | "think" | "knowledge" | "clarify" | "plan" | "track" | "state";

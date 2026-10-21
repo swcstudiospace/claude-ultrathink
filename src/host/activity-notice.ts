@@ -29,7 +29,7 @@ const DETAIL_CHARS = 160;
 const TITLE_CHARS = 120;
 const OUTCOME_CHARS = 40;
 const CONTROLS = /[\u0000-\u001f\u007f]/g;
-const ABSOLUTE_PATH = /(?:^|\s)~?\/[^\s]+/g;
+const ABSOLUTE_PATH = /(?<![\w.~/])~?\/[^\s]+/g;
 
 /** Redact, drop paths and controls. A redaction throw drops the field. */
 function scrub(value: unknown, max: number): string | undefined {

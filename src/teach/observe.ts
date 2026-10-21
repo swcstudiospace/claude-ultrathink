@@ -262,6 +262,8 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 			try {
 				const outcome = await capture({ ...input, status: confirm ? "confirmed" : "candidate" }, ctx);
 				captured.push(outcome);
+				// `retain: "off"` means no lesson was stored (store unavailable or a failed write): no success receipt.
+				if (outcome.retain === "off") continue;
 				const reason = outcome.reason ? redactLine(outcome.reason, 80) : "";
 				appendActivity(ctx.stateDir, {
 					v: 1,
@@ -271,7 +273,7 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 					names: [outcome.moment.name],
 					detail: `${outcome.moment.kind} · ${outcome.moment.status} · retain ${outcome.retain}${reason ? ` · ${reason}` : ""}`,
 					...(outcome.retain === "retained" ? { source: "hindsight" as const } : {}),
-				});
+				}, digest.sessionId);
 			} catch {
 				ctx.log?.("teach observe: a lesson could not be captured");
 			}

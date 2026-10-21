@@ -49,6 +49,10 @@ export interface BarState {
 	resolution?: ModelResolution;
 	/** Substrate status from the `substrate:status` bus channel; absent until one arrives. */
 	substrate?: SubstrateSegment;
+	/** Measured token savings from `token-opt:savings`; absent until a valid snapshot arrives. */
+	savings?: TokenSavingsSnapshot;
+	/** Host session this bar is painting. When set, another session's savings are not shown. */
+	liveSessionId?: string;
 }
 
 export interface BarStore {
@@ -61,6 +65,8 @@ export interface BarStore {
 	failed(detail: string, now: number): void;
 	setMcp(mcp: NonNullable<BarState["mcp"]>): void;
 	setSubstrate(substrate: SubstrateSegment | undefined): void;
+	setSavings(snapshot: TokenSavingsSnapshot | undefined): void;
+	setLiveSession(id: string | undefined): void;
 	subscribe(listener: () => void): () => void;
 	/** True while the bar or graph panel needs frame-by-frame renders. */
 	animating(now: number): boolean;
@@ -108,6 +114,144 @@ function modelFromView(view: PlanView): GraphModel {
 }
 
 const SUBSTRATE_STATES = ["checking", "ok", "error", "access-denied"] as const;
+const SAVINGS_SOURCES = ["provider", "compress", "graph"] as const;
+
+export interface TokenSavingsPoint {
+	at: number;
+	source: "provider" | "compress" | "graph";
+	baseline: number;
+	current: number;
+	saved: number;
+}
+
+/** Measured session savings. `saved` is always `baseline - current`; never an estimate. */
+export interface TokenSavingsSnapshot {
+	v: 1;
+	sessionId: string;
+	updatedAt: number;
+	baselineTokens: number;
+	currentTokens: number;
+	savedTokens: number;
+	points: TokenSavingsPoint[];
+	/** Wall time of the last completed assistant turn. Omitted until measured. */
+	lastTurnMs?: number;
+	/** Session cache-hit percent, 0-100. Omitted until a provider turn exists. */
+	cacheHitPct?: number;
+	/** Last graphify spawn or cache-hit latency. Omitted until measured. */
+	lastQueryMs?: number;
+	/** RTK session delta since start. Not included in savedTokens. Omitted until measured. */
+	rtkSavedTokens?: number;
+	/** Last provider request payload size in characters. Omitted until measured. */
+	lastPayloadChars?: number;
+	/** Time to first token on the last turn. Omitted until measured. */
+	ttftMs?: number;
+	/** Idle time since the last turn. Not included in savedTokens. Omitted until measured. */
+	lastIdleMs?: number;
+	/** Session cost in cents. Not included in savedTokens. Omitted until measured. */
+	costCents?: number;
+	/** Provider billed input tokens. Not included in savedTokens. Omitted until measured. */
+	providerInput?: number;
+	/** Provider billed output tokens. Not included in savedTokens. Omitted until measured. */
+	providerOutput?: number;
+	/** Provider cache-read tokens. Not included in savedTokens; the hit rate stays on cacheHitPct. Omitted until measured. */
+	providerCacheRead?: number;
+	/** Provider cache-write tokens. Not included in savedTokens. Omitted until measured. */
+	providerCacheWrite?: number;
+	/** 1 when the prompt prefix moved. Not included in savedTokens. Omitted until measured. */
+	prefixChanged?: 0 | 1;
+	/** 1 when the tool set moved. Not included in savedTokens. Omitted until measured. */
+	toolsChanged?: 0 | 1;
+	/** 1 when the graph is ready. Not included in savedTokens. Omitted until measured. */
+	graphReady?: 0 | 1;
+}
+
+function isSessionId(value: unknown): value is string {
+	return typeof value === "string" && value.length >= 1 && value.length <= 128 && !value.includes("/");
+}
+
+function parseSavingsPoint(value: unknown): TokenSavingsPoint | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const { at, source, baseline, current, saved } = value as Record<string, unknown>;
+	if (!isCount(at) || !oneOf(SAVINGS_SOURCES, source) || !isCount(baseline) || !isCount(current) || !isCount(saved)) return undefined;
+	if (saved !== baseline - current) return undefined;
+	return { at, source, baseline, current, saved };
+}
+
+/** Absent → undefined. Present but not a safe integer in `0..max` → null, which rejects the snapshot. */
+function optionalPerf(data: Record<string, unknown>, key: string, max = Number.MAX_SAFE_INTEGER): number | undefined | null {
+	if (!Object.hasOwn(data, key)) return undefined;
+	const value = data[key];
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > max) return null;
+	return value;
+}
+
+/** `token-opt:savings` v1, or undefined when any required check fails. A present optional perf field outside its range rejects the snapshot. */
+export function parseTokenSavings(data: unknown): TokenSavingsSnapshot | undefined {
+	try {
+		if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+		const record = data as Record<string, unknown>;
+		const { v, sessionId, updatedAt, baselineTokens, currentTokens, savedTokens, points } = record;
+		if (v !== 1 || !isSessionId(sessionId) || !isCount(updatedAt)) return undefined;
+		if (!isCount(baselineTokens) || !isCount(currentTokens) || !isCount(savedTokens)) return undefined;
+		if (savedTokens !== baselineTokens - currentTokens) return undefined;
+		if (!Array.isArray(points) || points.length > 200) return undefined;
+		const lastTurnMs = optionalPerf(record, "lastTurnMs");
+		const cacheHitPct = optionalPerf(record, "cacheHitPct", 100);
+		const lastQueryMs = optionalPerf(record, "lastQueryMs");
+		const rtkSavedTokens = optionalPerf(record, "rtkSavedTokens");
+		const lastPayloadChars = optionalPerf(record, "lastPayloadChars");
+		const ttftMs = optionalPerf(record, "ttftMs");
+		const lastIdleMs = optionalPerf(record, "lastIdleMs");
+		const costCents = optionalPerf(record, "costCents");
+		const providerInput = optionalPerf(record, "providerInput");
+		const providerOutput = optionalPerf(record, "providerOutput");
+		const providerCacheRead = optionalPerf(record, "providerCacheRead");
+		const providerCacheWrite = optionalPerf(record, "providerCacheWrite");
+		const prefixChanged = optionalPerf(record, "prefixChanged", 1);
+		const toolsChanged = optionalPerf(record, "toolsChanged", 1);
+		const graphReady = optionalPerf(record, "graphReady", 1);
+		if (lastTurnMs === null || cacheHitPct === null || lastQueryMs === null || rtkSavedTokens === null || lastPayloadChars === null || ttftMs === null) return undefined;
+		if (lastIdleMs === null || costCents === null) return undefined;
+		if (providerInput === null || providerOutput === null || providerCacheRead === null || providerCacheWrite === null) return undefined;
+		if (prefixChanged === null || toolsChanged === null || graphReady === null) return undefined;
+		const parsed: TokenSavingsPoint[] = [];
+		for (const point of points) {
+			const next = parseSavingsPoint(point);
+			if (!next) return undefined;
+			parsed.push(next);
+		}
+		const snapshot: TokenSavingsSnapshot = { v: 1, sessionId, updatedAt, baselineTokens, currentTokens, savedTokens, points: parsed };
+		if (lastTurnMs !== undefined) snapshot.lastTurnMs = lastTurnMs;
+		if (cacheHitPct !== undefined) snapshot.cacheHitPct = cacheHitPct;
+		if (lastQueryMs !== undefined) snapshot.lastQueryMs = lastQueryMs;
+		// Separate measured counts. Never folded into savedTokens.
+		if (rtkSavedTokens !== undefined) snapshot.rtkSavedTokens = rtkSavedTokens;
+		if (lastPayloadChars !== undefined) snapshot.lastPayloadChars = lastPayloadChars;
+		if (ttftMs !== undefined) snapshot.ttftMs = ttftMs;
+		if (lastIdleMs !== undefined) snapshot.lastIdleMs = lastIdleMs;
+		if (costCents !== undefined) snapshot.costCents = costCents;
+		// Bill totals and cache-stability flags. Never folded into savedTokens.
+		if (providerInput !== undefined) snapshot.providerInput = providerInput;
+		if (providerOutput !== undefined) snapshot.providerOutput = providerOutput;
+		if (providerCacheRead !== undefined) snapshot.providerCacheRead = providerCacheRead;
+		if (providerCacheWrite !== undefined) snapshot.providerCacheWrite = providerCacheWrite;
+		if (prefixChanged === 0 || prefixChanged === 1) snapshot.prefixChanged = prefixChanged;
+		if (toolsChanged === 0 || toolsChanged === 1) snapshot.toolsChanged = toolsChanged;
+		if (graphReady === 0 || graphReady === 1) snapshot.graphReady = graphReady;
+		return snapshot;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 999, 1.2k, 1.2M. Only for counts already checked as non-negative integers. */
+function formatTokens(n: number): string {
+	if (n < 1000) return String(n);
+	const scale = n >= 1_000_000 ? 1_000_000 : 1_000;
+	const suffix = n >= 1_000_000 ? "M" : "k";
+	const rounded = Math.round((n / scale) * 10) / 10;
+	return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}${suffix}`;
+}
 const SUBSTRATE_USAGES = ["IN_USE", "NOT_OBSERVED_IN_WINDOW", "UNKNOWN"] as const;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: bus text loses terminal control characters
 const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/g;
@@ -166,7 +310,7 @@ export function createBarStore(): BarStore {
 	return {
 		get: () => state,
 		begin(now) {
-			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate });
+			set({ phase: "planning", startedAt: now, stages: {}, engine: state.engine, mcp: state.mcp, last: state.last, substrate: state.substrate, savings: state.savings, liveSessionId: state.liveSessionId });
 		},
 		apply(event) {
 			switch (event.type) {
@@ -286,6 +430,15 @@ export function createBarStore(): BarStore {
 		setSubstrate(substrate) {
 			set({ ...state, substrate });
 		},
+		setSavings(snapshot) {
+			const savings = parseTokenSavings(snapshot);
+			if (!savings) return;
+			set({ ...state, savings });
+		},
+		setLiveSession(id) {
+			if (!isSessionId(id) || state.liveSessionId === id) return;
+			set({ ...state, liveSessionId: id });
+		},
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -330,6 +483,40 @@ function substrateSegment(p: Paint, substrate: SubstrateSegment): string {
 /** The substrate segment list: empty until a status has been published, so the bar is unchanged until then. */
 function substrateSegments(state: BarState, p: Paint): string[] {
 	return state.substrate ? [substrateSegment(p, state.substrate)] : [];
+}
+/** Savings painted on this bar. A set live session id hides another session's snapshot so the rest of the bar is unchanged. */
+function shownSavings(state: BarState): TokenSavingsSnapshot | undefined {
+	const savings = state.savings;
+	if (!savings) return undefined;
+	if (state.liveSessionId !== undefined && savings.sessionId !== state.liveSessionId) return undefined;
+	return savings;
+}
+
+/** Saved stays in the name chip. Turn time and TTFT share that chip when requested. Prefix, tools and graph-ready share it only when the flag is 1. `before`/`now` follows the name, with cache, query, RTK delta, payload size, idle time, cost, bill and output on that segment. Those extras drop before planning's protected stage or saved. Provider cache tokens are never folded into savedTokens. Another session's snapshot adds neither the chip nor that segment. */
+function withSavings(state: BarState, p: Paint, segments: string[], includeTurn: boolean, includeTtft = true, includeStability = true): string[] {
+	const savings = shownSavings(state);
+	if (!savings || segments.length === 0) return segments;
+	const saved = `saved ${formatTokens(savings.savedTokens)}`;
+	const chipParts = [saved];
+	if (includeTurn && savings.lastTurnMs !== undefined) chipParts.push(`${savings.lastTurnMs}ms`);
+	if (includeTtft && savings.ttftMs !== undefined) chipParts.push(`ttft ${savings.ttftMs}ms`);
+	if (includeStability && savings.prefixChanged === 1) chipParts.push("prefix moved");
+	if (includeStability && savings.toolsChanged === 1) chipParts.push("tools moved");
+	if (includeStability && savings.graphReady === 1) chipParts.push("graph ready");
+	const named = `${segments[0]} ${p.fg("success", chipParts.join(" · "))}`;
+	let detail = `before ${formatTokens(savings.baselineTokens)} · now ${formatTokens(savings.currentTokens)}`;
+	if (savings.cacheHitPct !== undefined) detail += ` · cache ${savings.cacheHitPct}%`;
+	if (savings.lastQueryMs !== undefined) detail += ` · query ${savings.lastQueryMs}ms`;
+	if (savings.rtkSavedTokens !== undefined) detail += ` · rtk +${formatTokens(savings.rtkSavedTokens)}`;
+	if (savings.lastPayloadChars !== undefined) detail += ` · payload ${savings.lastPayloadChars}c`;
+	if (savings.lastIdleMs !== undefined) detail += ` · idle ${savings.lastIdleMs}ms`;
+	if (savings.costCents !== undefined) detail += ` · cost ${savings.costCents}c`;
+	if (includeStability && savings.providerInput !== undefined) detail += ` · bill ${formatTokens(savings.providerInput)}`;
+	if (includeStability && savings.providerOutput !== undefined) detail += ` · out ${formatTokens(savings.providerOutput)}`;
+	const compare = p.fg("dim", detail);
+	const rest = segments.slice(1);
+	if (state.phase === "planning" && rest.length > 0) return [named, rest[0] ?? "", compare, ...rest.slice(1)];
+	return [named, compare, ...rest];
 }
 
 function planningSegments(state: BarState, p: Paint, now: number): string[] {
@@ -426,17 +613,48 @@ function segmentsFor(state: BarState, p: Paint, now: number): string[] {
 	}
 }
 
+/** Drop a leading spinner token so a savings chip can share a narrow planning line with the stage. */
+function dropLeadingToken(segment: string): string {
+	const compact = segment.replace(/^(?:\x1b\[[0-9;]*m)*(?:<[A-Za-z]+>)?\S+(?:\x1b\[[0-9;]*m)*\s+/, "");
+	return compact.length > 0 && compact !== segment ? compact : segment;
+}
+
 export function renderBarLine(state: BarState, theme: unknown, width: number, now: number): string {
 	if (width <= 0) return "";
 	const p = paint(theme);
-	let segments = segmentsFor(state, p, now);
+	const base = segmentsFor(state, p, now);
+	let includeTurn = true;
+	let includeTtft = true;
+	let includeStability = true;
+	const savings = shownSavings(state);
+	let segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
 	// planning keeps spinner+name and the current stage (first two); others keep the name
 	const minimum = state.phase === "planning" ? 2 : 1;
+	const sizeOf = (parts: string[]) => {
+		const band = p.band(parts);
+		return parts.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(parts.length);
+	};
+	// Prefix, tools, graph-ready, bill and out drop before the stage or saved when they would overflow the protected span.
+	if (includeStability && segments.length >= minimum && sizeOf(segments.slice(0, minimum)) > width) {
+		includeStability = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
+	}
+	// TTFT shares the name chip unless it pushes planning's protected pair over the width. RTK, payload, idle and cost stay on before/now, never the name, so they cannot displace the stage.
+	if (state.phase === "planning" && savings?.ttftMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		includeTtft = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
+	}
+	// Turn milliseconds share the saved chip unless they push planning's protected pair over the width.
+	if (state.phase === "planning" && savings?.lastTurnMs !== undefined && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		includeTurn = false;
+		segments = withSavings(state, p, base, includeTurn, includeTtft, includeStability);
+	}
+	if (state.phase === "planning" && savings && segments.length >= 2 && sizeOf(segments.slice(0, 2)) > width) {
+		segments = [dropLeadingToken(segments[0] ?? ""), ...segments.slice(1)];
+	}
 	for (;;) {
-		const band = p.band(segments);
-		const size = segments.reduce((sum, segment) => sum + visibleWidth(segment), 0) + band.overhead(segments.length);
-		if (size <= width || segments.length <= minimum) {
-			return size <= width ? band.text : truncateToWidth(band.text, width);
+		if (sizeOf(segments) <= width || segments.length <= minimum) {
+			return sizeOf(segments) <= width ? p.band(segments).text : truncateToWidth(p.band(segments).text, width);
 		}
 		segments = segments.slice(0, -1);
 	}

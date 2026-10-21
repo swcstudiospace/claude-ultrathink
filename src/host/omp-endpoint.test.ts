@@ -315,8 +315,9 @@ describe("named legacy flight identity (REV15-005)", () => {
 				}
 				current.delivery.resolve();
 				await flush();
-				expect(sent).toMatchObject([{ message: { customType: "ultrathink-plan", content: response.context }, options: { deliverAs: "aside" } }]);
-				expect(sent).toHaveLength(1);
+				expect(sent).toHaveLength(2);
+				expect(sent[0]).toMatchObject({ message: { customType: "ultrathink-activity" } });
+				expect(sent[1]).toMatchObject({ message: { customType: "ultrathink-plan", content: response.context }, options: { deliverAs: "aside" } });
 				const currentLine = t.line();
 				expect(currentLine).toContain("BUILD_PROMPT");
 				// An evidence source may ignore abort and settle late; the old end/progress/delivery also arrive late.
@@ -327,8 +328,8 @@ describe("named legacy flight identity (REV15-005)", () => {
 				expect(paths.map((path) => readFileSync(path, "utf8"))).toEqual(saved);
 				expect(old.tracked).toEqual([]);
 				expect(current.tracked).toHaveLength(1);
-				expect(sent).toHaveLength(1);
-				expect(sent).toMatchObject([{ message: { content: response.context }, options: { deliverAs: "aside" } }]);
+				expect(sent).toHaveLength(2);
+				expect(sent[1]).toMatchObject({ message: { content: response.context }, options: { deliverAs: "aside" } });
 				expect(await run(prompt)).toBeUndefined();
 				expect(runs).toHaveLength(2);
 				expect(calls).toHaveLength(2);

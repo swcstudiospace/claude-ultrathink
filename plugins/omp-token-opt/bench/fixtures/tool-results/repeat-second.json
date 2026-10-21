@@ -1,0 +1,14 @@
+{
+  "toolName": "grep",
+  "input": {
+    "pattern": "DEDUPE_MIN_CHARS|const|function",
+    "path": "src"
+  },
+  "isError": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "src/index.ts:17:const EVENT = \"token-opt:savings\";\nsrc/index.ts:18:const RTK_TIMEOUT_MS = 2_000;\nsrc/index.ts:19:const DEDUPE_MIN_CHARS = 200;\nsrc/index.ts:22:export const PREFIX_POLICY = { injectSystemPrompt: false as const };\nsrc/index.ts:97:function sessionIdFrom(event: unknown, ctx: unknown): string {\nsrc/index.ts:333:export default function tokenOpt(pi: PiLike): void {"
+    }
+  ]
+}

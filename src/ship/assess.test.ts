@@ -366,6 +366,11 @@ describe("assessDone rules", () => {
 			"GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd",
 		],
 		[
+			"gsd tools tracked by the repository",
+			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsMissing: true, toolsTracked: true }),
+			"a gsd-tools.cjs committed in this repository was not run (repository code is never executed); install GSD outside the repository or set GSD_TOOLS",
+		],
+		[
 			"node missing",
 			signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, nodeMissing: true }),
 			"GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd",
@@ -394,6 +399,15 @@ describe("assessDone rules", () => {
 			expect(called).toBe(false);
 		});
 	}
+
+	test("a tracked local copy with a working install reports no tools gap", async () => {
+		const a = await assessDone({
+			record: RECORD,
+			signals: signals({}, { phaseCount: 0, completedPhases: 0, trusted: true, toolsTracked: true }),
+			diff: DIFF,
+		});
+		expect(a.gaps.some((g) => g.startsWith("a gsd-tools.cjs committed"))).toBe(false);
+	});
 
 	test("rules pass without judge -> done at 0.5", async () => {
 		const a = await assessDone({ record: RECORD, signals: signals(), diff: DIFF, now: () => 7 });

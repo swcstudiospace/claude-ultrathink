@@ -95,6 +95,49 @@ describe("normalizeGraph", () => {
 		expect(out.nodes[2]?.dependsOn).toEqual(["n2"]);
 		expect(out.nodes[2]?.kind).toBe("synthesize");
 	});
+
+	test("prototype keys, ids with spaces or quotes and overlong ids take the positional id, and deps follow the rename", () => {
+		const out = normalizeGraph(
+			{
+				goal: "g",
+				nodes: [
+					{ id: "constructor", title: "A", kind: "understand", question: "q1", depends_on: [] },
+					{ id: "__proto__", title: "B", kind: "decompose", question: "q2", depends_on: ["constructor"] },
+					{ id: 'bad id"', title: "C", kind: "generate", question: "q3", depends_on: ["__proto__", "constructor"] },
+					{ id: "x".repeat(65), title: "D", kind: "generate", question: "q4", depends_on: ['bad id"', "keep_this-1"] },
+					{ id: "keep_this-1", title: "E", kind: "critique", question: "q5", depends_on: ["toString"] },
+				],
+			},
+			"fb",
+			3,
+			8,
+		);
+		expect(out.nodes.map((node) => node.id)).toEqual(["n1", "n2", "n3", "n4", "keep_this-1"]);
+		expect(out.nodes[0]?.title).toBe("A");
+		expect(out.nodes[1]?.dependsOn).toEqual(["n1"]);
+		expect(out.nodes[2]?.dependsOn).toEqual(["n2", "n1"]);
+		expect(out.nodes[3]?.dependsOn).toEqual(["n3", "keep_this-1"]);
+		expect(out.nodes[4]?.dependsOn).toEqual([]);
+		for (const node of out.nodes) expect(Object.hasOwn(Object.prototype, node.id)).toBe(false);
+	});
+
+	test("a positional fallback skips valid ids written later in the list, so no node is dropped", () => {
+		const out = normalizeGraph(
+			{
+				goal: "g",
+				nodes: [
+					{ id: "n2", title: "A", kind: "understand", question: "q1", depends_on: [] },
+					{ id: "bad id", title: "B", kind: "decompose", question: "q2", depends_on: ["n2"] },
+					{ id: "n3", title: "C", kind: "generate", question: "q3", depends_on: ["bad id"] },
+				],
+			},
+			"fb",
+			3,
+			8,
+		);
+		expect(out.nodes.map((node) => node.id)).toEqual(["n2", "n4", "n3"]);
+		expect(out.nodes[2]?.dependsOn).toEqual(["n4"]);
+	});
 });
 
 describe("topoSort", () => {

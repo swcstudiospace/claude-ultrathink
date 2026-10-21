@@ -1,0 +1,71 @@
+# Installed as /etc/systemd/system/ultrathink-maintenance.service and started by ultrathink-maintenance.timer.
+# Daily: consistent SQLite backup, backup archive retention, optional rsync, then pruning of old journal, sessions
+# and jobs entries (see deploy/ultrathink-backup.sh for the settings).
+# Run by hand: systemctl start ultrathink-maintenance.service ; journalctl -u ultrathink-maintenance -n 50 --no-pager
+# Optional settings (ULTRATHINK_RETENTION_DAYS, ULTRATHINK_BACKUP_RSYNC_TARGET, ULTRATHINK_BACKUP_KEEP) go in
+# /etc/ultrathink/ultrathink.env. For rsync over ssh, put the key (id_ed25519) and known_hosts in /var/lib/ultrathink/home/.ssh (mode 0700);
+# the backup script passes both paths to ssh explicitly because OpenSSH ignores $HOME.
+
+[Unit]
+Description=Ultrathink backup and state retention
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+After=local-fs.target network-online.target
+# The optional rsync step goes off-host; with Persistent=true on the timer a missed run fires right after boot and
+# would otherwise fail on ordering alone.
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same user as the web service: it opens the live SQLite file, and a root-owned -wal or -shm file would break the service.
+User=ultrathink
+Group=ultrathink
+WorkingDirectory=/opt/ultrathink/current
+EnvironmentFile=/etc/ultrathink/ultrathink.env
+Environment=HOME=/var/lib/ultrathink/home
+# /var/backups/ultrathink comes from deploy/ultrathink-tmpfiles.conf (tmpfiles.d), not from a pre-start command: the
+# mount namespace for ReadWritePaths= is built before any ExecStartPre= runs, so the path must already exist.
+ExecStartPre=/usr/bin/mkdir -p /var/lib/ultrathink/home
+# Invoked through bash so the unit does not depend on the executable bit surviving a release checkout.
+ExecStart=/usr/bin/bash /opt/ultrathink/current/deploy/ultrathink-backup.sh run
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+
+StateDirectory=ultrathink
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=512M
+TasksMax=64
+
+# Same sandbox as ultrathink-web.service, plus write access to the backup directory only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/ultrathink
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# The script needs neither the hostname nor SysV IPC; both are flagged by systemd-analyze security.
+ProtectHostname=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# @resources is not excluded: Bun may call setrlimit at startup (a blocked syscall kills the process with SIGSYS).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-maintenance

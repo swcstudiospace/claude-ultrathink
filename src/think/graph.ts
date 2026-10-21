@@ -53,6 +53,9 @@ function parseDependsOn(value: unknown): string[] {
 	return [];
 }
 
+/** Node ids key plain-object maps downstream (tracking refs, XML attributes): short word characters only, never a prototype key. */
+const NODE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 export function normalizeGraph(
 	raw: unknown,
 	fallbackGoal: string,
@@ -63,13 +66,28 @@ export function normalizeGraph(
 	const sourceNodes = Array.isArray(obj.nodes) ? obj.nodes : [];
 	const nodes: ThoughtNode[] = [];
 	const seen = new Set<string>();
+	/** Model id → the positional id that replaced it, so dependsOn references follow the rename. */
+	const renamed = new Map<string, string>();
+	// Valid ids the model wrote are kept, so a positional fallback must skip every one of them and every id already used.
+	const reserved = new Set<string>();
+	for (const entry of sourceNodes) {
+		const raw = entry && typeof entry === "object" ? asString((entry as Record<string, unknown>).id) : "";
+		if (NODE_ID.test(raw) && !Object.hasOwn(Object.prototype, raw)) reserved.add(raw);
+	}
+	const freshId = (index: number): string => {
+		let k = index + 1;
+		while (reserved.has(`n${k}`) || seen.has(`n${k}`)) k += 1;
+		return `n${k}`;
+	};
 
 	for (const [index, entry] of sourceNodes.entries()) {
 		if (!entry || typeof entry !== "object") continue;
 		const rec = entry as Record<string, unknown>;
-		const id = asString(rec.id) || `n${index + 1}`;
+		const rawId = asString(rec.id);
+		const id = NODE_ID.test(rawId) && !Object.hasOwn(Object.prototype, rawId) ? rawId : freshId(index);
 		if (seen.has(id)) continue;
 		seen.add(id);
+		if (rawId && rawId !== id && !renamed.has(rawId)) renamed.set(rawId, id);
 		const kindRaw = asString(rec.kind).toLowerCase();
 		const kind: NodeKind = isNodeKind(kindRaw) ? kindRaw : index === 0 ? "understand" : "generate";
 		nodes.push({
@@ -91,7 +109,7 @@ export function normalizeGraph(
 
 	const ids = new Set(nodes.map((node) => node.id));
 	for (const node of nodes) {
-		node.dependsOn = node.dependsOn.filter((dep) => ids.has(dep) && dep !== node.id);
+		node.dependsOn = node.dependsOn.map((dep) => renamed.get(dep) ?? dep).filter((dep) => ids.has(dep) && dep !== node.id);
 	}
 
 	const last = nodes[nodes.length - 1];

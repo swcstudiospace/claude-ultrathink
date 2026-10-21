@@ -1,0 +1,105 @@
+[
+  {
+    "id": "ACCESS",
+    "title": "Access control and credential management",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["CC6.1", "CC6.2", "CC6.3"],
+      "iso27001": ["5.15", "5.17", "8.2"],
+      "gdpr": ["Art. 25", "Art. 32(1)(b)"]
+    },
+    "evidence": [
+      "services/ultrathink/auth/auth.ts"
+    ]
+  },
+  {
+    "id": "LOGGING",
+    "title": "Audit logging and audit-chain verification",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["CC4.1", "CC7.2"],
+      "iso27001": ["8.15", "8.16"],
+      "gdpr": ["Art. 5(2)", "Art. 32(1)(d)"]
+    },
+    "evidence": [
+      "services/ultrathink/obs/audit.ts",
+      "services/ultrathink/obs/audit-cli.ts"
+    ]
+  },
+  {
+    "id": "CHANGE",
+    "title": "Change management and CI policy gates",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["CC8.1"],
+      "iso27001": ["8.25", "8.32"],
+      "gdpr": ["Art. 25", "Art. 32(1)(d)"]
+    },
+    "evidence": [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+      ".github/workflows/policy.yml"
+    ]
+  },
+  {
+    "id": "VULN",
+    "title": "Vulnerability management and dependency audit",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["CC7.1"],
+      "iso27001": ["8.8"],
+      "gdpr": ["Art. 32(1)(d)"]
+    },
+    "evidence": [
+      ".github/workflows/security-scan.yml"
+    ]
+  },
+  {
+    "id": "CONFIG",
+    "title": "Secure configuration and service sandbox baseline",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["CC6.6", "CC7.1"],
+      "iso27001": ["8.9"],
+      "gdpr": ["Art. 25", "Art. 32(1)(b)"]
+    },
+    "evidence": [
+      "deploy/ultrathink-web.service",
+      "policy/units.rego"
+    ]
+  },
+  {
+    "id": "RETENTION",
+    "title": "Data retention and erasure",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["C1.2"],
+      "iso27001": ["8.10", "8.13"],
+      "gdpr": ["Art. 5(1)(e)", "Art. 17"]
+    },
+    "evidence": [
+      "services/ultrathink/store/retention.ts",
+      "deploy/ultrathink-backup.sh"
+    ],
+    "findings": [
+      {
+        "id": "RET-D7",
+        "summary": "Live SQLite runs are pruned after ULTRATHINK_RETENTION_DAYS (default 30), but daily archives are kept for ULTRATHINK_BACKUP_KEEP (default 14) and contain the pruned data. Off-host copies persist until the target's own cleanup removes them. The repo defines no erasure deadline that covers archives."
+      }
+    ]
+  },
+  {
+    "id": "CRYPTO-BACKUP",
+    "title": "Backup encryption and customer-managed key custody",
+    "refs_status": "owner to validate",
+    "refs": {
+      "soc2": ["C1.1", "CC6.7"],
+      "iso27001": ["8.13", "8.24"],
+      "gdpr": ["Art. 32(1)(a)"]
+    },
+    "evidence": [
+      "deploy/ultrathink-dr-lib.sh"
+    ],
+    "pending": "Phase 74 DR-05 is partly implemented: dr_age encrypts archives and off-host pushes to customer recipients when a recipient is set (deploy/ultrathink-dr-lib.sh; deploy/ultrathink-backup.sh). Customer key creation and custody are BLOCKED: KMS, HSM or token, key owner, and rotation are not in the repo."
+  }
+]

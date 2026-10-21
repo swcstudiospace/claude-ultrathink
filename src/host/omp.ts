@@ -9,7 +9,7 @@
  * each flight owns its own cancellation and outer time limit. A tool result that opens a PR for a planned session gets
  * an ultrathink-sync aside. `/ultrathink-<verb>` commands toggle control state or send one unplanned message.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,7 +49,7 @@ import {
 import { extractPrFromOutput, isPrCreationTool } from "../track/pr-detect.ts";
 import { runControl, type UltrathinkVerb } from "../uplift/commands.ts";
 import { type ModelResolution, type NativeEngineSelector, type NativeModelQuery, selectNativeEngine } from "./engine.ts";
-import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus } from "./omp-ui.ts";
+import { type BarState, type BarStore, createBarComponent, createBarStore, parseSubstrateStatus, parseTokenSavings } from "./omp-ui.ts";
 import { ACTIVITY_TYPE, activityFallbackLine, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { resolveStateDir } from "./paths.ts";
 import { planPrompt, type PlanResponse } from "./plan.ts";
@@ -806,6 +806,21 @@ export function createOmpExtension(
 			});
 			pi.events?.emit("substrate:status-request", {});
 		} catch {}
+		try {
+			const live = join(homedir(), ".omp", "agent", "token-opt", "live.json");
+			if (existsSync(live)) {
+				const savings = parseTokenSavings(JSON.parse(readFileSync(live, "utf8")));
+				if (savings !== undefined) store.setSavings(savings);
+			}
+		} catch {
+			// a missing or unreadable snapshot must not block planning
+		}
+		try {
+			pi.events?.on("token-opt:savings", (data) => {
+				const savings = parseTokenSavings(data);
+				if (savings !== undefined) store.setSavings(savings);
+			});
+		} catch {}
 		let ui: ExtensionUI | undefined;
 		let tuiRef: TuiLike | undefined;
 		let timerStarted = false;
@@ -876,6 +891,7 @@ export function createOmpExtension(
 		/** Observe the active session before a paused planner can resume into tracking or persistence. */
 		const observeFlights = (ctx: ExtensionContext): void => {
 			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+			guard(() => store.setLiveSession(sessionId));
 			const cwd = ctx?.cwd || process.cwd();
 			// A prompt observed in another session/cwd orphans the dashboard: drop it silently here
 			// (the switch handler explains); planner-flight handling below is unchanged.
@@ -1233,6 +1249,9 @@ export function createOmpExtension(
 			if (!uiEnabled || shutDown || !ctx?.hasUI || ctx.mode !== "tui") return;
 			if (isSubagentSession(ctx, exists)) return;
 			const dir = stateDir(ctx.cwd || process.cwd());
+			// Receipts name the session whose observe run wrote them: this window publishes only its own session's.
+			const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+			if (sessionId === "") return;
 			try {
 				for (const row of readActivity(dir)) activitySeen.add(row.id);
 			} catch {
@@ -1242,14 +1261,14 @@ export function createOmpExtension(
 				if (shutDown) return;
 				try {
 					for (const row of readActivity(dir)) {
-						if (activitySeen.has(row.id)) continue;
+						if (row.sessionId !== sessionId || activitySeen.has(row.id)) continue;
 						activitySeen.add(row.id);
 						if (activitySeen.size > 200) {
 							const oldest = activitySeen.values().next().value;
 							if (oldest !== undefined) activitySeen.delete(oldest);
 						}
 						if (shutDown) return;
-						const { id: _id, ...notice } = row;
+						const { id: _id, sessionId: _owner, ...notice } = row;
 						guard(() =>
 							pi.sendMessage(
 								{ customType: ACTIVITY_TYPE, content: truncateToWidth(activityFallbackLine(notice), UI_FALLBACK_COLS), display: true, details: notice },
@@ -1269,6 +1288,8 @@ export function createOmpExtension(
 			attach(ctx);
 			startActivityPoll(ctx);
 			scheduleMount();
+			// The host already named this session. An invalid id is ignored; a throw must not block startup.
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_switch", (_event, ctx) => {
 			// The old session's flights would deliver into the new one: cancel and suppress them.
@@ -1279,6 +1300,7 @@ export function createOmpExtension(
 			attach(ctx);
 			startActivityPoll(ctx);
 			scheduleMount();
+			guard(() => store.setLiveSession(ctx?.sessionManager?.getSessionId?.()));
 		});
 		pi.on("session_shutdown", () => {
 			shutDown = true;
@@ -1538,6 +1560,7 @@ export function createOmpExtension(
 			// Registered before the planner runs, so a progress callback that fires at once already finds its flight.
 			flights.set(request.sessionId, flight);
 			if (previous) cancel(previous, SUPERSEDED);
+			guard(() => store.setLiveSession(request.sessionId));
 			guard(() => store.begin(now()));
 			const onEvent = (event: ProgressEvent) =>
 				guard(() => {
@@ -1661,6 +1684,7 @@ export function createOmpExtension(
 				const prompt = event?.prompt ?? "";
 				const cwd = ctx?.cwd || process.cwd();
 				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "";
+				guard(() => store.setLiveSession(sessionId));
 				const submission = turns.get(sessionId) ?? 0;
 				if (quick) {
 					if (quick.sessionId === sessionId && quick.text === prompt.trim() && (quick.submission ?? submission) === submission) {

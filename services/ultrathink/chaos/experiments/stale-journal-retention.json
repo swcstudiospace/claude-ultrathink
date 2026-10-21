@@ -1,0 +1,14 @@
+{
+	"id": "stale-journal-retention",
+	"title": "Stale client journal leaves readiness and liveness unchanged",
+	"failureMode": "stale_journal",
+	"kind": "operator",
+	"operatorStep": "On the staging host, create a client journal directory with a valid session id and age it past retention: `sudo install -d -o ultrathink -g ultrathink /var/lib/ultrathink/journal/00000000-0000-4000-8000-0000000c4a05` then `sudo touch -d '31 days ago' /var/lib/ultrathink/journal/00000000-0000-4000-8000-0000000c4a05`. The default ULTRATHINK_RETENTION_DAYS is 30; if the staging env file sets N days, use N+1 days in the touch command.",
+	"notes": "Retention is best effort: services/ultrathink/engine/retention.ts ages each journal/<session-id> directory by the newer of its own mtime and its meta.json mtime, and a journal with no meta.json is removed by age. The directory name must match SESSION_ID_PATTERN (services/ultrathink/engine/journal.ts), so the example id is a valid UUID. Sweeps run on the maintenance schedule (deploy/ultrathink-maintenance.service), not on a request, so this step does not force a sweep; the hypotheses only require that readiness and liveness are unaffected by a stale journal. The sweeper is not reused in this phase. Removal of the directory is not checked by these hypotheses.",
+	"load": { "method": "GET", "path": "/healthz", "requests": 1, "concurrency": 1 },
+	"hypotheses": [
+		{ "id": "readyz-200-with-stale-journal", "name": "/readyz still returns 200 with a stale journal present", "check": "status", "path": "/readyz", "equals": 200 },
+		{ "id": "healthz-200-with-stale-journal", "name": "/healthz still returns 200 with a stale journal present", "check": "status", "path": "/healthz", "equals": 200 }
+	],
+	"rollbackOnFail": true
+}

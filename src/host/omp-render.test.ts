@@ -1012,6 +1012,10 @@ describe("activity card", () => {
 		expect(many.plain).toContain("a");
 		expect(many.plain).toContain("c");
 		expect(many.plain).toContain("2 more");
+		// Validation keeps six names; the card's hidden total comes from the recall's full count (10 - 3 shown).
+		const recalled = cardOf({ v: 1, kind: "teachable-recalled", title: "Lesson recalled", outcome: "used", count: 10, names: ["a", "b", "c", "d", "e", "f"] });
+		expect(recalled.plain).toContain("7 more");
+		expect(recalled.plain).not.toContain("3 more");
 		const bad = cardOf({ v: 2, kind: "nope" });
 		expect(bad.plain).toContain("Activity unavailable.");
 		expect(bad.rows.map(visibleWidth)).toEqual(bad.rows.map(() => 80));

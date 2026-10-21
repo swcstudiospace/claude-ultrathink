@@ -2,29 +2,35 @@
 // Copyright (C) 2026 SWC Studio
 /**
  * Receipt log for teachable moments captured by a detached observe process, which cannot call `sendMessage`.
- * The Omp session polls this file and publishes a display-only card. Never throws.
+ * The Omp session that produced a receipt polls this file and publishes a display-only card. Never throws.
  */
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ActivityNotice, toActivityNotice } from "../host/activity-notice.ts";
+import { withFileLock } from "../claude/atomic.ts";
 
 const MAX_LINES = 50;
 const FILE_NAME = "activity.ndjson";
 
 export interface ActivityReceipt extends ActivityNotice {
 	id: string;
+	/** The Omp session whose observe run wrote the receipt; a poller shows it only in that session. */
+	sessionId?: string;
 }
 
 function activityPath(stateDir: string): string {
 	return join(stateDir, "teach", FILE_NAME);
 }
 
-/** Appends one validated notice. Drops a notice that fails validation. Keeps the newest 50 lines. */
-export function appendActivity(stateDir: string, notice: unknown): void {
+/**
+ * Appends one validated notice owned by `sessionId`. Drops a notice that fails validation. Keeps the newest 50 lines.
+ * The read-modify-write runs under the file lock, so overlapping observers cannot overwrite each other's receipts.
+ */
+export function appendActivity(stateDir: string, notice: unknown, sessionId: string): void {
 	try {
 		const clean = toActivityNotice(notice);
-		if (!clean) return;
+		if (!clean || sessionId === "") return;
 		const dir = join(stateDir, "teach");
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		try {
@@ -33,24 +39,26 @@ export function appendActivity(stateDir: string, notice: unknown): void {
 			// a directory we do not own keeps its mode
 		}
 		const path = activityPath(stateDir);
-		let prior = "";
-		try {
-			prior = readFileSync(path, "utf8");
-		} catch {
-			prior = "";
-		}
-		const lines = prior.split("\n").filter((line) => line !== "");
-		const id = randomBytes(4).toString("hex");
-		lines.push(JSON.stringify({ id, ...clean }));
-		const tail = lines.slice(-MAX_LINES);
-		const tmp = `${path}.${process.pid}.${id}.tmp`;
-		writeFileSync(tmp, `${tail.join("\n")}\n`, { mode: 0o600 });
-		try {
-			chmodSync(tmp, 0o600);
-		} catch {
-			// mode was set at create
-		}
-		renameSync(tmp, path);
+		withFileLock(path, () => {
+			let prior = "";
+			try {
+				prior = readFileSync(path, "utf8");
+			} catch {
+				prior = "";
+			}
+			const lines = prior.split("\n").filter((line) => line !== "");
+			const id = randomBytes(4).toString("hex");
+			lines.push(JSON.stringify({ id, sessionId, ...clean }));
+			const tail = lines.slice(-MAX_LINES);
+			const tmp = `${path}.${process.pid}.${id}.tmp`;
+			writeFileSync(tmp, `${tail.join("\n")}\n`, { mode: 0o600 });
+			try {
+				chmodSync(tmp, 0o600);
+			} catch {
+				// mode was set at create
+			}
+			renameSync(tmp, path);
+		});
 		try {
 			chmodSync(path, 0o600);
 		} catch {
@@ -72,9 +80,10 @@ export function readActivity(stateDir: string): ActivityReceipt[] {
 				const value: unknown = JSON.parse(line);
 				if (!value || typeof value !== "object" || Array.isArray(value)) continue;
 				const id = "id" in value && typeof value.id === "string" && /^[0-9a-f]{8}$/.test(value.id) ? value.id : undefined;
+				const sessionId = "sessionId" in value && typeof value.sessionId === "string" && value.sessionId !== "" ? value.sessionId : undefined;
 				const notice = toActivityNotice(value);
 				if (!id || !notice) continue;
-				receipts.push({ id, ...notice });
+				receipts.push({ id, ...(sessionId ? { sessionId } : {}), ...notice });
 			} catch {
 				// skip one bad line
 			}

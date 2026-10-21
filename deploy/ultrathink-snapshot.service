@@ -1,0 +1,65 @@
+# Installed as /etc/systemd/system/ultrathink-snapshot.service and started by ultrathink-snapshot.timer.
+# One point-in-time snapshot of the state database per run (deploy/ultrathink-snapshot.sh tick). The timer runs it every
+# 30 s; ticks never overlap, because systemd does not start an active oneshot and the script holds a lock as well.
+# Run by hand: systemctl start ultrathink-snapshot.service ; journalctl -u ultrathink-snapshot -n 50 --no-pager
+# Settings (ULTRATHINK_SNAPSHOT_*, ULTRATHINK_OFFHOST_INTERVAL_SECONDS, ULTRATHINK_BACKUP_RSYNC_TARGET and
+# ULTRATHINK_BACKUP_RECIPIENT) go in /etc/ultrathink/ultrathink.env. The ring holds plaintext for its window, so it
+# sits in the same trust boundary as the state directory.
+
+[Unit]
+Description=Ultrathink point-in-time snapshot (ring, file layer and off-host copy)
+Documentation=file:///opt/ultrathink/current/docs/ops/runbook-ultrathink.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Same user as the web service: it opens the live SQLite file, and a root-owned -wal or -shm file would break the service.
+User=ultrathink
+Group=ultrathink
+WorkingDirectory=/opt/ultrathink/current
+EnvironmentFile=/etc/ultrathink/ultrathink.env
+Environment=HOME=/var/lib/ultrathink/home
+# Invoked through bash so the unit does not depend on the executable bit surviving a release checkout.
+ExecStart=/usr/bin/bash /opt/ultrathink/current/deploy/ultrathink-snapshot.sh tick
+TimeoutStartSec=120
+# Lower CPU priority than the web service. No IOSchedulingClass=idle: an idle IO class could starve the tick and push
+# the recovery point objective out.
+Nice=5
+
+StateDirectory=ultrathink
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=512M
+TasksMax=64
+
+# Same sandbox as ultrathink-maintenance.service: the ring lives under the backup directory, nothing else is writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/ultrathink
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectHostname=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# @resources is not excluded: Bun may call setrlimit at startup (a blocked syscall kills the process with SIGSYS).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ultrathink-snapshot

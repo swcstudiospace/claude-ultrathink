@@ -1,0 +1,20 @@
+rules:
+  - id: no-dynamic-code
+    message: >-
+      Dynamic code evaluation (eval or new Function) runs arbitrary strings as
+      code. Replace it with a static function, a lookup table, or a parser for
+      the specific input format.
+    severity: ERROR
+    languages:
+      - typescript
+      - javascript
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+    paths:
+      exclude:
+        # Test-only: graph-app.test.ts runs the app's own static helpers extracted from the served HTML via new Function; no external input reaches it. Inline nosemgrep comments did not clear the external Semgrep check on PR #46 (head d561385), so the exclusion is scoped to this rule and this one file.
+        - services/ultrathink/ui/graph-app.test.ts
