@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import type { HindsightConfig } from "../hindsight/types.ts";
+import { recordObserveFailure } from "./observe-health.ts";
 import { momentCounts, teachStatusLine } from "./status.ts";
 import { openStore, storeDir } from "./store.ts";
 import { DEFAULT_TEACH_CONFIG } from "./types.ts";
@@ -86,6 +87,15 @@ describe("teachStatusLine", () => {
 		store.enqueue({ op: "retain", momentId: "aaaa0001" }, 0);
 		const line = teachStatusLine(config({ capture: "observe", recall: false }), {}, storePath, stateDir);
 		expect(line).toBe("Teach: on · capture observe · recall off · 2 confirmed, 1 candidate · Hindsight off · outbox 1");
+	});
+
+	test("a failing observe distiller is shown with its streak and reason", () => {
+		recordObserveFailure(stateDir, "distiller failed: credit balance is too low", new Date("2026-10-20T07:07:49.000Z"));
+		recordObserveFailure(stateDir, "distiller failed: credit balance is too low", new Date("2026-10-21T07:07:49.000Z"));
+		const line = teachStatusLine(config(), {}, storePath, stateDir);
+		expect(line).toBe(
+			"Teach: on · capture auto · recall on · 0 confirmed, 0 candidate · Hindsight off · outbox 0 · observe failing ×2 since 2026-10-20 07:07 UTC (distiller failed: credit balance is too low)",
+		);
 	});
 
 	test("an absent store reads as zero and is not created", () => {

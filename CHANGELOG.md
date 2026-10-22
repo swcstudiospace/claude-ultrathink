@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A failing Teachable Moments distiller is no longer silent. `teach observe` runs detached with its output discarded, so a distiller that failed on every run (an expired Claude login, an exhausted Anthropic API balance, a missing engine) produced no lessons, no Hindsight writes and no sign of trouble. Observe now records each failed run in `<state>/teach/observe-health.json` (consecutive count, streak start, a short redacted reason; mode 0600), clears it after the next answered run, and writes one `teachable-failed` activity receipt on the first failure of a streak and every tenth. The `Teach:` status line (and `teach status`) ends with `observe failing ×<n> since <time> UTC (<reason>)` while the streak lasts. Skips that are not failures (off, explicit capture, too few tool calls, no signal) record nothing.
+
 ### Added
 
 - Policy as code (phase 75). Policy is Rego under `policy/`, tested with `opa test` and `opa check --strict`, and evaluated by a pinned OPA CLI (`policy/opa-pin.json`, verified by sha256 before it runs; pinned to OPA v1.21.3, checked against the release's published checksum). `policy/collect.ts` builds the input from the CI workflows, the systemd units and the `SECURITY_HEADERS` export, and `policy/check.sh` evaluates it, failing closed when the pin is missing or mismatched. `bun run policy:check`, `policy:collect` and `compliance` run them. The compliance report (`policy/compliance-report.ts`, `policy/controls.json`) maps each control to its evidence files with sha256 digests and reports PASS, PENDING or FAIL. Drift detection (`deploy/drift-check.sh`) is report only; its units are installed by hand and not enabled. Rego runs with the pinned binary on the machine that wrote it and passes; the `policy.yml` CI job has not run yet. This is an engineering mapping, not an audit attestation. The runbook section "Policy as code" lists the open items, including the retention gap (RET-D7) and the pending backup key custody (CRYPTO-BACKUP).

@@ -6,7 +6,7 @@
  */
 import { redactLine } from "../teach/redact.ts";
 
-export const ACTIVITY_KINDS = ["teachable-created", "teachable-recalled", "skill-recalled", "resource"] as const;
+export const ACTIVITY_KINDS = ["teachable-created", "teachable-failed", "teachable-recalled", "skill-recalled", "resource"] as const;
 export const ACTIVITY_SOURCES = ["hindsight", "local", "substrate", "ragflow", "greptile"] as const;
 
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];

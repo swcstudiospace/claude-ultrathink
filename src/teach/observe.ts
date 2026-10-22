@@ -14,6 +14,7 @@ import { selectEngine } from "../host/engine.ts";
 import { HOSTS, type HostId } from "../host/types.ts";
 import { appendActivity } from "./activity.ts";
 import { captureMoment } from "./capture.ts";
+import { recordObserveFailure, recordObserveOk, shouldNotifyFailure } from "./observe-health.ts";
 import { askLesson, type DecisionSummary, lessonDecisions, summarizeDecision, teachEnabled } from "./context.ts";
 import { promoteDue } from "./promote.ts";
 import { redactLine, redactText } from "./redact.ts";
@@ -188,6 +189,26 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 		decisions: decisionLog,
 		...(skipped ? { skipped } : {}),
 	});
+	// A run that should have reached the distiller but could not is recorded, so a silent, permanent failure (expired
+	// login, exhausted balance, missing engine) shows on the status line and as one activity receipt per streak.
+	const failed = (skipped: string, detail: string): ObserveReport => {
+		const health = recordObserveFailure(ctx.stateDir, detail, new Date(now()));
+		if (shouldNotifyFailure(health) && typeof digest?.sessionId === "string") {
+			appendActivity(
+				ctx.stateDir,
+				{
+					v: 1,
+					kind: "teachable-failed",
+					title: "Teachable Moments distiller failed",
+					outcome: "failed",
+					count: health?.failures,
+					detail: redactLine(detail, 80),
+				},
+				digest.sessionId,
+			);
+		}
+		return done([], skipped);
+	};
 	try {
 		if (!teachEnabled(ctx)) return done([], "off");
 		const mode = ctx.config.teach.capture;
@@ -211,7 +232,7 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 		let complete = ctx.complete;
 		if (!complete) {
 			const selected = await engineComplete(ctx);
-			if (typeof selected === "string") return done([], `no engine: ${selected}`);
+			if (typeof selected === "string") return failed(`no engine: ${selected}`, `no engine: ${selected}`);
 			complete = selected;
 		}
 		const signal = AbortSignal.timeout(deps.timeoutMs ?? OBSERVE_TIMEOUT_MS);
@@ -219,9 +240,11 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 		let reply: string;
 		try {
 			reply = await Promise.race([complete(DISTILL_SYSTEM, user, combined), aborted(combined)]);
-		} catch {
-			return done([], "distiller failed");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return failed("distiller failed", `distiller failed: ${message}`);
 		}
+		recordObserveOk(ctx.stateDir, new Date(now()));
 
 		const capture = deps.capture ?? captureMoment;
 		const captured: CaptureOutcome[] = [];
@@ -284,7 +307,8 @@ export async function observeDigest(digest: TeachDigest, ctx: TeachContext, deps
 			ctx.log?.("teach observe: due promotions failed");
 		}
 		return done(captured);
-	} catch {
-		return done([], "error");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return failed("error", `error: ${message}`);
 	}
 }
