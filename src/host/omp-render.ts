@@ -895,6 +895,7 @@ function swarmRows(details: unknown, expanded: boolean, p: Paint, room: number):
 
 function activityHeader(notice: ActivityNotice): string {
 	if (notice.kind === "teachable-created") return "Teachable moment";
+	if (notice.kind === "teachable-failed") return "Teachable Moments failed";
 	if (notice.kind === "teachable-recalled") return "Lesson recalled";
 	if (notice.kind === "skill-recalled") return "Skill recalled";
 	return notice.title;

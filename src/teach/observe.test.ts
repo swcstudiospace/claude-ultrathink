@@ -9,6 +9,7 @@ import { DEFAULT_DECISIONS_CONFIG, type DecisionsConfig } from "../decisions/typ
 import { DEFAULT_HINDSIGHT_CONFIG } from "../hindsight/types.ts";
 import { readActivity } from "./activity.ts";
 import { DISTILL_SYSTEM, observeDigest, parseLessons } from "./observe.ts";
+import { readObserveHealth } from "./observe-health.ts";
 import { openStore, storeDir } from "./store.ts";
 import {
 	type CaptureFn,
@@ -572,6 +573,49 @@ describe("observeDigest receipts", () => {
 			const rows = readActivity(stateDir);
 			expect(rows).toHaveLength(1);
 			expect(rows[0]).toMatchObject({ sessionId: "sess-1", kind: "teachable-created", outcome: "created", names: [GOOD.name] });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("observeDigest failure visibility", () => {
+	test("a failing distiller records the reason and leaves one receipt per streak; an answer clears it", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ut-observe-failure-"));
+		try {
+			const stateDir = join(root, "state");
+			const failing = harness();
+			failing.ctx.stateDir = stateDir;
+			failing.ctx.complete = async () => {
+				throw new Error("Your credit balance is too low to access the Anthropic API");
+			};
+			for (let i = 0; i < 3; i++) {
+				const outcome = await observeDigest(digest(), failing.ctx, { capture: failing.capture });
+				expect(outcome.skipped).toBe("distiller failed");
+			}
+			expect(readObserveHealth(stateDir)).toMatchObject({ failures: 3, reason: "distiller failed: Your credit balance is too low to access the Anthropic API" });
+			const rows = readActivity(stateDir);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ sessionId: "sess-1", kind: "teachable-failed", outcome: "failed", count: 1 });
+
+			const ok = harness();
+			ok.ctx.stateDir = stateDir;
+			await observeDigest(digest(), ok.ctx, { capture: ok.capture });
+			expect(readObserveHealth(stateDir)?.failures).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("skips that are not failures leave no health file", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ut-observe-skip-"));
+		try {
+			const stateDir = join(root, "state");
+			const h = harness();
+			h.ctx.stateDir = stateDir;
+			const outcome = await observeDigest(digest({ toolCalls: 0 }), h.ctx, { capture: h.capture });
+			expect(outcome.skipped).toBe("too few tool calls");
+			expect(readObserveHealth(stateDir)).toBeUndefined();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
