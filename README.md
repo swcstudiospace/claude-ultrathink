@@ -73,7 +73,7 @@ claude-ultrathink is a cross-agent reasoning plugin for prompt uplift, Graph of 
 
 ### Platforms
 
-ultrathink runs on **Linux** and **macOS**. On Windows, use it inside **WSL**; native Windows is not supported. CI runs on Linux and macOS.
+ultrathink runs on **Linux** and **macOS**. On Windows, use it inside **WSL**; native Windows is not supported. CI runs on Linux only; macOS is supported but not tested in CI.
 
 Requirements:
 

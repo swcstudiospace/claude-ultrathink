@@ -17,7 +17,7 @@ In the commands below, `<clone>` is the absolute path of your checkout. Paths wr
 
 ## Platforms
 
-ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL; native Windows is not supported. CI runs the test suite on Linux and macOS.
+ultrathink runs on Linux and macOS. On Windows, run it and your host inside WSL; native Windows is not supported. CI runs the test suite on Linux only; macOS is supported but not tested in CI.
 
 ## Tested with
 

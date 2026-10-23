@@ -38,7 +38,7 @@ const PLAN_CHECKS = [
 	"Semgrep",
 	"Analyze (javascript-typescript)",
 	"Analyze (python)",
-	"Check and test (ubuntu-latest, Bun latest)",
+	"Check and test (Bun latest)",
 ];
 /** One real advisory object, copied verbatim from `bun audit --json` run against a probe project with lodash@4.17.15. */
 const CAPTURED_NONEMPTY =

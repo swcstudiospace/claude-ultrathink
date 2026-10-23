@@ -15,11 +15,14 @@ concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci], swcstudiospace/Omega-Prime
+# docs/ci-runners.md), never on GitHub-hosted runners. Fork pull requests are skipped: fork code never reaches the pool.
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     # pull_request permits CodeQL uploads with fork read-only tokens; never run untrusted code via pull_request_target.
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -34,11 +37,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pool's tool cache (/opt/hostedtoolcache) is read-only, so the CodeQL bundle is unpacked into the job's
+      # own temp directory instead.
       - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        env:
+          RUNNER_TOOL_CACHE: ${{ runner.temp }}/codeql-toolcache
         with:
           languages: ${{ matrix.language }}
           build-mode: none
 
       - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        env:
+          RUNNER_TOOL_CACHE: ${{ runner.temp }}/codeql-toolcache
         with:
           category: "/language:${{ matrix.language }}"
