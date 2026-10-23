@@ -13,15 +13,17 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci], swcstudiospace/Omega-Prime
+# docs/ci-runners.md), never on GitHub-hosted runners. Fork pull requests are skipped: fork code never reaches the pool.
 jobs:
   test:
-    name: Check and test (${{ matrix.os }}, Bun ${{ matrix.bun }})
-    runs-on: ${{ matrix.os }}
+    name: Check and test (Bun ${{ matrix.bun }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
         # 1.2.x is the minimum in package.json "engines"; latest catches regressions early.
         bun: [1.2.x, latest]
     steps:
@@ -37,6 +39,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
+
+      # The pool has no system Node; the minimum-Bun leg's npm install and any test that shells out to node use this one.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
 
       # ultrathink has no runtime dependencies; `bun install` only fetches type definitions for the type check.
       # bun.lock uses a lockfile format Bun 1.2 cannot read, so the minimum-Bun leg runs the tests without it.
@@ -66,16 +73,18 @@ jobs:
           git config --global user.email ci@example.com
           git config --global user.name ci
 
-      # Phase 74: the off-host round-trip and rsync tests skip silently when age or rsync is missing.
-      - name: Install age and rsync (Linux)
-        if: runner.os == 'Linux'
+      # Phase 74: the off-host round-trip and rsync tests skip silently when age or rsync is missing, so CI fails here
+      # instead. The Omega CI runner image ships both (jobs have no sudo to install them).
+      - name: Require age and rsync
         run: |
-          sudo apt-get update
-          sudo apt-get install -y age rsync
-
-      - name: Install age and rsync (macOS)
-        if: runner.os == 'macOS'
-        run: brew install age rsync
+          for tool in age age-keygen rsync; do
+            if ! command -v "$tool" >/dev/null; then
+              echo "::error::$tool is not on PATH; add it to the Omega CI runner image" >&2
+              exit 1
+            fi
+          done
+          age --version
+          rsync --version | head -n 1
 
       - name: Test
         run: bun test

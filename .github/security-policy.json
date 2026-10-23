@@ -13,6 +13,6 @@
     "Semgrep",
     "Analyze (javascript-typescript)",
     "Analyze (python)",
-    "Check and test (ubuntu-latest, Bun latest)"
+    "Check and test (Bun latest)"
   ]
 }

@@ -12,10 +12,13 @@ concurrency:
   group: security-scan-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci], swcstudiospace/Omega-Prime
+# docs/ci-runners.md), never on GitHub-hosted runners. Fork pull requests are skipped: fork code never reaches the pool.
 jobs:
   dependency-audit:
     name: Dependency audit
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +41,8 @@ jobs:
 
   license-policy:
     name: License policy
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,7 +65,8 @@ jobs:
 
   semgrep:
     name: Semgrep
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 15
     permissions:
       contents: read
@@ -76,7 +81,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Semgrep
-        run: pip install semgrep==1.182.0
+        run: python -m pip install semgrep==1.182.0
 
       - name: Semgrep rule tests
         run: semgrep --test --metrics=off .semgrep/rules

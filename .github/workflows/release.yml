@@ -15,10 +15,11 @@ on:
 permissions:
   contents: read
 
+# Runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci], swcstudiospace/Omega-Prime docs/ci-runners.md).
 jobs:
   release:
     name: Release ${{ github.ref_name }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, omega-ci]
     timeout-minutes: 30
     permissions:
       contents: write
@@ -37,6 +38,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
+
+      # The pool has no system Node; tests that shell out to node use this one.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.x"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
