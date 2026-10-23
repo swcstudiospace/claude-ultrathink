@@ -81,7 +81,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Semgrep
-        run: pip install semgrep==1.182.0
+        run: python -m pip install semgrep==1.182.0
 
       - name: Semgrep rule tests
         run: semgrep --test --metrics=off .semgrep/rules
