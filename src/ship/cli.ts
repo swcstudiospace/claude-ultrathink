@@ -519,7 +519,8 @@ function finishMerge(
 	const cleanup: Output = {};
 	if (deps.config.deleteBranch) {
 		const deleted = github.deleteRemoteBranch(pr.head);
-		const synced = github.syncBase({ base: pr.base, branch: pr.head });
+		// The merged head lets syncBase delete a squash/rebase-merged branch whose tip is exactly what landed.
+		const synced = github.syncBase({ base: pr.base, branch: pr.head, headSha: merged.headSha });
 		Object.assign(cleanup, { remoteDeleted: deleted.ok, synced: synced.ok });
 		if (deleted.error) cleanup.deleteError = deleted.error;
 		if (synced.error) cleanup.syncError = synced.error;

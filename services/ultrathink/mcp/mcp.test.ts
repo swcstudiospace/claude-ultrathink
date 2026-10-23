@@ -6,6 +6,7 @@ import pkg from "../../../package.json";
 import {
 	DEFAULT_PROTOCOL_VERSION,
 	handleMcpPayload,
+	MAX_BATCH_MESSAGES,
 	type McpContext,
 	type McpToolHost,
 	SUPPORTED_PROTOCOL_VERSIONS,
@@ -13,10 +14,12 @@ import {
 	type ToolOutcome,
 	toolDefinitions,
 } from "./mcp.ts";
+import { createResourceRegistry, UI_RESOURCE_MIME_TYPE } from "./resources.ts";
+import { getSecurityLogger, setSecurityLogger, type SecurityEvent, type SecurityEventLogger } from "../security/events.ts";
 
 const SESSION_ID = "session-1";
 const PLANNED: ToolOutcome = { ok: true, data: { sessionId: SESSION_ID, status: "planned", pending: [] } };
-const CLIENT_TOOLS = [
+const ORIGINAL_CLIENT_TOOLS = [
 	"ultrathink_plan",
 	"ultrathink_pending",
 	"ultrathink_show",
@@ -24,14 +27,33 @@ const CLIENT_TOOLS = [
 	"ultrathink_status",
 	"ultrathink_result",
 ];
+// The three connector tools are always listed, in both modes: Grok never refreshes tools/list.
+const CONNECTOR_TOOLS = ["ultrathink_graph", "ultrathink_sessions", "ultrathink_command"];
+const CLIENT_TOOLS = [...ORIGINAL_CLIENT_TOOLS, ...CONNECTOR_TOOLS];
 const SERVER_TOOLS = ["ultrathink_uplift", ...CLIENT_TOOLS];
+const UI_URI = "ui://ultrathink/graph";
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const START_NEW_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const START_NEW_PAID_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const INVALID_REQUEST_REPLY = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } };
 const INTERNAL_ERROR = { code: -32603, message: "internal error" };
 const UNKNOWN_TOOL = { code: -32602, message: "unknown tool" };
 const NEW_VERSIONS = ["2025-06-18", "2025-11-25"];
+const UUID = "0f4e5f2a-7f4e-4f6c-9a3c-1d2e3f4a5b6c";
+/** One argument object per tool that passes its inputSchema, for tests that must reach the host. */
+const VALID_ARGS: Record<string, Record<string, unknown>> = {
+	ultrathink_uplift: { prompt: "Plan" },
+	ultrathink_plan: { prompt: "Plan" },
+	ultrathink_pending: { sessionId: SESSION_ID },
+	ultrathink_show: { sessionId: SESSION_ID, key: "k1" },
+	ultrathink_answer: { sessionId: SESSION_ID, key: "k1", answer: "a" },
+	ultrathink_status: { sessionId: SESSION_ID },
+	ultrathink_result: { sessionId: SESSION_ID },
+	ultrathink_graph: {},
+	ultrathink_sessions: {},
+	ultrathink_command: { command: "help" },
+};
 
 interface Call {
 	name: string;
@@ -82,6 +104,7 @@ interface ToolDef {
 	description: string;
 	inputSchema: Record<string, unknown>;
 	annotations: Record<string, unknown>;
+	_meta?: Record<string, unknown>;
 }
 
 interface Schema {
@@ -173,10 +196,18 @@ describe("initialize", () => {
 		}
 	});
 
-	test("advertises tools and prompts and names the server after the package version", async () => {
-		const result = await initialize(fakeHost());
-		expect(result.capabilities).toEqual({ tools: {}, prompts: {} });
-		expect(result.serverInfo).toEqual({ name: "ultrathink", version: pkg.version });
+	test("advertises tools, prompts, resources and the UI extension, and names the server after the package version", async () => {
+		for (const host of [fakeHost(), serverHost()]) {
+			const result = await initialize(host);
+			// The extension is announced even though the client sent none: claude.ai web renders apps without it.
+			expect(result.capabilities).toEqual({
+				tools: {},
+				prompts: {},
+				resources: {},
+				extensions: { "io.modelcontextprotocol/ui": {} },
+			});
+			expect(result.serverInfo).toEqual({ name: "ultrathink", version: pkg.version });
+		}
 	});
 
 	test("client mode ties the /ultrathink trigger to the client-driven loop and the result tool", async () => {
@@ -184,7 +215,8 @@ describe("initialize", () => {
 			const { instructions } = await initialize(host);
 			// A client that cannot list prompts shows the model these instructions and the tool description instead.
 			expect(instructions).toContain("/ultrathink");
-			expect(instructions.length).toBeLessThan(2000);
+			// Claude Code cuts instructions at 4096 characters.
+			expect(instructions.length).toBeLessThanOrEqual(3500);
 			const named = toolNames(instructions);
 			expect(named).toContain("ultrathink_plan");
 			expect(named).toContain("ultrathink_result");
@@ -193,12 +225,37 @@ describe("initialize", () => {
 		}
 	});
 
-	test("server mode ties the /ultrathink trigger to ultrathink_uplift and ultrathink_result only", async () => {
+	test("server mode ties the /ultrathink trigger to ultrathink_uplift and ultrathink_result", async () => {
 		const { instructions } = await initialize(serverHost());
 		expect(instructions).toContain("/ultrathink");
-		expect(instructions.length).toBeLessThan(2000);
+		expect(instructions.length).toBeLessThanOrEqual(3500);
 		const named = toolNames(instructions);
-		expect(named.sort()).toEqual(["ultrathink_result", "ultrathink_uplift"]);
+		expect(named).toContain("ultrathink_uplift");
+		expect(named).toContain("ultrathink_result");
+		expect(named).not.toContain("ultrathink_plan");
+		for (const name of named) expect(SERVER_TOOLS).toContain(name);
+	});
+
+	test("both modes map the slash commands to the connector tools", async () => {
+		for (const host of [fakeHost(), serverHost()]) {
+			const { instructions } = await initialize(host);
+			expect(instructions).toContain("/ultrathink-think");
+			expect(instructions).toContain("/ultrathink-last");
+			expect(instructions).toContain("/ultrathink-status");
+			expect(instructions).toContain("/ultrathink-quick");
+			expect(instructions).toContain("wave tree");
+			expect(instructions).toContain("only if your interface renders Mermaid");
+			const named = toolNames(instructions);
+			for (const name of CONNECTOR_TOOLS) expect(named).toContain(name);
+		}
+	});
+
+	test("server mode keeps the model from drawing the graph a second time, client mode asks for it once", async () => {
+		const server = (await initialize(serverHost())).instructions;
+		expect(server).toMatch(/do not call ultrathink_graph/i);
+		const client = (await initialize(fakeHost())).instructions;
+		expect(client).toMatch(/call ultrathink_graph once/i);
+		expect(client).not.toMatch(/do not call ultrathink_graph/i);
 	});
 });
 
@@ -214,15 +271,24 @@ async function promptText(host: McpToolHost, text: string): Promise<string> {
 }
 
 describe("prompts", () => {
-	test("prompts/list offers one ultrathink prompt with a required request argument in both modes", async () => {
+	test("prompts/list offers the supported commands, the planning one first with a required request argument, in both modes", async () => {
 		for (const host of [fakeHost(), serverHost()]) {
 			const { prompts } = resultOf<{
 				prompts: { name: string; arguments: { name: string; required: boolean }[] }[];
 			}>(await replyOf(host, request("prompts/list")));
-			expect(prompts.map((prompt) => prompt.name)).toEqual(["ultrathink"]);
+			expect(prompts.map((prompt) => prompt.name)).toEqual([
+				"ultrathink",
+				"ultrathink-plan",
+				"ultrathink-think",
+				"ultrathink-last",
+				"ultrathink-status",
+				"ultrathink-quick",
+			]);
 			expect(prompts[0]?.arguments.map((argument) => [argument.name, argument.required])).toEqual([
 				["request", true],
 			]);
+			// Unsupported commands are not listed: they would crowd the real plugin commands in a slash menu.
+			expect(prompts.map((prompt) => prompt.name)).not.toContain("ultrathink-ship");
 		}
 	});
 
@@ -377,15 +443,15 @@ describe("ping", () => {
 });
 
 describe("tools/list", () => {
-	test("a host without capabilities lists the six client-mode tools, without ultrathink_uplift", async () => {
+	test("a host without capabilities lists the nine client-mode tools, without ultrathink_uplift", async () => {
 		expect((await listTools()).map((tool) => tool.name)).toEqual(CLIENT_TOOLS);
 	});
 
-	test("a host with serverPlanning false lists the same six tools", async () => {
+	test("a host with serverPlanning false lists the same nine tools", async () => {
 		expect((await listTools(fakeHost(PLANNED, false))).map((tool) => tool.name)).toEqual(CLIENT_TOOLS);
 	});
 
-	test("a host with serverPlanning true lists seven tools, ultrathink_uplift first", async () => {
+	test("a host with serverPlanning true lists ten tools, ultrathink_uplift first", async () => {
 		expect((await listTools(serverHost())).map((tool) => tool.name)).toEqual(SERVER_TOOLS);
 	});
 
@@ -393,9 +459,9 @@ describe("tools/list", () => {
 		let serverPlanning = false;
 		const host = fakeHost();
 		host.capabilities = () => ({ serverPlanning });
-		expect((await listTools(host)).length).toBe(6);
+		expect((await listTools(host)).length).toBe(9);
 		serverPlanning = true;
-		expect((await listTools(host)).length).toBe(7);
+		expect((await listTools(host)).length).toBe(10);
 	});
 
 	test("returns the exported definitions", async () => {
@@ -410,7 +476,8 @@ describe("tools/list", () => {
 			expect(schemaOf(tool).type).toBe("object");
 			expect(schemaOf(tool).additionalProperties).toBe(false);
 			expect("outputSchema" in tool).toBe(false);
-			expect(tool.annotations.idempotentHint).toBe(true);
+			// A start call without sessionId makes a new session, so only the two start tools are not idempotent.
+			expect(tool.annotations.idempotentHint).toBe(tool.name !== "ultrathink_uplift" && tool.name !== "ultrathink_plan");
 		}
 	});
 
@@ -421,7 +488,10 @@ describe("tools/list", () => {
 		expect(uplift.description.indexOf("/ultrathink")).toBeLessThan(80);
 		expect(schemaOf(uplift).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(uplift).properties)).toEqual(["prompt", "sessionId"]);
-		expect(uplift.annotations).toEqual(READ_WRITE_OPEN_WORLD);
+		expect(uplift.annotations).toEqual(START_NEW_PAID_SESSION);
+		expect(uplift.description).toContain("followed by a space");
+		expect(uplift.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
+		expect(uplift.description).toContain("ultrathink_command");
 	});
 
 	test("ultrathink_result requires sessionId, bounds waitSeconds to 0..45 and offers brief or full detail", async () => {
@@ -437,12 +507,72 @@ describe("tools/list", () => {
 		}
 	});
 
+	test("the seven original tools keep their names, in order, after ultrathink_uplift", async () => {
+		expect((await listTools(serverHost())).slice(0, 7).map((tool) => tool.name)).toEqual([
+			"ultrathink_uplift",
+			...ORIGINAL_CLIENT_TOOLS,
+		]);
+		expect((await listTools(serverHost())).slice(7).map((tool) => tool.name)).toEqual(CONNECTOR_TOOLS);
+	});
+
+	test("ultrathink_uplift and ultrathink_graph carry the UI resource in both the nested and the legacy flat key", async () => {
+		for (const name of ["ultrathink_uplift", "ultrathink_graph"]) {
+			const tool = await toolDef(name, serverHost());
+			expect(tool._meta?.ui).toEqual({ resourceUri: UI_URI });
+			expect(tool._meta?.["ui/resourceUri"]).toBe(UI_URI);
+		}
+		// Nothing is gated on what the client announced: the same list serves every client.
+		expect((await toolDef("ultrathink_graph", fakeHost()))._meta?.ui).toEqual({ resourceUri: UI_URI });
+	});
+
+	test("ultrathink_result, ultrathink_graph and ultrathink_command allow results up to 200000 characters; no other tool has either meta", async () => {
+		for (const tool of await listTools(serverHost())) {
+			const hasLimit = ["ultrathink_result", "ultrathink_graph", "ultrathink_command"].includes(tool.name);
+			expect(tool._meta?.["anthropic/maxResultSizeChars"]).toBe(hasLimit ? 200000 : undefined);
+			const hasUi = tool.name === "ultrathink_uplift" || tool.name === "ultrathink_graph";
+			expect(tool._meta?.ui !== undefined).toBe(hasUi);
+		}
+	});
+
+	test("ultrathink_graph takes an optional sessionId, node and detail and is read-only", async () => {
+		const graph = await toolDef("ultrathink_graph");
+		expect(graph.description).toContain("/ultrathink-think");
+		expect(graph.description).toContain("wave tree first");
+		expect(schemaOf(graph).required).toBeUndefined();
+		expect(Object.keys(schemaOf(graph).properties)).toEqual(["sessionId", "node", "detail"]);
+		expect(schemaOf(graph).properties.detail).toMatchObject({ enum: ["brief", "full"] });
+		expect(graph.annotations).toEqual(READ_ONLY);
+	});
+
+	test("ultrathink_sessions takes an optional limit of 1 to 20 and is read-only", async () => {
+		const sessions = await toolDef("ultrathink_sessions");
+		expect(sessions.description).toContain("/ultrathink-status");
+		expect(sessions.description).not.toContain("first step of /ultrathink-last");
+		expect(schemaOf(sessions).required).toBeUndefined();
+		expect(schemaOf(sessions).properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 20 });
+		expect(sessions.annotations).toEqual(READ_ONLY);
+		const graph = await toolDef("ultrathink_graph");
+		expect(graph.description).toContain("/ultrathink-last");
+		expect(graph.description).toContain("wave tree first");
+	});
+
+	test("ultrathink_command requires command, takes args and is read-only", async () => {
+		const command = await toolDef("ultrathink_command");
+		expect(command.description).toContain("/ultrathink-");
+		expect(schemaOf(command).required).toEqual(["command"]);
+		expect(Object.keys(schemaOf(command).properties)).toEqual(["command", "args"]);
+		expect(command.annotations).toEqual(READ_ONLY);
+	});
+
 	test("ultrathink_plan requires prompt, takes an optional sessionId and is not read-only", async () => {
 		const plan = await toolDef("ultrathink_plan");
 		expect(plan.description).toContain("/ultrathink");
 		expect(schemaOf(plan).required).toEqual(["prompt"]);
 		expect(Object.keys(schemaOf(plan).properties)).toEqual(["prompt", "sessionId"]);
-		expect(plan.annotations).toEqual(READ_WRITE);
+		expect(plan.annotations).toEqual(START_NEW_SESSION);
+		expect(plan.description).toContain("followed by a space");
+		expect(plan.description).toContain("starts with /ultrathink- (a hyphen) is a different command");
+		expect(plan.description).toContain("ultrathink_command");
 	});
 
 	test("ultrathink_pending requires sessionId and is read-only", async () => {
@@ -520,13 +650,15 @@ describe("ultrathink_plan", () => {
 });
 
 describe("ultrathink_show", () => {
-	test("forwards an out-of-enum part to the host unchanged", async () => {
+	test("an out-of-enum part is invalid_arguments and never reaches the host", async () => {
 		const host = fakeHost();
-		const args = { sessionId: SESSION_ID, key: "k1", part: "nonsense" };
-		await invoke(host, "ultrathink_show", args);
-		expect(host.calls).toEqual([
-			{ name: "ultrathink_show", args: { sessionId: SESSION_ID, key: "k1", part: "nonsense" } },
-		]);
+		const result = await invoke(host, "ultrathink_show", { sessionId: SESSION_ID, key: "k1", part: "nonsense" });
+		expect(result.isError).toBe(true);
+		expect(result.structuredContent).toEqual({
+			error: "invalid_arguments",
+			errors: ["arguments.part: not one of the allowed values"],
+		});
+		expect(host.calls).toHaveLength(0);
 	});
 
 	test("the tools/list schema declares part as an enum of system and user only", async () => {
@@ -543,12 +675,86 @@ describe("argument forwarding", () => {
 			["ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "option-a" }],
 			["ultrathink_status", { sessionId: SESSION_ID }],
 			["ultrathink_result", { sessionId: SESSION_ID, waitSeconds: 10, detail: "full" }],
+			["ultrathink_graph", { sessionId: SESSION_ID, node: "n2", detail: "full" }],
+			["ultrathink_sessions", { limit: 3 }],
+			["ultrathink_command", { command: "ultrathink-ship", args: "the branch" }],
 		];
 		for (const [name, args] of cases) {
 			const host = fakeHost();
 			await invoke(host, name, args);
 			expect(host.calls).toEqual([{ name, args }]);
 		}
+	});
+});
+
+describe("argument validation", () => {
+	test("a non-integer waitSeconds is invalid_arguments naming arguments.waitSeconds, and the host is not called", async () => {
+		const host = fakeHost();
+		const result = await invoke(host, "ultrathink_result", { sessionId: UUID, waitSeconds: 1.5 });
+		expect(result.isError).toBe(true);
+		expect(result.structuredContent).toEqual({ error: "invalid_arguments", errors: ["arguments.waitSeconds: expected integer"] });
+		expect(result.content).toEqual([
+			{ type: "text", text: "request refused: invalid_arguments (arguments.waitSeconds: expected integer)" },
+		]);
+		expect(host.calls).toHaveLength(0);
+	});
+
+	test("an unknown key is invalid_arguments with arguments.<key>: unknown property, and the host is not called", async () => {
+		const host = fakeHost();
+		const result = await invoke(host, "ultrathink_result", { sessionId: UUID, foo: 1 });
+		expect(result.isError).toBe(true);
+		expect(result.structuredContent).toEqual({ error: "invalid_arguments", errors: ["arguments.foo: unknown property"] });
+		expect(result.content[0]?.text).toContain("arguments.foo: unknown property");
+		expect(host.calls).toHaveLength(0);
+	});
+
+	test("a missing required key, a wrong type and an out-of-range bound are each refused before the host", async () => {
+		const cases: [string, Record<string, unknown>, string][] = [
+			["ultrathink_plan", {}, "arguments.prompt: missing required property"],
+			["ultrathink_answer", { sessionId: UUID, key: "k1", answer: 7 }, "arguments.answer: expected string"],
+			["ultrathink_result", { sessionId: UUID, waitSeconds: 46 }, "arguments.waitSeconds: above maximum 45"],
+			["ultrathink_sessions", { limit: 0 }, "arguments.limit: below minimum 1"],
+			["ultrathink_command", { command: "x".repeat(101) }, "arguments.command: longer than 100 characters"],
+		];
+		for (const [name, args, error] of cases) {
+			const host = fakeHost();
+			const result = await invoke(host, name, args);
+			expect(result.isError).toBe(true);
+			expect(result.structuredContent).toEqual({ error: "invalid_arguments", errors: [error] });
+			expect(host.calls).toHaveLength(0);
+		}
+	});
+
+	test("valid arguments reach the host unchanged, as the same object", async () => {
+		const host = fakeHost();
+		const args = { sessionId: UUID, waitSeconds: 45, detail: "full" };
+		const result = await invoke(host, "ultrathink_result", args);
+		expect(result.isError).toBe(false);
+		expect(host.calls).toEqual([{ name: "ultrathink_result", args }]);
+		expect(host.calls[0]?.args).toBe(args);
+	});
+
+	test("every served tool accepts its minimal valid arguments in both modes", async () => {
+		for (const [name, args] of Object.entries(VALID_ARGS)) {
+			const host = serverHost();
+			const result = await invoke(host, name, args);
+			expect(result.isError).toBe(false);
+			expect(host.calls).toEqual([{ name, args }]);
+		}
+		for (const name of CLIENT_TOOLS) {
+			const host = fakeHost();
+			expect((await invoke(host, name, VALID_ARGS[name])).isError).toBe(false);
+		}
+	});
+
+	test("the same tool validated twice is served by one compiled validator and still refuses the second bad call", async () => {
+		const host = fakeHost();
+		expect((await invoke(host, "ultrathink_status", { sessionId: UUID })).isError).toBe(false);
+		expect((await invoke(host, "ultrathink_status", { sessionId: 5 })).structuredContent).toEqual({
+			error: "invalid_arguments",
+			errors: ["arguments.sessionId: expected string"],
+		});
+		expect(host.calls).toHaveLength(1);
 	});
 });
 
@@ -559,6 +765,13 @@ describe("tool results", () => {
 		expect(result.isError).toBe(false);
 		expect(result.structuredContent).toEqual(data);
 		expect(result.content).toEqual([{ type: "text", text: JSON.stringify(data) }]);
+	});
+
+	test("a host that repeats the text in the data gives the same text in content and structuredContent", async () => {
+		const text = "Graph of Thought: wave 1";
+		const result = await invoke(fakeHost({ ok: true, data: { status: "planned", text }, text }), "ultrathink_graph", {});
+		expect(result.content).toEqual([{ type: "text", text }]);
+		expect(result.structuredContent.text).toBe(text);
 	});
 
 	test("a host success with text returns that text as the content and the data as structuredContent", async () => {
@@ -614,6 +827,21 @@ describe("tool results", () => {
 		expect(result.structuredContent).toEqual({ error: "invalid_answer", errors });
 	});
 
+	test("a refusal with errors lists them in the content text after the code", async () => {
+		const errors = ["answer is not valid JSON", "missing field: angle"];
+		const host = fakeHost({ ok: false, code: "invalid_answer", errors });
+		const result = await invoke(host, "ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "x" });
+		expect(result.content).toEqual([
+			{ type: "text", text: "request refused: invalid_answer (answer is not valid JSON; missing field: angle)" },
+		]);
+	});
+
+	test("a refusal with an empty errors array keeps the bare code in the content text", async () => {
+		const host = fakeHost({ ok: false, code: "invalid_answer", errors: [] });
+		const result = await invoke(host, "ultrathink_answer", { sessionId: SESSION_ID, key: "k1", answer: "x" });
+		expect(result.content).toEqual([{ type: "text", text: "request refused: invalid_answer" }]);
+	});
+
 	test("a refusal without errors has no errors key", async () => {
 		const host = fakeHost({ ok: false, code: "not_found" });
 		const result = await invoke(host, "ultrathink_status", { sessionId: SESSION_ID });
@@ -621,8 +849,8 @@ describe("tool results", () => {
 		expect("errors" in result.structuredContent).toBe(false);
 	});
 
-	test("non-object arguments return invalid_arguments without calling the host", async () => {
-		const badArgs: unknown[] = [undefined, null, "prompt", ["prompt"], 7, true];
+	test("present non-object arguments return invalid_arguments without calling the host", async () => {
+		const badArgs: unknown[] = [null, "prompt", ["prompt"], 7, true];
 		for (const name of SERVER_TOOLS) {
 			for (const args of badArgs) {
 				const host = serverHost();
@@ -632,6 +860,15 @@ describe("tool results", () => {
 				expect(result.content).toEqual([{ type: "text", text: "invalid arguments" }]);
 				expect(host.calls).toHaveLength(0);
 			}
+		}
+	});
+
+	test("omitted arguments run the tool with an empty object", async () => {
+		for (const name of ["ultrathink_sessions", "ultrathink_graph"]) {
+			const host = serverHost();
+			const result = await invoke(host, name);
+			expect(result.isError).toBe(false);
+			expect(host.calls).toEqual([{ name, args: {} }]);
 		}
 	});
 });
@@ -662,11 +899,84 @@ describe("tools/call errors", () => {
 
 describe("unknown methods", () => {
 	test("return -32601 with the request id", async () => {
-		expect(await bodyOf(fakeHost(), request("resources/list", {}, 7))).toEqual({
+		expect(await bodyOf(fakeHost(), request("sampling/createMessage", {}, 7))).toEqual({
 			jsonrpc: "2.0",
 			id: 7,
 			error: { code: -32601, message: "method not found" },
 		});
+	});
+});
+
+describe("resources", () => {
+	const HTML = "<!doctype html><title>graph</title>";
+	const UI_META = { csp: {}, prefersBorder: false };
+
+	function hostWithUi(): FakeHost {
+		const host = fakeHost();
+		host.resources = createResourceRegistry([
+			{
+				uri: UI_URI,
+				name: "ultrathink-graph",
+				title: "UltraThink graph",
+				description: "The plan graph.",
+				mimeType: UI_RESOURCE_MIME_TYPE,
+				html: () => HTML,
+				meta: UI_META,
+			},
+		]);
+		return host;
+	}
+
+	test("resources/list returns the UI document with its mime type and _meta.ui", async () => {
+		const { resources } = resultOf<{ resources: Record<string, unknown>[] }>(
+			await replyOf(hostWithUi(), request("resources/list")),
+		);
+		expect(resources).toEqual([
+			{
+				uri: UI_URI,
+				name: "ultrathink-graph",
+				title: "UltraThink graph",
+				description: "The plan graph.",
+				mimeType: "text/html;profile=mcp-app",
+				_meta: { ui: UI_META },
+			},
+		]);
+	});
+
+	test("resources/read returns the document with the MCP Apps mime type and _meta.ui", async () => {
+		const reply = await replyOf(hostWithUi(), request("resources/read", { uri: UI_URI }));
+		expect(resultOf<unknown>(reply)).toEqual({
+			contents: [{ uri: UI_URI, mimeType: "text/html;profile=mcp-app", text: HTML, _meta: { ui: UI_META } }],
+		});
+	});
+
+	test("resources/templates/list is empty", async () => {
+		expect(resultOf<unknown>(await replyOf(hostWithUi(), request("resources/templates/list")))).toEqual({
+			resourceTemplates: [],
+		});
+	});
+
+	test("an unknown ui uri is -32002 with the request id", async () => {
+		const body = await bodyOf(hostWithUi(), request("resources/read", { uri: "ui://ultrathink/other" }, "r-1"));
+		expect(body).toEqual({ jsonrpc: "2.0", id: "r-1", error: { code: -32002, message: "resource not found" } });
+	});
+
+	test("a missing, non-string or non-ui uri is -32602", async () => {
+		const refused: unknown[] = [undefined, {}, { uri: 5 }, { uri: null }, { uri: "https://example.com/x" }, { uri: "ui://" }, "ui://ultrathink/graph"];
+		for (const params of refused) {
+			const reply = await replyOf(hostWithUi(), request("resources/read", params));
+			expect(reply.error?.code).toBe(-32602);
+			expect(reply.result).toBeUndefined();
+		}
+	});
+
+	test("a host without a registry lists nothing and finds nothing", async () => {
+		const host = fakeHost();
+		expect(resultOf<unknown>(await replyOf(host, request("resources/list")))).toEqual({ resources: [] });
+		expect(resultOf<unknown>(await replyOf(host, request("resources/templates/list")))).toEqual({ resourceTemplates: [] });
+		expect((await replyOf(host, request("resources/read", { uri: UI_URI }))).error?.code).toBe(-32002);
+		expect((await replyOf(host, request("resources/read", { uri: 5 }))).error?.code).toBe(-32602);
+		expect(host.calls).toHaveLength(0);
 	});
 });
 
@@ -780,9 +1090,50 @@ describe("batch", () => {
 		]);
 	});
 
-	test("an element with an invalid id gets its own -32600 reply and the batch keeps its status", async () => {
-		const out = await handleMcpPayload(fakeHost(), [request("ping", undefined, null), request("ping", undefined, "d")]);
-		expect(out).toEqual({ body: [INVALID_REQUEST_REPLY, { jsonrpc: "2.0", id: "d", result: {} }] });
+	test("an element with an invalid id gets its own -32600 reply and the batch answers status 400", async () => {
+		const host = fakeHost();
+		const out = await handleMcpPayload(host, [request("ping", undefined, null), request("ping", undefined, "d")]);
+		expect(out).toEqual({ body: [INVALID_REQUEST_REPLY, { jsonrpc: "2.0", id: "d", result: {} }], status: 400 });
+	});
+
+	test("a batch of one invalid-id message answers status 400 with the per-element error", async () => {
+		const out = await handleMcpPayload(fakeHost(), [request("ping", undefined, {})], { protocolVersion: "2025-03-26" });
+		expect(out).toEqual({ body: [INVALID_REQUEST_REPLY], status: 400 });
+	});
+
+	test("a malformed element without an invalid id keeps the default status", async () => {
+		const out = await handleMcpPayload(fakeHost(), [42, request("ping", undefined, "c")]);
+		expect(out).toEqual({ body: [INVALID_REQUEST_REPLY, { jsonrpc: "2.0", id: "c", result: {} }] });
+	});
+
+	test("accepts MAX_BATCH_MESSAGES tool calls and runs every one", async () => {
+		expect(MAX_BATCH_MESSAGES).toBe(8);
+		const host = fakeHost();
+		const batch = Array.from({ length: MAX_BATCH_MESSAGES }, (_, i) => toolCall("ultrathink_status", { sessionId: SESSION_ID }, i));
+		const replies = (await bodyOf(host, batch)) as RpcReply[];
+		expect(replies.map((reply) => reply.id)).toEqual(batch.map((message) => message.id));
+		expect(host.calls).toHaveLength(MAX_BATCH_MESSAGES);
+	});
+
+	test("refuses a batch longer than MAX_BATCH_MESSAGES with status 400 and -32600, without calling the host", async () => {
+		for (const ctx of [undefined, {}, { protocolVersion: "2025-03-26" }]) {
+			const host = fakeHost();
+			const batch = Array.from({ length: MAX_BATCH_MESSAGES + 1 }, (_, i) =>
+				toolCall("ultrathink_result", { sessionId: SESSION_ID, waitSeconds: 45 }, i),
+			);
+			expect(await handleMcpPayload(host, batch, ctx)).toEqual({ body: INVALID_REQUEST_REPLY, status: 400 });
+			expect(host.calls).toHaveLength(0);
+		}
+	});
+
+	test("refuses an oversized batch of notifications before dispatching any element", async () => {
+		const host = fakeHost();
+		const batch = Array.from({ length: 400 }, () => ({ jsonrpc: "2.0", method: "notifications/initialized" }));
+		expect(await handleMcpPayload(host, [...batch, toolCall("ultrathink_plan", { prompt: "Plan" }, 1)])).toEqual({
+			body: INVALID_REQUEST_REPLY,
+			status: 400,
+		});
+		expect(host.calls).toHaveLength(0);
 	});
 
 	test("a batch of malformed elements and notifications returns only the malformed replies", async () => {
@@ -800,7 +1151,7 @@ describe("host failures", () => {
 			throw new Error(DETAIL);
 		});
 		for (const name of SERVER_TOOLS) {
-			const body = await bodyOf(host, toolCall(name, { sessionId: SESSION_ID }, "t-1"));
+			const body = await bodyOf(host, toolCall(name, VALID_ARGS[name], "t-1"));
 			expect(body).toEqual({ jsonrpc: "2.0", id: "t-1", error: INTERNAL_ERROR });
 			expect(JSON.stringify(body)).not.toContain(DETAIL);
 			expect(JSON.stringify(body)).not.toContain("stack");
@@ -849,5 +1200,83 @@ describe("host failures", () => {
 		])) as RpcReply[];
 		expect(resultOf<ToolResult>(replies[0] as RpcReply).isError).toBe(false);
 		expect(replies[1]).toEqual({ jsonrpc: "2.0", id: "b", error: INTERNAL_ERROR });
+	});
+});
+
+/** Keeps each validation refusal the logger seam reports, and writes nothing. */
+class RecordingLogger implements SecurityEventLogger {
+	readonly validation: Partial<SecurityEvent>[] = [];
+	log(): void {}
+	logAuthFailure(): void {}
+	logValidationFailure(details: Partial<SecurityEvent>): void {
+		this.validation.push(details);
+	}
+	logRateLimitExceeded(): void {}
+	logSuspiciousActivity(): void {}
+}
+
+describe("refused input", () => {
+	test("a tool name with a control character is refused before the host runs, and the refusal is logged", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect(await replyOf(host, toolCall("ultrathink_plan\u0000", { prompt: "Plan" }, 3))).toEqual({
+				jsonrpc: "2.0",
+				id: 3,
+				error: { code: -32602, message: "invalid params" },
+			});
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "PATTERN_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+});
+
+describe("refused tool calls are logged", () => {
+	test("a numeric tool name is refused as unknown and logs one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			expect((await replyOf(host, toolCall(5, {}, 3))).error).toEqual(UNKNOWN_TOOL);
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "name", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that are not an object are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", "prompt", 3));
+			expect(resultOf<ToolResult>(reply).structuredContent).toEqual({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "TYPE_MISMATCH" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
+	});
+
+	test("arguments that fail the tool schema are refused as invalid_arguments and log one validation event", async () => {
+		const recorder = new RecordingLogger();
+		const previous = getSecurityLogger();
+		setSecurityLogger(recorder);
+		try {
+			const host = fakeHost();
+			const reply = await replyOf(host, toolCall("ultrathink_plan", {}, 4));
+			expect(resultOf<ToolResult>(reply).structuredContent).toMatchObject({ error: "invalid_arguments" });
+			expect(host.calls).toHaveLength(0);
+			expect(recorder.validation).toEqual([{ source: "mcp", resource: "mcp", details: { field: "arguments", code: "INVALID_ARGUMENTS" } }]);
+		} finally {
+			setSecurityLogger(previous);
+		}
 	});
 });

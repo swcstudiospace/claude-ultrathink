@@ -8,14 +8,17 @@ import type { DecisionRecord } from "../decisions/types.ts";
 import { shipNudge } from "../ship/nudge.ts";
 import { DEFAULT_SHIP_CONFIG } from "../ship/types.ts";
 import type { ModelResolution } from "../host/engine.ts";
+import { main as mcpMain } from "../mcp/cli.ts";
 import {
 	controlPath,
 	defaultStateDir,
+	legacySessionPath,
 	readControl,
 	readLast,
 	readSession,
 	type SessionRecord,
 	sessionPath,
+	sessionRecordPath,
 	updateSession,
 	writeControl,
 	writeSession,
@@ -47,8 +50,8 @@ describe("control state", () => {
 		const dir = tempDir();
 		expect(readControl(dir)).toEqual({});
 		expect(writeControl(dir, { enabled: false })).toEqual({ enabled: false });
-		expect(writeControl(dir, { skipOnce: true })).toEqual({ enabled: false, skipOnce: true });
-		expect(readControl(dir)).toEqual({ enabled: false, skipOnce: true });
+		expect(writeControl(dir, { hitlEnabled: true })).toEqual({ enabled: false, hitlEnabled: true });
+		expect(readControl(dir)).toEqual({ enabled: false, hitlEnabled: true });
 	});
 
 	test("hitlEnabled and engine persist; unknown engine values are dropped", () => {
@@ -79,10 +82,28 @@ describe("session records", () => {
 		};
 		writeSession(dir, record);
 		expect(existsSync(sessionPath(dir, "abc/../evil"))).toBe(true);
-		expect(sessionPath(dir, "abc/../evil")).toContain("abc_.._evil.json");
+		expect(sessionPath(dir, "abc/../evil")).toMatch(/abc_\.\._evil~[0-9a-f]{16}\.json$/);
 		expect(readSession(dir, "abc/../evil")).toEqual(record);
 		expect(readLast(dir)).toEqual(record);
 		expect(readSession(dir, "nope")).toBeUndefined();
+	});
+
+	test("a record saved under the earlier file name is read back for its own id; a file naming another id is not", () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		const saved = { sessionId: "Claude-A", at: 1, result: { xml: "<X/>", original: "old answers", root: "X", source: "llm" as const } };
+		writeFileSync(legacySessionPath(dir, "Claude-A"), JSON.stringify(saved));
+		expect(legacySessionPath(dir, "Claude-A")).not.toBe(sessionPath(dir, "Claude-A"));
+		expect(sessionRecordPath(dir, "Claude-A")).toBe(legacySessionPath(dir, "Claude-A"));
+		expect(readSession(dir, "Claude-A")).toEqual(saved);
+		// On a case-insensitive file system the earlier name of `claude-a` is the same file, but it records another id.
+		writeFileSync(legacySessionPath(dir, "claude-a"), JSON.stringify({ ...saved, sessionId: "Claude-A" }));
+		expect(readSession(dir, "claude-a")).toBeUndefined();
+		// A replan writes the current name, and from then on that record is the one read.
+		const replanned = { ...saved, at: 2 };
+		writeSession(dir, replanned);
+		expect(sessionRecordPath(dir, "Claude-A")).toBe(sessionPath(dir, "Claude-A"));
+		expect(readSession(dir, "Claude-A")).toEqual(replanned);
 	});
 
 	test("round-trips a record carrying a track plan and kickoff/sync flags", () => {
@@ -485,5 +506,53 @@ describe("the HITL answers hook", () => {
 		expect(exit).toBe(0);
 		expect(stdout).toBe("");
 		expect(existsSync(sessionPath(dir, "ghost"))).toBe(false);
+	});
+});
+
+describe("a legacy-only session record through the answers hook", () => {
+	test("the answer and a later write through the original stateFile stay in one JSON/XML pair", async () => {
+		const dir = tempDir();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		const sessionId = "Claude-A";
+		const legacy = legacySessionPath(dir, sessionId);
+		const legacyXml = legacy.replace(/\.json$/, ".xml");
+		const xml = "<BUILD_PROMPT>\n<ORIGINAL>x</ORIGINAL>\n</BUILD_PROMPT>";
+		writeFileSync(legacy, JSON.stringify({ sessionId, at: 1, kickedOff: false, result: { xml, original: "x", root: "BUILD_PROMPT", source: "llm" } }));
+		writeFileSync(legacyXml, `${xml}\n`);
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+
+		const envelope = {
+			session_id: sessionId,
+			tool_name: "AskUserQuestion",
+			tool_input: { questions: [{ question: "Which database?", header: "Database", options: [{ label: "Postgres" }, { label: "SQLite" }] }] },
+			tool_response: { answers: { "Which database?": "Postgres" } },
+		};
+		const proc = Bun.spawn([process.execPath, ANSWERS_HOOK], {
+			cwd: join(dir, ".."),
+			env: { PATH: process.env.PATH, HOME: dir, ULTRATHINK_STATE_DIR: dir },
+			stdin: new TextEncoder().encode(JSON.stringify(envelope)),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		expect(exit).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({ systemMessage: "HITL · 1 answer(s) recorded" });
+
+		// The answer stays in the legacy pair: the readers keep selecting it and the new name is never created.
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+		expect(existsSync(sessionPath(dir, sessionId))).toBe(false);
+		const answered = readSession(dir, sessionId);
+		expect(answered?.clarifications?.[0]).toMatchObject({ question: "Which database?", answer: "Postgres" });
+		expect(answered?.result.xml).toContain("Postgres");
+		expect(readFileSync(legacyXml, "utf8")).toBe(`${answered?.result.xml}\n`);
+
+		// A command holding the original stateFile (the legacy JSON) writes into that same record and XML pair.
+		expect(await mcpMain(["session", "mark", "--state", legacy, "kicked-off"])).toBe(0);
+		expect(sessionRecordPath(dir, sessionId)).toBe(legacy);
+		expect(existsSync(sessionPath(dir, sessionId))).toBe(false);
+		const marked = readSession(dir, sessionId);
+		expect(marked?.kickedOff).toBe(true);
+		expect(marked?.clarifications?.[0]).toMatchObject({ question: "Which database?", answer: "Postgres" });
+		expect(readFileSync(legacyXml, "utf8")).toBe(`${marked?.result.xml}\n`);
 	});
 });

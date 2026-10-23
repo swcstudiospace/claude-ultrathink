@@ -52,7 +52,8 @@ export function shrinkToolText(text: string, cap: number = DEFAULT_CAP): ShrinkR
 	const limit = Number.isSafeInteger(cap) && cap > 0 ? cap : DEFAULT_CAP;
 	try {
 		if (typeof text !== "string" || text.length === 0) return unchanged("");
-		if (text.length < NOOP_UNDER || looksLikeEditableSource(text)) return unchanged(text);
+		// A tighter session-budget cap must also apply to results shorter than NOOP_UNDER.
+		if (text.length < Math.min(NOOP_UNDER, limit) || looksLikeEditableSource(text)) return unchanged(text);
 		let next = collapseDuplicateLines(text);
 		if (next.length > limit) next = headTail(next, limit);
 		const baseline = estimateTokens(text);

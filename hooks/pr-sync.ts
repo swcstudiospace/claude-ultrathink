@@ -14,7 +14,7 @@
  */
 import { resolve } from "node:path";
 import { isChildInvocation } from "../src/claude/complete.ts";
-import { defaultStateDir, readSession, sessionPath } from "../src/claude/state.ts";
+import { defaultStateDir, readSession, sessionRecordPath } from "../src/claude/state.ts";
 import { isSubagentEnvelope, parseEnvelope } from "../src/host/envelope.ts";
 import { extractPrFromOutput, isPrCreationTool } from "../src/track/pr-detect.ts";
 
@@ -54,7 +54,7 @@ async function main(): Promise<void> {
 
 	const pr = extractPrFromOutput(responseText(input.tool_response));
 	const prNote = pr ? ` (${pr.url})` : "";
-	const stateFile = resolve(sessionPath(stateDir, input.session_id));
+	const stateFile = resolve(sessionRecordPath(stateDir, input.session_id));
 	const prArg = pr ? ` and prUrl=${pr.url}` : " and the PR URL";
 	console.log(
 		JSON.stringify({

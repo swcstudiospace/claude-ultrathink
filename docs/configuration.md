@@ -4,7 +4,7 @@ ultrathink reads JSON config files, a small per-host control file written by the
 
 Terms used on this page:
 
-- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp or Prime Agent.
+- **Host**: the coding agent ultrathink runs inside: Claude Code, Grok Build, Hermes Agent, Muse Code, Omp, Prime Agent or Cursor.
 - **Engine**: the model that writes the plan. On Omp with `think.engine: "auto"` it is the session's own live model, called inside Omp. Everywhere else, and on Omp with a named engine, it is Claude, Grok or Muse on its CLI route (Grok also over HTTP or a gateway you run).
 - **Graph of Thought**: the 5 to 8 reasoning nodes the engine builds for each prompt. Each node is filled with numbered rationale steps.
 - **HITL** (human in the loop): the clarifying questions the plan asks before work starts.
@@ -42,6 +42,8 @@ How the merge works (`src/config.ts`):
 - A value with the wrong type or outside its allowed range is ignored, and the value from the earlier file (or the default) stays.
 - Some string keys only accept a non-empty value, so an empty string in a later file does not clear a value an earlier file set: `notion.dataSourceUrl`, `linear.team`, `grok.baseUrl`, `grok.model`, `grok.bin`, `grok.shuntModel`, `claude.bin`, `decisions.model`, `hindsight.url`, `hindsight.bank`, `ragflow.url`, and the URL keys `grok.shuntBaseUrl` and `substrate.url`. To stop row creation, use `/ultrathink-track off` (see [Turning tracking off](tracking.md#turning-tracking-off)). To turn the Agent Substrate brief off, set `SUBSTRATE_DISABLED=1`.
 - The URL keys `grok.shuntBaseUrl` and `substrate.url` must be `http://` or `https://` URLs. Trailing slashes are removed.
+- The project file cannot set `claude.bin`, `claude.settingSources`, `grok.bin`, `grok.home`, `grok.baseUrl`, `grok.shuntBaseUrl` or `muse.bin`. Together they choose which program runs, where your Grok login is read from, and which URLs receive your prompts and Grok token. A cloned repository must not choose these, so only the two user files set them and a project value is ignored. `grok.baseUrl` and `grok.shuntBaseUrl` must be `http://` or `https://` URLs.
+- Millisecond budgets are capped at 2147483647 ms, the timer maximum. A larger value is set to the cap, not rejected, and `0` still means no timer. The capped keys are `claude.callTimeoutMs`, `claude.budgetMs`, `grok.callTimeoutMs`, `muse.callTimeoutMs` and `track.budgetMs`.
 - `pstack` is user-only. The merge ignores a project file's whole `pstack` section, so `pstack.enabled: true` there does not turn the Cursor bridge on. The Cursor hook never reads the project file. See [`pstack`](#pstack-cursor-bridge).
 - The project file can only make Jev decisions more restrictive: there, `decisions.zdr` can only turn zero data retention on (a `false` is ignored), and `decisions.points` can only drop points (it is intersected with the list from the earlier files, or the default). `decisions.enabled` is ignored in every file: Jev is always on, and only `ULTRATHINK_DECISIONS=0` turns it off. The other `decisions` keys (`provider`, `model`, `timeoutMs` and the thresholds) merge as usual, and the two user files merge every key as usual. See [`decisions`](#decisions-jev-decisions-openrouter-decisions-api).
 - The project file can only tighten Hindsight, RAGFlow and Teachable Moments. For `hindsight`, only `enabled: false` counts; `url`, `bank` and the timeouts are ignored, so a repository cannot point memory traffic at its own host. For `ragflow`, only `enabled: false` and `ground: false` count; `url`, `datasetIds` and the other keys are ignored. For `teach`, `enabled`, `recall` and `autoPromote` can only turn off, and `capture` can only go down (`auto` to `observe` to `explicit`); the other `teach` keys are ignored. The two user files merge every key as usual. See [`hindsight`](#hindsight-memory-server), [`ragflow`](#ragflow-document-search) and [`teach`](#teach-teachable-moments).
@@ -153,6 +155,8 @@ On Omp, `auto` plans natively. ultrathink copies the session's live model once p
 
 Native Omp planning also snapshots the session's thinking level once per flight and uses it for every planning stage. `off` uses Omp's reasoning-disable option; `inherit`, an unset level, or an older host without the capability leaves provider options unset. There is no hidden low-effort default, and the CLI-route effort settings do not control native planning. Changing the session level invalidates a reused flight at the next planning observation.
 
+Native Omp planning has no outer planning deadline by default: an omitted or zero factory deadline creates no outer flight timer, and the 25-second handoff is delivery-only — it switches a slow plan to a pending note plus one eventual aside without cancelling, lowering effort, changing route, or retrying. That removes only the default outer flight timer. The shared explicit whole-planning budget (`claude.budgetMs`) still applies when configured, keeping its plan-built-so-far semantics; the CLI per-call timers (`callTimeoutMs`) still bound their CLI routes; and the independent service and hook limits on the other hosts are unchanged.
+
 Hermes sends its session's model id, and ultrathink picks the Claude, Grok or Muse route from its family. An unknown model (Kimi included, until it gets an engine) plans with Claude. The id itself is never sent as the wire model.
 
 Claude replaces a selected Grok route only through the two explicit, labeled user switches: `grok.fallbackToClaude: true` (HTTP/CLI login missing or expired) and `grok.enabled: false` (documented ‘forces Claude even when Grok is selected’). Without them, a missing or expired Grok login skips planning with the unchanged `GROK_LOGIN_REQUIRED` notice. Naming `think.engine: "claude"` is a deliberate engine choice, not a replacement.
@@ -249,7 +253,7 @@ Ship is opt-in. With the defaults, no skill run ever pushes a branch, opens a pu
 | `requireNoComments` | boolean | `true` | Refuse to merge while the head review has open comments. |
 | `maxRounds` | number, >= 1 | `5` | Completed Greptile reviews below `minScore` or with open threads before the ship is blocked. Failed and timed-out reviews don't count (see `reviewRetries`). Rounded down. |
 | `mergeMethod` | `"squash"`, `"merge"` or `"rebase"` | `"squash"` | Merge method. When the repository does not allow it, the first allowed method is used and the output says so. |
-| `deleteBranch` | boolean | `false` | After the merge, delete the remote branch, check out and fast-forward the base branch, then delete the local branch. When `false`, branches are left alone. |
+| `deleteBranch` | boolean | `false` | After the merge, delete the remote branch with an explicit refspec, check out and fast-forward the base branch, then delete the local branch with `git branch -d`. The local branch is force-deleted (`-D`) only when its tip is exactly the merged head. When `false`, branches are left alone. |
 | `greptileOrganization` | string | `""` | Greptile organization id or handle, passed as `organization` on every Greptile MCP call. `""` lets Greptile pick, which works for accounts in one organization. An account in several organizations needs it: without it, the review is `blocked` with a reason that names this key and the candidates. |
 | `reviewTimeoutMs` | number, >= 1 | `1200000` | How long a review of one head commit may stay pending before it counts as timed out (20 minutes). A timed-out review is re-triggered like a failed one (see `reviewRetries`). Rounded down. |
 | `reviewRetries` | integer, >= 0 | `3` | A failed Greptile review (Greptile FAILED/ERROR/SKIPPED, no score, CLI failure) or one pending past `reviewTimeoutMs` is re-triggered on the next `review` call, up to this many times per head commit; then the ship blocks with a PR comment. These never count toward `maxRounds`. `0` blocks on the first failure. Rounded down. |
@@ -679,6 +683,8 @@ GSD (Get Shit Done) is a planning workflow that keeps a roadmap in `.planning/RO
 4. `gsd-core/bin/gsd-tools.cjs` under `~/.claude`, `~/.agents`, `$HERMES_HOME` (else `~/.hermes`), `$CODEX_HOME` (else `~/.codex`), `$GEMINI_CONFIG_DIR` (else `~/.gemini`), `~/.cursor` and `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), in that order.
 5. The legacy `~/.claude/get-shit-done/bin/gsd-tools.cjs`.
 
+A copy in the repository that git tracks is skipped, so code committed to a repository is never run. An untracked local install in the same place is still used.
+
 When a roadmap exists and none of these is found, the assessment reports the gap `GSD roadmap found but gsd-tools.cjs was not found; set GSD_TOOLS or rerun assess with --ignore-gsd`. When the tools are found but `node` is not on `PATH`, it reports `GSD roadmap found but node is not on PATH, so gsd-tools.cjs could not run; install Node.js or rerun assess with --ignore-gsd`.
 
 #### Finding Bun
@@ -729,6 +735,7 @@ Each host keeps its own state. Planning never writes `.planning/` into the worki
 | Hermes Agent | `~/.hermes/ultrathink` (`$HERMES_HOME/ultrathink` when set) |
 | Muse Code | `~/.config/muse/ultrathink` (`$XDG_CONFIG_HOME/muse/ultrathink` when set) |
 | Omp | `~/.omp/agent/ultrathink` (`$PI_CODING_AGENT_DIR/ultrathink` when set) |
+| Cursor | `~/.cursor/ultrathink` |
 
 Empty or whitespace-only values count as unset. `ULTRATHINK_STATE_DIR` replaces the directory for every host, as long as it is not inside `.planning`. Use an absolute path for it: a relative path resolves against the session's working directory on most hosts, but against the ultrathink checkout on Hermes.
 
@@ -759,7 +766,7 @@ A value in the control state beats the config value until you change it again:
 | Command | Control field | Overrides |
 |---|---|---|
 | `/ultrathink-off`, `/ultrathink-on`, `bin/ultrathink off`, `bin/ultrathink on` | `enabled` | `uplift.enabled` |
-| `/ultrathink-skip`, `bin/ultrathink skip` | `skipOnce` | Skips the next prompt once, then clears itself. |
+| `/ultrathink-skip` (Omp, and Claude Code via `${CLAUDE_SESSION_ID}`), `bin/ultrathink skip --session <id>`, `ctl skip --session <id>` (grok-bot) | per-session flag `sessions/<id>.skip` | Skips the next prompt of that session once, then clears itself. Not a `control.json` field. A skip with no session id is refused and arms nothing. |
 | `/ultrathink-track off`, `/ultrathink-track on`, `bin/ultrathink track off`, `bin/ultrathink track on` | `trackEnabled` | `track.enabled`. `off` also stops the kickoff skill and `track complete` from creating rows. |
 | `bin/ultrathink think on`, `bin/ultrathink think off` | `thinkEnabled` | `think.enabled` |
 | `bin/ultrathink hitl on`, `bin/ultrathink hitl off` | `hitlEnabled` | `hitl.enabled` |

@@ -109,8 +109,9 @@ describe("selectEngine grok login handling", () => {
 
 describe("HOST_DEFAULT_ENGINES", () => {
 	test("covers every host", () => {
-		expect(Object.keys(HOST_DEFAULT_ENGINES).sort()).toEqual(["claude-code", "grok-build", "hermes", "muse", "omp", "prime-agent"]);
+		expect(Object.keys(HOST_DEFAULT_ENGINES).sort()).toEqual(["claude-code", "cursor", "grok-build", "hermes", "muse", "omp", "prime-agent"]);
 		expect(HOST_DEFAULT_ENGINES["prime-agent"]).toBe("claude");
+		expect(HOST_DEFAULT_ENGINES.cursor).toBe("claude");
 	});
 });
 

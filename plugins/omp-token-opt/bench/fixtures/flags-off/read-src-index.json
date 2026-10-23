@@ -1,0 +1,88 @@
+{
+  "events": [
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 15623,
+        "cacheHitPct": 0,
+        "currentTokens": 3398,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 7307,
+            "current": 384,
+            "saved": 6923,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 8320,
+        "providerOutput": 0,
+        "savedTokens": 12225,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    },
+    {
+      "event": "token-opt:savings",
+      "payload": {
+        "baselineTokens": 15623,
+        "cacheHitPct": 0,
+        "currentTokens": 3398,
+        "points": [
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 4158,
+            "current": 1507,
+            "saved": 2651,
+            "source": "compress"
+          },
+          {
+            "baseline": 7307,
+            "current": 384,
+            "saved": 6923,
+            "source": "compress"
+          }
+        ],
+        "providerCacheRead": 0,
+        "providerCacheWrite": 0,
+        "providerInput": 15627,
+        "providerOutput": 0,
+        "savedTokens": 12225,
+        "sessionId": "bench-session",
+        "v": 1
+      }
+    }
+  ],
+  "fixture": "read-src-index.json",
+  "tokens": {
+    "baseline": 7307,
+    "current": 384
+  },
+  "toolCall": null,
+  "toolResult": {
+    "content": [
+      {
+        "text": "interface DedupeSet {\ninterface BudgetState {\nexport const PREFIX_POLICY = { injectSystemPrompt: false as const };\ninterface TextBlock {\ninterface ToolResultLike {\ninterface UsageLike {\ninterface MessageLike {\ninterface NotifyCtx {\ninterface ToolCallLike {\ninterface PiLike {\nfunction sessionIdFrom(event: unknown, ctx: unknown): string {\nfunction finiteInt(value: unknown, missing: boolean): number | null {\nfunction safeDuration(value: unknown): number | null {\nfunction graphDelta(text: string): { baseline: number; current: number; saved: number } | null {\nfunction formatStatus(snap: TokenSavingsSnapshot): string {\nfunction graphStatusLine(cwd: string): string {\nfunction graphReadyFlag(cwd: string | undefined): 0 | 1 {\nfunction prefixSource(payload: object): string | null {\nfunction toolNameList(tools: unknown[]): string[] {\nfunction costCentsFrom(usage: UsageLike): number | null {\nfunction homeDir(): string {\nfunction rtkExtensionPresent(cwd: string): boolean {\nfunction callCwd(event: ToolCallLike): string {\nasync function readStream(stream: ReadableStream<Uint8Array> | null | undefined, limit: number): Promise<string> {\nasync function rewriteWithRtk(command: string, cwd: string): Promise<string | null> {\nfunction parseRtkTotalSaved(text: string): number | null {\nasync function readRtkTotalSaved(): Promise<number | null> {\nfunction isEmptyToolResult(text: string): boolean {\nfunction l2Key(tenant: string, key: string): string {\nexport default function tokenOpt(pi: PiLike): void {\ntoken-opt: skimmed 27724 chars",
+        "type": "text"
+      }
+    ]
+  }
+}

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { describe, expect, test } from "bun:test";
 import type { ModelResolution } from "./engine.ts";
-import { INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SWARM_TYPE, SYNC_TYPE } from "./omp-render.ts";
+import { ACTIVITY_DELIVERY, ACTIVITY_TYPE, INSIGHT_TYPE, PENDING_TYPE, PLAN_TYPE, registerUltrathinkRenderers, SHIP_TYPE, SWARM_TYPE, SYNC_TYPE } from "./omp-render.ts";
 import { visibleWidth } from "./omp-paint.ts";
 import { toInsightCardSnapshot, type InsightCardSnapshot, type InsightDecision, type InsightSnapshot } from "./omp-insights.ts";
 import type { PlanView } from "./view.ts";
@@ -972,5 +972,77 @@ describe("swarm card", () => {
 				}
 			}
 		}
+	});
+});
+
+describe("activity card", () => {
+	const renderActivity = renderers[ACTIVITY_TYPE] as Renderer;
+	const cardOf = (details: unknown, width = 80, expanded = false) => {
+		const rows = renderActivity({ content: "ignored", details }, { expanded }, theme)?.render(width) ?? [];
+		return { rows, plain: rows.map((row) => Bun.stripANSI(row)).join("\n") };
+	};
+
+	test("cards are delivered nextTurn with triggerTurn false, so they never steer a streaming turn or start one", () => {
+		expect(ACTIVITY_DELIVERY).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
+	});
+
+	test("each kind names its header, and expanded renders the same bounded rows", () => {
+		const recall = { v: 1, kind: "teachable-recalled", title: "ignored title", source: "hindsight", outcome: "used", count: 2, names: ["Retry fetch", "Pin the lockfile"] };
+		const created = { v: 1, kind: "teachable-created", title: "Teachable moment", outcome: "created", detail: "playbook · confirmed · retain retained", names: ["Retry fetch"] };
+		const skill = { v: 1, kind: "skill-recalled", title: "Skill recalled", outcome: "none", count: 0 };
+		const resource = { v: 1, kind: "resource", title: "RAGFlow", source: "ragflow", outcome: "used", count: 1, detail: "1 excerpts" };
+		for (const [details, header] of [
+			[recall, "Lesson recalled"],
+			[created, "Teachable moment"],
+			[skill, "Skill recalled"],
+			[resource, "RAGFlow"],
+		] as const) {
+			const compact = cardOf(details);
+			const expanded = cardOf(details, 80, true);
+			expect(compact.plain).toContain(header);
+			expect(expanded.plain).toBe(compact.plain);
+			expect(compact.rows.map(visibleWidth)).toEqual(compact.rows.map(() => 80));
+		}
+		const recalled = cardOf(recall);
+		expect(recalled.plain).toContain("hindsight");
+		expect(recalled.plain).toContain("Retry fetch");
+		expect(recalled.plain).toContain("Pin the lockfile");
+		expect(cardOf(created).plain).toContain("retain retained");
+		expect(cardOf(resource).plain).toContain("RAGFlow");
+	});
+
+	test("names past three say how many more, and a malformed notice is one fallback row", () => {
+		const many = cardOf({ v: 1, kind: "skill-recalled", title: "Skill recalled", names: ["a", "b", "c", "d", "e"] });
+		expect(many.plain).toContain("a");
+		expect(many.plain).toContain("c");
+		expect(many.plain).toContain("2 more");
+		// Validation keeps six names; the card's hidden total comes from the recall's full count (10 - 3 shown).
+		const recalled = cardOf({ v: 1, kind: "teachable-recalled", title: "Lesson recalled", outcome: "used", count: 10, names: ["a", "b", "c", "d", "e", "f"] });
+		expect(recalled.plain).toContain("7 more");
+		expect(recalled.plain).not.toContain("3 more");
+		const bad = cardOf({ v: 2, kind: "nope" });
+		expect(bad.plain).toContain("Activity unavailable.");
+		expect(bad.rows.map(visibleWidth)).toEqual(bad.rows.map(() => 80));
+		expect(() => cardOf(null)).not.toThrow();
+	});
+
+	test("a hostile persisted notice does not print a token, a path, a body, or a control character", () => {
+		const hostile = {
+			v: 1,
+			kind: "teachable-recalled",
+			title: "Lesson recalled",
+			names: ["sk-abcdefghijklmnopqrstuvwxyz", "ok name"],
+			detail: "see /home/someone/.ssh/id_rsa\u0000now",
+			body: "LESSON-BODY-SECRET",
+			path: "/tmp/secret-path",
+		};
+		const { rows, plain } = cardOf(hostile);
+		const raw = rows.join("");
+		expect(raw).not.toContain("sk-");
+		expect(plain).not.toContain("LESSON-BODY-SECRET");
+		expect(plain).not.toContain("/tmp/secret-path");
+		expect(plain).not.toContain("/home/someone");
+		expect(raw).not.toContain("\u0000");
+		expect(plain).toContain("ok name");
 	});
 });

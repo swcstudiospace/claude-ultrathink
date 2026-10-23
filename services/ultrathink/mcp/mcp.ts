@@ -3,6 +3,11 @@
 
 import pkg from "../../../package.json";
 import { promptDefinitions, renderPrompt } from "./prompts.ts";
+import type { ResourceRegistry } from "./resources.ts";
+import { CONNECTOR_TOOL_DEFINITIONS, GRAPH_UI_META, LARGE_RESULT_META, READ_ONLY } from "./tools-connector.ts";
+import { compileSchema, type Validator } from "./validate.ts";
+import { getSecurityLogger } from "../security/events.ts";
+import { StringValidator } from "../security/validation.ts";
 
 /** Newest first: initialize answers with the requested version when listed here, otherwise the first. */
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"] as const;
@@ -13,28 +18,43 @@ export const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 /** Versions from this one on forbid batches. Versions are ISO dates, so string order is date order. */
 const BATCH_REMOVED_IN = "2025-06-18";
 
+/**
+ * Most messages accepted in one JSON-RPC batch. The connector rate limit and the long-poll bound of
+ * `ultrathink_result` apply per HTTP request, so a batch multiplies both; a 64 KiB body could otherwise
+ * carry hundreds of tool calls. Eight keeps batching clients working without that amplification.
+ */
+export const MAX_BATCH_MESSAGES = 8;
+
 export interface ToolDefinition {
 	name: string;
 	title: string;
 	description: string;
 	inputSchema: Record<string, unknown>;
 	annotations: Record<string, unknown>;
+	/** MCP `_meta`: the UI resource a host draws the result with, and the result size Claude Code allows. */
+	_meta?: Record<string, unknown>;
 }
 
 /**
  * The host's result for one tool call. A refusal is a normal outcome, not an exception.
  * When `text` is present it is the tool result content and `data` becomes structuredContent only;
- * otherwise the content is the JSON of `data`.
+ * otherwise the content is the JSON of `data`. Claude Code shows the model structuredContent instead of content
+ * when both exist, so a host that returns `text` also puts the same text in `data.text`.
  */
 export type ToolOutcome =
 	| { ok: true; data: Record<string, unknown>; text?: string }
 	| { ok: false; code: string; errors?: string[] };
 
-/** The domain side. The host runs each tool; this module only speaks MCP. */
+/**
+ * The domain side. The host runs each tool; this module only speaks MCP. `args` has already passed the tool's
+ * inputSchema: required keys present, declared types, enums and bounds respected, no unknown keys.
+ */
 export interface McpToolHost {
 	call(name: string, args: Record<string, unknown>): ToolOutcome | Promise<ToolOutcome>;
 	/** Absent means { serverPlanning: false }. */
 	capabilities?(): { serverPlanning: boolean };
+	/** The `ui://` documents the host serves. Absent means none: resources/list is empty and every read is not found. */
+	resources?: ResourceRegistry;
 }
 
 export interface McpContext {
@@ -45,23 +65,47 @@ export interface McpContext {
 const JSONRPC = "2.0";
 const NOTIFICATION_PREFIX = "notifications/";
 const UPLIFT_TOOL = "ultrathink_uplift";
+const UI_EXTENSION = "io.modelcontextprotocol/ui";
 
-const CLIENT_INSTRUCTIONS =
+/** Text an id, a method or a text parameter may carry. Control characters are refused everywhere. */
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+const REQUEST_ID_TEXT = new StringValidator({ allowEmpty: true, maxLength: 256, pattern: NO_CONTROL });
+const METHOD_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+const NAME_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+/** The text parameter each method reads, with its bound. Only a string is checked; other values keep their existing handling. */
+const TEXT_PARAMS: Record<string, { field: string; validator: StringValidator }> = {
+	initialize: { field: "protocolVersion", validator: new StringValidator({ allowEmpty: true, maxLength: 64, pattern: NO_CONTROL }) },
+	"tools/call": { field: "name", validator: NAME_TEXT },
+	"prompts/get": { field: "name", validator: NAME_TEXT },
+	"resources/read": { field: "uri", validator: new StringValidator({ allowEmpty: true, maxLength: 2048, pattern: NO_CONTROL }) },
+};
+
+// Claude Code cuts server instructions at 4096 characters; each mode stays under the 3500 the tests pin.
+const CLIENT_PLANNING =
 	"ultrathink plans a request before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_plan with the request as prompt, answer each pending prompt with ultrathink_show and ultrathink_answer, then call ultrathink_plan again with the same sessionId and prompt until status is planned. Then call ultrathink_result with the sessionId, ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
-const SERVER_INSTRUCTIONS =
-	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. While its status is running, call ultrathink_result with the sessionId until the status is planned. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+const SERVER_PLANNING =
+	"ultrathink plans a request on the server before work starts. When the user's message starts with /ultrathink, the request is everything after it, verbatim. If nothing follows, ask for a request and call no tool. Otherwise call ultrathink_uplift with the request as prompt; the server does the thinking and needs no work from you. Then call ultrathink_result with the sessionId until its status is planned, also when ultrathink_uplift already reports planned, because only ultrathink_result returns the plan. Then ask the user the questions in the plan that matter (or state the defaults you assume), and carry out the plan.";
+const COMMAND_ROUTING =
+	"A message that starts with /ultrathink- and a command name is that command, not a request to plan. /ultrathink-think [sessionId] calls ultrathink_graph with the sessionId when one follows (the newest planned session otherwise). /ultrathink-last calls ultrathink_graph with no arguments (newest planned session), then ultrathink_result with that sessionId. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> (for example /ultrathink-plan or /ultrathink-ship) calls ultrathink_command with command set to the name and args set to the rest of the message, verbatim; relay its message to the user and make the tool call it names in next. When a plan is ready, show its wave tree to the user first, unchanged, in a code block, and its mermaid diagram too only if your interface renders Mermaid.";
+const CLIENT_GRAPH_RULE =
+	"When a client-answered plan is ready, call ultrathink_graph once with its sessionId besides ultrathink_result.";
+const SERVER_GRAPH_RULE =
+	"With server planning the plan card already shows the graph: after ultrathink_result, do not call ultrathink_graph for the same session unless the user asks for it, for example with /ultrathink-think or /ultrathink-last.";
+const CLIENT_INSTRUCTIONS = [CLIENT_PLANNING, COMMAND_ROUTING, CLIENT_GRAPH_RULE].join("\n\n");
+const SERVER_INSTRUCTIONS = [SERVER_PLANNING, COMMAND_ROUTING, SERVER_GRAPH_RULE].join("\n\n");
 
 const SERVER_INFO = { name: "ultrathink", version: pkg.version };
 
 const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
+const RESOURCE_NOT_FOUND = -32002;
 const INTERNAL_ERROR = -32603;
 
-// idempotentHint only means something for a tool that writes; the read-only tools carry it too so every tool states it.
-const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const READ_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-const READ_WRITE_OPEN_WORLD = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+// A call without sessionId starts a new session, so repeating it is not free (for uplift it starts another paid plan).
+const START_NEW_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const START_NEW_PAID_SESSION = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 
 /** Every tool the service can offer. Use toolDefinitions for the list a host actually serves. */
 export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
@@ -69,7 +113,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 		name: UPLIFT_TOOL,
 		title: "Plan a request on the server",
 		description:
-			"The entry point for the /ultrathink command. When the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. When the status is running, call ultrathink_result with the sessionId.",
+			"The entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. The server does the thinking; no work is needed from you while it runs. Returns a sessionId and a status. Then call ultrathink_result with the sessionId until its status is planned, also when this tool already reports planned, because only ultrathink_result returns the plan.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -82,13 +126,14 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			required: ["prompt"],
 			additionalProperties: false,
 		},
-		annotations: READ_WRITE_OPEN_WORLD,
+		annotations: START_NEW_PAID_SESSION,
+		_meta: GRAPH_UI_META,
 	},
 	{
 		name: "ultrathink_plan",
 		title: "Start or continue a client-answered plan",
 		description:
-			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command: when the user's message starts with /ultrathink, pass everything after it, verbatim, as prompt. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
+			"Start or continue an ultrathink planning session for a request. This is the entry point for the /ultrathink command. The trigger is /ultrathink followed by a space and the request (pass everything after it, verbatim, as prompt), or a message that is exactly /ultrathink. A message that starts with /ultrathink- (a hyphen) is a different command: use ultrathink_command (or ultrathink_graph / ultrathink_sessions for /ultrathink-think, /ultrathink-last, /ultrathink-status), not this tool. Returns the sessionId, the status, and the pending prompts. Answer each pending prompt, then call this again with the same sessionId and prompt until status is planned.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -101,7 +146,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			required: ["prompt"],
 			additionalProperties: false,
 		},
-		annotations: READ_WRITE,
+		annotations: START_NEW_SESSION,
 	},
 	{
 		name: "ultrathink_pending",
@@ -187,7 +232,9 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
 			additionalProperties: false,
 		},
 		annotations: READ_ONLY,
+		_meta: LARGE_RESULT_META,
 	},
+	...CONNECTOR_TOOL_DEFINITIONS,
 ];
 
 const CLIENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = TOOL_DEFINITIONS.filter((tool) => tool.name !== UPLIFT_TOOL);
@@ -195,6 +242,23 @@ const CLIENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = TOOL_DEFINITIONS.filt
 /** The tools a host serves: ultrathink_uplift exists only when the host plans on the server. */
 export function toolDefinitions(serverPlanning: boolean): readonly ToolDefinition[] {
 	return serverPlanning ? TOOL_DEFINITIONS : CLIENT_TOOL_DEFINITIONS;
+}
+
+/**
+ * One compiled validator per tool definition, keyed by the definition object itself: the lists are module constants
+ * that share their entries, so each schema compiles once per process and the request path only looks it up. A
+ * schema compileSchema refuses throws on the first call of that tool (-32603); assertToolDefinitions reports the
+ * same schema at boot, so a running process never meets one.
+ */
+const validators = new WeakMap<ToolDefinition, Validator>();
+
+function validatorFor(tool: ToolDefinition): Validator {
+	let validate = validators.get(tool);
+	if (validate === undefined) {
+		validate = compileSchema(tool.inputSchema);
+		validators.set(tool, validate);
+	}
+	return validate;
 }
 
 type RpcResponse =
@@ -217,8 +281,9 @@ interface Handled {
  * Handles one parsed JSON-RPC payload.
  * Returns null when nothing should be sent back (notifications and client responses only).
  * A batch is refused with 400 from 2025-06-18 on and handled for 2025-03-26, one message at a time in
- * payload order, so host side effects follow the batch order. A request id that is not a string or an
- * integer is refused with 400.
+ * payload order, so host side effects follow the batch order. A batch longer than MAX_BATCH_MESSAGES is
+ * refused with 400 before any element runs. A request id that is not a string or an integer is refused
+ * with 400; in a batch, that element gets its own error reply and the batch answers 400.
  */
 export async function handleMcpPayload(
 	host: McpToolHost,
@@ -236,12 +301,17 @@ export async function handleMcpPayload(
 		return { body: invalidRequest(), status: 400 };
 	}
 	if (payload.length === 0) return { body: invalidRequest() };
+	if (payload.length > MAX_BATCH_MESSAGES) return { body: invalidRequest(), status: 400 };
 	const replies: RpcResponse[] = [];
+	let status: number | undefined;
 	for (const message of payload) {
 		const handled = await handleMessage(host, message);
-		if (handled !== null) replies.push(handled.reply);
+		if (handled === null) continue;
+		replies.push(handled.reply);
+		if (handled.status !== undefined) status = handled.status;
 	}
-	return replies.length === 0 ? null : { body: replies };
+	if (replies.length === 0) return null;
+	return status === undefined ? { body: replies } : { body: replies, status };
 }
 
 async function handleMessage(host: McpToolHost, message: unknown): Promise<Handled | null> {
@@ -259,14 +329,47 @@ async function handleMessage(host: McpToolHost, message: unknown): Promise<Handl
 	if (typeof id !== "string" && !(typeof id === "number" && Number.isInteger(id))) {
 		return { reply: invalidRequest(), status: 400 };
 	}
+	const envelope = refusedEnvelope(id, method);
+	if (envelope !== null) {
+		refusedRequest(envelope.field, envelope.code);
+		return { reply: invalidRequest(), status: 400 };
+	}
 	// A request cannot be a notification: the client waits for an answer.
 	if (method.startsWith(NOTIFICATION_PREFIX)) return { reply: rpcError(id, METHOD_NOT_FOUND, "method not found") };
+	const param = refusedParams(method, message.params);
+	if (param !== null) {
+		refusedRequest(param.field, param.code);
+		return { reply: rpcError(id, INVALID_PARAMS, "invalid params") };
+	}
 	try {
 		return { reply: await dispatch(host, id, method, message.params) };
 	} catch {
 		// Host failures are reported without the thrown message or stack.
 		return { reply: rpcError(id, INTERNAL_ERROR, "internal error") };
 	}
+}
+
+/** The first refused field of a request's envelope: its id when that is a string too long or with a control character, else its method. */
+function refusedEnvelope(id: unknown, method: string): { field: string; code: string } | null {
+	if (typeof id === "string") {
+		const verdict = REQUEST_ID_TEXT.validate(id);
+		if (!verdict.valid) return { field: "id", code: verdict.errors[0]?.code ?? "INVALID" };
+	}
+	const verdict = METHOD_TEXT.validate(method);
+	return verdict.valid ? null : { field: "method", code: verdict.errors[0]?.code ?? "INVALID" };
+}
+
+/** Records one refused request on the security feed. Only the field and the validator code are recorded, never the value. */
+function refusedRequest(field: string, code: string): void {
+	getSecurityLogger().logValidationFailure({ source: "mcp", resource: "mcp", details: { field, code } });
+}
+
+/** The first text parameter a method reads, when it is a string too long or with a control character. Other values keep their existing handling. */
+function refusedParams(method: string, params: unknown): { field: string; code: string } | null {
+	const spec = Object.hasOwn(TEXT_PARAMS, method) ? TEXT_PARAMS[method] : undefined;
+	if (spec === undefined || !isRecord(params) || typeof params[spec.field] !== "string") return null;
+	const verdict = spec.validator.validate(params[spec.field]);
+	return verdict.valid ? null : { field: spec.field, code: verdict.errors[0]?.code ?? "INVALID" };
 }
 
 async function dispatch(host: McpToolHost, id: unknown, method: string, params: unknown): Promise<RpcResponse> {
@@ -284,6 +387,12 @@ async function dispatch(host: McpToolHost, id: unknown, method: string, params: 
 			return rpcResult(id, { prompts: promptDefinitions({ serverPlanning }) });
 		case "prompts/get":
 			return getPrompt(id, params, serverPlanning);
+		case "resources/list":
+			return rpcResult(id, { resources: host.resources?.list() ?? [] });
+		case "resources/templates/list":
+			return rpcResult(id, { resourceTemplates: host.resources?.templates() ?? [] });
+		case "resources/read":
+			return readResource(host, id, params);
 		default:
 			return rpcError(id, METHOD_NOT_FOUND, "method not found");
 	}
@@ -295,10 +404,23 @@ function initializeResult(params: unknown, serverPlanning: boolean) {
 		SUPPORTED_PROTOCOL_VERSIONS.find((version) => version === requested) ?? SUPPORTED_PROTOCOL_VERSIONS[0];
 	return {
 		protocolVersion,
-		capabilities: { tools: {}, prompts: {} },
+		// The UI extension is announced unconditionally: claude.ai web renders MCP Apps without sending the extension itself.
+		capabilities: { tools: {}, prompts: {}, resources: {}, extensions: { [UI_EXTENSION]: {} } },
 		serverInfo: SERVER_INFO,
 		instructions: serverPlanning ? SERVER_INSTRUCTIONS : CLIENT_INSTRUCTIONS,
 	};
+}
+
+/** The 2025-era revisions answer a resource that does not exist with -32002; -32602 is for a malformed uri. */
+function readResource(host: McpToolHost, id: unknown, params: unknown): RpcResponse {
+	const uri = isRecord(params) ? params.uri : undefined;
+	const read = host.resources
+		? host.resources.read(uri)
+		: { ok: false as const, code: typeof uri === "string" ? ("not_found" as const) : ("invalid_uri" as const) };
+	if (read.ok) return rpcResult(id, { contents: read.contents });
+	return read.code === "not_found"
+		? rpcError(id, RESOURCE_NOT_FOUND, "resource not found")
+		: rpcError(id, INVALID_PARAMS, "invalid params: uri must be a ui:// uri");
 }
 
 function getPrompt(id: unknown, params: unknown, serverPlanning: boolean): RpcResponse {
@@ -310,6 +432,12 @@ function getPrompt(id: unknown, params: unknown, serverPlanning: boolean): RpcRe
 	return rpcResult(id, { description: prompt.description, messages: prompt.messages });
 }
 
+/**
+ * Runs one tool after enforcing its inputSchema. Arguments that fail the schema are an `invalid_arguments` tool
+ * result (the same code a non-object `arguments` gets) whose single error reads `<path>: <reason>`, for example
+ * `arguments.foo: unknown property`; the host is not called. Every inputSchema sets `additionalProperties: false`,
+ * so an argument key the schema does not declare is refused rather than forwarded.
+ */
 async function callTool(
 	host: McpToolHost,
 	id: unknown,
@@ -317,18 +445,30 @@ async function callTool(
 	serverPlanning: boolean,
 ): Promise<RpcResponse> {
 	const name = isRecord(params) ? params.name : undefined;
-	const args = isRecord(params) ? params.arguments : undefined;
-	if (typeof name !== "string" || !toolDefinitions(serverPlanning).some((tool) => tool.name === name)) {
+	// MCP lets tools/call leave arguments out; every tool then runs with an empty object. Only a present non-object is refused.
+	const given = isRecord(params) ? params.arguments : undefined;
+	const args = isRecord(params) && "arguments" in params ? given : {};
+	const tool =
+		typeof name === "string" ? toolDefinitions(serverPlanning).find((candidate) => candidate.name === name) : undefined;
+	if (tool === undefined) {
+		// A name that is present but not a string is a refused request. A missing one is simply unknown.
+		if (name !== undefined && typeof name !== "string") refusedRequest("name", "TYPE_MISMATCH");
 		return rpcError(id, INVALID_PARAMS, "unknown tool");
 	}
 	if (!isRecord(args)) {
+		refusedRequest("arguments", "TYPE_MISMATCH");
 		return rpcResult(id, {
 			content: [{ type: "text", text: "invalid arguments" }],
 			structuredContent: { error: "invalid_arguments" },
 			isError: true,
 		});
 	}
-	return rpcResult(id, toolResult(await host.call(name, args)));
+	const verdict = validatorFor(tool)(args);
+	if (!verdict.ok) {
+		refusedRequest("arguments", "INVALID_ARGUMENTS");
+		return rpcResult(id, toolResult({ ok: false, code: "invalid_arguments", errors: [`${verdict.path}: ${verdict.reason}`] }));
+	}
+	return rpcResult(id, toolResult(await host.call(tool.name, args)));
 }
 
 /** Maps a host outcome to an MCP tool result. Throws on a malformed outcome, which becomes -32603. */
@@ -347,8 +487,9 @@ function toolResult(outcome: unknown): ToolResult {
 	const { code, errors } = outcome;
 	if (typeof code !== "string") throw new Error("malformed host outcome");
 	if (errors !== undefined && !isStringArray(errors)) throw new Error("malformed host outcome");
+	const detail = errors !== undefined && errors.length > 0 ? ` (${errors.join("; ")})` : "";
 	return {
-		content: [{ type: "text", text: `request refused: ${code}` }],
+		content: [{ type: "text", text: `request refused: ${code}${detail}` }],
 		structuredContent: { error: code, ...(errors !== undefined ? { errors } : {}) },
 		isError: true,
 	};

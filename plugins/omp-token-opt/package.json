@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "description": "measured token savings for omp",
+  "engines": {
+    "bun": ">=1.2.9"
+  },
+  "scripts": {
+    "typecheck": "bunx tsc --noEmit -p ."
+  },
   "omp": {
     "extensions": ["./src/index.ts"]
   },
@@ -11,6 +17,6 @@
     "extensions": ["./src/index.ts"]
   },
   "dependencies": {
-    "gpt-tokenizer": "4.0.3"
+    "gpt-tokenizer": "4.1.0"
   }
 }

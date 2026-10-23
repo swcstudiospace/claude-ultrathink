@@ -1,0 +1,39 @@
+{
+	"id": "inflight-saturation",
+	"title": "A request waiting on a silent upstream holds the only inflight slot; a concurrent request gets 503 overloaded",
+	"failureMode": "inflight_saturation",
+	"kind": "inprocess",
+	"plan": { "steps": [{ "count": "forever", "fault": { "kind": "blackhole" } }] },
+	"config": { "maxInflight": 1, "timeoutMs": 1000 },
+	"notes": "Load is POST /mcp, a JSON-RPC tools/call of ultrathink_uplift, which is the route that waits on the upstream. The router holds one inflight slot per non-probe request for its whole dispatch (routes/router.ts, inflight.enter around line 1159), and the uplift handler awaits planner.start, which awaits the completer. So a call waiting on the silent upstream holds the slot, and a second concurrent request is refused with 503 overloaded and Retry-After 1, counted by ultrathink_overload_total. config.timeoutMs is 1000 because the default model timeout (config.ts DEFAULT_MODEL_TIMEOUT_MS, 240000 ms) would hold the slot for four minutes. The 503 on the load path is proven by the overload counter: a status hypothesis reads one fixed path, not the load responses. /readyz is never shed (routes/router.ts UNGATED). The harness must enable server planning and present the connector key; this template holds no credential.",
+	"load": {
+		"method": "POST",
+		"path": "/mcp",
+		"body": {
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "tools/call",
+			"params": { "name": "ultrathink_uplift", "arguments": { "prompt": "chaos probe: outline a rollout plan" } }
+		},
+		"requests": 4,
+		"concurrency": 2
+	},
+	"hypotheses": [
+		{
+			"id": "overload-refused",
+			"name": "A concurrent request is refused with 503 overloaded",
+			"check": "metric",
+			"metric": "ultrathink_overload_total",
+			"op": "gte",
+			"value": 1
+		},
+		{
+			"id": "readyz-200",
+			"name": "/readyz answers 200 during saturation (probes are never shed)",
+			"check": "status",
+			"path": "/readyz",
+			"equals": 200
+		}
+	],
+	"rollbackOnFail": false
+}

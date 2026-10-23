@@ -156,6 +156,8 @@ export const HOST_DEFAULT_ENGINES: Record<HostId, LegacyRoute> = {
 	omp: "claude",
 	// Prime Agent's session model never leaves its kernel, so planning runs on the Claude CLI route unless configured.
 	"prime-agent": "claude",
+	// Cursor has no planning CLI of its own. The beforeSubmitPrompt hook plans on the Claude CLI, same as Hermes.
+	cursor: "claude",
 };
 
 export function captureFirstError(label: string, complete: ClaudeCompleter, resolution: ModelResolution): SelectedEngine {

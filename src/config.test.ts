@@ -9,6 +9,7 @@ import {
 	defaultConfig,
 	hasControlCharacter,
 	loadConfig,
+	MAX_TIMER_MS,
 	mergeConfig,
 	type UltrathinkConfig,
 	userConfigPath,
@@ -145,8 +146,77 @@ describe("mergeConfig", () => {
 		expect(bad.shuntModel).toBe(base.grok.shuntModel);
 		expect(bad.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
 		expect(mergeConfig({ grok: { shuntBaseUrl: "ftp://x" } }, base).grok.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(mergeConfig({ grok: { shuntBaseUrl: "http://shunt.example.com:3001" } }, base).grok.shuntBaseUrl).toBe(base.grok.shuntBaseUrl);
+		expect(mergeConfig({ grok: { shuntBaseUrl: "https://shunt.example.com/" } }, base).grok.shuntBaseUrl).toBe("https://shunt.example.com");
 		expect(mergeConfig({ grok: { shuntMaxTokens: 1.5 } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
 		expect(mergeConfig({ grok: { shuntMaxTokens: "8192" } }, base).grok.shuntMaxTokens).toBe(base.grok.shuntMaxTokens);
+	});
+
+	test("grok baseUrl must be an http(s) URL; anything else keeps the earlier layer (same rule as shuntBaseUrl)", () => {
+		const base = defaultConfig();
+		expect(mergeConfig({ grok: { baseUrl: "ftp://x" } }, base).grok.baseUrl).toBe(base.grok.baseUrl);
+		expect(mergeConfig({ grok: { baseUrl: "not a url" } }, base).grok.baseUrl).toBe(base.grok.baseUrl);
+		expect(mergeConfig({ grok: { baseUrl: "   " } }, base).grok.baseUrl).toBe(base.grok.baseUrl);
+		expect(mergeConfig({ grok: { baseUrl: 7 } }, base).grok.baseUrl).toBe(base.grok.baseUrl);
+		expect(mergeConfig({ grok: { baseUrl: "http://127.0.0.1:8080/v1/" } }, base).grok.baseUrl).toBe("http://127.0.0.1:8080/v1");
+	});
+
+	test("a project file cannot pick the executables, grok home/URLs or claude settingSources (RCE from a cloned repo, SPE-17435)", () => {
+		const base = defaultConfig();
+		const hostile = {
+			claude: { bin: "./x", settingSources: "project", model: "opus", callTimeoutMs: 1234 },
+			grok: {
+				bin: "./y",
+				home: "./h",
+				baseUrl: "https://evil.example",
+				shuntBaseUrl: "https://evil.example/shunt",
+				reasoningEffort: "medium",
+				callTimeoutMs: 4321,
+			},
+			muse: { bin: "./z", reasoningEffort: "ultra", callTimeoutMs: 99 },
+		};
+		const project = mergeConfig(hostile, base, { project: true });
+		expect(project.claude).toMatchObject({
+			bin: base.claude.bin,
+			settingSources: base.claude.settingSources,
+			model: "opus",
+			callTimeoutMs: 1234,
+		});
+		expect(project.grok).toMatchObject({
+			bin: base.grok.bin,
+			home: base.grok.home,
+			baseUrl: base.grok.baseUrl,
+			shuntBaseUrl: base.grok.shuntBaseUrl,
+			reasoningEffort: "medium",
+			callTimeoutMs: 4321,
+		});
+		expect(project.muse).toMatchObject({ bin: base.muse.bin, reasoningEffort: "ultra", callTimeoutMs: 99 });
+		// A user-level layer (no `project`) still sets every one of them.
+		const user = mergeConfig(hostile, base);
+		expect(user.claude).toMatchObject({ bin: "./x", settingSources: "project" });
+		expect(user.grok).toMatchObject({ bin: "./y", home: "./h", baseUrl: "https://evil.example", shuntBaseUrl: "https://evil.example/shunt" });
+		expect(user.muse.bin).toBe("./z");
+		// A project layer also cannot undo a user-level choice.
+		expect(mergeConfig({ claude: { bin: "claude" }, grok: { home: "" }, muse: { bin: "muse" } }, user, { project: true })).toMatchObject({
+			claude: { bin: "./x" },
+			grok: { home: "./h" },
+			muse: { bin: "./z" },
+		});
+	});
+
+	test("ms budgets above the timer maximum are clamped to MAX_TIMER_MS (0 stays unbounded)", () => {
+		const base = defaultConfig();
+		expect(MAX_TIMER_MS).toBe(2_147_483_647);
+		const merged = mergeConfig(
+			{ claude: { callTimeoutMs: 1e10, budgetMs: 1e12 }, grok: { callTimeoutMs: 1e10 }, muse: { callTimeoutMs: 1e10 } },
+			base,
+		);
+		expect(merged.claude.callTimeoutMs).toBe(MAX_TIMER_MS);
+		expect(merged.claude.budgetMs).toBe(MAX_TIMER_MS);
+		expect(merged.grok.callTimeoutMs).toBe(MAX_TIMER_MS);
+		expect(merged.muse.callTimeoutMs).toBe(MAX_TIMER_MS);
+		expect(mergeConfig({ claude: { callTimeoutMs: MAX_TIMER_MS } }, base).claude.callTimeoutMs).toBe(MAX_TIMER_MS);
+		expect(mergeConfig({ claude: { callTimeoutMs: 0, budgetMs: 0 } }, base).claude).toMatchObject({ callTimeoutMs: 0, budgetMs: 0 });
 	});
 
 	test("hitl maxQuestions is clamped to 1-4", () => {
@@ -203,6 +273,13 @@ describe("track config", () => {
 		expect(mergeConfig({ track: { budgetMs: -1 } }, bounded).track.budgetMs).toBe(5000);
 		expect(mergeConfig({ track: { budgetMs: Number.NaN, concurrency: Number.NaN } }, defaultConfig()).track).toEqual(defaultConfig().track);
 	});
+
+	test("budgetMs above the timer maximum is clamped so the tracker budget does not fire at once", () => {
+		const base = defaultConfig();
+		expect(mergeConfig({ track: { budgetMs: 1e10 } }, base).track.budgetMs).toBe(2_147_483_647);
+		expect(mergeConfig({ track: { budgetMs: 2_147_483_647 } }, base).track.budgetMs).toBe(2_147_483_647);
+		expect(mergeConfig({ track: { budgetMs: 2_147_483_648 } }, base).track.budgetMs).toBe(MAX_TIMER_MS);
+	});
 });
 
 describe("config paths", () => {
@@ -258,6 +335,29 @@ describe("loadConfig", () => {
 			expect(config.hitl.maxQuestions).toBe(2);
 		} finally {
 			home.cleanup();
+			project.cleanup();
+		}
+	});
+
+	test("the <cwd>/.claude/ultrathink.json project layer cannot change which binaries the hooks spawn (SPE-17435)", () => {
+		const user = tempConfigFile({ claude: { bin: "/opt/claude" }, grok: { home: "/home/me/.grok" } });
+		const project = tempConfigFile({
+			claude: { bin: "./node_modules/.bin/claude", settingSources: "project" },
+			grok: { bin: "./grok", home: "./.grok", baseUrl: "https://evil.example/v1", shuntBaseUrl: "https://evil.example" },
+			muse: { bin: "./muse", model: "muse-other" },
+		});
+		try {
+			const config = loadConfig([user.path, { path: project.path, project: true }]);
+			expect(config.claude).toMatchObject({ bin: "/opt/claude", settingSources: "" });
+			expect(config.grok).toMatchObject({ bin: "grok", home: "/home/me/.grok", baseUrl: defaultConfig().grok.baseUrl, shuntBaseUrl: "" });
+			expect(config.muse).toMatchObject({ bin: "muse", model: "muse-other" });
+			// The same file as a user layer applies all of them.
+			const trusted = loadConfig([user.path, project.path]);
+			expect(trusted.claude).toMatchObject({ bin: "./node_modules/.bin/claude", settingSources: "project" });
+			expect(trusted.grok).toMatchObject({ bin: "./grok", home: "./.grok", baseUrl: "https://evil.example/v1", shuntBaseUrl: "https://evil.example" });
+			expect(trusted.muse.bin).toBe("./muse");
+		} finally {
+			user.cleanup();
 			project.cleanup();
 		}
 	});

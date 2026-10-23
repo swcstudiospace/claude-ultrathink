@@ -250,6 +250,65 @@ describe("grok-bot Jev journal", () => {
 		expect(files).toHaveLength(1);
 		expect(readFileSync(join(root, "decisions", files[0]!), "utf8")).not.toContain("sk-test");
 	});
+	test("overlapping installations restore the real fetch whichever restore runs first", () => {
+		const real = globalThis.fetch;
+		const base = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+		for (const order of ["a-then-b", "b-then-a"] as const) {
+			const restoreA = installDecisionsJournal(tmp(), base);
+			const wrapperA = globalThis.fetch;
+			const restoreB = installDecisionsJournal(tmp(), base);
+			const wrapperB = globalThis.fetch;
+			expect(wrapperB).not.toBe(wrapperA);
+			if (order === "a-then-b") {
+				restoreA();
+				expect(globalThis.fetch).toBe(wrapperB);
+				restoreB();
+			} else {
+				restoreB();
+				expect(globalThis.fetch).toBe(wrapperA);
+				restoreA();
+			}
+			expect(globalThis.fetch).toBe(real);
+			restoreA();
+			restoreB();
+			expect(globalThis.fetch).toBe(real);
+		}
+	});
+	test("restore leaves a fetch it did not install alone", () => {
+		const real = globalThis.fetch;
+		const foreign = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+		const restore = installDecisionsJournal(tmp(), foreign);
+		globalThis.fetch = foreign;
+		try {
+			restore();
+			expect(globalThis.fetch).toBe(foreign);
+		} finally {
+			globalThis.fetch = real;
+		}
+	});
+	test("a journal installed over another one never journals into the other's dir", async () => {
+		const real = globalThis.fetch;
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response('{"p":0.5}', { status: 200 });
+		}) as unknown as typeof fetch;
+		const dirA = tmp();
+		const dirB = tmp();
+		const restoreA = installDecisionsJournal(dirA);
+		const restoreB = installDecisionsJournal(dirB);
+		try {
+			const response = await fetch("https://openrouter.ai/api/alpha/decisions", { method: "POST", body: '{"y":2}' });
+			expect(await response.text()).toBe('{"p":0.5}');
+		} finally {
+			restoreA();
+			restoreB();
+			globalThis.fetch = real;
+		}
+		expect(calls).toBe(1);
+		expect(readdirSync(join(dirB, "decisions"))).toHaveLength(1);
+		expect(existsSync(join(dirA, "decisions"))).toBe(false);
+	});
 	test("a pending request without a controller rejects as AbortError", async () => {
 		const root = tmp();
 		const journal = createJournalCompleter({ dir: root });

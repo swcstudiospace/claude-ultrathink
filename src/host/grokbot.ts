@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { CLARIFY_SYSTEM_PROMPT } from "../hitl/prompts.ts";
 import { normalizeClarifications } from "../hitl/pipeline.ts";
-import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionRecordPath, type SessionRecord } from "../claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../config.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { extractJsonObject, isFallbackGraph, normalizeGraph, parseNodeFill } from "../think/graph.ts";
@@ -225,11 +225,25 @@ function decisionsUrl(input: unknown): string | undefined {
 	}
 }
 
+interface InstalledJournal {
+	wrapped: typeof fetch;
+	/** The global fetch this wrapper replaced; for the outermost installed wrapper, the real fetch. */
+	original: typeof fetch;
+}
+
+/** Journal wrappers currently installed, outermost first. While any is installed the last one is `globalThis.fetch`. */
+const installedJournals: InstalledJournal[] = [];
+
 /**
  * Wraps `globalThis.fetch` for Decisions API calls only: a journalled response (keyed by URL + request body, never
  * headers) replays; a fresh one is stored on success. Returns the restore function. Credentials are never written.
+ *
+ * Installations may overlap (concurrent client-driven plans). `base` defaults to the fetch beneath every installed
+ * wrapper so overlapping journals never chain through each other's dir; restore only puts the replaced fetch back
+ * while this wrapper still owns the global, otherwise it just drops out of the stack so the last restore leaves the
+ * real fetch.
  */
-export function installDecisionsJournal(dir: string, base: typeof fetch = globalThis.fetch): () => void {
+export function installDecisionsJournal(dir: string, base: typeof fetch = installedJournals[0]?.original ?? globalThis.fetch): () => void {
 	const original = globalThis.fetch;
 	const wrapped = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
 		const url = decisionsUrl(input);
@@ -246,9 +260,17 @@ export function installDecisionsJournal(dir: string, base: typeof fetch = global
 		if (response.ok) writeAtomic(path, `${JSON.stringify({ status: response.status, body: text, at: Date.now() })}\n`);
 		return new Response(text, { status: response.status, headers: { "content-type": response.headers.get("content-type") ?? "application/json" } });
 	};
-	globalThis.fetch = Object.assign(wrapped, { preconnect: original.preconnect }) as typeof fetch;
+	const entry: InstalledJournal = { wrapped: Object.assign(wrapped, { preconnect: original.preconnect }) as typeof fetch, original };
+	installedJournals.push(entry);
+	globalThis.fetch = entry.wrapped;
 	return () => {
-		globalThis.fetch = original;
+		const index = installedJournals.indexOf(entry);
+		if (index < 0) return;
+		installedJournals.splice(index, 1);
+		const inner = installedJournals[index];
+		// A wrapper installed over this one now sits directly on what this one replaced.
+		if (inner && inner.original === entry.wrapped) inner.original = entry.original;
+		if (globalThis.fetch === entry.wrapped) globalThis.fetch = entry.original;
 	};
 }
 
@@ -454,6 +476,8 @@ export interface GrokbotPlanInput {
 	debounceMs?: number;
 	/** Re-run a planned session (after `answer --replace`); mints a new graph id. Without it a planned session is returned as is. */
 	replan?: boolean;
+	/** Plugin entry point; defaults to `planPrompt`. A test seam, never a behavior switch. */
+	plan?: typeof planPrompt;
 }
 
 export interface GrokbotPlanResult {
@@ -473,7 +497,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 	const dir = journalDir(stateDir, input.sessionId);
 	const meta = readMeta(dir);
 	if (meta?.original !== undefined && meta.original !== input.prompt) throw new Error("session already holds a different original prompt; use a new session id");
-	const existing = sessionPath(stateDir, input.sessionId);
+	const existing = sessionRecordPath(stateDir, input.sessionId);
 	if (meta?.status === "planned" && !input.replan && existsSync(existing)) {
 		const record = JSON.parse(readFileSync(existing, "utf8")) as SessionRecord;
 		return { status: "planned", sessionId: input.sessionId, journal: dir, pending: [], replayed: 0, check: checkRecord(record, { thinkOff: thinkingOff(stateDir, input.cwd, env) }), response: { statePath: existing, specPath: existing.replace(/\.json$/, ".xml") } as PlanResponse };
@@ -486,7 +510,7 @@ export async function runGrokbotPlan(input: GrokbotPlanInput): Promise<GrokbotPl
 	const resolution = hostResolution();
 	let response: PlanResponse;
 	try {
-		response = await planPrompt(
+		response = await (input.plan ?? planPrompt)(
 			{ host: GROKBOT_ENGINE_HOST, session_id: input.sessionId, prompt: input.prompt, cwd: input.cwd, ...(input.transcriptPath ? { transcript_path: normalizeTranscript(input.transcriptPath, dir) } : {}) },
 			env,
 			{

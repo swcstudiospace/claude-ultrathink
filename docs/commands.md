@@ -24,7 +24,7 @@ Some details:
 
 - Nothing changes unless you use a command. Planning stays on by default.
 - The state is per host. Each host has its own state directory (see [State directories](configuration.md#state-directories)), so `/ultrathink-off` in Omp leaves Claude Code planning. Within a host the setting applies to every session and project on the machine.
-- `/ultrathink-skip` sets a one-shot flag. The next message that reaches the planner uses it up, even a trivial one such as `ok` or a skill invocation. Built-in slash commands and `raw:` messages do not use it up. `/ultrathink-status` shows `(skipping next prompt)` while it is armed.
+- `/ultrathink-skip` sets a one-shot flag for the session it is typed in; other sessions are not affected. The next message of that session that reaches the planner uses it up, even a trivial one such as `ok` or a skill invocation. Built-in slash commands and `raw:` messages do not use it up. `/ultrathink-status` shows `(skipping next prompt)` while it is armed. A prompt with no session id cannot arm a skip.
 - `/ultrathink-track off` stops every row: the planner creates none, and `ultrathink-kickoff` and `bin/ultrathink-mcp track complete` create none either. If neither `notion.dataSourceUrl` nor `linear.team` is configured, no rows are created whatever this setting says. See [Tracking](tracking.md).
 - Commands are case-insensitive, and unknown verbs are not treated as commands.
 
@@ -100,7 +100,14 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - **Limits.** Browsing, refresh, detail views and preview are passive and local: no store creation, recall-count bump, credential lookup, network, model or Jev call. Below 24 columns or 8 rows, mutation is unavailable (resize guidance is shown; browsing and `Esc` still work). In a task-subagent session, with `createOmpExtension({ ui: false })`, or outside the TUI (`omp -p`, RPC, headless), the command answers with bounded read-only text instead of the interactive dashboard; guarded actions need the Omp TUI. Switching session or shutting down closes the dashboard and suppresses stale refresh/action completions for the old selection.
 - **Headless summaries.** Plain-text fallback reports displayed versus snapshot lesson counts and explicitly identifies lessons omitted by its 24-row budget. Those snapshot counts are not a complete project inventory when the read model reports a partial scan.
 - **Host failures and Jev off.** A current native custom-UI mounting failure degrades to the same bounded read-only snapshot without starting a model turn; a stale or aborted mount emits nothing. `ULTRATHINK_DECISIONS=0` marks current Jev policy off in the dashboard and expanded captured card, but does not hide saved decisions or resolve credentials.
-- **Cards.** Compact cards show scope, latest-decision, lesson-lifecycle and autonomy summaries plus a limitation line (at most 6 content rows), including capture omissions when lesson summaries exceed the 24-per-collection card bound. Expanded cards reflow recorded Jev metadata to terminal cell width, add up to 3 lesson and 3 eligible/promoted summaries, and reserve space for effective policy, counts and actionable limitations (at most 24 physical content rows). Additional detail lines are explicitly omitted with an `N more — open /ultrathink-ui` notice. Every card is labeled `captured — not live` with its snapshot time: expanding an old card never re-reads state or proves current installation.
+- **Cards.** Compact cards show scope, latest-decision, lesson-lifecycle and autonomy summaries plus a limitation line (at most 6 content rows), including capture omissions when lesson summaries exceed the 24-per-collection card bound. Expanded cards reflow recorded Jev metadata to terminal cell width, add up to 3 lesson and 3 eligible/promoted summaries, and reserve space for effective policy, counts and actionable limitations (at most 24 physical content rows). Additional detail lines are explicitly omitted with an `N more — open /ultrathink-ui` notice. Every card is labeled `captured — not live` with its snapshot time: expanding an old card never re-reads state or proves current installation. A separate display-only `ultrathink-activity` card names a recalled lesson or skill, a substrate brief, RAGFlow or knowledge read, or a captured teachable moment (names and retain state only).
+
+### Cursor
+
+- Planning is the `beforeSubmitPrompt` hook from `bun scripts/cursor-plugin.ts install`, not a slash-command dispatcher. `/ultrathink-quick`, `/ultrathink-skip`, `/ultrathink-off`, `/ultrathink-on`, `/ultrathink-track` and `/ultrathink-status` are still the engine's commands: type them as the prompt. The shell form is `ULTRATHINK_HOST=cursor <clone>/bin/ultrathink <verb>`.
+- `/gsd-*` and `/skill:gsd-*` are planned. The text after the command is the task; a bare command plans that command's objective. `install` also copies the known GSD names into `~/.cursor/commands/` so Cursor can offer them. `/ultrathink-quick` is not planned.
+- A planned implementation prompt tells the agent to run `ultrathink-cursor` after kickoff. That skill spawns `a01-orchestrator` once when `.cursor/agents/a01-orchestrator.md` is installed, and passes the Graph ID. It does not spawn `a02`–`a15`, and it does not run `swarm_run.py`.
+- A child session (`SWARM_CHILD=1`, a non-empty `SWARM_AGENT`, or a prompt that names a parent conversation) is not planned.
 
 ### Prime Agent
 
@@ -118,6 +125,51 @@ On Claude Code, Grok and Muse, each command also ships as a command file in `com
 - `/ultrathink-learn <note>` saves the note as a `pattern` lesson (the name is its first sentence). It does nothing useful while `teach.enabled` is off. `/ultrathink-lessons` with no argument lists lessons. `recall <query>`, `promote <id>` and `status` are the other verbs. `promote` stages a draft through Hermes `skill_manage`; ultrathink does not write `~/.hermes/skills`. See [Teachable Moments on Hermes](how-to/teachable-moments-on-hermes.md) (`docs/how-to/teachable-moments-on-hermes.md`).
 - In a shared multi-user gateway session, Hermes puts a sender tag such as `[Alice] ` in front of each message. The plugin strips a leading tag that names the current sender before its checks (a label you type, such as `[backend]`, stays), so the tag stops neither a `quick` message from matching nor the `raw:` prefix and the [automatic skips](#prompt-prefixes-and-automatic-skips) from applying, and the engine plans the untagged text.
 
+## Connector
+
+The hosted connector (`https://ultrathink.swcstudio.space/mcp`) and its local stdio twin (`bin/ultrathink-connector`) give a chat client the same `/ultrathink-*` names, but they are not the plugin: they run the planner and a few read-only views, and nothing else. Setup per client is in [Use /ultrathink in Claude, Claude Code and Grok Chat](how-to/use-ultrathink-in-chat.md). The catalog of commands is read from the plugin's own `commands/` and `skills/` files plus three connector-native names, and a decision for every name sits in one place, `COMMAND_OVERLAY` in `services/ultrathink/mcp/commands.ts`; the table below is that overlay. Status: the connector has not been connected to Claude chat, Claude Code or Grok Chat in a live session, so the per-client behavior after the table is taken from vendor documentation and reports, and unproven parts are marked *not verified*.
+
+States: **native** means the connector implements it; **alias** means the same as another command; **passthrough** means the model answers directly and no ultrathink tool runs; **unsupported** means it needs a plugin host. Unsupported commands are not listed as prompts, but typing one reaches `ultrathink_command`, which answers with the reason and the alternative, and `prompts/get` for one returns the same explanation.
+
+| Command | State | What it does on the connector, or why it is unsupported | Instead |
+|---|---|---|---|
+| `/ultrathink <request>` | native | Plans the request: `ultrathink_uplift` (server planning) or `ultrathink_plan` (client-driven), then `ultrathink_result`. | |
+| `/ultrathink-plan <request>` | alias of `/ultrathink` | Same as `/ultrathink`. | |
+| `/ultrathink-think [sessionId] [node]` | native | Shows a plan's graph (diagram, tree, one node's steps) with `ultrathink_graph`. Without a session id it shows the newest planned session. | |
+| `/ultrathink-last` | native | Shows the newest planned session's plan with its diagram (`ultrathink_sessions`, `ultrathink_result`, `ultrathink_graph`). | |
+| `/ultrathink-status` | native | Shows the planning mode, ceilings and recent sessions with `ultrathink_sessions`. | |
+| `/ultrathink-quick <message>` | passthrough | The model answers the message directly and calls no ultrathink tool. | |
+| `/ultrathink-skip` | unsupported | Planning runs only when `/ultrathink` is typed in chat, there is no automatic planning to switch. | Do not type `/ultrathink`, or use `/ultrathink-quick <message>`. |
+| `/ultrathink-off` | unsupported | Planning runs only when `/ultrathink` is typed in chat, there is no automatic planning to switch. | Do not type `/ultrathink`, or use `/ultrathink-quick <message>`. |
+| `/ultrathink-on` | unsupported | Planning runs only when `/ultrathink` is typed in chat, there is no automatic planning to switch. | Do not type `/ultrathink`, or use `/ultrathink-quick <message>`. |
+| `/ultrathink-track` | unsupported | The hosted connector has no Linear or Notion tracking. | Use it in a plugin host. |
+| `/ultrathink-kickoff` | unsupported | It needs git, a shell and the user's tracker or pull-request credentials. | Run it in Claude Code, Omp, Grok Build, Hermes or Muse with the plugin. |
+| `/ultrathink-sync` | unsupported | It needs git, a shell and the user's tracker or pull-request credentials. | Run it in Claude Code, Omp, Grok Build, Hermes or Muse with the plugin. |
+| `/ultrathink-ship` | unsupported | It needs git, a shell and the user's tracker or pull-request credentials. | Run it in Claude Code, Omp, Grok Build, Hermes or Muse with the plugin. |
+| `/ultrathink-teach` | unsupported | Teachable Moments state lives on the host. | Use it in a plugin host. |
+| `/ultrathink-teach-admin` | unsupported | Teachable Moments state lives on the host. | Use it in a plugin host. |
+| `/ultrathink-learn` | unsupported | Teachable Moments state lives on the host. | Use it in a plugin host. |
+| `/ultrathink-lessons` | unsupported | Teachable Moments state lives on the host. | Use it in a plugin host. |
+| `/ultrathink-decisions` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
+| `/ultrathink-hindsight` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
+| `/ultrathink-engine` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
+| `/ultrathink-protocol` | unsupported | It is an operator control for a plugin host's own planner. | Use it in a plugin host. |
+| `/ultrathink-hitl` | unsupported | Clarifying questions are part of every plan result. | Read the plan's questions. |
+| `/ultrathink-cursor` | unsupported | It is a Cursor host command, and the connector has no Cursor session to run it in. | Run it in Cursor with the ultrathink plugin installed. |
+
+That is 23 commands: 4 native, 1 alias, 1 passthrough and 17 unsupported. The six supported ones are listed as MCP prompts, with the arguments above (`request` is required for `/ultrathink` and `/ultrathink-plan`, `message` for `/ultrathink-quick`, and `sessionId` and `node` are optional for `/ultrathink-think`). `ultrathink_command` also accepts a bare name (`ship`), a slash form, the `ultrathink:` plugin namespace and any case, and `help` lists every command with its state. A command argument is limited to 20,000 characters.
+
+### How each client reaches a command
+
+| Client | Prompts | Typed `/ultrathink ...` |
+|---|---|---|
+| Claude Desktop and claude.ai chat | Listed only as "+" menu attachments ("Add from ultrathink"), not as slash commands. Reports say prompts from custom connectors can vanish from the UI (`anthropics/claude-ai-mcp` issue 333). | Plain text to the model unless picked from the "/" menu. The plugin bundle `plugins/ultrathink-connector/` puts the six supported commands in that menu, where a command loads as a skill. Without the plugin, only the tool descriptions tell the model what to do. |
+| Claude Code | Slash commands: `/mcp__ultrathink__ultrathink`, `/mcp__ultrathink__ultrathink-plan`, `/mcp__ultrathink__ultrathink-think`, `/mcp__ultrathink__ultrathink-last`, `/mcp__ultrathink__ultrathink-status`, `/mcp__ultrathink__ultrathink-quick`, with space-separated arguments. | Tool descriptions and the server `instructions` (cut at 4,096 characters). Plugin commands and the installed ultrathink plugin's own commands also apply. |
+| Grok Chat | No evidence of any prompt surface; treat the connector as tools only. | Tool descriptions, and the custom-instructions text in the [chat guide](how-to/use-ultrathink-in-chat.md#commands-and-the-typed-ultrathink) if the model ignores them. Grok never refreshes its tool list: reconnect after any tool change. |
+| Local stdio | Whatever the client does with prompts. | Whatever the client does with tool descriptions. |
+
+Hosted Claude does not deliver server `instructions` (issue 93), which is why the tool descriptions carry the trigger text themselves. A typed command is a convention the model follows, not a command the client runs. Sources: `https://claude.com/docs/plugins/platform-support`, `https://code.claude.com/docs/en/mcp`, `https://github.com/xai-org/plugin-marketplace/issues/1402`.
+
 ## Prompt prefixes and automatic skips
 
 | Input | Effect |
@@ -130,7 +182,7 @@ The prefixes are case-insensitive. A one-shot `/ultrathink-skip` still wins over
 These prompts are skipped automatically, with no command needed:
 
 - Trivial acknowledgements: `yes`, `y`, `no`, `n`, `ok`, `okay`, `k`, `continue`, `go`, `go ahead`, `do it`, `please`, `thanks`, `thank you`, `sure`, `yep`, `nope`, `lgtm`, optionally followed by punctuation. Set `uplift.skipTrivial: false` to plan them (see [Configuration](configuration.md)).
-- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done.
+- Slash commands that are built in or unknown, such as `/model` or `/clear`. A slash command that resolves to a skill or command file is planned: ultrathink plans the text you typed after the skill, or the skill's own objective when you typed nothing. The skill's instructions stay authoritative for how the work is done. A `/gsd-*` or `/skill:gsd-*` command is planned the same way even when no skill file is installed.
 - ultrathink's own skills (`ultrathink-kickoff`, `ultrathink-sync`, `ultrathink-plan`, `ultrathink-ship`) and commands, so they never re-plan.
 - Prompts that already are an uplifted spec (they start with the spec's root XML element).
 - Subagent sessions, and child processes that ultrathink itself started.
@@ -513,6 +565,10 @@ usage: ultrathink-ship assess|pr|review|merge|run|status --state <sessions/<id>.
 `--state` is the session state file (`<state dir>/sessions/<id>.json`). `--cwd` is the repository working tree and defaults to the current directory. Every subcommand prints one JSON object. `bin/ultrathink-ship` works when you run it by hand even with `ship.enabled: false`; that key only controls whether the agent is told to run it. `merge` is the only way the ship flow merges: agents must never merge any other way (no `gh pr merge`, no web UI), and a PR merged outside the flow without a passing review of its head is reported blocked, never recorded as a ship merge.
 
 With `ship` in `decisions.points` and a Jev key for the resolved rail, `assess` also asks Jev whether the patch fully delivers the request, alongside the engine judge, after the rule checks pass. Its JSON then gains `decision`: `{"p": <P>, "model": "<resolved model>", "action": "<action>"}`, or `{"action": "fail-open", "error": "<kind>"}` when Jev could not answer. It gains `"source": "jev"` only when Jev gave the verdict because there was no usable engine verdict, which happens only in gate mode with `ship.autoMerge` off. With Decisions off, the JSON is unchanged. See [Ship: Jev decision](ship.md#jev-decision).
+
+### `bin/ultrathink-connector`
+
+The local stdio MCP server of the [connector](#connector): newline-delimited JSON-RPC on stdin and stdout, one reply line per request. It is a POSIX shell wrapper like the others (it follows symlinks and runs through `bin/run-bun`); without Bun it exits 127 with the install hint. On Windows run `bun <path>\services\ultrathink\stdio\main.ts`. It has no planner, no OAuth and no network access, serves nine tools (no `ultrathink_uplift`), six prompts and the graph card resource, and keeps its sessions under `ULTRATHINK_STATE_DIR`, or else the `connector` directory under the host state directory. `ULTRATHINK_LOG_LEVEL` (`info`, `warn`, `error`; default `warn`) sets the stderr log level; stdout carries protocol lines only, and logs never contain request text. It ends when stdin closes and on `SIGINT` or `SIGTERM`. The client configuration and a hand check are in [Use /ultrathink in Claude, Claude Code and Grok Chat](how-to/use-ultrathink-in-chat.md#local-stdio) and the [runbook](ops/runbook-ultrathink.md#13-connector-surface-and-diagnostics).
 
 ### `scripts/setup.ts`
 

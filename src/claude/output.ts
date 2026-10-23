@@ -493,7 +493,8 @@ export function formatPromptContext(input: PromptContextInput): string {
 		);
 	}
 
-	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, skills, tail, linked, input.maxChars ?? HANDOFF_MAX_CHARS);
+	// 0 means no limit, as on the spec path below.
+	if (input.handoff) return fitHandoff(parts, briefParts, lessons, docs, skills, tail, linked, input.maxChars === undefined ? HANDOFF_MAX_CHARS : input.maxChars > 0 ? input.maxChars : Number.MAX_SAFE_INTEGER);
 	const fixed = parts.join("\n\n").length + tail.join("\n\n").length + 4;
 	parts.push(maxChars > 0 ? truncateXml(input.result.xml, Math.max(2_000, maxChars - fixed), input.specPath) : input.result.xml);
 	return [...parts, ...tail].join("\n\n");

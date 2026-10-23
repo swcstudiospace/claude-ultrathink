@@ -97,6 +97,15 @@ def skill_description(path: Path) -> str:
 	return ""
 
 
+def _command_session(context: dict[str, Any]) -> str | None:
+	"""The session a slash command runs in, when Hermes passes one to its handler (``session_id`` or ``sessionId``)."""
+	for key in ("session_id", "sessionId"):
+		value = context.get(key)
+		if isinstance(value, str) and value.strip():
+			return value.strip()
+	return None
+
+
 def register(ctx: Any) -> None:
 	def context(build: Callable[[dict[str, Any]], str]) -> Callable[..., dict[str, str] | None]:
 		def on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
@@ -242,11 +251,11 @@ def register(ctx: Any) -> None:
 		return bool(inject_message(message, session_key=session_key))
 
 	def command(verb: str) -> Callable[[str], str | None]:
-		def handler(raw_args: str = "") -> str | None:
+		def handler(raw_args: str = "", **kwargs: Any) -> str | None:
 			try:
 				if verb == "quick":
 					return quick(raw_args or "", inject)
-				return control([verb, *(raw_args or "").split()])[1]
+				return control([verb, *(raw_args or "").split()], session_id=_command_session(kwargs))[1]
 			except Exception as error:
 				return " ".join(f"Ultrathink {verb} failed: {error}".split())
 

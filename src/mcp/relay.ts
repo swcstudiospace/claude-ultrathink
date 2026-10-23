@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
+import { readBodyPrefix, readBodyText } from "../net/body.ts";
 import { createSseParser } from "./sse.ts";
+import { getSecurityLogger } from "../../services/ultrathink/security/events.ts";
+import { StringValidator } from "../../services/ultrathink/security/validation.ts";
 
 export interface RelayAuth {
 	header(): Promise<string | undefined>;
@@ -15,6 +18,10 @@ export interface RelayOptions {
 	userAgent: string;
 	loginHint: string;
 	log?: (message: string) => void;
+	/** Budget for a message whose caller passes no signal (serve mode); default REQUEST_TIMEOUT_MS. */
+	requestTimeoutMs?: number;
+	/** Budget for the shared re-initialize after a stale session; default REINIT_TIMEOUT_MS. */
+	reinitTimeoutMs?: number;
 }
 
 interface RateLimit {
@@ -36,29 +43,50 @@ function asRpc(message: unknown): JsonRpc {
 
 const RATE_LIMIT_BODY_BYTES = 4096;
 const RATE_LIMIT_TEXT = /rate[\s_-]?limit/i;
+/** A JSON response or one SSE line larger than this is refused rather than buffered. */
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+/** Serve mode has no per-call timer of its own; without this a stalled upstream would pin a task forever. */
+const REQUEST_TIMEOUT_MS = 120_000;
+/** Every later message waits on the shared re-initialize, so it must settle on its own. */
+const REINIT_TIMEOUT_MS = 30_000;
 
-/** Reads at most `limit` bytes of the body, then cancels the rest of the stream. */
-async function readBodyPrefix(response: Response, limit: number): Promise<string> {
-	if (!response.body) return "";
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let text = "";
-	let size = 0;
-	try {
-		while (size < limit) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const chunk = value.subarray(0, limit - size);
-			size += chunk.length;
-			text += decoder.decode(chunk, { stream: true });
-		}
-		return text + decoder.decode();
-	} catch {
-		return text;
-	} finally {
-		await reader.cancel().catch(() => {});
-		reader.releaseLock();
+/** Text a request id or method may carry: bounded, and free of control characters. */
+const NO_CONTROL = /^[^\x00-\x1f\x7f]*$/;
+const ID_TEXT = new StringValidator({ allowEmpty: true, maxLength: 256, pattern: NO_CONTROL });
+const METHOD_TEXT = new StringValidator({ allowEmpty: true, maxLength: 128, pattern: NO_CONTROL });
+
+function isObjectMessage(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The first refused field of one JSON-RPC 2.0 object, or null. A request, a notification and a response are all accepted. */
+function refusedEnvelope(message: unknown): { field: string; code: string } | null {
+	if (!isObjectMessage(message)) return { field: "message", code: "TYPE_MISMATCH" };
+	if (message.jsonrpc !== "2.0") return { field: "jsonrpc", code: "INVALID_VALUE" };
+	if (message.method !== undefined) {
+		const method = METHOD_TEXT.validate(message.method);
+		if (!method.valid) return { field: "method", code: method.errors[0]?.code ?? "INVALID" };
+	} else if (!("result" in message) && !("error" in message)) {
+		return { field: "message", code: "NOT_A_MESSAGE" };
 	}
+	if (message.id !== undefined && message.id !== null && typeof message.id !== "number") {
+		const id = ID_TEXT.validate(message.id);
+		if (!id.valid) return { field: "id", code: id.errors[0]?.code ?? "INVALID" };
+	}
+	return null;
+}
+
+/** A refused message is answered with -32600 only when it awaits an answer: a request, or any value that is not an object. A notification (no id) and a response (result or error) never are. */
+function awaitsAnswer(message: unknown): boolean {
+	if (!isObjectMessage(message)) return true;
+	if ("result" in message || "error" in message) return false;
+	return message.id !== undefined;
+}
+
+/** The id a -32600 answer echoes: the message's own id when it is a string or a number, otherwise null. */
+function answerId(message: unknown): string | number | null {
+	if (!isObjectMessage(message)) return null;
+	return typeof message.id === "string" || typeof message.id === "number" ? message.id : null;
 }
 
 function retryAfterSeconds(headers: Headers, body: string): string | undefined {
@@ -75,7 +103,7 @@ function retryAfterSeconds(headers: Headers, body: string): string | undefined {
 async function detectRateLimit(response: Response): Promise<RateLimit | undefined> {
 	const { status, headers } = response;
 	if (status !== 429 && status !== 401 && status !== 403) return undefined;
-	const body = await readBodyPrefix(response, RATE_LIMIT_BODY_BYTES);
+	const body = await readBodyText(response, RATE_LIMIT_BODY_BYTES).catch(() => "");
 	const limited =
 		status === 429 || headers.has("retry-after") || headers.get("x-ratelimit-remaining")?.trim() === "0" || RATE_LIMIT_TEXT.test(body);
 	return limited ? { retryAfter: retryAfterSeconds(headers, body) } : undefined;
@@ -89,6 +117,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 	let protocolVersion: string | undefined;
 	let initMessage: unknown;
 	let reinitializing: Promise<void> | undefined;
+	const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+	const reinitTimeoutMs = options.reinitTimeoutMs ?? REINIT_TIMEOUT_MS;
 
 	const post = async (message: unknown, withSession: boolean, signal?: AbortSignal): Promise<Posted> => {
 		const header = await options.auth.header();
@@ -102,7 +132,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		if (sessionUsed !== undefined) headers["Mcp-Session-Id"] = sessionUsed;
 		if (protocolVersion !== undefined) headers["MCP-Protocol-Version"] = protocolVersion;
 		try {
-			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal });
+			// A redirect would resend the bearer token to wherever it points, so it is an error.
+			const response = await doFetch(options.url, { method: "POST", headers, body: JSON.stringify(message), signal, redirect: "error" });
 			return { response, header, sessionUsed, rateLimit: await detectRateLimit(response) };
 		} catch {
 			return { header, sessionUsed };
@@ -141,21 +172,35 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 					return;
 				}
 				observe(parsed, initId, emit);
-			});
+			}, MAX_BODY_BYTES);
+			const reader = response.body.getReader();
+			const onAbort = (): void => {
+				reader.cancel(signal?.reason).catch(() => {});
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
 			const decoder = new TextDecoder();
-			for await (const chunk of response.body) {
-				if (signal?.aborted) throw new Error("aborted");
-				parser.push(decoder.decode(chunk, { stream: true }));
+			try {
+				for (;;) {
+					const { done, value } = await reader.read();
+					if (signal?.aborted) throw new Error("aborted");
+					if (done) break;
+					parser.push(decoder.decode(value, { stream: true }));
+				}
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+				await reader.cancel().catch(() => {});
+				reader.releaseLock();
 			}
 			parser.push(decoder.decode());
 			parser.end();
 			return;
 		}
-		const text = await response.text();
-		if (text.trim() === "") return;
+		const body = await readBodyPrefix(response, MAX_BODY_BYTES, signal);
+		if (!body.complete) throw new Error("response too large");
+		if (body.text.trim() === "") return;
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(text);
+			parsed = JSON.parse(body.text);
 		} catch {
 			log("skipping unparsable JSON response");
 			return;
@@ -168,7 +213,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 			sessionId = undefined;
 			return;
 		}
-		const posted = await postWithAuth(initMessage, false);
+		const signal = AbortSignal.timeout(reinitTimeoutMs);
+		const posted = await postWithAuth(initMessage, false, signal);
 		if (!posted.response?.ok) {
 			log(`re-initialize failed: ${posted.response ? `HTTP ${posted.response.status}` : "unreachable"}`);
 			await posted.response?.body?.cancel().catch(() => {});
@@ -176,8 +222,14 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 			return;
 		}
 		sessionId = posted.response.headers.get("mcp-session-id") ?? undefined;
-		await consume(posted.response, asRpc(initMessage).id, () => {});
-		const notified = await postWithAuth({ jsonrpc: "2.0", method: "notifications/initialized" });
+		try {
+			await consume(posted.response, asRpc(initMessage).id, () => {}, signal);
+		} catch {
+			log(`re-initialize failed: ${signal.aborted ? "timed out" : "stream failed"}`);
+			sessionId = undefined;
+			return;
+		}
+		const notified = await postWithAuth({ jsonrpc: "2.0", method: "notifications/initialized" }, true, signal);
 		await notified.response?.body?.cancel().catch(() => {});
 	};
 
@@ -191,7 +243,7 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		isRequest: boolean,
 		emit: (line: string) => void,
 		answered: () => boolean,
-		signal: AbortSignal | undefined,
+		signal: AbortSignal,
 	): Promise<void> => {
 		const isInitialize = rpc.method === "initialize";
 		if (isInitialize) initMessage = message;
@@ -236,8 +288,8 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		}
 		try {
 			await consume(response, isInitialize ? rpc.id : undefined, emit, signal);
-		} catch {
-			log("upstream stream failed");
+		} catch (error) {
+			log(`upstream stream failed: ${error instanceof Error ? error.message : String(error)}`);
 			if (isRequest && !answered()) writeError(rpc.id, -32000, "upstream unreachable");
 			return;
 		}
@@ -246,36 +298,66 @@ export function createRelay(options: RelayOptions): { handle(message: unknown, s
 		}
 	};
 
+	const refuse = (message: unknown, refusal: { field: string; code: string }): void => {
+		getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "message", details: refusal });
+		if (awaitsAnswer(message)) writeError(answerId(message), -32600, "invalid request");
+	};
+
+	const forward = async (message: unknown, signal?: AbortSignal): Promise<void> => {
+		const rpc = asRpc(message);
+		const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
+		let replied = false;
+		const emit = (line: string): void => {
+			if (isRequest && !replied) {
+				const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
+				if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
+			}
+			options.write(line);
+		};
+		try {
+			await relay(message, rpc, isRequest, emit, () => replied, signal ?? AbortSignal.timeout(requestTimeoutMs));
+		} catch (error) {
+			log("relay error");
+			if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
 	return {
 		async handle(message: unknown, signal?: AbortSignal): Promise<void> {
-			const rpc = asRpc(message);
-			const isRequest = rpc.id !== undefined && rpc.id !== null && typeof rpc.method === "string";
-			let replied = false;
-			const emit = (line: string): void => {
-				if (isRequest && !replied) {
-					const out = asRpc(JSON.parse(line)) as JsonRpc & { error?: unknown };
-					if (out.id === rpc.id && out.method === undefined && ("result" in out || "error" in out)) replied = true;
+			if (!Array.isArray(message)) {
+				const refusal = refusedEnvelope(message);
+				if (refusal !== null) {
+					refuse(message, refusal);
+					return;
 				}
-				options.write(line);
-			};
-			try {
-				await relay(message, rpc, isRequest, emit, () => replied, signal);
-			} catch (error) {
-				log("relay error");
-				if (isRequest && !replied) writeError(rpc.id, -32603, `relay error: ${error instanceof Error ? error.message : String(error)}`);
+				await forward(message, signal);
+				return;
 			}
+			if (message.length === 0) {
+				refuse(message, { field: "batch", code: "EMPTY" });
+				return;
+			}
+			// Each item is judged alone: a refused item is answered, and the valid items are still forwarded.
+			const valid: unknown[] = [];
+			for (const item of message) {
+				const refusal = refusedEnvelope(item);
+				if (refusal === null) valid.push(item);
+				else refuse(item, refusal);
+			}
+			if (valid.length > 0) await forward(valid, signal);
 		},
 	};
 }
 
 export async function runStdioRelay(
-	options: Omit<RelayOptions, "write">,
+	options: Omit<RelayOptions, "write"> & { maxLineChars?: number },
 	input: ReadableStream<Uint8Array> = Bun.stdin.stream(),
 	output: (line: string) => void = (line) => {
 		process.stdout.write(`${line}\n`);
 	},
 ): Promise<void> {
 	const relay = createRelay({ ...options, write: output });
+	const maxLineChars = options.maxLineChars ?? MAX_BODY_BYTES;
 	const inFlight = new Set<Promise<void>>();
 	const dispatch = (line: string): void => {
 		if (line.trim() === "") return;
@@ -283,6 +365,7 @@ export async function runStdioRelay(
 		try {
 			message = JSON.parse(line);
 		} catch {
+			getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "PARSE_ERROR" } });
 			output(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }));
 			return;
 		}
@@ -292,18 +375,35 @@ export async function runStdioRelay(
 		inFlight.add(task);
 		void task.finally(() => inFlight.delete(task));
 	};
+	// A line past the cap is refused whole. Its remainder is discarded up to the next newline, so buffering stays bounded.
+	const refuseLong = (): void => {
+		getSecurityLogger().logValidationFailure({ source: "mcp_relay", resource: "stdio", details: { field: "line", code: "TOO_LONG" } });
+		output(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } }));
+	};
 	const decoder = new TextDecoder();
 	let buffer = "";
+	let discarding = false;
 	for await (const chunk of input) {
 		buffer += decoder.decode(chunk, { stream: true });
 		let index = buffer.indexOf("\n");
 		while (index !== -1) {
-			dispatch(buffer.slice(0, index));
+			const line = buffer.slice(0, index);
 			buffer = buffer.slice(index + 1);
+			if (discarding) discarding = false;
+			else if (line.length > maxLineChars) refuseLong();
+			else dispatch(line);
 			index = buffer.indexOf("\n");
+		}
+		if (discarding) buffer = "";
+		else if (buffer.length > maxLineChars) {
+			refuseLong();
+			buffer = "";
+			discarding = true;
 		}
 	}
 	buffer += decoder.decode();
-	dispatch(buffer);
+	if (discarding) buffer = "";
+	else if (buffer.length > maxLineChars) refuseLong();
+	else dispatch(buffer);
 	while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
 }

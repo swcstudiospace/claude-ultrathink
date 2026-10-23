@@ -3,7 +3,8 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { isTrivial } from "./detect.ts";
+import { resolvePstack } from "../cursor/pstack.ts";
+import { isCommandPrompt, isTrivial } from "./detect.ts";
 
 export interface SkillInvocation {
 	/** As invoked, without a leading "/" or the Omp / Prime Agent "skill:" prefix; Claude plugin skills keep "plugin:skill". */
@@ -21,6 +22,8 @@ export interface SkillLookup {
 	home?: string;
 	/** This plugin's checkout, whose commands/ and skills/ are ultrathink's own. Defaults to the running copy. */
 	pluginRoot?: string;
+	/** The host the prompt came from. `cursor` also searches Cursor's skill and command folders and its pstack plugin cache. */
+	host?: string;
 }
 
 /** Ultrathink's own skills; a user typing one of them must never re-plan (duplicate tracker rows). */
@@ -55,6 +58,15 @@ const OMP_USER = "\nUser: ";
 const NAME_RE = /^[A-Za-z0-9._:-]+$/;
 /** `/ultrathink:<anything>` and `/ultrathink <verb>`: ultrathink's command namespace, answered by the hooks, never planned. */
 const ULTRATHINK_COMMAND_RE = /^ultrathink(?::|$)/i;
+/** A GSD-Core command: `/gsd-*`, `/skill:gsd-*` (the `skill:` prefix is already stripped), or `plugin:gsd-*`. */
+const GSD_COMMAND_RE = /^gsd-[a-z0-9][a-z0-9-]*$/i;
+
+/** Bare `gsd-*` name, or undefined when `name` is not a GSD command. */
+export function gsdCommandBareName(name: string): string | undefined {
+	const bare = name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : name;
+	return GSD_COMMAND_RE.test(bare) ? bare.toLowerCase() : undefined;
+}
+
 /** The running copy of this plugin (Claude's `${CLAUDE_PLUGIN_ROOT}`, or the checkout Grok, Muse, Omp and Hermes load). */
 const PLUGIN_ROOT = resolve(import.meta.dir, "..", "..");
 /** Claude Code stacked slash skills (`/review /simplify fix it`) resolved per prompt, first command included. */
@@ -233,6 +245,24 @@ export function resolveSkillFile(name: string, lookup: SkillLookup): { path: str
 		join(lookup.cwd, ".prime", "agent", "skills", normalized, "SKILL.md"),
 		join(home, ".prime", "agent", "skills", normalized, "SKILL.md"),
 	];
+	if (lookup.host === "cursor") {
+		// Cursor's own project and personal skills and commands are checked first, so a same-name skill in another host's folder
+		// (Prime Agent, Claude, Grok, Omp, ...) never wins. Then the shared folders, then the newest pstack plugin's skills. Other hosts
+		// do not search Cursor's folders: a Cursor skill cannot run in Claude Code, so planning it there would plan a missing skill.
+		const cursorCandidates = [
+			join(lookup.cwd, ".cursor", "skills", normalized, "SKILL.md"),
+			join(lookup.cwd, ".cursor", "commands", `${normalized}.md`),
+			join(home, ".cursor", "skills", normalized, "SKILL.md"),
+			join(home, ".cursor", "commands", `${normalized}.md`),
+		];
+		for (const path of [...cursorCandidates, ...candidates]) {
+			const found = readSkill(path);
+			if (found) return found;
+		}
+		const pstack = resolvePstack(join(home, ".cursor"));
+		const pstackFound = "skillsDir" in pstack ? readSkill(join(pstack.skillsDir, normalized, "SKILL.md")) : undefined;
+		return pstackFound;
+	}
 	for (const path of candidates) {
 		const found = readSkill(path);
 		if (found) return found;
@@ -266,6 +296,41 @@ function targetFor(skill: SkillInvocation): { text: string; skill: SkillInvocati
 }
 
 /**
+ * A `/gsd-*` prompt with no skill file is still planning input. The task is the text after the
+ * command. When that text is itself a slash command, keep it, but do not let the planning text
+ * start with `/` — `decideUplift` would then skip it as an unknown command.
+ */
+function gsdPlanningTarget(name: string, instruction?: string): { text: string; skill: SkillInvocation } {
+	const skill: SkillInvocation = { name, ...(instruction ? { instruction } : {}), source: "slash" };
+	const planned = targetFor(skill);
+	if (!isCommandPrompt(planned.text)) return planned;
+	return { text: `Run the "${name}" skill. ${planned.text}`, skill };
+}
+
+type SkipReason = "slash-command" | "ultrathink-skill" | "ultrathink-command" | "nested-child";
+
+/**
+ * Walks the slash commands stacked after a skill or a `/gsd-*` name. An ultrathink skill or command, or an installed
+ * ultrathink file, stops planning. Any other stacked command stays in the instruction. Checked before any fallback, so
+ * `/gsd-quick /ultrathink-quick …` is not planned even when no GSD file is installed.
+ */
+function walkStacked(args: string | undefined, lookup: SkillLookup): { skip: SkipReason } | { instruction?: string } {
+	let instruction = args;
+	for (let count = 1; count < MAX_STACKED_SKILLS && instruction?.startsWith("/"); count++) {
+		const stacked = parseSlashCommand(instruction);
+		if (!stacked) break;
+		if (isUltrathinkSkill(stacked.name)) return { skip: "ultrathink-skill" };
+		if (ULTRATHINK_COMMAND_RE.test(stacked.name)) return { skip: "ultrathink-command" };
+		const stackedFile = resolveSkillFile(stacked.name, lookup);
+		if (!stackedFile) break;
+		const stackedOwn = ownFile(stackedFile.path, lookup);
+		if (stackedOwn) return { skip: stackedOwn };
+		instruction = stacked.args;
+	}
+	return { instruction };
+}
+
+/**
  * What ultrathink plans for a prompt: the plain prompt, the instruction inside a skill invocation
  * (or the skill's objective for a bare one), or a skip for ultrathink's own skills and commands and non-skill slash commands.
  */
@@ -293,18 +358,15 @@ export function planningTarget(
 	const own = file && ownFile(file.path, lookup);
 	if (own) return { skip: own };
 	if (!command) return { text: prompt };
-	if (!file) return { skip: "slash-command" };
-	let instruction = command.args;
-	for (let count = 1; count < MAX_STACKED_SKILLS && instruction?.startsWith("/"); count++) {
-		const stacked = parseSlashCommand(instruction);
-		if (!stacked) break;
-		if (isUltrathinkSkill(stacked.name)) return { skip: "ultrathink-skill" };
-		if (ULTRATHINK_COMMAND_RE.test(stacked.name)) return { skip: "ultrathink-command" };
-		const stackedFile = resolveSkillFile(stacked.name, lookup);
-		if (!stackedFile) break;
-		const stackedOwn = ownFile(stackedFile.path, lookup);
-		if (stackedOwn) return { skip: stackedOwn };
-		instruction = stacked.args;
+	// `/gsd-*` and `/skill:gsd-*` are planned even when no skill or command file is installed.
+	// `/ultrathink-*` was already returned above. `/model` and other unknown commands still skip.
+	const gsdName = gsdCommandBareName(command.name);
+	if (!file && gsdName) {
+		const walked = walkStacked(command.args, lookup);
+		return "skip" in walked ? walked : gsdPlanningTarget(gsdName, command.args);
 	}
-	return targetFor({ name: command.name, instruction, summary: file.summary, source: "slash" });
+	if (!file) return { skip: "slash-command" };
+	const walked = walkStacked(command.args, lookup);
+	if ("skip" in walked) return walked;
+	return targetFor({ name: command.name, instruction: walked.instruction, summary: file.summary, source: "slash" });
 }

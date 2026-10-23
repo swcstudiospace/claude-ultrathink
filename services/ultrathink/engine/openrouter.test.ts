@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { runWithRequestContext } from "../obs/context.ts";
+import type { FinishedSpan, SpanSink } from "../obs/otel.ts";
+import { createCircuitBreaker } from "./breaker.ts";
 import {
 	createOpenRouterCompleter,
+	MAX_RESPONSE_BYTES,
 	OpenRouterError,
 	type OpenRouterCallInfo,
 	type OpenRouterCompleter,
@@ -153,20 +157,22 @@ describe("usage", () => {
 		expect(seen).toEqual([{ promptTokens: 11, completionTokens: 7, costUsd: 0.0021 }]);
 	});
 
-	test("a response without cost omits costUsd; without usage reports zeros", async () => {
+	test("a response without cost omits costUsd; missing or invalid counts stay unknown, never zero", async () => {
 		const seen: OpenRouterUsage[] = [];
 		const { complete } = setup(
-			[completion("a", { prompt_tokens: 3, completion_tokens: 4 }), completion("b"), completion("c", { prompt_tokens: "x", completion_tokens: -1, cost: "free" })],
+			[
+				completion("a", { prompt_tokens: 3, completion_tokens: 4 }),
+				completion("b"),
+				completion("c", { prompt_tokens: "x", completion_tokens: -1, cost: "free" }),
+				completion("d", { prompt_tokens: 9 }),
+			],
 			{ onUsage: (usage) => seen.push(usage) },
 		);
 		await complete("s", "u");
 		await complete("s", "u");
 		await complete("s", "u");
-		expect(seen).toEqual([
-			{ promptTokens: 3, completionTokens: 4 },
-			{ promptTokens: 0, completionTokens: 0 },
-			{ promptTokens: 0, completionTokens: 0 },
-		]);
+		await complete("s", "u");
+		expect(seen).toEqual([{ promptTokens: 3, completionTokens: 4 }, {}, {}, { promptTokens: 9 }]);
 		expect("costUsd" in (seen[0] as OpenRouterUsage)).toBe(false);
 	});
 
@@ -302,6 +308,44 @@ describe("network errors", () => {
 		expect(error.cause).toBeUndefined();
 		expectNoLeak(error);
 	});
+
+	test("a body that fails after a 200 is bad_response and is not retried", async () => {
+		const { complete, calls, sleeps } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode('{"choices":['));
+							controller.error(new TypeError(`connection reset ${KEY} ${BODY_MARK}`));
+						},
+					}),
+					{ status: 200 },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
+
+	test("a text() that rejects after a 200 is bad_response and is not retried", async () => {
+		const { complete, calls, sleeps } = setup([
+			() => {
+				const response = new Response(BODY_MARK, { status: 200, headers: { "content-type": "application/json" } });
+				Object.defineProperty(response, "body", { value: null });
+				Object.defineProperty(response, "text", { value: () => Promise.reject(new TypeError(`socket closed ${KEY}`)) });
+				return response;
+			},
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
 });
 
 describe("timeout and abort", () => {
@@ -431,6 +475,74 @@ describe("response validation", () => {
 		}
 		expect(codes).toEqual(["auth", "rate_limited", "upstream", "bad_response", "empty"]);
 	});
+
+	test("a body at the byte cap is still parsed", async () => {
+		const frame = (pad: string): string => JSON.stringify({ choices: [{ message: { content: "fits" } }], pad });
+		const body = frame("x".repeat(MAX_RESPONSE_BYTES - frame("").length));
+		expect(new TextEncoder().encode(body).byteLength).toBe(MAX_RESPONSE_BYTES);
+		const { complete } = setup([status(200, {}, body)]);
+		expect(await complete("s", "u")).toBe("fits");
+	});
+
+	test("a streamed body over the byte cap is bad_response, cancelled early and not retried", async () => {
+		// About 1 MiB per chunk; sixteen caps' worth are available, so a full read would show in the pull count.
+		const chunk = new TextEncoder().encode(`{"choices":[{"message":{"content":"${BODY_MARK.repeat(Math.floor((1024 * 1024) / BODY_MARK.length))}`);
+		const available = Math.ceil((MAX_RESPONSE_BYTES / chunk.byteLength) * 16);
+		let pulls = 0;
+		let cancelled = false;
+		const { complete, calls, sleeps } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulls += 1;
+							if (pulls >= available) controller.close();
+							else controller.enqueue(chunk);
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ status: 200 },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(cancelled).toBe(true);
+		// One chunk over the cap, plus whatever the stream read ahead; nowhere near the 16x available.
+		expect(pulls).toBeLessThanOrEqual(MAX_RESPONSE_BYTES / chunk.byteLength + 2);
+		expect(calls).toHaveLength(1);
+		expect(sleeps).toEqual([]);
+		expectNoLeak(error);
+	});
+
+	test("a declared content-length over the byte cap is cancelled before the body is read", async () => {
+		let pulls = 0;
+		let cancelled = false;
+		const { complete, calls } = setup([
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							pulls += 1;
+							controller.enqueue(new TextEncoder().encode(BODY_MARK));
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ status: 200, headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } },
+				),
+			completion("never"),
+		]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(cancelled).toBe(true);
+		expect(pulls).toBeLessThanOrEqual(1);
+		expect(calls).toHaveLength(1);
+		expectNoLeak(error);
+	});
 });
 
 describe("reasoning effort", () => {
@@ -556,19 +668,269 @@ describe("onCall", () => {
 	});
 });
 
-describe("unlimited limits and truncation", () => {
-	test("timeoutMs 0 sets no timer, so a response that arrives after 50 ms still succeeds", async () => {
-		// A real 50 ms wait on purpose: the claim is that no platform timer cuts a slow response short.
-		const slow: Step = async (init) => {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			setTimeout(resolve, 50);
-			await promise;
-			return completion("late")(init);
+describe("circuit breaker", () => {
+	const OPEN_MS = 30000;
+
+	function tripped(steps: Step[]) {
+		const clock = { t: 1_000_000 };
+		const breaker = createCircuitBreaker({ failureThreshold: 2, windowMs: 60000, openMs: OPEN_MS, now: () => clock.t });
+		const infos: OpenRouterCallInfo[] = [];
+		const harness = setup(steps, { breaker, onCall: (info) => infos.push(info) });
+		return { ...harness, breaker, clock, infos };
+	}
+
+	test("two 503s open the breaker: the first call stops retrying, the second is refused without fetch", async () => {
+		const { complete, calls, sleeps, breaker, infos } = tripped([status(503), status(503)]);
+		const first = await failure(complete("s", "u"));
+		expect(first.code).toBe("upstream_unavailable");
+		expect(first.retryAfterMs).toBe(OPEN_MS);
+		expect(calls).toHaveLength(2);
+		expect(sleeps).toHaveLength(1);
+		expect(breaker.state()).toBe("open");
+		expect(infos[0]).toMatchObject({ outcome: "upstream_unavailable", attempts: 2 });
+		expect(infos[0]?.status).toBeUndefined();
+
+		const second = await failure(complete("s", "u"));
+		expect(second.code).toBe("upstream_unavailable");
+		expect(second.retryAfterMs).toBeGreaterThan(0);
+		expect(second.message).toBe("openrouter upstream_unavailable");
+		expectNoLeak(second);
+		expect(calls).toHaveLength(2);
+		expect(sleeps).toHaveLength(1);
+		expect(infos).toHaveLength(2);
+		expect(infos[1]).toMatchObject({ outcome: "upstream_unavailable", attempts: 0 });
+	});
+
+	test("the breaker is shared: another completer on the same breaker is refused too", async () => {
+		const { complete, breaker } = tripped([status(503), status(503)]);
+		await failure(complete("s", "u"));
+		const other = setup([completion("never")], { breaker });
+		const error = await failure(other.complete("s", "u"));
+		expect(error.code).toBe("upstream_unavailable");
+		expect(other.calls).toHaveLength(0);
+	});
+
+	test("auth failures do not count toward opening", async () => {
+		const { complete, breaker } = tripped([status(401), status(401), completion("fine")]);
+		expect((await failure(complete("s", "u"))).code).toBe("auth");
+		expect((await failure(complete("s", "u"))).code).toBe("auth");
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+	});
+
+	test("caller aborts do not count toward opening", async () => {
+		const { complete, breaker } = tripped([pendingUntilAbort, pendingUntilAbort, completion("fine")]);
+		for (let i = 0; i < 2; i += 1) {
+			const controller = new AbortController();
+			const pending = complete("s", "u", controller.signal);
+			controller.abort();
+			expect((await failure(pending)).code).toBe("aborted");
+		}
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+	});
+
+	test("timeouts count toward opening", async () => {
+		const clock = { t: 0 };
+		const breaker = createCircuitBreaker({ failureThreshold: 2, windowMs: 60000, openMs: OPEN_MS, now: () => clock.t });
+		const { complete, calls } = setup([pendingUntilAbort, pendingUntilAbort, completion("never")], { breaker, timeoutMs: 10 });
+		expect((await failure(complete("s", "u"))).code).toBe("timeout");
+		expect((await failure(complete("s", "u"))).code).toBe("timeout");
+		expect(breaker.state()).toBe("open");
+		expect((await failure(complete("s", "u"))).code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(2);
+	});
+
+	test("a success after the open period closes the breaker again", async () => {
+		const { complete, calls, breaker, clock, infos } = tripped([status(503), status(503), completion("fine"), completion("again")]);
+		await failure(complete("s", "u"));
+		clock.t += OPEN_MS - 1;
+		expect((await failure(complete("s", "u"))).code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(2);
+		clock.t += 1;
+		expect(await complete("s", "u")).toBe("fine");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(0);
+		expect(await complete("s", "u")).toBe("again");
+		expect(calls).toHaveLength(4);
+		expect(infos.map((info) => info.outcome)).toEqual(["upstream_unavailable", "upstream_unavailable", "ok", "ok"]);
+	});
+
+	test("a failed probe re-opens the breaker", async () => {
+		const { complete, calls, breaker, clock } = tripped([status(503), status(503), status(502)]);
+		await failure(complete("s", "u"));
+		clock.t += OPEN_MS;
+		const probe = await failure(complete("s", "u"));
+		expect(probe.code).toBe("upstream_unavailable");
+		expect(calls).toHaveLength(3);
+		expect(breaker.state()).toBe("open");
+		expect(breaker.snapshot().openedAt).toBe(clock.t);
+	});
+
+	test("a parse failure after a 200 releases the slot as ignored and the breaker stays closed", async () => {
+		const { complete, breaker } = tripped([status(503), status(200, { "content-type": "application/json" }, "{not json")]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("bad_response");
+		expect(breaker.state()).toBe("closed");
+		expect(breaker.snapshot().failures).toBe(1);
+	});
+
+	test("without a breaker every outcome and field is unchanged", async () => {
+		const { complete } = setup([status(503), status(503), status(503)]);
+		const error = await failure(complete("s", "u"));
+		expect(error.code).toBe("upstream");
+		expect(error.retryAfterMs).toBeUndefined();
+	});
+});
+
+describe("trace propagation", () => {
+	const CTX = { reqId: "req-trace-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+	const TRACEPARENT = /^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/;
+
+	function traceparentOf(call: Call): string | undefined {
+		return (call.init.headers as Record<string, string>).traceparent;
+	}
+
+	test("sends a traceparent with the request's trace id and a fresh span id", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const header = traceparentOf(calls[0] as Call);
+		expect(header).toMatch(TRACEPARENT);
+		expect(header?.split("-")[2]).not.toBe(CTX.spanId);
+	});
+
+	test("each attempt gets its own span id under the same trace", async () => {
+		const { complete, calls } = setup([status(500), completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		expect(calls).toHaveLength(2);
+		const first = traceparentOf(calls[0] as Call);
+		const second = traceparentOf(calls[1] as Call);
+		expect(first).toMatch(TRACEPARENT);
+		expect(second).toMatch(TRACEPARENT);
+		expect(first).not.toBe(second);
+	});
+
+	test("the traceparent never carries the key or the body", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext(CTX, () => complete("SYS-PROMPT", "USR-PROMPT"));
+		const header = traceparentOf(calls[0] as Call) ?? "";
+		expect(header).not.toContain(KEY);
+		expect(header).not.toContain("PROMPT");
+	});
+
+	test("sends no traceparent outside a request context", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await complete("s", "u");
+		expect(Object.keys((calls[0] as Call).init.headers as Record<string, string>)).not.toContain("traceparent");
+	});
+
+	test("an unsampled inbound trace stays unsampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-00$/);
+	});
+
+	test("a sampled or undefined inbound trace is sent sampled upstream", async () => {
+		const { complete, calls } = setup([completion("ok"), completion("ok")]);
+		await runWithRequestContext({ ...CTX, sampled: true }, () => complete("s", "u"));
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		expect(traceparentOf(calls[0] as Call)).toMatch(TRACEPARENT);
+		expect(traceparentOf(calls[1] as Call)).toMatch(TRACEPARENT);
+	});
+});
+
+describe("client span", () => {
+	const CTX = { reqId: "req-span-1", traceId: "4bf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" };
+
+	/** A sink that keeps every span it is handed; with `throws`, it also throws after keeping it. */
+	function recorder(throws = false): { sink: SpanSink; spans: FinishedSpan[] } {
+		const spans: FinishedSpan[] = [];
+		const sink: SpanSink = {
+			record: (span) => {
+				spans.push(span);
+				if (throws) throw new Error("sink failure");
+			},
 		};
-		const { complete, calls } = setup([slow], { timeoutMs: 0 });
-		expect(await complete("s", "u")).toBe("late");
-		expect(calls).toHaveLength(1);
-		expect((calls[0] as Call).init.signal?.aborted).toBe(false);
+		return { sink, spans };
+	}
+
+	test("records a CLIENT span whose id is the parent-id the upstream received", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sent = (calls[0] as Call).init.headers as Record<string, string>;
+		const span = spans[0] as FinishedSpan;
+		expect(spans).toHaveLength(1);
+		expect(span.spanId).toBe(sent.traceparent?.split("-")[2] ?? "");
+		expect(span.traceId).toBe(CTX.traceId);
+		expect(span.parentSpanId).toBe(CTX.spanId);
+		expect(span.kind).toBe(3);
+		expect(span.name).toBe("POST chat/completions");
+		expect(span.error).toBe(false);
+	});
+
+	test("a 500 then a 200 gives two spans: the first is an error, the second is not", async () => {
+		const { sink, spans } = recorder();
+		const { complete, calls } = setup([status(500), completion("ok")], { spans: sink });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const sentIds = calls.map((call) => (call.init.headers as Record<string, string>).traceparent?.split("-")[2] ?? "");
+		expect(spans.map((span) => span.error)).toEqual([true, false]);
+		expect(spans.map((span) => span.spanId)).toEqual(sentIds);
+		expect(spans.map((span) => span.attributes["ultrathink.attempt"])).toEqual([1, 2]);
+	});
+
+	test("no request context and an unsampled context each record no span", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok"), completion("ok")], { spans: sink });
+		await complete("s", "u");
+		await runWithRequestContext({ ...CTX, sampled: false }, () => complete("s", "u"));
+		expect(spans).toHaveLength(0);
+	});
+
+	test("attributes name the method and the host only, never the key, path, query or headers", async () => {
+		const { sink, spans } = recorder();
+		const { complete } = setup([completion("ok")], { spans: sink, baseUrl: "https://openrouter.test/api/v1?x=1" });
+		await runWithRequestContext(CTX, () => complete("s", "u"));
+		const span = spans[0] as FinishedSpan;
+		expect(span.attributes).toEqual({
+			"http.request.method": "POST",
+			"server.address": "openrouter.test",
+			"http.response.status_code": 200,
+			"ultrathink.attempt": 1,
+		});
+		expect(JSON.stringify(span.attributes)).not.toContain(KEY);
+	});
+
+	test("a sink whose record throws still yields the successful completion", async () => {
+		const { sink, spans } = recorder(true);
+		const { complete } = setup([completion("ok")], { spans: sink });
+		expect(await runWithRequestContext(CTX, () => complete("s", "u"))).toBe("ok");
+		expect(spans).toHaveLength(1);
+	});
+});
+
+describe("unlimited limits and truncation", () => {
+	test("timeoutMs 0 sets no timer: a reply still pending after a long wait is not aborted", async () => {
+		vi.useFakeTimers();
+		try {
+			const gate = Promise.withResolvers<void>();
+			const held: Step = async (init) => {
+				await gate.promise;
+				return completion("late")(init);
+			};
+			const { complete, calls } = setup([held], { timeoutMs: 0 });
+			const pending = complete("s", "u");
+			for (let i = 0; calls.length === 0 && i < 100; i++) await Promise.resolve();
+			expect(calls).toHaveLength(1);
+			vi.advanceTimersByTime(60_000);
+			expect((calls[0] as Call).init.signal?.aborted).toBe(false);
+			gate.resolve();
+			expect(await pending).toBe("late");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test("without maxOutputTokens (undefined or 0) the body has no max_tokens key", async () => {

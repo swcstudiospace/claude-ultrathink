@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -161,58 +161,135 @@ function readJson(path: string): unknown {
 	}
 }
 const LOCK_WAIT_MS = 500;
-const LOCK_STALE_MS = 5_000;
+// A write holds the lock for one small file write plus a rename, so a lock older than this belongs to a hung owner.
+const LOCK_STALE_MS = 2_000;
+const LOCK_RETRY_MS = 10;
+let lockSeq = 0;
 
-function lockIsStale(lockPath: string): boolean {
+interface LockObservation {
+	token: string;
+	ino: number;
+	mtimeMs: number;
+}
+
+function observeLock(lockPath: string): LockObservation | null {
 	try {
-		const age = Date.now() - statSync(lockPath).mtimeMs;
-		return age > LOCK_STALE_MS;
+		const st = statSync(lockPath);
+		// A directory lock left by an older build has no token; it is identified by inode alone.
+		const token = st.isFile() ? readFileSync(lockPath, "utf8") : "";
+		return { token, ino: st.ino, mtimeMs: st.mtimeMs };
 	} catch {
-		return false;
+		return null;
 	}
 }
 
-function acquireLock(lockPath: string): void {
+function ownerIsDead(token: string): boolean {
+	const match = /^(\d+):/.exec(token);
+	if (match === null) return false;
+	try {
+		process.kill(Number(match[1]), 0);
+		return false;
+	} catch (err) {
+		return err !== null && typeof err === "object" && "code" in err && err.code === "ESRCH";
+	}
+}
+
+/**
+ * Removes the lock only if it is still the one that was judged stale. The rename is atomic, so two
+ * waiters cannot both remove the same file; the claimed file is then checked against what was observed
+ * and put back if a live owner replaced it in between.
+ *
+ * Known limitation (TOCTOU): the staleness judgment in acquireLock and the rename here are separate
+ * syscalls. A live owner can create a fresh lock in that gap, and the rename then displaces it. Until
+ * restoreClaim puts it back, another process can enter the critical section alongside the displaced
+ * owner. If restoreClaim finds lockPath already recreated, the displaced owner's lock is dropped and the
+ * two holders overlap. The no-clobber link prevents overwriting a lock but not this overlap. Closing the
+ * window needs a protocol that never renames a lock whose owner may still be alive.
+ */
+function breakStale(lockPath: string, seen: LockObservation): void {
+	const claim = `${lockPath}.stale.${process.pid}.${lockSeq++}`;
+	try {
+		renameSync(lockPath, claim);
+	} catch {
+		return;
+	}
+	const claimed = observeLock(claim);
+	if (claimed === null || claimed.ino !== seen.ino || claimed.token !== seen.token) {
+		restoreClaim(claim, lockPath);
+		return;
+	}
+	rmSync(claim, { recursive: true, force: true });
+}
+
+/**
+ * Puts a claimed lock back without replacing whatever now sits at lockPath. linkSync fails with EEXIST when
+ * another process created the lock after the stale one was removed; that process holds the lock, so the
+ * claim is dropped and the caller's next acquire attempt waits on it like any live owner.
+ */
+function restoreClaim(claim: string, lockPath: string): void {
+	try {
+		linkSync(claim, lockPath);
+	} catch {
+		// EEXIST: another holder. Any other failure also leaves lockPath to the next acquire attempt.
+	}
+	rmSync(claim, { recursive: true, force: true });
+}
+
+/** Returns the owner token that releaseLock needs. */
+function acquireLock(lockPath: string): string {
+	const token = `${process.pid}:${lockSeq++}:${Date.now().toString(36)}`;
 	const started = Date.now();
-	let removedStale = false;
 	for (;;) {
+		let created = false;
 		try {
-			mkdirSync(lockPath);
-			return;
+			const fd = openSync(lockPath, "wx");
+			created = true;
+			try {
+				writeFileSync(fd, token);
+			} finally {
+				closeSync(fd);
+			}
+			return token;
 		} catch (err) {
 			const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
-			if (code !== "EEXIST") throw new LedgerReject("ledger lock failed");
-			if (!removedStale && lockIsStale(lockPath)) {
-				removedStale = true;
-				try {
-					rmSync(lockPath, { recursive: true, force: true });
-				} catch {
-					// another writer may have removed it
-				}
-				continue;
+			if (code !== "EEXIST") {
+				// remove only a lock this call created; any other failure leaves lockPath alone
+				if (created) rmSync(lockPath, { force: true });
+				throw new LedgerReject("ledger lock failed");
 			}
-			if (Date.now() - started >= LOCK_WAIT_MS) throw new LedgerReject("ledger lock timeout");
-			Bun.sleepSync(20);
 		}
+		if (Date.now() - started >= LOCK_WAIT_MS) throw new LedgerReject("ledger lock timeout");
+		const seen = observeLock(lockPath);
+		// A crashed owner is detected at once; a hung owner after LOCK_STALE_MS.
+		if (seen !== null && (ownerIsDead(seen.token) || Date.now() - seen.mtimeMs > LOCK_STALE_MS)) {
+			breakStale(lockPath, seen);
+			continue;
+		}
+		Bun.sleepSync(LOCK_RETRY_MS);
 	}
 }
 
+/** Removes the lock only while it still carries this writer's token. */
+function releaseLock(lockPath: string, token: string): void {
+	try {
+		if (readFileSync(lockPath, "utf8") === token) rmSync(lockPath, { force: true });
+	} catch {
+		// already reclaimed by a waiter
+	}
+}
 
 function writeAtomic(path: string, body: string): void {
 	const dir = dirname(path);
 	mkdirSync(dir, { recursive: true });
 	const lockPath = join(dir, ".lock");
-	acquireLock(lockPath);
+	const token = acquireLock(lockPath);
 	const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
 	try {
 		writeFileSync(tmp, body);
 		renameSync(tmp, path);
 	} finally {
-		try {
-			rmSync(lockPath, { recursive: true, force: true });
-		} catch {
-			// a stale directory lock can be reclaimed after 5s
-		}
+		rmSync(tmp, { force: true });
+		releaseLock(lockPath, token);
 	}
 }
 

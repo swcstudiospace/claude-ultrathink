@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { decideUplift } from "./detect.ts";
 import {
 	CHILD_PROMPT_SENTINEL,
 	isNestedChildPrompt,
@@ -251,6 +252,32 @@ describe("planningTarget", () => {
 		});
 	});
 
+	test("/gsd-* and /skill:gsd-* plan even when no skill file is installed", () => {
+		const phase = planningTarget("/gsd-plan-phase 24", { cwd, home });
+		expect(phase).toMatchObject({ text: "24", skill: { name: "gsd-plan-phase", source: "slash" } });
+		expect("text" in phase && decideUplift({ text: phase.text, source: "user", idle: true }, { enabled: true, skipOnce: false, skipTrivial: true }).action).toBe(
+			"uplift",
+		);
+		expect(planningTarget("/skill:gsd-fast add a route", { cwd, home })).toMatchObject({
+			text: "add a route",
+			skill: { name: "gsd-fast", source: "slash" },
+		});
+		expect(planningTarget("/plugin:gsd-execute-phase phase 3", { cwd, home })).toMatchObject({
+			text: "phase 3",
+			skill: { name: "gsd-execute-phase", source: "slash" },
+		});
+		expect(planningTarget("/gsd-autonomous", { cwd, home })).toMatchObject({
+			text: 'Run the "gsd-autonomous" skill.',
+			skill: { name: "gsd-autonomous", source: "slash" },
+		});
+		const stacked = planningTarget("/gsd-quick /notaskill do x", { cwd, home });
+		expect(stacked).toMatchObject({ skill: { name: "gsd-quick", source: "slash" } });
+		expect("text" in stacked && stacked.text.startsWith('Run the "gsd-quick" skill.')).toBe(true);
+		expect("text" in stacked && !stacked.text.startsWith("/")).toBe(true);
+		expect(planningTarget("/ultrathink-quick fix it", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/clear", { cwd, home })).toEqual({ skip: "slash-command" });
+	});
+
 	test("stacked slash skills plan the remainder after every resolvable skill", () => {
 		put(join(home, ".claude/skills/a/SKILL.md"), "---\ndescription: skill a\n---\n");
 		put(join(cwd, ".claude/commands/b.md"), "---\ndescription: command b\n---\n");
@@ -265,6 +292,17 @@ describe("planningTarget", () => {
 		expect(planningTarget("/a /ultrathink-kickoff do x", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
 		put(join(home, ".claude/skills/b/SKILL.md"), "---\ndescription: skill b\n---\n");
 		expect(planningTarget("/a /b /ultrathink-sync do x", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+	});
+
+	test("a /gsd-* command stacked with an ultrathink command or skill is not planned, with no GSD file installed", () => {
+		expect(planningTarget("/gsd-quick /ultrathink-quick fix it", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/gsd-quick /ultrathink:ultrathink-status", { cwd, home })).toEqual({ skip: "ultrathink-command" });
+		expect(planningTarget("/gsd-quick /ultrathink-kickoff stateFile=/tmp/s.json", { cwd, home })).toEqual({
+			skip: "ultrathink-skill",
+		});
+		expect(planningTarget("/skill:gsd-fast /ultrathink-sync do x", { cwd, home })).toEqual({ skip: "ultrathink-skill" });
+		// Without an opt-out the GSD command is still planned, as before.
+		expect(planningTarget("/gsd-quick /notaskill do x", { cwd, home })).toMatchObject({ skill: { name: "gsd-quick" } });
 	});
 
 	test("an unresolvable stacked token stops stripping and stays in the instruction", () => {
@@ -289,5 +327,65 @@ describe("planningTarget", () => {
 		const quoted = `explain what ${CHILD_PROMPT_SENTINEL} does in this doc`;
 		expect(isNestedChildPrompt(quoted)).toBe(false);
 		expect(planningTarget(quoted, { cwd, home })).toMatchObject({ text: quoted });
+	});
+});
+
+describe("Cursor skill and command folders and the pstack plugin cache", () => {
+	/** A completed pstack plugin in Cursor's plugin cache, the layout resolvePstack reads. */
+	function pstackPlugin(version: string, skill: string): void {
+		const plugin = join(home, ".cursor", "plugins", "cache", "cursor-public", "pstack", version);
+		put(join(plugin, ".cursor-plugin", "plugin.json"), JSON.stringify({ name: "pstack", version }));
+		put(join(plugin, ".cache-complete"), "");
+		put(join(plugin, "skills", skill, "SKILL.md"), `---\ndescription: ${skill} from pstack\n---\n`);
+	}
+
+	test("host cursor plans skills and commands in Cursor's project and personal folders", () => {
+		put(join(cwd, ".cursor", "skills", "projectskill", "SKILL.md"), "---\ndescription: project skill\n---\n");
+		put(join(home, ".cursor", "skills", "personalskill", "SKILL.md"), "---\ndescription: personal skill\n---\n");
+		put(join(home, ".cursor", "commands", "deploy.md"), "---\ndescription: deploy command\n---\n");
+		put(join(cwd, ".cursor", "commands", "review.md"), "---\ndescription: review command\n---\n");
+		expect(planningTarget("/projectskill do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "projectskill", source: "slash", summary: "project skill" },
+		});
+		expect(planningTarget("/personalskill do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "personalskill", summary: "personal skill" },
+		});
+		expect(planningTarget("/deploy do x", { cwd, home, host: "cursor" })).toMatchObject({ text: "do x", skill: { name: "deploy" } });
+		expect(planningTarget("/review do x", { cwd, home, host: "cursor" })).toMatchObject({ text: "do x", skill: { name: "review" } });
+	});
+
+	test("host cursor plans its own same-name skill, not the one in the Prime Agent folder", () => {
+		put(join(home, ".prime", "agent", "skills", "review", "SKILL.md"), "---\ndescription: prime review\n---\n");
+		put(join(home, ".cursor", "skills", "review", "SKILL.md"), "---\ndescription: cursor review\n---\n");
+		expect(planningTarget("/review do x", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "do x",
+			skill: { name: "review", summary: "cursor review" },
+		});
+	});
+
+	test("host cursor plans a skill that the pstack plugin provides in Cursor's plugin cache", () => {
+		pstackPlugin("1.0.0", "architect");
+		expect(planningTarget("/architect design the cache", { cwd, home, host: "cursor" })).toMatchObject({
+			text: "design the cache",
+			skill: { name: "architect", summary: "architect from pstack" },
+		});
+	});
+
+	test("the other hosts do not search Cursor's folders or cache, so the same names still skip", () => {
+		put(join(home, ".cursor", "skills", "personalskill", "SKILL.md"), "---\ndescription: personal skill\n---\n");
+		pstackPlugin("1.0.0", "architect");
+		expect(planningTarget("/personalskill do x", { cwd, home, host: "claude-code" })).toEqual({ skip: "slash-command" });
+		expect(planningTarget("/architect design", { cwd, home })).toEqual({ skip: "slash-command" });
+		expect(planningTarget("/architect design", { cwd, home, host: "omp" })).toEqual({ skip: "slash-command" });
+	});
+
+	test("resolveSkillFile names the pstack skill file under the newest completed version", () => {
+		pstackPlugin("1.0.0", "architect");
+		expect(resolveSkillFile("architect", { cwd, home, host: "cursor" })?.path).toBe(
+			join(home, ".cursor", "plugins", "cache", "cursor-public", "pstack", "1.0.0", "skills", "architect", "SKILL.md"),
+		);
+		expect(resolveSkillFile("architect", { cwd, home })).toBeUndefined();
 	});
 });

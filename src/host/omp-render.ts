@@ -5,6 +5,7 @@ import { formatModelSelection } from "../claude/output.ts";
 import { type SwarmLaneCard, type SwarmSpawnCardSnapshot, type SwarmStatusCardSnapshot, type SwarmStatusLane } from "../swarm/teams.ts";
 import { type GraphModel, renderGraph } from "./omp-graph.ts";
 import { sanitizeInsightText } from "./omp-insights.ts";
+import { type ActivityNotice, toActivityNotice } from "./activity-notice.ts";
 import { formatElapsed, type Paint, paint, truncateToWidth, visibleWidth } from "./omp-paint.ts";
 import { type PlanView, projectResolution } from "./view.ts";
 
@@ -16,6 +17,14 @@ export const SHIP_TYPE = "ultrathink-ship";
 export const INSIGHT_TYPE = "ultrathink-insight";
 /** Display-only swarm card over the spawn/status lane DTOs from ../swarm/teams.ts; transcript rows stay read-only. */
 export const SWARM_TYPE = "ultrathink-swarm";
+/** Display-only card of what a substrate flow accessed. Names and retain state only. */
+export const ACTIVITY_TYPE = "ultrathink-activity";
+/**
+ * Delivery for activity cards. Default delivery steers the running turn while the session streams, which injects the
+ * card into the model's context. `triggerTurn: false` alone only stops an idle turn start. `nextTurn` with
+ * `triggerTurn: false` neither steers nor starts a turn, and renders at once when idle.
+ */
+export const ACTIVITY_DELIVERY = { deliverAs: "nextTurn", triggerTurn: false } as const;
 
 /** Graph rows in the collapsed card; the graph degrades its layout to fit. */
 const COLLAPSED_GRAPH_ROWS = 18;
@@ -884,6 +893,36 @@ function swarmRows(details: unknown, expanded: boolean, p: Paint, room: number):
 	return rows;
 }
 
+function activityHeader(notice: ActivityNotice): string {
+	if (notice.kind === "teachable-created") return "Teachable moment";
+	if (notice.kind === "teachable-recalled") return "Lesson recalled";
+	if (notice.kind === "skill-recalled") return "Skill recalled";
+	return notice.title;
+}
+
+/** One plain line a host without a card renderer can show. */
+export function activityFallbackLine(notice: ActivityNotice): string {
+	const count = notice.count !== undefined ? ` · ${notice.count}` : notice.outcome ? ` · ${notice.outcome}` : "";
+	const source = notice.source ? ` (${notice.source})` : "";
+	return `${activityHeader(notice)}${count}${source}`;
+}
+
+function activityRows(details: unknown, p: Paint): string[] {
+	const notice = toActivityNotice(details);
+	if (!notice) return [p.fg("muted", "Activity unavailable.")];
+	const rows = [p.fg("customMessageLabel", p.bold(activityHeader(notice)))];
+	if (notice.source) rows.push(p.fg("muted", notice.source));
+	if (notice.outcome) rows.push(p.fg("muted", notice.outcome));
+	if (notice.count !== undefined) rows.push(p.fg("muted", String(notice.count)));
+	const names = notice.names ?? [];
+	for (const name of names.slice(0, 3)) rows.push(p.fg("muted", name));
+	// Validation caps `names`, so the hidden total comes from `count` when that is larger than the stored names.
+	const hidden = names.length > 0 ? Math.max(names.length, notice.count ?? 0) - Math.min(names.length, 3) : 0;
+	if (hidden > 0) rows.push(p.fg("dim", `${hidden} more`));
+	if (notice.detail) rows.push(p.fg("dim", notice.detail));
+	return rows;
+}
+
 export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: string, renderer: Renderer): void }): void {
 	pi.registerMessageRenderer(PLAN_TYPE, (message, options, theme) => {
 		// details are untrusted session data: a malformed view falls back to Omp's default card instead of throwing into Omp
@@ -943,6 +982,15 @@ export function registerUltrathinkRenderers(pi: { registerMessageRenderer(type: 
 		try {
 			const p = paint(theme);
 			return card((room) => swarmRows(message.details, options.expanded, p, room), p, { border: "borderMuted", padY: options.expanded ? 1 : 0 });
+		} catch {
+			return undefined;
+		}
+	});
+	pi.registerMessageRenderer(ACTIVITY_TYPE, (message, _options, theme) => {
+		// details are untrusted persisted data: validated into a bounded card. Expanded and compact render the same rows.
+		try {
+			const p = paint(theme);
+			return card(() => activityRows(message.details, p), p, { border: "borderMuted", padY: 0 });
 		} catch {
 			return undefined;
 		}

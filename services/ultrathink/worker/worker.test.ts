@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Ledger, type LedgerLimits, LedgerWriteError, createLedger } from "../cost/ledger.ts";
@@ -502,6 +502,95 @@ describe("worker", () => {
 			.query<{ holder: string }, [string]>("SELECT holder FROM run_leases WHERE run_id = ?")
 			.get(run.id);
 		expect(holder?.holder).toBe("thief");
+	});
+
+	test("a takeover during the last model attempt cannot overwrite the new holder's status", async () => {
+		const env = makeEnv();
+		const run = newRun(env);
+		const model = fakeModel((_call, index) => {
+			if (index === 0) {
+				// The new holder takes the expired lease and finishes the run while this call is in flight.
+				env.store.db
+					.query("UPDATE run_leases SET holder = 'thief', expires_at = ? WHERE run_id = ?")
+					.run(Date.now() + 60_000, run.id);
+				env.store.updateRun(run.id, { status: "complete", currentPhase: null });
+				throw new Error("provider unavailable");
+			}
+			return { text: "unused", tokensUsed: 1 };
+		});
+		const { worker } = makeWorker(env, model, { maxModelAttempts: 1 });
+
+		// The old worker's model_unavailable pause is refused; its reservation is abandoned by tickOnce.
+		expect(await worker.tickOnce()).toBe("idle");
+		expect(model.calls.length).toBe(1);
+		expect(reload(env, run).status).toBe("complete");
+		expect(reload(env, run).currentPhase).toBeNull();
+		expect(ledgerRows(env, run.id).map((row) => [row.phase, row.state])).toEqual([["discover", "abandoned"]]);
+	});
+
+	test("a completed phase whose artifact is missing is re-materialised on the next tick", async () => {
+		const env = makeEnv();
+		const run = newRun(env);
+		const model = fakeModel((_call, index) =>
+			index === 1 ? { text: DECISION, tokensUsed: 30 } : { text: `output ${index}`, tokensUsed: 30 },
+		);
+		const { worker } = makeWorker(env, model);
+		const runDir = join(env.artifactDir, run.id);
+
+		// discover commits and writes its artifact; discuss pauses for a decision.
+		expect(await worker.tickOnce()).toBe("paused");
+		expect(readFileSync(join(runDir, "discover.md"), "utf8")).toBe("output 0");
+
+		// Simulate the artifact being lost after the phase commit (crash between commit and write).
+		rmSync(runDir, { recursive: true, force: true });
+		expect(existsSync(runDir)).toBe(false);
+
+		expect(answerDecision(env.store, { runId: run.id, ownerId: OWNER, answer: "sqlite" })).toEqual({ ok: true });
+		expect(await worker.tickOnce()).toBe("complete");
+
+		// discover is not re-run, but its artifact is restored from the recorded output.
+		expect(model.calls.length).toBe(5);
+		expect(env.store.listPhases(run.id).filter((record) => record.phase === "discover").length).toBe(1);
+		expect(readdirSync(runDir).sort()).toEqual(PHASES.map((phase) => `${phase}.md`).sort());
+		expect(readFileSync(join(runDir, "discover.md"), "utf8")).toBe("output 0");
+		expect(statSync(join(runDir, "discover.md")).mode & 0o777).toBe(0o600);
+	});
+
+	test("a lease lost to a holder that already abandoned the reservation still resolves idle", async () => {
+		const env = makeEnv();
+		const run = newRun(env);
+		let clock = 1_000_000;
+		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+		const slowModel: PlanningModel = {
+			async complete() {
+				await gate;
+				return { text: "late output", tokensUsed: 10 };
+			},
+		};
+		const fastModel = fakeModel((_call, index) => ({ text: `output ${index}`, tokensUsed: 20 }));
+		const shared: Partial<WorkerOptions> = { leaseMs: 1000, heartbeatMs: 60_000, now: () => clock };
+		const { worker: workerA } = makeWorker(env, slowModel, shared, "worker-a");
+		const { worker: workerB } = makeWorker(env, fastModel, shared, "worker-b");
+
+		// Worker A claims the run and reserves tokens, then blocks inside the model call.
+		const tickA = workerA.tickOnce();
+		expect(ledgerRows(env, run.id).map((row) => [row.phase, row.state])).toEqual([["discover", "reserved"]]);
+
+		// Its lease expires; worker B claims the run, abandons A's dead reservation and finishes the run.
+		clock += 2000;
+		expect(await workerB.tickOnce()).toBe("complete");
+		expect(ledgerRows(env, run.id).filter((row) => row.phase === "discover").map((row) => row.state)).toEqual([
+			"abandoned",
+			"settled",
+		]);
+
+		// A's commit is fenced by the lease; the already-abandoned reservation must not turn into an error.
+		release();
+		expect(await tickA).toBe("idle");
+		expect(fastModel.calls.length).toBe(4);
+		expect(env.store.listPhases(run.id).length).toBe(4);
+		expect(env.store.listPhases(run.id).every((record) => record.output !== "late output")).toBe(true);
+		expect(reload(env, run).status).toBe("complete");
 	});
 
 	test("runUntilAborted sleeps after idle and stops once aborted", async () => {

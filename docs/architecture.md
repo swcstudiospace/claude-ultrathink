@@ -39,6 +39,7 @@ This page explains how the pieces fit together. To install it, start with [Getti
 - [Decisions (Jev)](#decisions-jev)
 - [Cursor pstack bridge](#cursor-pstack-bridge)
 - [Fail-open principles](#fail-open-principles)
+- [Connector surface](#connector-surface)
 - [Source tree](#source-tree)
 
 ## Services and trust boundaries
@@ -304,10 +305,10 @@ sequenceDiagram
         X-->>O: inline ultrathink-plan message
     else still planning
         X-->>O: pending note (read and investigate only)
-        P-->>X: context, when planning completes
+        P-->>X: context, when ready (no outer deadline)
         X->>O: aside message at the next step boundary
     end
-    Note over O,X: A newer prompt, /ultrathink-quick, a model switch, a session switch or the end of the session cancels the flight, and nothing is delivered.
+    Note over O,X: A newer prompt, an accepted /ultrathink-quick message, a model switch, a session switch or the end of the session cancels the flight, and nothing is delivered.
 ```
 
 ### Omp native planning
@@ -316,7 +317,7 @@ Under `think.engine: "auto"`, Omp plans on the session's own model inside the Om
 
 - **Binding.** When a prompt arrives, the extension reads the session's live model (`ctx.model`, else `ctx.models.current()`; `ctx.model` wins when both exist) and copies it whole, once, for the flight. Selection then takes a `models.hosts.omp.model` override (`override`), else that copy when Omp can use it for a plain text completion (`detected`), else the same provider's default: `models.providerDefaults`, then the per-provider default of the `@oh-my-pi/pi-catalog` that Omp ships (`default`). The default must come from exactly that provider. Anything else is `unresolved` with a reason, and the prompt goes on unplanned. Omp never uses family mapping, the route-default map or another provider's model.
 - **One model per flight.** The uplift, the graph, every node fill and the clarification call go through Omp's `completeSimple` (`@oh-my-pi/pi-ai`) on that one model, with one auth resolver per flight from Omp's own model registry. No tools and no extra headers are sent, and only the text blocks of an answer count. A provider error becomes the fixed message `omp-native completion failed (provider error)`, and the stage degrades fail-open like any engine error. The `@oh-my-pi` modules are loaded only on this path.
-- **Lifetime and cancellation.** Each flight has its own abort controller and no outer time limit; a flight ends when its plan completes or it is cancelled. The 25 s race only switches delivery to the pending note and the aside; it never cancels. A newer prompt, an armed `/ultrathink-quick`, a changed live model (checked at planning calls, existing agent/turn/tool lifecycle observations and before delivery), a session switch or `session_shutdown` cancels the flight. Cancellation suppresses later stages, tracker calls, state writes and delivery. Unchanged turn-end events and `session_stop` do not cancel a deferred plan. Late output after cancellation is discarded.
+- **Lifetime and cancellation.** Each flight has its own abort controller and, by default, no outer planning deadline: a `maxRunMs` of 0, the default, creates no outer timer and no automatic cutoff. The 25 s race is delivery-only: it switches delivery to the pending note and the exactly-once eventual aside, and it never cancels, lowers effort, changes route, retries, or admits another model call. A hung provider requires existing cancellation — a newer prompt, an accepted `/ultrathink-quick` message matching `before_agent_start` (arming alone is not cancellation), a changed live model (checked at planning calls, existing agent/turn/tool lifecycle observations and before delivery), a session switch or `session_shutdown` — and there is no new stop command. Cancellation suppresses later stages, tracker calls, state writes and delivery. Unchanged turn-end events and `session_stop` do not cancel a deferred plan. Provider failure or empty output still degrades fail-open. An explicit positive `maxRunMs` remains separately opt-in with terminal no-plan semantics and cleanup; late output is discarded.
 - **Reentry.** Omp can run `before_agent_start` again for one submission. Reuse requires the same session, working directory, submission, prompt, whole live Model, captured thinking level, engine request, native override/default settings and resolved selector identities. Named routes also compare effective model pins, provenance and Grok transport/fallback/endpoint settings. Endpoint comparison stays private and ignores inactive or equivalent endpoint values. A changed effective target cancels the old flight and starts a new one.
 - **Visibility.** The status bar, the plan cards and `/ultrathink-status` show the safe record: label, reason and engine request. The extension keeps the latest observed record per session in memory only. Before a plan, status reads `omp-native:auto (live model not observed)`.
 - **No native support.** Without Omp's model interfaces on the extension context (`ctx.models`, `ctx.modelRegistry`), with a live model that can't be copied whole, or when `hooks/engine.ts` is called with `host: "omp"`, the record is `unresolved` with reason `native-unavailable`.
@@ -565,6 +566,47 @@ It is off until `pstack.enabled` is `true` in the user config the hook reads. A 
 - **Nudges fire once.** The ship nudge is recorded in the session before it is printed. Omp and Hermes send the PR-sync nudge once per PR URL, and the Hermes `pre_verify` sync nudge fires at most once per plan (session and Graph ID) and never after sync has recorded `synced`. A subagent's PR is credited to its parent once, through Hermes' `subagent_start` hook.
 - **Nothing lands in the working tree.** State lives in the host state directory. An `ULTRATHINK_STATE_DIR` that points into `.planning/` is ignored. The A01 orchestrator hook (`src/hooks/a01-orchestrator-hook.ts`) appends a redacted failure line to `<stateDir>/a01-failures.log` (directory `0700`, file `0600`). It does not write `<cwd>/.planning`.
 - **Secrets stay out of messages.** Engine and command errors go through `redactSecrets` before they are shown, and `auth status` reports readiness without printing tokens. Decisions errors are redacted the same way (the OpenRouter key and any `sk-or-…` or `Bearer …` value), cut to 200 characters, and `DecisionRecord`s hold no prompt, patch or key.
+
+## Connector surface
+
+The hosted server `services/ultrathink/` (and its local twin over stdio) is a separate program from the five host adapters: it gives a chat client planning tools, six prompts and one UI resource over MCP, and it never runs a hook. All transports share one protocol core, so a client sees the same surface over HTTP and stdio. The connector has not been connected to Claude chat, Claude Code or Grok Chat in a live session; what each client does with it is in [Use /ultrathink in Claude, Claude Code and Grok Chat](how-to/use-ultrathink-in-chat.md).
+
+```mermaid
+flowchart LR
+    subgraph clients["Clients"]
+        hosted["Claude chat, Claude Code, Grok Chat, Grok Bot"]
+        local["Local MCP client"]
+    end
+    subgraph service["services/ultrathink"]
+        router["routes/router.ts<br/>OAuth, key, logs"]
+        stdio["stdio/server.ts<br/>JSON lines"]
+        core["mcp/mcp.ts<br/>JSON-RPC, tools/list, prompts, resources"]
+        host["mcp/tool-host.ts<br/>the ten tools"]
+        catalog["mcp/commands.ts<br/>command catalog"]
+        views["engine/graph-view.ts<br/>wave tree, Mermaid, card data"]
+        card["mcp/resources.ts<br/>ui/graph-app.ts"]
+        planner["Server planner<br/>HTTP only"]
+    end
+    bundle["plugins/ultrathink-connector<br/>commands, skill, .mcp.json"]
+    hosted -->|"Streamable HTTP"| router
+    local -->|"stdin and stdout"| stdio
+    router --> core
+    stdio --> core
+    core --> host
+    core --> catalog
+    core --> card
+    host --> views
+    host -.-> planner
+    bundle -.->|"names the URL"| router
+```
+
+- **Command catalog** (`mcp/commands.ts`). The universe of command names is read from the plugin's own files (`commands/*.md`, `skills/<name>/SKILL.md`, `hosts/grok-bot/skills/<name>/SKILL.md`) plus three connector-native names. `COMMAND_OVERLAY` is the only place that decides what each name is on the connector (native, alias, passthrough or unsupported, with a reason and an alternative). The loader refuses to build a catalog when the files and the overlay disagree, so a new plugin command cannot reach the connector without a decision; a release without those directories serves the static overlay instead. Prompts (`mcp/prompts.ts`) and the `ultrathink_command` tool are rendered from it.
+- **Tool host** (`mcp/tool-host.ts`). `createToolHost` runs the ten tools (nine without a planner) and never speaks JSON-RPC, logs or counts: the HTTP router wraps it with its planner, metrics and ledger, and the stdio server builds the same host without a planner. `mcp/tools-connector.ts` holds the three connector tools `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`. Every text result also carries the text in `structuredContent.text`, because Claude Code hands the model `structuredContent` instead of `content`.
+- **Protocol core** (`mcp/mcp.ts`, `mcp/transport.ts`). Hand-written JSON-RPC for MCP 2025-11-25, 2025-06-18 and 2025-03-26; `initialize` announces tools, prompts, resources and the `io.modelcontextprotocol/ui` extension. A `MCP-Protocol-Version` it does not know, including 2026-07-28, is refused with HTTP 400, which spec-following dual-era clients read as "legacy server" and answer by sending `initialize`. The router logs the header as `mcpVersion` and the method as `rpcMethod` so an operator can see that happen.
+- **Graph views** (`engine/graph-view.ts`, `engine/plan-view.ts`). A `GraphView` is derived from the session record's graph only: there is no second reasoning model. It renders a plain-text wave tree (the part sure to be readable in any client), a Mermaid flowchart and the data of the card. Every string in it comes from a model, so it is flattened, capped and, for Mermaid, reduced to a character whitelist inside quoted labels.
+- **Resources and the card** (`mcp/resources.ts`, `ui/graph-app.ts`). The registry is generic and serves `ui://` documents as `text/html;profile=mcp-app`; the one document is `ui://ultrathink/graph`, a self-contained card with no external loads and an empty content security policy. `ultrathink_uplift` and `ultrathink_graph` point at it through `_meta.ui.resourceUri`; a client that does not draw it still gets the full plan as text.
+- **stdio** (`stdio/server.ts`, `stdio/main.ts`, `bin/ultrathink-connector`). Newline-delimited JSON-RPC on stdin and stdout; every message goes through the same `handleMcpPayload`. There is no planner, no OAuth and no network access, logging goes to stderr only, and the state directory is `ULTRATHINK_STATE_DIR` or the `connector` directory under the host state directory.
+- **Plugin bundle** (`plugins/ultrathink-connector/`). A separate Claude plugin with one command file per supported command, a skill with the playbook for the tools, and an `.mcp.json` that names the hosted URL and holds no key. It exists because hosted Claude lists a plugin's commands in its "/" menu but shows MCP prompts only as "+" attachments and does not deliver server `instructions`. A parity test (`mcp/bundle.test.ts`) fails when its commands and the catalog's supported commands differ.
 
 ## Source tree
 

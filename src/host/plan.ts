@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { isChildInvocation } from "../claude/complete.ts";
 import { type HookDeps, runPromptSubmit } from "../claude/hook.ts";
-import { type ControlState, readControl, sessionPath, writeControl } from "../claude/state.ts";
+import { clearSkipOnce, hostSessionId, newTurnSessionId, type ControlState, readControl, readSkipOnce, sessionPath } from "../claude/state.ts";
 import { recentConversationFromTranscript } from "../claude/transcript.ts";
 import { parseUltrathinkCommand, trackingEnabled, trackingOff } from "../uplift/commands.ts";
 import { decideUplift, isTrivial } from "../uplift/detect.ts";
@@ -111,6 +111,8 @@ export async function planPrompt(
 	const skipped = skipReason(request, env);
 	if (skipped) return skip(skipped);
 	const cwd = request.cwd?.trim() || process.cwd();
+	// A host that gives no session id gets a fresh turn id: the same id names the record, spec and carrier this turn writes.
+	const sessionId = hostSessionId(request.session_id) ?? newTurnSessionId();
 	if (request.invalidHost) {
 		// An entry handed a host it does not recognize gets a visible unresolved record, never a detected host's route,
 		// control or state. The record uses the §6 vocabulary only: diagnostic host "unknown", no transport, provider or
@@ -143,21 +145,22 @@ export async function planPrompt(
 	}
 	let text = request.prompt ?? "";
 	let skill: SkillInvocation | undefined;
-	// Supplied config, control and stateDir are this flight's captured values, never alternate stores: skip-once is still
-	// consumed here and written to the one state directory planning, carriers and commands share.
+	// Supplied config, control and stateDir are this flight's captured values, never alternate stores. The armed skip is
+	// per session: it is read from, and cleared in, the one state directory planning, carriers and commands share.
 	const stateDir = options.stateDir ?? resolveStateDir({ ...env, ULTRATHINK_HOST: host });
+	const skipArmed = readSkipOnce(stateDir, sessionId);
 	let control: ControlState = options.control ?? {};
 	try {
 		// `/ultrathink-<verb>` (and the older `/ultrathink:<verb>` / `/ultrathink <verb>`) is a control command, never a request to plan.
 		if (parseUltrathinkCommand(text)) return skip("ultrathink-command");
-		const target = planningTarget(text, { cwd });
+		const target = planningTarget(text, { cwd, host });
 		if ("skip" in target) return skip(target.skip);
 		text = target.text;
 		skill = target.skill;
 		control = options.control ?? readControl(stateDir);
 		// A Hermes skill loaded with no task (or only an ack) is a preamble, not a request to plan. An armed
 		// /ultrathink-skip must still be consumed by runPromptSubmit, as a trivial prompt consumes it on Claude.
-		if (control.skipOnce !== true && host === "hermes" && skill && (!skill.instruction || isTrivial(skill.instruction)))
+		if (!skipArmed && host === "hermes" && skill && (!skill.instruction || isTrivial(skill.instruction)))
 			return skip("skill-preamble");
 	} catch {
 		// fail-open: a throwing skill parser plans the prompt as written
@@ -170,14 +173,13 @@ export async function planPrompt(
 		// Claude hook does, so a failed engine selection can never leave it armed for a later task.
 		const state: UpliftState = {
 			enabled: control.enabled ?? config.uplift.enabled,
-			skipOnce: control.skipOnce === true,
+			skipOnce: skipArmed,
 			skipTrivial: config.uplift.skipTrivial,
 		};
 		const decision = decideUplift({ text, source: "user", idle: true }, state);
-		if (control.skipOnce === true && !state.skipOnce) {
-			control = { ...control, skipOnce: false };
+		if (skipArmed && !state.skipOnce) {
 			try {
-				writeControl(stateDir, { skipOnce: false });
+				clearSkipOnce(stateDir, sessionId);
 			} catch {
 				// fail-open: the skip still applies to this prompt
 			}
@@ -186,12 +188,11 @@ export async function planPrompt(
 		// Only eligible input reaches selection, so a skipped prompt never meets the native selector or cancellation. A
 		// flight cancelled already selects nothing: no native lookup, auth or inference.
 		if (options.signal?.aborted) return skip("aborted");
-		const sessionId = request.session_id?.trim() || "unknown";
 		const engine = await (options.selectEngine ?? selectEngine)(config, control, cwd, {
 			host,
 			sessionModel: request.model,
 			provider: request.provider,
-			sessionId: request.session_id?.trim() || undefined,
+			sessionId: hostSessionId(request.session_id),
 			signal: options.signal,
 			native: options.native,
 			purpose: "planning",
@@ -203,7 +204,7 @@ export async function planPrompt(
 		if (options.signal?.aborted) return skip("aborted", resolution);
 		const result = await runPromptSubmit(
 			{
-				session_id: request.session_id,
+				session_id: sessionId,
 				prompt: text,
 				...(skill ? { skill } : {}),
 				cwd,
@@ -218,6 +219,7 @@ export async function planPrompt(
 				engineReport: engine.report,
 				modelResolution: resolution,
 				stateDir,
+				armedSkip: skipArmed,
 				surface: host,
 				conversation: recentConversationFromTranscript,
 				brief: (input) =>

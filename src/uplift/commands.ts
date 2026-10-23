@@ -7,7 +7,7 @@
  */
 import { claudeConfigPaths, loadConfig, type UltrathinkConfig } from "../config.ts";
 import { displayId, formatModelSelection, OPAQUE_MODEL } from "../claude/output.ts";
-import { type ControlState, readControl, readLast, writeControl } from "../claude/state.ts";
+import { armSkipOnce, type ControlState, readControl, readLast, readSkipOnce, writeControl } from "../claude/state.ts";
 import { DECISIONS_URL_IGNORED, resolveDecisionsUrl } from "../decisions/client.ts";
 import { runDecisionsCommand } from "../decisions/cli.ts";
 import { runDoctorCommand } from "../doctor/cli.ts";
@@ -207,10 +207,10 @@ function engineRequestLine(config: UltrathinkConfig, state: ControlState, host: 
  * nothing here looks a model up or authenticates for it. The saved successful plan's record shows as `Last planned
  * resolution`, never as current detection (§9 path 6); together they replace the universal `Model: <claude.model>` line.
  */
-async function statusText(config: UltrathinkConfig, state: ControlState, stateDir: string, host: HostId, live?: ModelResolution): Promise<string> {
+async function statusText(config: UltrathinkConfig, state: ControlState, stateDir: string, host: HostId, live?: ModelResolution, skipArmed = false): Promise<string> {
 	const last = readLast(stateDir);
 	const lines = [
-		`Prompt Uplift ${flag(state.enabled, config.uplift.enabled)}${state.skipOnce ? " (skipping next prompt)" : ""}`,
+		`Prompt Uplift ${flag(state.enabled, config.uplift.enabled)}${skipArmed ? " (skipping next prompt)" : ""}`,
 		`Engine: ${engineLabel(config, state, host, live)}`,
 		grokTransportLine(config),
 		await grokOauthLine(config),
@@ -243,25 +243,28 @@ async function statusText(config: UltrathinkConfig, state: ControlState, stateDi
  */
 export async function runControl(
 	args: string[],
-	input: { stateDir: string; cwd: string; host?: HostId; modelResolution?: ModelResolution },
+	input: { stateDir: string; cwd: string; host?: HostId; modelResolution?: ModelResolution; sessionId?: string },
 ): Promise<string> {
 	try {
 		const { stateDir, cwd } = input;
 		const host = input.host ?? detectHost();
 		const live = projectResolution(input.modelResolution);
+		// The armed skip belongs to one session. Without its id there is no session to arm or to show as armed.
+		const sessionId = input.sessionId?.trim() || undefined;
 		const [command = "status", verb = "status", value] = args.map((arg) => arg.trim().toLowerCase()).filter(Boolean);
 		const config = loadConfig(claudeConfigPaths(cwd));
 		const state = readControl(stateDir);
 		switch (command) {
 			case "status":
-				return await statusText(config, state, stateDir, host, live);
+				return await statusText(config, state, stateDir, host, live, sessionId !== undefined && readSkipOnce(stateDir, sessionId));
 			case "on":
 			case "off":
 				writeControl(stateDir, { enabled: command === "on" });
 				return `Prompt Uplift ${command}`;
 			case "skip":
-				writeControl(stateDir, { skipOnce: true });
-				return "Prompt Uplift will skip the next prompt";
+				if (sessionId === undefined) return "Prompt Uplift skip needs a session id (--session <id>); none was given, so nothing was armed.";
+				armSkipOnce(stateDir, sessionId);
+				return "Prompt Uplift will skip the next prompt in this session";
 			case "last": {
 				const last = readLast(stateDir);
 				return last ? `${last.result.root} · ${last.result.source}\n\n${last.result.xml}` : "No uplift recorded yet";
@@ -324,6 +327,16 @@ export async function runControl(
 	}
 }
 
+/**
+ * Splits `--session <id>` out of control args. The id is kept exactly as given (host session ids are case-sensitive), so
+ * it is read here, before runControl lower-cases its args. A flag with no value yields no id, which the skip refuses.
+ */
+export function takeSessionFlag(args: readonly string[]): { sessionId?: string; args: string[] } {
+	const at = args.indexOf("--session");
+	if (at === -1) return { args: [...args] };
+	return { sessionId: args[at + 1]?.trim() || undefined, args: [...args.slice(0, at), ...args.slice(at + 2)] };
+}
+
 // `bin/ultrathink <verb> [args…]`: the host state dir comes from ULTRATHINK_HOST, else the detected host.
 // `decisions`, `hindsight`, `ragflow`, `teach`, `doctor` and `prune` bypass runControl, which lower-cases its args (probe takes a file path).
 if (import.meta.main) {
@@ -348,7 +361,8 @@ if (import.meta.main) {
 			process.stdout.write(`${text}\n`, () => process.exit(code));
 		});
 	} else {
-		runControl(argv, { stateDir: resolveStateDir(), cwd: process.cwd() }).then((text) => {
+		const { sessionId, args } = takeSessionFlag(argv);
+		runControl(args, { stateDir: resolveStateDir(), cwd: process.cwd(), sessionId }).then((text) => {
 			process.stdout.write(`${text}\n`, () => process.exit(0));
 		});
 	}

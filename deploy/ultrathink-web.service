@@ -4,6 +4,9 @@
 # (deploy/ultrathink-release.sh manages the symlink). Bun is installed at /opt/ultrathink/bin/bun, outside any home directory.
 # Audit the sandbox with: systemd-analyze security ultrathink-web
 # Rollback of a release: deploy/ultrathink-release.sh rollback. Stop the service: systemctl disable --now ultrathink-web
+# TLS: the listener is mandatory. With no ULTRATHINK_TLS_* settings the service refuses to start unless
+# ULTRATHINK_PLAINTEXT_LOOPBACK=1 is set (dev and local smoke only). Leaves and the CA are in /etc/ultrathink/tls,
+# written only by root (ultrathink-pki.sh and ultrathink-cert-renew.timer); the app reads them and never writes them.
 
 [Unit]
 Description=Ultrathink authenticated web surface and MCP server
@@ -46,6 +49,8 @@ UMask=0077
 # Sandbox.
 NoNewPrivileges=true
 ProtectSystem=strict
+# The TLS leaves and CA are read-only to the app. ProtectSystem=strict already makes /etc read-only; this names the path.
+ReadOnlyPaths=/etc/ultrathink/tls
 # /home, /root and /run/user are empty for the service. The code is under /opt, so nothing needs them.
 ProtectHome=true
 PrivateTmp=true

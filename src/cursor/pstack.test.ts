@@ -12,6 +12,7 @@ import {
 	buildBlock,
 	DEFAULT_MAPPING,
 	detectStage,
+	gsdCommandNames,
 	resolvePstack,
 	skillPath,
 	type PstackFs,
@@ -263,5 +264,21 @@ describe("buildBlock", () => {
 		expect(dropped.block).toContain("architect");
 		expect(dropped.block).not.toContain("not-a-skill");
 		expect(dropped.block.length).toBeLessThanOrEqual(bare.block.length);
+	});
+});
+
+describe("gsd command names", () => {
+	test("the stage table expands to the command names the installer registers", () => {
+		const names = gsdCommandNames();
+		expect(new Set(names).size).toBe(names.length);
+		expect(names).toContain("gsd-discuss-phase");
+		expect(names).toContain("gsd-autonomous");
+		expect(names).toContain("gsd-quick");
+		for (const name of names) {
+			const detected = detectStage(`/${name}`);
+			expect(detected.stage).not.toBeNull();
+			expect(detected.command).toBe(name);
+		}
+		expect(detectStage("/gsd-not-a-command").stage).toBeNull();
 	});
 });

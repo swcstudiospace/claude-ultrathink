@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 SWC Studio
 
-import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CEILING_DAY, CEILING_RUN, CeilingError, type Ledger, LedgerWriteError } from "../cost/ledger.ts";
 import type { RunStatus, Store } from "../store/store.ts";
+import { writeAtomic } from "./atomic.ts";
 
 export const PHASES = ["discover", "discuss", "plan", "execute"] as const;
 export type Phase = (typeof PHASES)[number];
@@ -222,24 +222,21 @@ function normalizeAnswer(raw: string): string | null {
 	return cleaned;
 }
 
+function artifactPath(artifactDir: string, runId: string, phase: Phase): string {
+	return join(artifactDir, runId, `${phase}.md`);
+}
+
 /** Writes via a temp file in the same directory, fsyncs, then renames into place. */
 function writeArtifact(artifactDir: string, runId: string, phase: Phase, content: string): void {
-	const runDir = join(artifactDir, runId);
-	mkdirSync(runDir, { recursive: true, mode: 0o700 });
-	const finalPath = join(runDir, `${phase}.md`);
-	const tempPath = join(runDir, `.${phase}.${randomUUID()}.tmp`);
+	writeAtomic(join(artifactDir, runId), `${phase}.md`, content);
+}
+
+/** Returns the artifact's current text, or null when it is missing or unreadable. */
+function readArtifact(artifactDir: string, runId: string, phase: Phase): string | null {
 	try {
-		const fd = openSync(tempPath, "wx", 0o600);
-		try {
-			writeFileSync(fd, content);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
-		renameSync(tempPath, finalPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
+		return readFileSync(artifactPath(artifactDir, runId, phase), "utf8");
+	} catch {
+		return null;
 	}
 }
 
@@ -289,13 +286,43 @@ export function createWorker(options: WorkerOptions): Worker {
 		if (changes !== 1) throw new LeaseLostError(runId);
 	}
 
+	/**
+	 * Abandons one reservation only while it is still `reserved`. Defect BUG-13: the call sites abandoned by
+	 * id, so a reservation that another worker had already settled or abandoned (after this lease expired)
+	 * made ledger.abandon throw and failed the tick. The state check and the abandon share one IMMEDIATE
+	 * transaction, so a concurrent settle cannot land between them. Settled, completed and already-abandoned
+	 * reservations stay unchanged, and a repeat call is a no-op.
+	 */
+	function abandonReservation(reservationId: number): void {
+		db.transaction(() => {
+			const row = db
+				.query<{ state: string }, [number]>("SELECT state FROM token_ledger WHERE id = ?")
+				.get(reservationId);
+			if (row?.state !== "reserved") return;
+			ledger.abandon(reservationId);
+		}).immediate();
+	}
+
+	/**
+	 * Writes a pause or terminal status only while this worker still holds the lease. Fixes the Greptile P1
+	 * "Old workers overwrite finished status" (PR #44, head bf0628f): a worker whose lease expired could finish a
+	 * model call and overwrite the status the new holder had written. The lease check and the status write share
+	 * one IMMEDIATE transaction, so a lost lease throws LeaseLostError and writes nothing.
+	 */
+	function setTerminalStatus(runId: string, patch: Parameters<Store["updateRun"]>[1]): void {
+		db.transaction(() => {
+			renewLease(runId);
+			store.updateRun(runId, patch);
+		}).immediate();
+	}
+
 	function abandonDeadReservations(runId: string): void {
 		const rows = db
 			.query<{ id: number }, [string]>(
 				"SELECT id FROM token_ledger WHERE run_id = ? AND state = 'reserved' ORDER BY id",
 			)
 			.all(runId);
-		for (const row of rows) ledger.abandon(row.id);
+		for (const row of rows) abandonReservation(row.id);
 	}
 
 	function completedOutputs(runId: string): Map<Phase, string> {
@@ -328,8 +355,7 @@ export function createWorker(options: WorkerOptions): Worker {
 
 	/**
 	 * Calls the model with retries and exponential backoff. The lease is renewed on a
-	 * heartbeat for the whole call. A truncated reply is not retried: the same request
-	 * would be cut the same way. Returns "unavailable" when every attempt fails.
+	 * heartbeat for the whole call. A truncated reply is not retried; unavailable means every attempt failed.
 	 */
 	async function callModel(runId: string, input: ModelInput): Promise<ModelOutcome> {
 		const heartbeat = { error: null as unknown };
@@ -353,9 +379,9 @@ export function createWorker(options: WorkerOptions): Worker {
 				} catch (error) {
 					if (heartbeat.error !== null) throw heartbeat.error;
 					// The adapter reports a reply cut at its own output limit with error code `truncated`.
-					const truncated =
-						typeof error === "object" && error !== null && "code" in error && error.code === "truncated";
-					if (truncated) return { kind: "truncated" };
+					if (typeof error === "object" && error !== null && "code" in error && error.code === "truncated") {
+						return { kind: "truncated" };
+					}
 					if (attempt >= maxModelAttempts) return { kind: "unavailable" };
 					await sleep(backoffMs * 2 ** (attempt - 1));
 				}
@@ -377,15 +403,14 @@ export function createWorker(options: WorkerOptions): Worker {
 			)
 			.get(run.id, phase);
 		if (pending) {
-			store.updateRun(run.id, { status: "paused-for-decision", reason: pending.question });
+			setTerminalStatus(run.id, { status: "paused-for-decision", reason: pending.question });
 			return { done: false, result: "paused" };
 		}
 
 		const attempt = nextAttempt(run.id, phase);
 		const system = SYSTEM_PROMPTS[phase];
 		const prompt = buildPrompt(run.request, phase, outputs, latestAnswer(run.id, phase));
-		const estimatedTokens =
-			Math.ceil((system.length + prompt.length) / CHARS_PER_TOKEN) + RESERVATION_ALLOWANCE_TOKENS;
+		const estimatedTokens = Math.ceil((system.length + prompt.length) / CHARS_PER_TOKEN) + RESERVATION_ALLOWANCE_TOKENS;
 
 		let reservationId: number;
 		try {
@@ -393,14 +418,14 @@ export function createWorker(options: WorkerOptions): Worker {
 		} catch (error) {
 			if (error instanceof CeilingError) {
 				if (error.reason === CEILING_RUN) {
-					store.updateRun(run.id, { status: "failed", reason: CEILING_RUN });
+					setTerminalStatus(run.id, { status: "failed", reason: CEILING_RUN });
 					return { done: false, result: "failed" };
 				}
-				store.updateRun(run.id, { status: "paused-for-blocker", reason: CEILING_DAY });
+				setTerminalStatus(run.id, { status: "paused-for-blocker", reason: CEILING_DAY });
 				return { done: false, result: "paused" };
 			}
 			if (error instanceof LedgerWriteError) {
-				store.updateRun(run.id, { status: "paused-for-blocker", reason: "ledger_unavailable" });
+				setTerminalStatus(run.id, { status: "paused-for-blocker", reason: "ledger_unavailable" });
 				return { done: false, result: "paused" };
 			}
 			throw error;
@@ -410,10 +435,11 @@ export function createWorker(options: WorkerOptions): Worker {
 
 		const outcome = await callModel(run.id, { system, prompt });
 		if (outcome.kind !== "reply") {
-			ledger.abandon(reservationId);
-			state.reservationId = null;
+			// The fenced status write goes first, so a lost lease leaves the reservation for tickOnce to abandon.
 			const reason = outcome.kind === "truncated" ? "output_truncated" : "model_unavailable";
-			store.updateRun(run.id, { status: "paused-for-blocker", reason });
+			setTerminalStatus(run.id, { status: "paused-for-blocker", reason });
+			abandonReservation(reservationId);
+			state.reservationId = null;
 			return { done: false, result: "paused" };
 		}
 		const reply = outcome.reply;
@@ -455,12 +481,22 @@ export function createWorker(options: WorkerOptions): Worker {
 	async function runClaimed(run: ClaimedRun, state: ReservationState): Promise<TickResult> {
 		const outputs = completedOutputs(run.id);
 		for (const phase of PHASES) {
-			if (outputs.has(phase)) continue;
+			if (outputs.has(phase)) {
+				// The phase commits before its artifact is written; a crash or write failure in between
+				// leaves it complete in the DB only, so the file is rebuilt from the recorded output.
+				// Defect BUG-12: the file was trusted whenever it existed, so a stale copy was never corrected.
+				// The DB output is the source of truth, so a missing, unreadable or mismatched file is rewritten.
+				const output = outputs.get(phase) ?? "";
+				if (readArtifact(artifactDir, run.id, phase) !== output) {
+					writeArtifact(artifactDir, run.id, phase, output);
+				}
+				continue;
+			}
 			const step = await runPhase(run, phase, outputs, state);
 			if (!step.done) return step.result;
 			outputs.set(phase, step.output);
 		}
-		store.updateRun(run.id, { status: "complete", currentPhase: null });
+		setTerminalStatus(run.id, { status: "complete", currentPhase: null });
 		return "complete";
 	}
 
@@ -473,7 +509,14 @@ export function createWorker(options: WorkerOptions): Worker {
 			return await runClaimed(run, state);
 		} catch (error) {
 			if (error instanceof LeaseLostError) {
-				if (state.reservationId !== null) ledger.abandon(state.reservationId);
+				if (state.reservationId !== null) {
+					try {
+						abandonReservation(state.reservationId);
+					} catch {
+						// abandonReservation is a no-op for a row the new holder already settled or abandoned, so only
+						// a ledger write error reaches here; the new holder's claim-time sweep covers that case.
+					}
+				}
 				return "idle";
 			}
 			throw error;

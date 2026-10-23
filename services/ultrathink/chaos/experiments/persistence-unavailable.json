@@ -1,0 +1,14 @@
+{
+	"id": "persistence-unavailable",
+	"title": "Store ping failure makes /healthz answer 503 persistence_unavailable",
+	"failureMode": "persistence_unavailable",
+	"kind": "operator",
+	"operatorStep": "BLOCKED, do not run: no operator action on the staging host makes store.ping() return false in the running process. The step needs a code seam in services/ultrathink/store/store.ts, which this phase does not change. Record this blocker in the run log and stop.",
+	"notes": "Status BLOCKED, not PLANNED. store.ping() (services/ultrathink/store/store.ts, around line 213) runs `SELECT 1` on the SQLite handle that openStore opened at startup, and does no file I/O. The file-level steps therefore do not reach it: chmod 000 on the database and deleting the database both leave the open handle working, because an open SQLite handle survives chmod and unlink. A full disk does not affect a read-only SELECT 1. Restarting with a corrupt database fails openStore's quick_check (store.ts, around line 333) and server.ts calls openStore at top level, so the process exits and /healthz never answers 503 with a body; the hypotheses would then fail for the wrong reason. The step that works needs a seam such as a forced ping failure available only in tests or staging; that seam is not in the repo and store.ts must not change in this phase. Keep the hypotheses as written. Do not run this template until the seam exists. The route is services/ultrathink/routes/router.ts (healthz handler, around line 1099) and persistenceUnavailable (router.ts, around line 675) returns the body key `error` with value `persistence_unavailable`.",
+	"load": { "method": "GET", "path": "/healthz", "requests": 1, "concurrency": 1 },
+	"hypotheses": [
+		{ "id": "healthz-503", "name": "/healthz returns 503 when the store ping fails", "check": "status", "path": "/healthz", "equals": 503 },
+		{ "id": "healthz-error-persistence-unavailable", "name": "/healthz body field error is persistence_unavailable", "check": "body", "path": "/healthz", "field": "error", "equals": "persistence_unavailable" }
+	],
+	"rollbackOnFail": true
+}

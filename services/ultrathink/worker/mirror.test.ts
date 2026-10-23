@@ -2,11 +2,13 @@
 // Copyright (C) 2026 SWC Studio
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type Ledger, createLedger } from "../cost/ledger.ts";
 import { openStore, type Store } from "../store/store.ts";
 import { mirrorAllRuns, writeRunState } from "./mirror.ts";
+import { createWorker, type PlanningModel } from "./worker.ts";
 
 const DECISIONS_DDL = `
 CREATE TABLE IF NOT EXISTS decisions (
@@ -179,5 +181,104 @@ describe("mirrorAllRuns", () => {
 
 	test("returns zero when the owner has no runs", () => {
 		expect(mirrorAllRuns({ store, artifactDir, ownerId: "nobody" })).toBe(0);
+	});
+});
+
+describe("worker artifacts and abandon", () => {
+	const OWNER = "owner-a";
+	const LIMITS = { runTokenCeiling: 1_000_000, dailyTokenCeiling: 10_000_000 };
+
+	/** Replies `output <call index>` and counts the calls. */
+	function countingModel(): { model: PlanningModel; calls: () => number } {
+		let count = 0;
+		return {
+			model: {
+				async complete() {
+					count += 1;
+					return { text: `output ${count - 1}`, tokensUsed: 20 };
+				},
+			},
+			calls: () => count,
+		};
+	}
+
+	function workerFor(ledger: Ledger, model: PlanningModel, maxModelAttempts = 3) {
+		return createWorker({
+			store,
+			ledger,
+			model,
+			artifactDir,
+			holderId: "worker-a",
+			maxModelAttempts,
+			sleep: async () => {},
+		});
+	}
+
+	function reservedId(runId: string): number {
+		const row = store.db
+			.query<{ id: number }, [string]>("SELECT id FROM token_ledger WHERE run_id = ? AND state = 'reserved'")
+			.get(runId);
+		if (!row) throw new Error(`no reserved row for ${runId}`);
+		return row.id;
+	}
+
+	test("rebuilds a missing and a stale artifact from the recorded phase output on resume (BUG-12)", async () => {
+		const ledger = createLedger(store, LIMITS);
+		const run = store.createRun({ ownerId: OWNER, request: REQUEST_TEXT, route: "standard" });
+		const first = countingModel();
+		expect(await workerFor(ledger, first.model).tickOnce()).toBe("complete");
+		expect(first.calls()).toBe(4);
+
+		// A crash after the last phase committed but before the run status was written.
+		store.updateRun(run.id, { status: "executing", currentPhase: "execute" });
+		const runDir = join(artifactDir, run.id);
+		rmSync(join(runDir, "discover.md"));
+		writeFileSync(join(runDir, "plan.md"), "stale copy from an older attempt");
+
+		const resumed = countingModel();
+		expect(await workerFor(ledger, resumed.model).tickOnce()).toBe("complete");
+		expect(resumed.calls()).toBe(0);
+		expect(readFileSync(join(runDir, "discover.md"), "utf8")).toBe("output 0");
+		expect(readFileSync(join(runDir, "plan.md"), "utf8")).toBe("output 2");
+	});
+
+	test("a reservation abandoned by another worker mid-call stays abandoned and the tick does not throw (BUG-13)", async () => {
+		const ledger = createLedger(store, LIMITS);
+		const run = store.createRun({ ownerId: OWNER, request: REQUEST_TEXT, route: "standard" });
+		const model: PlanningModel = {
+			async complete() {
+				// Another worker's sweep abandons this reservation while the call is in flight.
+				ledger.abandon(reservedId(run.id));
+				throw new Error("provider unavailable");
+			},
+		};
+		expect(await workerFor(ledger, model, 1).tickOnce()).toBe("paused");
+		expect(store.getRunForOwner(run.id, OWNER)?.reason).toBe("model_unavailable");
+		expect(
+			store.db
+				.query<{ phase: string; attempt: number; state: string; actual: number | null }, [string]>(
+					"SELECT phase, attempt, state, actual_tokens AS actual FROM token_ledger WHERE run_id = ? ORDER BY id",
+				)
+				.all(run.id),
+		).toEqual([{ phase: "discover", attempt: 1, state: "abandoned", actual: null }]);
+	});
+
+	test("a reservation settled by another actor mid-call stays settled (BUG-13)", async () => {
+		const ledger = createLedger(store, LIMITS);
+		const run = store.createRun({ ownerId: OWNER, request: REQUEST_TEXT, route: "standard" });
+		const model: PlanningModel = {
+			async complete() {
+				ledger.settle(reservedId(run.id), 17);
+				throw new Error("provider unavailable");
+			},
+		};
+		expect(await workerFor(ledger, model, 1).tickOnce()).toBe("paused");
+		expect(
+			store.db
+				.query<{ phase: string; attempt: number; state: string; actual: number | null }, [string]>(
+					"SELECT phase, attempt, state, actual_tokens AS actual FROM token_ledger WHERE run_id = ? ORDER BY id",
+				)
+				.all(run.id),
+		).toEqual([{ phase: "discover", attempt: 1, state: "settled", actual: 17 }]);
 	});
 });

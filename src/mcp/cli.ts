@@ -8,7 +8,7 @@ import { readControl } from "../claude/state.ts";
 import type { SessionRecord } from "../claude/state.ts";
 import { createGatewayTracker } from "../track/gateway.ts";
 import { formatTrackingTodos, injectTrackingXml } from "../track/render.ts";
-import { createMcpClient, loginHint } from "./client.ts";
+import { createMcpClient, loginHint, MAX_TOOL_PAGES } from "./client.ts";
 import { DEFAULT_TASK_GRAPH_TITLE, initTaskGraphDatabase, notionPageId, writeNotionConfig } from "./notion-db.ts";
 import {
 	beginLogin,
@@ -278,11 +278,14 @@ async function checkOne(id: McpProviderId, deps: AuthDeps): Promise<number> {
 	await relay.handle({ jsonrpc: "2.0", method: "notifications/initialized" });
 	let count = 0;
 	let cursor: string | undefined;
-	do {
+	for (let page = 0; ; page++) {
+		if (page >= MAX_TOOL_PAGES) throw new Error("tools/list: pagination did not terminate");
 		const result = await request("tools/list", cursor ? { cursor } : {});
 		count += result.tools?.length ?? 0;
+		if (!result.nextCursor) break;
+		if (result.nextCursor === cursor) throw new Error("tools/list: pagination did not terminate");
 		cursor = result.nextCursor;
-	} while (cursor);
+	}
 	return count;
 }
 

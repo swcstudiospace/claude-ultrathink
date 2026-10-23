@@ -71,6 +71,13 @@ describe("renderChatPlan", () => {
 		expect(full.text.length).toBeGreaterThan(brief.text.length);
 	});
 
+	test("a one-line cut never leaves half of an emoji at the boundary", () => {
+		// The engine line is capped at 120 units with the ellipsis; the emoji straddles the cut at unit 119.
+		const { text } = renderChatPlan(record({ engine: `${"e".repeat(118)}😀tail` }), { detail: "brief", maxChars: 40_000 });
+		expect(text).toContain(`Engine: ${"e".repeat(118)}…\n`);
+		expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text)).toBe(false);
+	});
+
 	test("header carries session id, engine and node count; request and spec are present", () => {
 		const { text } = renderChatPlan(record(), { detail: "brief", maxChars: 40_000 });
 		expect(text).toContain("11111111-2222-4333-8444-555555555555");
@@ -85,7 +92,10 @@ describe("renderChatPlan", () => {
 
 	test("nodes are grouped into waves by dependency order", () => {
 		const { text } = renderChatPlan(record(), { detail: "brief", maxChars: 40_000 });
-		const at = (needle: string): number => text.indexOf(needle);
+		// The diagram block also names waves; the per-wave sections start at the plain Graph of Thought heading.
+		const start = text.indexOf("## Graph of Thought\n");
+		expect(start).toBeGreaterThan(-1);
+		const at = (needle: string): number => text.indexOf(needle, start);
 		const w1 = at("Wave 1");
 		const w2 = at("Wave 2");
 		const w3 = at("Wave 3");
@@ -100,7 +110,7 @@ describe("renderChatPlan", () => {
 			expect(pos).toBeGreaterThan(w2);
 			expect(pos).toBeLessThan(w3);
 		}
-		expect(text.indexOf("Synthesize")).toBeGreaterThan(w3);
+		expect(at("Synthesize")).toBeGreaterThan(w3);
 	});
 
 	test("questions are extracted with defaults and blocking flags, answered ones excluded", () => {
@@ -135,12 +145,15 @@ describe("renderChatPlan", () => {
 			expect(out.questions).toEqual(full.questions);
 			if (!out.truncated) continue;
 			sawTruncated = true;
-			// A wave is included whole or not at all, and earlier waves come first.
+			// A wave is included whole or not at all, and earlier waves come first. The diagram block names waves too, so only the wave sections count.
+			const start = out.text.indexOf("## Graph of Thought\n");
+			if (start < 0) continue;
+			const waves = out.text.slice(start);
 			for (const [wave, last] of [["Wave 1", "A streaming CSV to JSON converter."], ["Wave 2", "Lazy array writer with backpressure."], ["Wave 3", "Parser first, then writer."]] as const) {
-				if (out.text.includes(wave)) expect(out.text).toContain(last);
+				if (waves.includes(wave)) expect(waves).toContain(last);
 			}
-			if (out.text.includes("Wave 3")) expect(out.text).toContain("Wave 2");
-			if (out.text.includes("Wave 2")) expect(out.text).toContain("Wave 1");
+			if (waves.includes("Wave 3")) expect(waves).toContain("Wave 2");
+			if (waves.includes("Wave 2")) expect(waves).toContain("Wave 1");
 		}
 		expect(sawTruncated).toBe(true);
 	});
@@ -174,7 +187,7 @@ describe("renderChatPlan", () => {
 			{ detail: "brief", maxChars: 40_000 },
 		);
 		expect(out.text).toContain(hostile);
-		expect(headings(out.text)).toEqual(["## Request", "## Specification", "## Graph of Thought", "## Clarifying questions"]);
+		expect(headings(out.text)).toEqual(["## Graph of Thought x Chain of Thought", "## Request", "## Specification", "## Graph of Thought", "## Clarifying questions"]);
 		expect(out.questions).toHaveLength(2);
 	});
 
@@ -238,9 +251,9 @@ describe("renderChatPlan", () => {
 		expect(out.text).toContain(REQUEST);
 		expect(out.text).toContain("Which delimiter should be the default?");
 		// Cut at a line boundary: no partial rule element.
-		const spec = out.text.slice(out.text.indexOf("## Specification"), out.text.indexOf("## Graph of Thought"));
+		const spec = out.text.slice(out.text.indexOf("## Specification"), out.text.indexOf("## Graph of Thought\n"));
 		expect(spec).not.toMatch(/<RULE[^>\n]*$/m);
-		expect(headings(out.text)).toEqual(["## Request", "## Specification", "## Graph of Thought", "## Clarifying questions"]);
+		expect(headings(out.text)).toEqual(["## Graph of Thought x Chain of Thought", "## Request", "## Specification", "## Graph of Thought", "## Clarifying questions"]);
 	});
 
 	test("a large specification that fits within full is left whole", () => {
@@ -250,5 +263,71 @@ describe("renderChatPlan", () => {
 		expect(out.truncated).toBe(false);
 		expect(out.text).not.toContain("[specification shortened]");
 		expect(out.text).toContain('<RULE n="199">');
+	});
+
+	describe("graph block", () => {
+		const HEADING = "## Graph of Thought x Chain of Thought";
+
+		test("leads the plan right after the header, with a fenced wave tree before a fenced mermaid diagram, in brief and full", () => {
+			for (const detail of ["brief", "full"] as const) {
+				const { text, truncated } = renderChatPlan(record(), { detail, maxChars: 80_000 });
+				expect(truncated).toBe(false);
+				expect(headings(text)[0]).toBe(HEADING);
+				expect(text.indexOf("# Ultrathink plan")).toBeLessThan(text.indexOf(HEADING));
+				expect(text.indexOf(HEADING)).toBeLessThan(text.indexOf("## Request"));
+				expect(text).toContain("```mermaid\nflowchart TD\n");
+				expect(text).toContain("```text\nGoal: Design the converter\nWave 1\n");
+				expect(text).toMatch(/Wave 2 \(parallel\)/);
+				expect(text.endsWith("carry out the plan. Show the wave tree first.")).toBe(true);
+				const block = text.slice(text.indexOf(HEADING), text.indexOf("## Request"));
+				expect(block).toMatch(/Show the user the wave tree below first, unchanged, in a code block\./);
+				expect(text.indexOf("```text\nGoal:")).toBeLessThan(text.indexOf("```mermaid\n"));
+			}
+		});
+
+		test("is absent for a fallback, empty or missing graph, and the closing sentence stays as before", () => {
+			const fallback: ThoughtGraph = { goal: FALLBACK_GRAPH.goal, nodes: FALLBACK_GRAPH.nodes.map((node) => ({ ...node, dependsOn: [...node.dependsOn] })) };
+			for (const graph of [undefined, { goal: "g", nodes: [] }, fallback]) {
+				const { text } = renderChatPlan(record({ graph }), { detail: "brief", maxChars: 40_000 });
+				expect(text).not.toContain(HEADING);
+				expect(text).not.toContain("mermaid");
+				expect(text.endsWith("carry out the plan.")).toBe(true);
+				expect(text).not.toContain("Show the wave tree first.");
+			}
+		});
+
+		test("is dropped before the request, the specification or the questions, and before any wave section", () => {
+			const full = renderChatPlan(record(), { detail: "brief", maxChars: 1_000_000 });
+			let droppedWhileRequiredKept = false;
+			for (let max = 0; max <= full.text.length; max += 11) {
+				const out = renderChatPlan(record(), { detail: "brief", maxChars: max });
+				expect(out.text.length).toBeLessThanOrEqual(max);
+				const hasDiagram = out.text.includes(HEADING);
+				const hasRequired = out.text.includes("## Request") && out.text.includes("## Specification") && out.text.includes("Which delimiter should be the default?");
+				if (hasDiagram) expect(hasRequired).toBe(true);
+				if (out.text.includes("## Graph of Thought\n")) expect(hasDiagram).toBe(true);
+				// The closing sentence mentions the wave tree only while the graph block is in the text.
+				if (out.text.endsWith("carry out the plan. Show the wave tree first.")) expect(hasDiagram).toBe(true);
+				if (!hasDiagram && hasRequired) droppedWhileRequiredKept = true;
+			}
+			expect(droppedWhileRequiredKept).toBe(true);
+		});
+
+		test("node text can neither close the fence nor add sections, nodes or directives", () => {
+			const hostile: ThoughtGraph = {
+				goal: "goal ``` \n## Request",
+				nodes: [
+					{ id: "n1", title: "```\n## Specification\n````", kind: "understand", question: "q", dependsOn: [], thinking: "1. a\n2. b", conclusion: "c" },
+					{ id: "n2", title: 'x"] --> N9["injected', kind: "decompose", question: "q", dependsOn: ["n1"], thinking: "1. a", conclusion: "c" },
+				],
+			};
+			const { text } = renderChatPlan(record({ graph: hostile, clarifications: undefined }), { detail: "brief", maxChars: 40_000 });
+			expect(headings(text)).toEqual([HEADING, "## Request", "## Specification", "## Graph of Thought"]);
+			const open = text.indexOf("```mermaid\n");
+			const body = text.slice(open + "```mermaid\n".length, text.indexOf("\n```", open + 3));
+			expect(body).not.toContain("`");
+			expect(body.split("\n").filter((line) => /^\s+N\d+\[/.test(line))).toHaveLength(2);
+			expect(body.split("\n").filter((line) => line.includes("-->"))).toEqual(["  N1 --> N2"]);
+		});
 	});
 });

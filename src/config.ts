@@ -18,17 +18,17 @@ import { type HostId, isHostId } from "./host/types.ts";
 import { type LegacyRoute, ROUTE_DEFAULT_MODELS } from "./route-defaults.ts";
 
 export interface ClaudeConfig {
-	/** `claude` binary used for headless completions. */
+	/** `claude` binary used for headless completions. A project file cannot set this. */
 	bin: string;
 	/** Model alias/name for the uplift and thinking calls; empty inherits the user default. */
 	model: string;
 	/** Allow extended thinking in child calls (slower). */
 	thinking: boolean;
-	/** `--setting-sources` for child calls; empty loads none (fastest, no nested hooks). */
+	/** `--setting-sources` for child calls; empty loads none (fastest, no nested hooks). A project file cannot set this. */
 	settingSources: string;
-	/** Per-call timeout for one headless completion. 0 = no timer. */
+	/** Per-call timeout for one headless completion. 0 = no timer; capped at `MAX_TIMER_MS`. */
 	callTimeoutMs: number;
-	/** Whole-hook budget in ms. 0 = run until the host hook timeout. */
+	/** Whole-hook budget in ms. 0 = run until the host hook timeout; capped at `MAX_TIMER_MS`. */
 	budgetMs: number;
 	/** Parallel node-detail fills per dependency level. */
 	concurrency: number;
@@ -75,7 +75,7 @@ export const DEFAULT_LINEAR_CONFIG: LinearConfig = {
 export interface TrackConfig {
 	/** Create Linear/Notion rows from the hook before the agent sees the prompt. */
 	enabled: boolean;
-	/** Whole tracker-creation budget in ms. 0 = no limit: no timer is created and the run waits for every row. */
+	/** Whole tracker-creation budget in ms. 0 = no limit: no timer is created and the run waits for every row. Capped at `MAX_TIMER_MS`. */
 	budgetMs: number;
 	/** Parallel tracker calls. */
 	concurrency: number;
@@ -289,19 +289,27 @@ function mergeThink(think: Record<string, unknown> | undefined, defaults: ThinkC
 	};
 }
 
+/**
+ * Largest delay `setTimeout`/`AbortSignal.timeout` accept (signed 32-bit ms, ~24.8 days). Timers clamp bigger
+ * values to 1 ms, so a budget of e.g. `1e10` meant as "no limit" would fire at once; every ms budget is capped here.
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 function nonNegativeMs(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(value, MAX_TIMER_MS) : fallback;
 }
 
-function mergeClaude(claude: Record<string, unknown> | undefined, defaults: ClaudeConfig): ClaudeConfig {
+/** `project` (a repository-controlled layer) cannot choose the executable or its setting sources; model/effort/timers stay open. */
+function mergeClaude(claude: Record<string, unknown> | undefined, defaults: ClaudeConfig, project: boolean): ClaudeConfig {
 	if (!claude) return defaults;
 	const positive = (value: unknown, fallback: number): number =>
 		typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 	return {
-		bin: typeof claude.bin === "string" && claude.bin.trim() ? claude.bin.trim() : defaults.bin,
+		bin: project ? defaults.bin : nonEmpty(claude.bin, defaults.bin),
 		model: selectorField(claude.model) ?? defaults.model,
 		thinking: typeof claude.thinking === "boolean" ? claude.thinking : defaults.thinking,
-		settingSources: typeof claude.settingSources === "string" ? claude.settingSources.trim() : defaults.settingSources,
+		settingSources:
+			!project && typeof claude.settingSources === "string" ? claude.settingSources.trim() : defaults.settingSources,
 		callTimeoutMs: nonNegativeMs(claude.callTimeoutMs, defaults.callTimeoutMs),
 		budgetMs: nonNegativeMs(claude.budgetMs, defaults.budgetMs),
 		concurrency: Math.max(1, Math.floor(positive(claude.concurrency, defaults.concurrency))),
@@ -313,21 +321,22 @@ function nonEmpty(value: unknown, fallback: string): string {
 	return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 
-function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConfig): GrokConfig {
+/** Same trust rule as `mergeClaude`: a project layer keeps `bin`, `home`, `baseUrl` and `shuntBaseUrl` (where the CLI and traffic go). */
+function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConfig, project: boolean): GrokConfig {
 	if (!grok) return defaults;
 	return {
 		enabled: typeof grok.enabled === "boolean" ? grok.enabled : defaults.enabled,
-		baseUrl: nonEmpty(grok.baseUrl, defaults.baseUrl).replace(/\/+$/, "") || defaults.baseUrl,
+		baseUrl: project ? defaults.baseUrl : httpUrl(grok.baseUrl, defaults.baseUrl),
 		model: selectorField(grok.model) || defaults.model,
 		reasoningEffort: GROK_EFFORTS.includes(grok.reasoningEffort as GrokEffort)
 			? (grok.reasoningEffort as GrokEffort)
 			: defaults.reasoningEffort,
 		transport: GROK_TRANSPORTS.includes(grok.transport as GrokTransport) ? (grok.transport as GrokTransport) : defaults.transport,
-		bin: nonEmpty(grok.bin, defaults.bin),
-		home: typeof grok.home === "string" ? grok.home.trim() : defaults.home,
+		bin: project ? defaults.bin : nonEmpty(grok.bin, defaults.bin),
+		home: !project && typeof grok.home === "string" ? grok.home.trim() : defaults.home,
 		callTimeoutMs: nonNegativeMs(grok.callTimeoutMs, defaults.callTimeoutMs),
 		fallbackToClaude: typeof grok.fallbackToClaude === "boolean" ? grok.fallbackToClaude : defaults.fallbackToClaude,
-		shuntBaseUrl: httpUrl(grok.shuntBaseUrl, defaults.shuntBaseUrl),
+		shuntBaseUrl: project ? defaults.shuntBaseUrl : httpUrl(grok.shuntBaseUrl, defaults.shuntBaseUrl),
 		shuntModel: selectorField(grok.shuntModel) || defaults.shuntModel,
 		shuntMaxTokens:
 			typeof grok.shuntMaxTokens === "number" && Number.isInteger(grok.shuntMaxTokens) && grok.shuntMaxTokens > 0
@@ -336,11 +345,11 @@ function mergeGrok(grok: Record<string, unknown> | undefined, defaults: GrokConf
 	};
 }
 
-/** Like `mergeClaude`: every layer may set the local CLI target; no project tightening (mirrors claude/grok). */
-function mergeMuse(muse: Record<string, unknown> | undefined, defaults: MuseConfig): MuseConfig {
+/** Same trust rule as `mergeClaude`: a project layer cannot pick the `muse` executable. */
+function mergeMuse(muse: Record<string, unknown> | undefined, defaults: MuseConfig, project: boolean): MuseConfig {
 	if (!muse) return defaults;
 	return {
-		bin: nonEmpty(muse.bin, defaults.bin),
+		bin: project ? defaults.bin : nonEmpty(muse.bin, defaults.bin),
 		model: selectorField(muse.model) ?? defaults.model,
 		reasoningEffort: MUSE_EFFORTS.includes(muse.reasoningEffort as MuseEffort)
 			? (muse.reasoningEffort as MuseEffort)
@@ -425,7 +434,9 @@ function httpUrl(value: unknown, fallback: string): string {
 	if (!trimmed) return fallback;
 	try {
 		const url = new URL(trimmed);
-		return url.protocol === "http:" || url.protocol === "https:" ? trimmed : fallback;
+		if (url.protocol === "https:") return trimmed;
+		// Cleartext is allowed only to loopback and private (RFC 1918) addresses, which do not route on the public internet.
+		return url.protocol === "http:" && /^(localhost|127(\.\d{1,3}){3}|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}|\[::1\])$/.test(url.hostname) ? trimmed : fallback;
 	} catch {
 		return fallback;
 	}
@@ -462,7 +473,7 @@ function mergeTrack(track: Record<string, unknown> | undefined, defaults: TrackC
 		enabled: typeof track.enabled === "boolean" ? track.enabled : defaults.enabled,
 		budgetMs:
 			typeof track.budgetMs === "number" && Number.isFinite(track.budgetMs) && track.budgetMs >= 0
-				? track.budgetMs
+				? Math.min(track.budgetMs, MAX_TIMER_MS)
 				: defaults.budgetMs,
 		concurrency:
 			typeof track.concurrency === "number" && Number.isFinite(track.concurrency) && track.concurrency >= 1
@@ -753,9 +764,9 @@ export function mergeConfig(
 	const muse = asRecord(file.muse);
 	return {
 		uplift: mergeUplift(asRecord(file.uplift), base.uplift),
-		claude: mergeClaude(claude, base.claude),
-		grok: mergeGrok(grok, base.grok),
-		muse: mergeMuse(muse, base.muse),
+		claude: mergeClaude(claude, base.claude, options.project === true),
+		grok: mergeGrok(grok, base.grok, options.project === true),
+		muse: mergeMuse(muse, base.muse, options.project === true),
 		hitl: mergeHitl(asRecord(file.hitl), base.hitl),
 		think: mergeThink(asRecord(file.think), base.think),
 		notion: mergeNotion(asRecord(file.notion), base.notion),

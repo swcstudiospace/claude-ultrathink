@@ -2,6 +2,7 @@
 // Copyright (C) 2026 SWC Studio
 import { writeSync } from "node:fs";
 import type { ModelResolution } from "./engine.ts";
+import type { ActivityNotice } from "./activity-notice.ts";
 
 export type StageName = "brief" | "uplift" | "think" | "knowledge" | "clarify" | "plan" | "track" | "state";
 
@@ -37,12 +38,12 @@ export type ProgressEvent =
 	  }
 	/** One per created or adopted tracker row; `step` absent for the node's own issue. */
 	| { type: "issue"; at: number; provider: "linear" | "notion"; nodeId: string; step?: number; identifier?: string; url: string }
+	| { type: "activity"; at: number; notice: ActivityNotice }
 	| { type: "end"; at: number; outcome: "planned" | "skipped" | "failed"; detail?: string; modelResolution?: ModelResolution };
 
 export type ProgressSink = (event: ProgressEvent) => void;
 
-const EVENT_TYPES: Record<string, true> = { begin: true, stage: true, graph: true, node: true, track: true, issue: true, end: true };
-
+const EVENT_TYPES: Record<string, true> = { begin: true, stage: true, graph: true, node: true, track: true, issue: true, activity: true, end: true };
 /** Sink writing JSON lines to the fd named by ULTRATHINK_PROGRESS_FD (>= 3). Never touches stdout; swallows errors. */
 export function createFdProgressSink(env: Record<string, string | undefined> = process.env): ProgressSink | undefined {
 	const raw = env.ULTRATHINK_PROGRESS_FD?.trim();

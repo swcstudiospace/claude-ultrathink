@@ -50,7 +50,7 @@ const events: ProgressEvent[] = [
 	{ type: "graph", at: 6, total: 2, nodes: [{ id: "n1", title: "A", kind: "understand", dependsOn: [] }, { id: "n2", title: "B", kind: "generate", dependsOn: ["n1"] }] },
 	{ type: "node", at: 6, phase: "done", id: "n1", title: "A", kind: "understand", index: 0, total: 2, steps: ["Step 1: read"] },
 	{ type: "issue", at: 6, provider: "linear", nodeId: "n1", step: 2, identifier: "ENG-1", url: "https://linear.app/o/issue/ENG-1" },
-	{ type: "issue", at: 6, provider: "notion", nodeId: "n1", url: "https://www.notion.so/p" },
+	{ type: "activity", at: 6, notice: { v: 1, kind: "teachable-recalled", title: "Lesson recalled", source: "hindsight", outcome: "used", count: 2, names: ["Retry the fetch"] } },
 	{ type: "end", at: 6, outcome: "planned" },
 	{ type: "begin", at: 7, sessionId: "s", engine: detected.label, modelResolution: detected },
 	{ type: "end", at: 8, outcome: "planned", modelResolution: detected },

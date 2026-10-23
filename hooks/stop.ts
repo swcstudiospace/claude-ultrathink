@@ -11,7 +11,7 @@
  */
 import { fileURLToPath } from "node:url";
 import { isChildInvocation } from "../src/claude/complete.ts";
-import { defaultStateDir, readSession, type SessionRecord, sessionPath } from "../src/claude/state.ts";
+import { defaultStateDir, readSession, type SessionRecord, sessionRecordPath } from "../src/claude/state.ts";
 import { claudeConfigPaths, loadConfig } from "../src/config.ts";
 import { detectHost } from "../src/host/detect.ts";
 import { isSubagentEnvelope, parseEnvelope } from "../src/host/envelope.ts";
@@ -105,7 +105,7 @@ function shipCheck(record: SessionRecord, stateDir: string, sessionId: string, c
 	try {
 		const config = loadConfig(claudeConfigPaths(cwd)).ship;
 		if (!shipApplies(config, record.skill?.name) || record.ship?.nudgedAt !== undefined) return undefined;
-		const statePath = sessionPath(stateDir, sessionId);
+		const statePath = sessionRecordPath(stateDir, sessionId);
 		const nudge = shipNudge({ record, config, precheck: shipPrecheck(cwd), statePath });
 		if (!nudge || !writeShip(statePath, { nudgedAt: Date.now() })) return undefined;
 		return nudge;

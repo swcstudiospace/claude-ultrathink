@@ -1,6 +1,6 @@
 # Connect Grok Bot to ultrathink (handoff)
 
-Not connected. This document is the handoff. The connection counts as verified only after the checklist in section 4 passes. Sections 8 and 9 cover Grok Chat, which uses OAuth and server-side planning. For all chat clients, see [Use /ultrathink in Grok Chat, Claude and Claude Code](../how-to/use-ultrathink-in-chat.md). For server operation, see the [runbook](runbook-ultrathink.md).
+Not connected. This document is the handoff. The connection counts as verified only after the checklist in section 4 passes. Sections 8 and 9 cover Grok Chat, which authenticates by OAuth only and, like Claude chat, has not been connected to this server in a live session. For all chat clients, see [Use /ultrathink in Claude, Claude Code and Grok Chat](../how-to/use-ultrathink-in-chat.md). For server operation, see the [runbook](runbook-ultrathink.md).
 
 ## 1. What it does
 
@@ -62,7 +62,9 @@ The connector URL is `https://ultrathink.swcstudio.space/mcp`. It uses OAuth 2.1
 1. In Grok, go to grok.com/connectors, click **New Connector**, and select **Custom**.
 2. Enter the URL `https://ultrathink.swcstudio.space/mcp`.
 3. If Grok offers OAuth, choose it and continue. Grok opens the ultrathink consent page. Enter the owner password and click **Approve**.
-4. Confirm the ultrathink tools appear in the connector. With server-side planning on, the list includes `ultrathink_uplift` and `ultrathink_result`.
+4. Confirm the ultrathink tools appear in the connector. With server-side planning on there are 10: `ultrathink_uplift`, `ultrathink_plan`, `ultrathink_pending`, `ultrathink_show`, `ultrathink_answer`, `ultrathink_status`, `ultrathink_result`, `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`. Without it there are 9 (no `ultrathink_uplift`).
+
+Grok Chat takes OAuth only: no place to enter the `x-connector-key` header was found, so that header is for Grok Bot (section 2) and Claude Code, not for Grok Chat. Grok also fetches a connector's tool list once, when it connects, and refreshes it only when the connector is re-authenticated (`https://github.com/xai-org/plugin-marketplace/issues/1402`, maintainer reply of 2026-10-13). After any server change to the tools, such as the three connector tools `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command`, disconnect and reconnect the connector in Grok before checking the list.
 
 What the server enforces:
 
@@ -73,7 +75,7 @@ What the server enforces:
 - The consent page shows the origin the client will be sent back to and says the client name is not verified.
 - Registration, authorize, token and revoke calls are rate limited per IP. The owner login allows 5 attempts per IP per 15 minutes.
 - `/mcp` refuses a browser `Origin` that is not the server's own, one of the four default origins above, or listed in `ULTRATHINK_ALLOWED_ORIGINS`. A request with no `Origin` is allowed.
-- The `x-connector-key` header keeps working for the Grok Bot path in section 2.
+- The `x-connector-key` header keeps working for the Grok Bot path in section 2. It is not usable from Grok Chat's connector UI.
 
 A client can revoke its own token at `POST /oauth/revoke`. To revoke every client and token, stop `ultrathink-web`, delete `/var/lib/ultrathink/oauth.json`, and start the service again. Every client then connects and asks for approval again.
 
@@ -85,22 +87,24 @@ In a chat that has the connector attached, send `/ultrathink <request>`.
 
 **Client-driven fallback.** When the server has no OpenRouter key or planning model, or `ULTRATHINK_SERVER_PLANNING=0`, `ultrathink_uplift` is not listed. The chat model then calls `ultrathink_plan`, answers each pending prompt with `ultrathink_show` and `ultrathink_answer`, and repeats until the status is `planned`. It then calls `ultrathink_result` for the plan. In this mode the server runs no model, and the plan comes from the chat model's own answers.
 
-The server offers the command in three ways:
+The server offers the command in these ways:
 
-1. **Tool text.** `ultrathink_uplift` (or `ultrathink_plan` in client-driven mode) is described as the entry point for `/ultrathink`, and the server `instructions` say the same. A client that shows the model tool descriptions needs nothing else.
-2. **MCP prompt.** The server lists a prompt named `ultrathink` with a required `request` argument. A client that turns MCP prompts into slash commands shows it in its `/` menu. Grok's connector documentation describes tool discovery only, and no source found says Grok Chat lists MCP prompts. Treat this route as unverified in Grok Chat.
+1. **Tool text.** `ultrathink_uplift` (or `ultrathink_plan` in client-driven mode) is described as the entry point for `/ultrathink`, and the connector tools `ultrathink_graph`, `ultrathink_sessions` and `ultrathink_command` carry the trigger text for `/ultrathink-think`, `/ultrathink-last`, `/ultrathink-status` and every other `/ultrathink-<name>`. The server `instructions` say the same, but whether Grok Chat shows `instructions` to the model is not verified. A client that shows the model tool descriptions needs nothing else.
+2. **MCP prompts.** The server lists six prompts, one per supported command (`ultrathink`, `ultrathink-plan`, `ultrathink-think`, `ultrathink-last`, `ultrathink-status`, `ultrathink-quick`). A client that turns MCP prompts into slash commands shows them in its `/` menu. Grok's connector documentation describes tool discovery only, and no source found says Grok Chat lists MCP prompts. Treat this route as unverified in Grok Chat.
 3. **Custom instructions.** If Grok does not act on a typed `/ultrathink`, paste this into Grok's global custom instructions (Settings, Customize; the label varies by app version).
 
 For server-side planning:
 
 ```text
-When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command, verbatim. Call ultrathink_uplift with it as prompt. If the status is running, call ultrathink_result with the sessionId, and call it again until the status is planned. Do not invent a sessionId or a status. When the plan is ready, ask the user the questions in it that matter, state the defaults you assume for the rest, and carry out the plan. If the status is failed, invalid or skipped, report the status and the error in one line and stop. If nothing follows /ultrathink, ask for a request and call no tool.
+When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command, verbatim. Call ultrathink_uplift with it as prompt. If the status is running, call ultrathink_result with the sessionId, and call it again until the status is planned. Do not invent a sessionId or a status. When the plan is ready, show the user its wave tree first, unchanged, in a code block, ask the questions in the plan that matter, state the defaults you assume for the rest, and carry out the plan. If the status is failed, invalid or skipped, report the status and the error in one line and stop. If nothing follows /ultrathink, ask for a request and call no tool.
+A message that starts with /ultrathink- and a command name is another command, not a request to plan. /ultrathink-think [sessionId] [node] calls ultrathink_graph. /ultrathink-last calls ultrathink_graph with no arguments (newest planned session), then ultrathink_result with that sessionId. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> calls ultrathink_command with command set to the name and args set to the rest, verbatim; relay its message and make the tool call it names in next.
 ```
 
 For the client-driven fallback:
 
 ```text
-When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command. Call ultrathink_plan with it as prompt. While the status is needs-model, answer each pending prompt: call ultrathink_show, write the answer its system text asks for, and call ultrathink_answer. Then call ultrathink_plan again with the same sessionId and prompt. When the status is planned, call ultrathink_result with the sessionId, ask the user the questions in the plan that matter, state the defaults you assume for the rest, and carry out the plan. If nothing follows /ultrathink, ask for a request.
+When a message starts with /ultrathink, use the ultrathink connector. The request is everything after the command. Call ultrathink_plan with it as prompt. While the status is needs-model, answer each pending prompt: call ultrathink_show, write the answer its system text asks for, and call ultrathink_answer. Then call ultrathink_plan again with the same sessionId and prompt. When the status is planned, call ultrathink_result with the sessionId and call ultrathink_graph once with it, show the user the wave tree first, unchanged, in a code block, ask the questions in the plan that matter, state the defaults you assume for the rest, and carry out the plan. If nothing follows /ultrathink, ask for a request.
+A message that starts with /ultrathink- and a command name is another command, not a request to plan. /ultrathink-think [sessionId] [node] calls ultrathink_graph. /ultrathink-last calls ultrathink_graph with no arguments (newest planned session), then ultrathink_result with that sessionId. /ultrathink-status calls ultrathink_sessions with no arguments. /ultrathink-quick <message> is answered directly, with no ultrathink tool. Any other /ultrathink-<name> calls ultrathink_command with command set to the name and args set to the rest, verbatim; relay its message and make the tool call it names in next.
 ```
 
 A typed `/ultrathink` is a convention the model follows, not a command the client runs. To check what Grok does, send `/ultrathink plan the frontend` and look for `ultrathink_uplift` (or `ultrathink_plan`) calls in the chat. Then type `/` and `@` and see whether `ultrathink` is listed.

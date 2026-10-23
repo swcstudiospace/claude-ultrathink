@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readSkipOnce } from "../claude/state.ts";
 import { carrierPath, clearPlanCarrier, writePlanCarrier } from "./carrier.ts";
 import { claimTurn } from "./claim.ts";
 
@@ -62,10 +63,17 @@ describe("writePlanCarrier", () => {
 		writePlanCarrier({ host: "omp", stateDir, sessionId: "s1", context: "ctx" });
 		expect(statSync(carrierPath(stateDir)).mode & 0o777).toBe(0o600);
 	});
+
+	test("an absent session id (blank, or Prime's unknown placeholder) writes no carrier, since no record could be matched to it", () => {
+		for (const sessionId of ["", "  ", "unknown"]) {
+			expect(writePlanCarrier({ host: "prime-agent", stateDir, sessionId, specPath: "/s/x.xml", context: "ctx" })).toBeUndefined();
+		}
+		expect(existsSync(carrierPath(stateDir))).toBe(false);
+	});
 });
 
-describe("uplift hook on Grok", () => {
-	function runHook(envelope: Record<string, unknown>): string {
+describe("uplift hook on Grok, Claude and Muse", () => {
+	function runHook(envelope: Record<string, unknown>, host = "grok-build"): string {
 		const home = join(dir, "home");
 		mkdirSync(home, { recursive: true });
 		const env: Record<string, string | undefined> = {};
@@ -74,7 +82,7 @@ describe("uplift hook on Grok", () => {
 		}
 		const proc = Bun.spawnSync([process.execPath, HOOK], {
 			cwd: dir,
-			env: { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ULTRATHINK_HOST: "grok-build", ULTRATHINK_STATE_DIR: stateDir },
+			env: { ...env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ULTRATHINK_HOST: host, ULTRATHINK_STATE_DIR: stateDir },
 			stdin: Buffer.from(JSON.stringify({ hookEventName: "user_prompt_submit", cwd: dir, ...envelope })),
 			stdout: "pipe",
 			stderr: "pipe",
@@ -112,6 +120,40 @@ describe("uplift hook on Grok", () => {
 		const path = writeStalePlan();
 		runHook({ sessionId: "s1", promptId: "p2", subagentType: "explore", userPrompt: "/ultrathink-quick look around" });
 		expect(existsSync(path)).toBe(true);
+	});
+
+	test("/ultrathink-skip arms exactly the session the envelope names, case included", () => {
+		const output = JSON.parse(runHook({ sessionId: "Grok-S1", promptId: "p9", userPrompt: "/ultrathink-skip" }));
+		expect(output).toMatchObject({ decision: "block", reason: "Prompt Uplift will skip the next prompt in this session" });
+		expect(readSkipOnce(stateDir, "Grok-S1")).toBe(true);
+		expect(readSkipOnce(stateDir, "grok-s1")).toBe(false);
+	});
+
+	test("the --ctl control CLI arms the session named by --session, with its id kept as given", () => {
+		const home = join(dir, "home");
+		mkdirSync(home, { recursive: true });
+		const proc = Bun.spawnSync([process.execPath, HOOK, "--ctl", "skip", "--session", "Ctl-S1"], {
+			cwd: dir,
+			env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ULTRATHINK_HOST: "grok-build", ULTRATHINK_STATE_DIR: stateDir },
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 30_000,
+		});
+		expect(proc.exitCode).toBe(0);
+		expect(proc.stdout.toString()).toContain("Prompt Uplift will skip the next prompt in this session");
+		expect(readSkipOnce(stateDir, "Ctl-S1")).toBe(true);
+		expect(readSkipOnce(stateDir, "ctl-s1")).toBe(false);
+	});
+
+	test("the normal command branch arms the session its session_id names on every host that routes through this hook; without one it refuses", () => {
+		for (const host of ["claude-code", "muse", "grok-build"]) {
+			const sessionId = `${host}-Sess`;
+			const output = JSON.parse(runHook({ session_id: sessionId, prompt: "/ultrathink-skip" }, host));
+			expect(output).toMatchObject({ decision: "block", reason: "Prompt Uplift will skip the next prompt in this session" });
+			expect(readSkipOnce(stateDir, sessionId)).toBe(true);
+		}
+		const refused = JSON.parse(runHook({ prompt: "/ultrathink-skip" }, "claude-code"));
+		expect(refused.reason).toContain("needs a session id");
 	});
 });
 

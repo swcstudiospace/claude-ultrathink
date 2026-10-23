@@ -16,9 +16,9 @@ import { runTeachCommand } from "../teach/cli.ts";
 import { DISTILL_SYSTEM } from "../teach/observe.ts";
 import { COT_SYSTEM_PROMPT, GRAPH_SYSTEM_PROMPT } from "../think/prompts.ts";
 import { workflowWaves } from "../think/graph.ts";
-import { readControl, sessionPath, type SessionRecord } from "../claude/state.ts";
+import { readControl, sessionRecordPath, type SessionRecord } from "../claude/state.ts";
 import { UPLIFT_SYSTEM_PROMPT } from "../uplift/prompt.ts";
-import { runControl, trackingOff } from "../uplift/commands.ts";
+import { runControl, takeSessionFlag, trackingOff } from "../uplift/commands.ts";
 import {
 	checkRecord,
 	createJournalCompleter,
@@ -80,7 +80,7 @@ function session(args: string[]): string {
 }
 
 function statePathFor(stateDir: string, sessionId: string): string {
-	return sessionPath(stateDir, sessionId);
+	return sessionRecordPath(stateDir, sessionId);
 }
 
 function readRecord(stateDir: string, sessionId: string): { record: SessionRecord; path: string } {
@@ -382,8 +382,11 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			if (which) return all[which] ? { code: 0, text: all[which] } : { code: 2, text: `unknown prompt ${which}` };
 			return { code: 0, text: Object.entries(all).map(([k, v]) => `## ${k}\n${v}`).join("\n\n") };
 		}
-		case "ctl":
-			return { code: 0, text: grokbotStatusLines(await runControl(rest, { stateDir, cwd, host: GROKBOT_ENGINE_HOST, modelResolution: hostResolution() })) };
+		case "ctl": {
+			// Grok Bot names no session to the CLI: the caller passes the planner's `--session` (the flag plan and show take).
+			const { sessionId, args } = takeSessionFlag(rest);
+			return { code: 0, text: grokbotStatusLines(await runControl(args, { stateDir, cwd, host: GROKBOT_ENGINE_HOST, modelResolution: hostResolution(), sessionId })) };
+		}
 		case "decisions":
 			return await runDecisionsCommand(rest, { cwd });
 		case "hindsight":

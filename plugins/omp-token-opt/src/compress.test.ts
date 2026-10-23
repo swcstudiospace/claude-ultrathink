@@ -64,4 +64,14 @@ describe("shrinkToolText", () => {
 			},
 		);
 	});
+
+	test("a cap below 4000 applies to results shorter than 4000 chars", () => {
+		const text = Array.from({ length: 150 }, (_, i) => `row ${i} value ${(i * 7919) % 10007}`).join("\n");
+		expect(text.length).toBeGreaterThan(1200);
+		expect(text.length).toBeLessThan(4000);
+		expect(shrinkToolText(text).saved).toBe(0);
+		const out = shrinkToolText(text, 1200);
+		expect(out.text).toContain("… omitted");
+		expect(out.saved).toBeGreaterThan(0);
+	});
 });

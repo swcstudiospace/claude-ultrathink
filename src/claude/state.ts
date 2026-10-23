@@ -4,6 +4,7 @@
  * On-disk state for the ultrathink Claude Code plugin. Hooks are one-shot
  * processes, so this lives under ~/.claude/ultrathink instead of in-session.
  */
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type LockOptions, withFileLock, writeFileAtomic, withLockMutation } from "./atomic.ts";
@@ -22,7 +23,6 @@ import type { LessonsLookup, SkillsLookup } from "../teach/types.ts";
 
 export interface ControlState {
 	enabled?: boolean;
-	skipOnce?: boolean;
 	thinkEnabled?: boolean;
 	hitlEnabled?: boolean;
 	/** Create Linear/Notion rows; overrides `track.enabled` from config. `false` also stops kickoff from creating them. */
@@ -73,6 +73,13 @@ export interface SessionRecord {
 	docs?: DocsLookup;
 	/** Jev decisions made while planning this prompt (plan, knowledge, blocking), in call order. Absent on older records and when none ran. */
 	decisions?: DecisionRecord[];
+	/** Repos of the files this session's edit/write tools changed (omp), sorted and unique. Attribution only; never changes the label. */
+	workRepos?: string[];
+	/**
+	 * Set when an edited repo differs from the plan's labelled repo (`plan.task.repo`; null when the plan has none).
+	 * `edited` is the full `workRepos` at that point, so a warning fires once per distinct edited set.
+	 */
+	repoMismatch?: { labelled: string | null; edited: string[] } | null;
 }
 
 export function defaultStateDir(env: Record<string, string | undefined> = process.env): string {
@@ -103,7 +110,6 @@ export function readControl(dir: string): ControlState {
 	const rec = raw as Record<string, unknown>;
 	const out: ControlState = {};
 	if (typeof rec.enabled === "boolean") out.enabled = rec.enabled;
-	if (typeof rec.skipOnce === "boolean") out.skipOnce = rec.skipOnce;
 	if (typeof rec.thinkEnabled === "boolean") out.thinkEnabled = rec.thinkEnabled;
 	if (typeof rec.hitlEnabled === "boolean") out.hitlEnabled = rec.hitlEnabled;
 	if (typeof rec.trackEnabled === "boolean") out.trackEnabled = rec.trackEnabled;
@@ -126,19 +132,102 @@ export function writeControl(dir: string, patch: ControlState): ControlState {
 	});
 }
 
+/** A plain session id keeps its name: lowercase, letters, digits, `_`, `.`, `-`, at most 120 characters. */
+const PLAIN_SESSION_ID_RE = /^[a-z0-9_.-]{1,120}$/;
+
+/**
+ * The file-name stem of a session id. Host ids are case-sensitive and may hold characters a file name cannot, and macOS
+ * and Windows ignore case: `Claude-A` and `claude-a` would then share one record and one skip flag. A plain id keeps its
+ * name; any other id gets a readable lowercase slug plus a hash of the exact id after `~`, which a plain id never holds.
+ * Every stem is lowercase, and distinct ids get distinct stems.
+ */
 function safeSessionId(id: string): string {
-	return id.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "unknown";
+	if (PLAIN_SESSION_ID_RE.test(id)) return id;
+	const slug = Array.from(id, (char) => (/[A-Za-z0-9_.-]/.test(char) ? char.toLowerCase() : "_")).join("").slice(0, 80);
+	return `${slug}~${createHash("sha256").update(id).digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * The host's session id, trimmed, or undefined when it names no session: blank, or Prime Agent's `unknown` placeholder
+ * for a kernel with no session. Such a prompt gets its own turn id, never a record or skip flag shared by every prompt.
+ */
+export function hostSessionId(id: string | undefined): string | undefined {
+	const trimmed = id?.trim();
+	return trimmed && trimmed !== "unknown" ? trimmed : undefined;
 }
 
 export function sessionPath(dir: string, sessionId: string): string {
 	return join(dir, "sessions", `${safeSessionId(sessionId)}.json`);
 }
 
+/**
+ * Where earlier builds wrote this id's record: the id with characters a file name cannot hold replaced by `_`, its case
+ * kept. Only read as a fallback; a record found there is used only when its stored sessionId is this id, since on a
+ * case-insensitive file system `Claude-A.json` is also `claude-a.json`.
+ */
+export function legacySessionPath(dir: string, sessionId: string): string {
+	return join(dir, "sessions", `${sessionId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120) || "unknown"}.json`);
+}
+
+/**
+ * The file that holds this session's record: its current name, or the earlier name when only that file exists and names
+ * this id. Otherwise the current name, which may not exist yet.
+ */
+export function sessionRecordPath(dir: string, sessionId: string): string {
+	const current = sessionPath(dir, sessionId);
+	if (existsSync(current)) return current;
+	const legacy = legacySessionPath(dir, sessionId);
+	if (legacy !== current && existsSync(legacy)) {
+		const raw = readJson(legacy) as { sessionId?: unknown } | undefined;
+		if (raw && typeof raw === "object" && raw.sessionId === sessionId) return legacy;
+	}
+	return current;
+}
+
+/** A fresh id for a turn whose host gave no session id: unique to that prompt, so no turn reads or writes another's state. */
+export function newTurnSessionId(): string {
+	return `turn-${randomUUID()}`;
+}
+
+const TURN_SESSION_RE = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function isTurnSessionId(id: string): boolean {
+	return TURN_SESSION_RE.test(id);
+}
+
+/**
+ * Path of a session's armed /ultrathink-skip. A flag file beside the session's record, not part of it: a session can be
+ * skipped before its first plan writes a record. The `.skip` suffix keeps it out of the `sessions/*.json` record count.
+ */
+export function skipOncePath(dir: string, sessionId: string): string {
+	return join(dir, "sessions", `${safeSessionId(sessionId)}.skip`);
+}
+
+export function readSkipOnce(dir: string, sessionId: string): boolean {
+	return existsSync(skipOncePath(dir, sessionId));
+}
+
+export function armSkipOnce(dir: string, sessionId: string): void {
+	// The session's record lock, which prune holds while it decides on and deletes a stale flag: an arm never lands between
+	// that decision and its delete. A lock that cannot be taken runs unlocked, as every session write does.
+	withFileLock(sessionPath(dir, sessionId), () => writeFileAtomic(skipOncePath(dir, sessionId), "skip\n"));
+}
+
+/** Clears the session's armed skip; an already clear session is left as it is. */
+export function clearSkipOnce(dir: string, sessionId: string): void {
+	try {
+		unlinkSync(skipOncePath(dir, sessionId));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
 export function readSession(dir: string, sessionId: string): SessionRecord | undefined {
-	const raw = readJson(sessionPath(dir, sessionId));
+	const raw = readJson(sessionRecordPath(dir, sessionId));
 	if (!raw || typeof raw !== "object") return undefined;
 	const rec = raw as Partial<SessionRecord>;
-	if (!rec.result || typeof rec.result !== "object") return undefined;
+	// A file names its session: on a case-insensitive file system another id's record can share this file's name.
+	if (rec.sessionId !== sessionId || !rec.result || typeof rec.result !== "object") return undefined;
 	return rec as SessionRecord;
 }
 
@@ -236,33 +325,41 @@ export function lastRefreshMessage(lastPath: string): string {
 	return `could not refresh ${lastPath}; the session was saved, but ctl last may still show the previous plan`;
 }
 
-/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
-export function writeSession(dir: string, record: SessionRecord): string | undefined {
-	writeJson(sessionPath(dir, record.sessionId), record);
+/** Writes `record` to `path` and mirrors it to last.json. Returns a warning when `last.json` could not be refreshed; the record file is still saved. */
+function saveSessionFile(dir: string, path: string, record: SessionRecord): string | undefined {
+	writeJson(path, record);
 	const last = join(dir, "last.json");
 	if (!withLastLock(last, () => writeJson(last, record))) return lastRefreshMessage(last);
 	return undefined;
 }
 
+/** Writes the session. Returns a warning when `last.json` could not be refreshed; the session file is still saved. */
+export function writeSession(dir: string, record: SessionRecord): string | undefined {
+	return saveSessionFile(dir, sessionPath(dir, record.sessionId), record);
+}
+
 /**
- * Locked read-mutate-write of one session record (the session file and last.json). Returns the written record, or
- * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` must not write the
- * same session file itself.
+ * Locked read-mutate-write of one session record (the record file and last.json). Returns the written record, or
+ * undefined without writing when the record is missing or `mutate` returns undefined. `mutate` receives the path
+ * readers resolve for this id (`sessionRecordPath`), so any sidecar it writes beside the JSON pairs with it. The
+ * record is written back to that same path: a record still under its earlier name keeps its JSON beside its XML, and
+ * never splits onto the new name. `mutate` must not write the record file itself.
  */
 export function updateSession(
 	dir: string,
 	sessionId: string,
-	mutate: (record: SessionRecord) => SessionRecord | undefined,
+	mutate: (record: SessionRecord, recordPath: string) => SessionRecord | undefined,
 	lock?: LockOptions,
 ): SessionRecord | undefined {
 	return withFileLock(
 		sessionPath(dir, sessionId),
 		() => {
+			const recordPath = sessionRecordPath(dir, sessionId);
 			const record = readSession(dir, sessionId);
 			if (!record) return undefined;
-			const next = mutate(record);
+			const next = mutate(record, recordPath);
 			if (!next) return undefined;
-			writeSession(dir, next);
+			saveSessionFile(dir, recordPath, next);
 			return next;
 		},
 		lock,

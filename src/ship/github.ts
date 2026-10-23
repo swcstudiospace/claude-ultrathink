@@ -27,7 +27,8 @@ export interface Github {
 	deleteRemoteBranch(branch: string): { ok: boolean; error?: string };
 	comment(number: number, body: string): { ok: boolean; error?: string };
 	mergeMethods(): ShipConfig["mergeMethod"][];
-	syncBase(input: { base: string; branch: string }): { ok: boolean; error?: string };
+	/** Checks out `base` and fast-forwards it; then deletes the local `branch` only when it is fully merged or its tip is `headSha`. */
+	syncBase(input: { base: string; branch: string; headSha?: string }): { ok: boolean; error?: string };
 	/**
 	 * The PR's Greptile review threads; fails on any doubt (errors, truncation) so callers can fail closed.
 	 * With `opts.deadlineMs`, repository lookup and every page share the remaining wait budget; a response
@@ -173,10 +174,16 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 		return name && defaultBranch ? { name, defaultBranch } : undefined;
 	};
 
+	// A name beginning with `-` would be parsed by git as an option; full refspecs keep every other name a positional.
+	const badBranch = (branch: string) => (branch.startsWith("-") ? `refusing branch name ${JSON.stringify(branch)}` : undefined);
+
 	const gh: Github = {
 		repo,
 		push(branch) {
-			const r = exec(["git", "push", "-u", "origin", branch], { timeoutMs: LONG_TIMEOUT_MS });
+			const bad = badBranch(branch);
+			if (bad) return { ok: false, error: bad };
+			const refspec = `refs/heads/${branch}:refs/heads/${branch}`;
+			const r = exec(["git", "push", "-u", "origin", refspec], { timeoutMs: LONG_TIMEOUT_MS });
 			return r.exitCode === 0 ? { ok: true } : { ok: false, error: errorOf(r) };
 		},
 		findOpenPr(head) {
@@ -222,7 +229,9 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			return { ok: false, error: r.exitCode !== 0 ? errorOf(r) : `PR is ${state ?? "unknown"} after merge` };
 		},
 		deleteRemoteBranch(branch) {
-			const r = exec(["git", "push", "origin", "--delete", branch], { timeoutMs: LONG_TIMEOUT_MS });
+			const bad = badBranch(branch);
+			if (bad) return { ok: false, error: bad };
+			const r = exec(["git", "push", "origin", `:refs/heads/${branch}`], { timeoutMs: LONG_TIMEOUT_MS });
 			if (r.exitCode === 0 || r.stderr.includes("remote ref does not exist")) return { ok: true };
 			return { ok: false, error: errorOf(r) };
 		},
@@ -240,15 +249,21 @@ export function createGithub(input: { cwd: string; run?: Run }): Github {
 			if (o.rebaseMergeAllowed === true) methods.push("rebase");
 			return methods;
 		},
-		syncBase({ base, branch }) {
+		syncBase({ base, branch, headSha }) {
+			const bad = badBranch(branch) ?? badBranch(base);
+			if (bad) return { ok: false, error: bad };
 			const checkout = exec(["git", "checkout", base]);
 			if (checkout.exitCode !== 0) return { ok: false, error: errorOf(checkout) };
 			const pull = exec(["git", "pull", "--ff-only", "origin", base], { timeoutMs: LONG_TIMEOUT_MS });
 			if (pull.exitCode !== 0) return { ok: false, error: errorOf(pull) };
 			const current = exec(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim();
-			const exists = exec(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).exitCode === 0;
-			if (exists && current !== branch) exec(["git", "branch", "-D", branch]);
-			return { ok: true };
+			const tip = exec(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+			if (tip.exitCode !== 0 || current === branch) return { ok: true };
+			// A squash/rebase merge leaves the branch "unmerged" for `-d`; its tip being exactly the merged head proves
+			// nothing local is lost. Otherwise `-d` refuses unmerged commits (a later amend or commit) and is never forced.
+			const safe = headSha !== undefined && tip.stdout.trim() === headSha;
+			const deleted = exec(["git", "branch", safe ? "-D" : "-d", branch]);
+			return deleted.exitCode === 0 ? { ok: true } : { ok: false, error: errorOf(deleted) };
 		},
 		reviewThreads(prNumber, opts = {}) {
 			const now = opts.now ?? Date.now;
