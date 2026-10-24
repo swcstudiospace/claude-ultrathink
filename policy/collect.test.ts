@@ -64,8 +64,9 @@ describe("static collection of the real repository", () => {
 	test("reads the four original workflows and their pinned uses", () => {
 		for (const file of ORIGINAL_WORKFLOWS) expect(findWorkflow(input, file).file).toBe(file);
 		const uses = ORIGINAL_WORKFLOWS.flatMap((file) => Object.values(findWorkflow(input, file).jobs).flatMap((job) => job.uses));
-		// 16 before task 00057, plus the SHA-pinned setup-node step in ci.yml and in release.yml (the Omega CI pool has no system Node).
-		expect(uses).toHaveLength(18);
+		// 16 before task 00057, plus the SHA-pinned setup-node step in ci.yml and in release.yml (the Omega CI pool has no system Node),
+		// plus the one in codeql.yml (task 00066: CodeQL's TypeScript extractor starts Node).
+		expect(uses).toHaveLength(19);
 		for (const use of uses) expect(use).toMatch(SHA_PIN);
 	});
 

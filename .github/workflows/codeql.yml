@@ -37,6 +37,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # CodeQL's TypeScript extractor starts Node, and the pool image has no system Node (ci.yml sets it up the same
+      # way). Without this the javascript-typescript leg fails with "Could not start Node.js".
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.language == 'javascript-typescript'
+        with:
+          node-version: "22.x"
+
       # The pool's tool cache (/opt/hostedtoolcache) is read-only, so this action cannot download its CodeQL
       # bundle at job time: the runner image ships the bundle this pin asks for (CodeQL 2.27.3). Bump the image
       # with the action (swcstudiospace/Omega-Prime deploy/ci-runner-desktop).
