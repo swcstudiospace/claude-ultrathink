@@ -291,6 +291,9 @@ describe("headless planner: start and result", () => {
 		const h = setup({}, { completer: model.complete });
 		const sessionId = randomUUID();
 		await startRunning(h, sessionId);
+		// The running job reaches the model on its own schedule; count only once it has, so a
+		// slow runner cannot credit the first job's call to the repeated start.
+		await model.firstCall;
 		const calls = model.stages.length;
 		const again = h.planner.start({ prompt: PROMPT, sessionId });
 		await flush();
