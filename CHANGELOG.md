@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CodeQL's `Analyze (javascript-typescript)` job sets up Node 22 before `codeql-action/init`. The Omega CI runner pool has no system Node, so the TypeScript extractor failed with "Could not start Node.js" and the check stayed red on `main`.
 - Prompts no longer share state across sessions. An edit or write in Omp is attributed to the git repo it touched: a session whose edits land in a repo other than its plan's labelled repo records `repoMismatch` on its session record and shows one warning per distinct edited set. The label itself is unchanged.
 - `/ultrathink-skip` arms the skip for the session it is typed in, not for every session on the machine. Claude Code passes its session id (`${CLAUDE_SESSION_ID}`); `bin/ultrathink skip --session <id>` and grok-bot `ctl skip --session <id>` take one explicitly. Without an id it is refused with a message and arms nothing.
 - A prompt with no session id gets its own `turn-<uuid>` id instead of the shared `unknown` record, so no turn reads another turn's clarifications and no carrier names a turn.
